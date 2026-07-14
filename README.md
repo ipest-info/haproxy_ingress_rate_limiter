@@ -22,4 +22,4 @@ haproxy_ingress_rate_limiter/
 
 ## 核心思路一句话
 
-Agent 每秒从 HAProxy stats socket 读取各 frontend 的 `bytes_out` 计算下行速率，按控制面下发的节点配额做**滞回 + 渐进式**的准入控制（动态调 `maxconn` / 会话速率），并以 HAProxy 原生 `bwlim-out` 过滤器（或 tc）作为硬性兜底；控制面按环境聚合各节点用量，周期性再分配节点配额，同时承担带宽计费数据的权威管理与对账告警。
+Agent 每秒从 HAProxy stats socket 读取各 frontend 的 `bytes_out` 计算下行速率，用 HAProxy 原生 `bwlim-out` 聚合整形把 **10 秒滑动均值**压在环境配额内（瞬时容忍 110%，AIMD 急收慢放，不拒绝新建连接、不断开存量连接，上游靠 TCP 背压自然减速），tc 作硬兜底、maxconn 仅作资源保护；控制面按环境聚合各节点用量，周期性再分配节点配额，同时承担带宽计费数据的权威管理、用量数据沉淀展示与对账告警。
