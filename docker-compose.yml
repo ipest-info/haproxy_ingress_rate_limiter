@@ -1,0 +1,81 @@
+# docker-compose.yml —— rl-limiter v3.0 一键部署（MySQL 配置源 + 假 HAProxy）。
+#
+# 一句话：`docker compose up --build` 即拉起 MySQL + 两台假 HAProxy + 限速服务
+# 三件套，无需任何本地 YAML。
+#   - 改配置就改库：UPDATE envs/env_targets/settings 表，rl-limiter 每 5s 轮询
+#     配置版本（= 这三张表 updated_at 的最大值），发现变化即热重载，秒级生效、
+#     无需重启服务；
+#   - 用量落库：每秒用量样本批量写入 usage_samples 表，心跳写入 heartbeats 表，
+#     供后台展示/对账；
+#   - schema.sql 挂到 MySQL 初始化目录，首次启动自动建表并写入种子（两台节点、
+#     env-a 200Mbps / env-b 50Mbps、mode=dry-run）。
+
+services:
+  # MySQL 8.0：配置权威 + 用量库。schema.sql 首次启动自动执行。
+  mysql:
+    image: mysql:8.0
+    # 用 mysql_native_password 认证，PyMySQL 无需 cryptography 即可连接。
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: rl_limiter
+      MYSQL_USER: rl
+      MYSQL_PASSWORD: rlpass
+    volumes:
+      # 初始化脚本：仅在数据卷为空的首次启动时执行。
+      - ./deploy/mysql/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+      # 数据持久化：删除卷（docker compose down -v）即回到全新初始化状态。
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # rl-limiter 用 depends_on service_healthy 等这里就绪后再启动。
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-prootpass"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # 假 HAProxy 节点 1：提供 fe_env_a(16Mbps) 与 fe_env_b(4Mbps) 两个 frontend。
+  # 服务名 hap-1 即容器主机名，与 haproxy_nodes 表的 host 一致。
+  hap-1:
+    build:
+      context: ./
+      dockerfile: deploy/docker/Dockerfile
+    command: >-
+      python tools/fake_haproxy.py --host 0.0.0.0 --port 9999
+      --frontends fe_env_a:16,fe_env_b:4
+    restart: unless-stopped
+
+  # 假 HAProxy 节点 2：仅提供 fe_env_a(12Mbps)，与 hap-1 的 fe_env_a 同属 env-a。
+  hap-2:
+    build:
+      context: ./
+      dockerfile: deploy/docker/Dockerfile
+    command: >-
+      python tools/fake_haproxy.py --host 0.0.0.0 --port 9999
+      --frontends fe_env_a:12
+    restart: unless-stopped
+
+  # rl-limiter 限速服务：MySQL 模式（RL_MYSQL_HOST 触发）。
+  rl-limiter:
+    build:
+      context: ./
+      dockerfile: deploy/docker/Dockerfile
+    depends_on:
+      mysql:
+        condition: service_healthy
+      hap-1:
+        condition: service_started
+      hap-2:
+        condition: service_started
+    environment:
+      RL_MYSQL_HOST: mysql
+      RL_MYSQL_USER: rl
+      RL_MYSQL_PASSWORD: rlpass
+      RL_MYSQL_DB: rl_limiter
+      RL_MYSQL_POLL_INTERVAL_S: "5"
+      RL_NODE_ID: rl-limiter-01
+      RL_LOG_LEVEL: info
+    restart: unless-stopped
+
+volumes:
+  mysql-data:

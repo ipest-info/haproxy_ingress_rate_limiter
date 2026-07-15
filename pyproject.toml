@@ -13,6 +13,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# MySQL 配置源（v3.0）：PyMySQL 为纯 Python 驱动，docker 镜像内零编译
+# 依赖。搭配 MySQL 用户使用 mysql_native_password 认证时无需 cryptography。
+mysql = ["PyMySQL>=1.1"]
 test = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.scripts]

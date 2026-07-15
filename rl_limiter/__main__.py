@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -141,7 +142,21 @@ async def _amain(cfg, log: logging.Logger) -> None:
             "backend_base_url=%s",
             getattr(backend, "base_url", "") if backend is not None else "")
 
-    # --- 信号处理：SIGINT/SIGTERM 触发优雅退出（记录信号名后取消任务）。
+    # --- 并发运行：快环 + （可选）后台适配器（HTTP 上报器 / MySQL 后台）。
+    tick_interval_s = getattr(cfg, "tick_interval_s", 1.0) or 1.0
+    log.info("rl-limiter 服务已启动，快环与上报器开始运行 "
+             "node_id=%s mode=%s nodes=%d backend=%s version=%s",
+             cfg.node_id, executor_mode(exe), len(cfg.nodes),
+             getattr(backend, "base_url", "") if backend is not None else "",
+             SERVICE_VERSION)
+    await _serve(ctl, rep, tick_interval_s, log)
+
+
+async def _serve(ctl, backend, tick_interval_s: float, log: logging.Logger) -> None:
+    """通用运行骨架：装信号处理、并发跑快环与后台适配器、等退出信号后
+    优雅取消。YAML 模式与 MySQL 模式共用这一段——两者的差别只在如何
+    构造 backend（HTTP 上报器 vs MySQL 后台）与 backend.configs 的来源，
+    运行与停机逻辑完全一致。backend 可为 None（standalone，无配置源）。"""
     stop = asyncio.Event()
     ev = asyncio.get_running_loop()
 
@@ -155,33 +170,94 @@ async def _amain(cfg, log: logging.Logger) -> None:
         except NotImplementedError:  # pragma: no cover - 非 Unix 平台兜底
             signal.signal(sig, lambda *_a, _n=sig.name: _on_signal(_n))
 
-    # --- 并发运行：快环 + （可选）上报器。上报器的 config_queue 即快环的
-    # 配置入口，长轮询拿到的新配置经它进入循环（配置优先于 tick）。
-    tick_interval_s = getattr(cfg, "tick_interval_s", 1.0) or 1.0
+    # backend.configs 即快环的配置入口，配置源（长轮询/DB 轮询）拿到的新
+    # 配置经它进入循环（配置优先于 tick）。
     tasks = [asyncio.create_task(
-        ctl.run(rep.configs if rep is not None else None, tick_interval_s),
+        ctl.run(backend.configs if backend is not None else None, tick_interval_s),
         name="control-loop")]
-    if rep is not None:
-        tasks.append(asyncio.create_task(rep.run(), name="reporter"))
-
-    log.info("rl-limiter 服务已启动，快环与上报器开始运行 "
-             "node_id=%s mode=%s nodes=%d backend=%s version=%s",
-             cfg.node_id, executor_mode(exe), len(cfg.nodes),
-             getattr(backend, "base_url", "") if backend is not None else "",
-             SERVICE_VERSION)
+    if backend is not None:
+        tasks.append(asyncio.create_task(backend.run(), name="backend"))
 
     # 等待退出信号；任一常驻任务意外结束（本应永续运行）也触发整体退出，
-    # 交由 systemd Restart=always 拉起，比带着半残状态继续跑更安全。
+    # 交由 systemd / docker Restart 拉起，比带着半残状态继续跑更安全。
     stop_task = asyncio.create_task(stop.wait(), name="stop-signal")
     done, _pending = await asyncio.wait(
         [stop_task, *tasks], return_when=asyncio.FIRST_COMPLETED)
     for t in done:
         if t is not stop_task and t.exception() is not None:
-            log.error("常驻任务异常退出，服务整体退出交由 systemd 拉起 "
+            log.error("常驻任务异常退出，服务整体退出交由进程管理器拉起 "
                       "task=%s err=%s", t.get_name(), t.exception())
     for t in (stop_task, *tasks):
         t.cancel()
     await asyncio.gather(stop_task, *tasks, return_exceptions=True)
+
+
+async def _amain_db(log: logging.Logger) -> None:
+    """MySQL 配置源模式（v3.0）：受控节点、环境配额、运行模式全部从
+    数据库读取，改库即热重载；用量与心跳写回库。引导信息（DB 连接、
+    node_id、tick 间隔）来自环境变量，契合 docker compose 部署。"""
+    from . import db as dbmod
+
+    node_id = os.environ.get("RL_NODE_ID", "rl-limiter-01")
+    tick_interval_s = float(os.environ.get("RL_TICK_INTERVAL_S", "1.0")) or 1.0
+    db_cfg = dbmod.DbConfig.from_env()
+    db = dbmod.Database(db_cfg, log_=log)
+
+    # 等待 MySQL 就绪（compose 里 DB 与服务同时拉起）。
+    await db.wait_ready()
+
+    # 从库加载受控节点接线，构建 runtime 客户端（采集 + 执行共用）。
+    nodes = await db.fetch_nodes()
+    clients = {
+        n.name: haproxy.RuntimeClient(n.host, n.port, n.timeout_s, log)
+        for n in nodes
+    }
+    map_paths = {n.name: n.bwlim_map_path for n in nodes}
+
+    # 拉取首份配置（环境配额 + 挂载点 + 模式），据此构建并 seed 快环。
+    cfg = await db.fetch_config()
+    col = Collector(clients, log)
+    gov = Governor(log)
+    exe = Executor(clients, map_paths, cfg.mode, log)
+
+    # backend 与 sampler 都引用下方才赋值的 ctl——它们只在 run 的 tick
+    # 里被调用，Python 闭包延迟求值，首次调用时 ctl 已构造，安全。
+    ctl: ControlLoop
+    backend = dbmod.DbBackend(
+        db, node_id, SERVICE_VERSION,
+        mode_fn=lambda: executor_mode(exe),
+        version_fn=lambda: ctl.version,
+        poll_interval_s=db_cfg.poll_interval_s,
+        log_=log,
+    )
+
+    def sampler(now, usages, decisions):
+        backend.add_sample(now, usages, decisions, executor_mode(exe), ctl.version)
+    ctl = ControlLoop(col, gov, exe, sampler=sampler, log=log)
+
+    ctl.seed(cfg)
+    backend.set_initial_version(cfg.version)
+
+    log.info(
+        "rl-limiter 服务已启动（MySQL 配置源），快环与数据库后台开始运行 "
+        "node_id=%s mode=%s nodes=%d envs=%d mysql=%s:%d/%s version=%s",
+        node_id, executor_mode(exe), len(nodes), len(cfg.envs),
+        db_cfg.host, db_cfg.port, db_cfg.database, SERVICE_VERSION)
+    await _serve(ctl, backend, tick_interval_s, log)
+
+
+def _setup_logging(level_name: str) -> logging.Logger:
+    """日志格式固定为"时间 级别 消息"三段；消息本体统一为中文描述 +
+    英文 snake_case 的 key=value 键值对，便于 grep 与日志采集系统按字段
+    解析。"""
+    level = getattr(logging, str(level_name).upper(), logging.INFO)
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=level,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+    )
+    return logging.getLogger("rl_limiter")
 
 
 def main() -> None:
@@ -191,7 +267,8 @@ def main() -> None:
                     "保证各环境下行带宽不超约定配额")
     parser.add_argument(
         "-c", "--config", default="/etc/rl-limiter/config.yaml",
-        help="服务配置文件路径（默认 %(default)s）")
+        help="YAML 配置文件路径（默认 %(default)s）；设置了 RL_MYSQL_HOST "
+             "环境变量时改用 MySQL 配置源，忽略本参数")
     parser.add_argument(
         "--version", action="store_true", help="打印版本号后退出")
     args = parser.parse_args()
@@ -200,23 +277,30 @@ def main() -> None:
         print("rl-limiter", SERVICE_VERSION)
         return
 
+    # 配置源选择：设置了 RL_MYSQL_HOST 即进入 MySQL 模式（docker compose
+    # 默认路径）；否则沿用本地 YAML 文件模式。
+    if os.environ.get("RL_MYSQL_HOST"):
+        log = _setup_logging(os.environ.get("RL_LOG_LEVEL", "info"))
+        log.info(
+            "配置源为 MySQL（v3.0）：受控节点/环境配额/运行模式均来自数据库 "
+            "mysql_host=%s mysql_db=%s node_id=%s",
+            os.environ.get("RL_MYSQL_HOST"),
+            os.environ.get("RL_MYSQL_DB", "rl_limiter"),
+            os.environ.get("RL_NODE_ID", "rl-limiter-01"))
+        try:
+            asyncio.run(_amain_db(log))
+        except KeyboardInterrupt:
+            pass
+        log.info("rl-limiter 服务已停止")
+        return
+
     try:
         cfg = configmod.load(args.config)
     except Exception as e:
         print(f"rl-limiter: {e}", file=sys.stderr)
         raise SystemExit(1)
 
-    # 日志配置：级别来自配置文件（debug/info/warning/error），格式固定为
-    # "时间 级别 消息"三段；消息本体统一为中文描述 + 英文 snake_case 的
-    # key=value 键值对，便于 grep 与日志采集系统按字段解析。
-    level = getattr(logging, str(cfg.log_level).upper(), logging.INFO)
-    logging.basicConfig(
-        stream=sys.stderr,
-        level=level,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-    )
-    log = logging.getLogger("rl_limiter")
+    log = _setup_logging(cfg.log_level)
 
     # 启动即输出完整配置摘要：现场排障时第一条要看的日志，可直接核对
     # 服务身份、模式、受控节点清单与配额来源。

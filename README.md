@@ -26,10 +26,15 @@ rl_limiter/       # Python 3.11 + asyncio 集中限速服务
   allocator.py    #   整形值按挂载点用量加权分配
   executor.py     #   dry-run/enforce 执行、pending 重试、resync
   reporter.py     #   管理后台长轮询/上报/心跳、fail-static 缓存
-  config.py       #   本地 YAML 配置（节点连接信息 + 引导配额）
+  db.py           #   MySQL 配置源（v3.0：节点/配额/模式）与用量/心跳落库
+  config.py       #   本地 YAML 配置（节点连接信息 + 引导配额，YAML 模式）
   loop.py         #   1s 主循环
 tools/            # fake_haproxy.py（联调假节点）、mock_backend.py（后台桩）
-deploy/           # systemd、haproxy 2.8 配置片段、tc 兜底脚本、示例配置
+deploy/
+  mysql/          #   schema.sql（MySQL 建表 + 种子，容器自动初始化）
+  docker/         #   Dockerfile（rl-limiter 镜像，主服务与假节点共用）
+  ...             #   systemd、haproxy 2.8 配置片段、tc 兜底脚本、示例配置
+docker-compose.yml  # 一键起 MySQL + 两台假 HAProxy + 限速服务（v3.0）
 ```
 
 ## 核心思路一句话
@@ -44,8 +49,29 @@ runtime API map 写回各节点完成聚合整形；上游流量靠 TCP 背压�
 
 ## 快速开始
 
+v3.0 起配置源为 **MySQL**，`docker compose` 一键拉起 MySQL + 两台假 HAProxy + 限速服务：
+
+```bash
+docker compose up --build     # 起 MySQL(自动建表+种子) + hap-1/hap-2 + rl-limiter(dry-run)
+```
+
+改配置就改库，rl-limiter 每 5s 轮询自动热重载，用量落 `usage_samples` 表：
+
+```bash
+# 改配额（秒级生效）
+docker compose exec mysql mysql -url -prlpass rl_limiter -e "UPDATE envs SET quota_mbps=100 WHERE env_id='env-a'"
+# 切 enforce（真实下发限速）
+docker compose exec mysql mysql -url -prlpass rl_limiter -e "UPDATE settings SET v='enforce' WHERE k='mode'"
+# 看用量
+docker compose exec mysql mysql -url -prlpass rl_limiter -e "SELECT * FROM usage_samples ORDER BY id DESC LIMIT 10"
+```
+
+细节（环境变量、数据库表、切模式、可选的本地 YAML 模式）见 [docs/03-限速服务运行指南.md](docs/03-限速服务运行指南.md)。
+
+本地开发与测试：
+
 ```bash
 make install    # pip install -e ".[test]"
 make test       # 全量单元测试
-# 本地三步演示（假 HAProxy ×2 + 后台桩 + dry-run 服务）见 docs/03
+# 本地非 docker（YAML 模式）三步演示（假 HAProxy ×2 + 后台桩 + dry-run 服务）见 docs/03
 ```
