@@ -1,3 +1,8 @@
 /bin/
 *.test
 coverage.out
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
