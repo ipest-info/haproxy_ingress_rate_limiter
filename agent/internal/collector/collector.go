@@ -163,6 +163,14 @@ func (c *Collector) tickOK(mapping map[string]string, stats []model.FrontendStat
 	type agg struct {
 		rate float64
 		conn int64
+		// measured: at least one mapped frontend contributed a diff-based rate.
+		// baselined: at least one mapped frontend was first-sampled this tick.
+		// A baseline-only tick (baselined && !measured) has an UNKNOWN rate, not
+		// a zero rate: feeding 0 into the window/EWMA right after an agent
+		// restart would bias mean10 low for ~10s and the slow-loop EWMA input
+		// low for tens of seconds, delaying tightening.
+		measured  bool
+		baselined bool
 	}
 	// Every env referenced by the mapping is emitted, even with no live
 	// frontends this tick, so downstream consumers see a stable env set.
@@ -186,9 +194,10 @@ func (c *Collector) tickOK(mapping map[string]string, stats []model.FrontendStat
 				}
 				continue
 			}
-			// First-ever sample: baseline only, rate 0.
+			// First-ever sample: baseline only, rate unknown.
 			c.frontends[st.Name] = &frontendState{lastBytesOut: st.BytesOut}
 			sums[envID].conn += st.ConnCur
+			sums[envID].baselined = true
 			continue
 		}
 		fs.absentTicks = 0
@@ -208,6 +217,7 @@ func (c *Collector) tickOK(mapping map[string]string, stats []model.FrontendStat
 			a := sums[envID]
 			a.rate += rate
 			a.conn += st.ConnCur
+			a.measured = true
 		}
 	}
 
@@ -239,9 +249,14 @@ func (c *Collector) tickOK(mapping map[string]string, stats []model.FrontendStat
 			}
 			c.envs[envID] = st
 		}
-		st.window.Push(a.rate)
-		st.ewma.Update(a.rate)
-		st.lastRate = a.rate
+		// Skip the window/EWMA on baseline-only ticks (rate unknown). An env
+		// with no live frontends at all (neither measured nor baselined) is a
+		// genuine zero: no frontend, no traffic.
+		if a.measured || !a.baselined {
+			st.window.Push(a.rate)
+			st.ewma.Update(a.rate)
+			st.lastRate = a.rate
+		}
 		u := model.EnvUsage{
 			EnvID:     envID,
 			RateBps:   a.rate,

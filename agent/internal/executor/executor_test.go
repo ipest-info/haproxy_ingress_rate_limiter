@@ -98,10 +98,12 @@ func TestDryRunLogsWithoutIO(t *testing.T) {
 	}
 }
 
-func TestEnforceWritesIntegerBytesPerFrontend(t *testing.T) {
+func TestEnforceSplitsAggregateAcrossFrontends(t *testing.T) {
 	f := &fakeSetter{}
 	s := NewSwitchable(f, "/etc/haproxy/bwlim.map", model.ModeEnforce, discardLogger())
 
+	// BwlimBps is the env AGGREGATE: each of the 2 frontends must receive
+	// floor(1048576.9 / 2) = 524288 so the per-frontend sum stays ≤ aggregate.
 	ds := []model.Decision{
 		decision("env-a", []string{"fe_a1", "fe_a2"}, 1_048_576.9, true),
 	}
@@ -113,8 +115,8 @@ func TestEnforceWritesIntegerBytesPerFrontend(t *testing.T) {
 	}
 	for _, fe := range []string{"fe_a1", "fe_a2"} {
 		vs := f.valuesFor(fe)
-		if len(vs) != 1 || vs[0] != "1048576" {
-			t.Fatalf("values for %s = %v, want [1048576]", fe, vs)
+		if len(vs) != 1 || vs[0] != "524288" {
+			t.Fatalf("values for %s = %v, want [524288]", fe, vs)
 		}
 	}
 	for _, c := range f.calls {
@@ -123,7 +125,47 @@ func TestEnforceWritesIntegerBytesPerFrontend(t *testing.T) {
 		}
 	}
 	if got := s.Snapshot()["env-a"]; got != 1_048_576.9 {
-		t.Fatalf("snapshot env-a = %v, want 1048576.9", got)
+		t.Fatalf("snapshot env-a = %v, want aggregate 1048576.9", got)
+	}
+}
+
+func TestFailedWriteRetriedOnUnchangedDecision(t *testing.T) {
+	boom := errors.New("socket gone")
+	f := &fakeSetter{errs: map[string]error{"fe1": boom}}
+	s := NewSwitchable(f, "m", model.ModeEnforce, discardLogger())
+
+	changed := []model.Decision{decision("env-a", []string{"fe1"}, 1000, true)}
+	unchanged := []model.Decision{decision("env-a", []string{"fe1"}, 1000, false)}
+
+	if err := s.Apply(context.Background(), changed); !errors.Is(err, boom) {
+		t.Fatalf("first Apply error = %v, want %v", err, boom)
+	}
+	if _, ok := s.Snapshot()["env-a"]; ok {
+		t.Fatal("failed env recorded in snapshot")
+	}
+
+	// The runtime API recovers; the governor emits Changed=false from now on
+	// (its own emitted value already advanced). The executor must retry.
+	f.mu.Lock()
+	delete(f.errs, "fe1")
+	f.mu.Unlock()
+
+	if err := s.Apply(context.Background(), unchanged); err != nil {
+		t.Fatalf("retry Apply: %v", err)
+	}
+	if n := f.callCount(); n != 2 {
+		t.Fatalf("call count = %d, want 2 (initial failure + one retry)", n)
+	}
+	if got := s.Snapshot()["env-a"]; got != 1000 {
+		t.Fatalf("snapshot env-a = %v, want 1000 after retry", got)
+	}
+
+	// Once converged, unchanged decisions are no-ops again.
+	if err := s.Apply(context.Background(), unchanged); err != nil {
+		t.Fatalf("post-retry Apply: %v", err)
+	}
+	if n := f.callCount(); n != 2 {
+		t.Fatalf("call count = %d, want still 2", n)
 	}
 }
 

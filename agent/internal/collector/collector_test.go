@@ -149,20 +149,21 @@ func TestCollectorScenarios(t *testing.T) {
 			mapping: map[string]string{"fe1": "envA"},
 			steps: []step{
 				{
+					// Baseline-only tick: rate unknown, window untouched.
 					stats: []model.FrontendStat{fe("fe1", 0, 1)},
 					want:  []expect{{envID: "envA", rate: 0, mean10: 0, conn: 1}},
 				},
 				{
 					stats: []model.FrontendStat{fe("fe1", 100, 1)},
-					want:  []expect{{envID: "envA", rate: 100, mean10: 50, conn: 1}},
+					want:  []expect{{envID: "envA", rate: 100, mean10: 100, conn: 1}},
 				},
 				{
 					stats: []model.FrontendStat{fe("fe1", 200, 1)},
-					want:  []expect{{envID: "envA", rate: 100, mean10: 200.0 / 3.0, conn: 1}},
+					want:  []expect{{envID: "envA", rate: 100, mean10: 100, conn: 1}},
 				},
 				{
 					stats: []model.FrontendStat{fe("fe1", 300, 1)},
-					want:  []expect{{envID: "envA", rate: 100, mean10: 75, conn: 1}},
+					want:  []expect{{envID: "envA", rate: 100, mean10: 100, conn: 1}},
 				},
 			},
 		},
@@ -176,18 +177,18 @@ func TestCollectorScenarios(t *testing.T) {
 				},
 				{
 					stats: []model.FrontendStat{fe("fe1", 1100, 1)},
-					want:  []expect{{envID: "envA", rate: 100, mean10: 50, conn: 1}},
+					want:  []expect{{envID: "envA", rate: 100, mean10: 100, conn: 1}},
 				},
 				{
 					// HAProxy reload: counter drops to 50. Rate held at 100,
 					// new baseline stored.
 					stats: []model.FrontendStat{fe("fe1", 50, 1)},
-					want:  []expect{{envID: "envA", rate: 100, mean10: 200.0 / 3.0, conn: 1}},
+					want:  []expect{{envID: "envA", rate: 100, mean10: 100, conn: 1}},
 				},
 				{
 					// Diff resumes from the new baseline: 150-50 = 100.
 					stats: []model.FrontendStat{fe("fe1", 150, 1)},
-					want:  []expect{{envID: "envA", rate: 100, mean10: 75, conn: 1}},
+					want:  []expect{{envID: "envA", rate: 100, mean10: 100, conn: 1}},
 				},
 			},
 		},
@@ -201,7 +202,7 @@ func TestCollectorScenarios(t *testing.T) {
 				},
 				{
 					stats: []model.FrontendStat{fe("fe1", 100, 2), fe("fe2", 50, 3)},
-					want:  []expect{{envID: "envA", rate: 150, mean10: 75, conn: 5}},
+					want:  []expect{{envID: "envA", rate: 150, mean10: 150, conn: 5}},
 				},
 			},
 		},
@@ -219,8 +220,8 @@ func TestCollectorScenarios(t *testing.T) {
 				{
 					stats: []model.FrontendStat{fe("fe-b", 200, 1), fe("fe-a", 100, 2)},
 					want: []expect{
-						{envID: "envA", rate: 100, mean10: 50, conn: 2},
-						{envID: "envB", rate: 200, mean10: 100, conn: 1},
+						{envID: "envA", rate: 100, mean10: 100, conn: 2},
+						{envID: "envB", rate: 200, mean10: 200, conn: 1},
 					},
 				},
 			},
@@ -235,7 +236,7 @@ func TestCollectorScenarios(t *testing.T) {
 				},
 				{
 					stats: []model.FrontendStat{fe("fe1", 100, 1), fe("stray", 5000, 9)},
-					want:  []expect{{envID: "envA", rate: 100, mean10: 50, conn: 1}},
+					want:  []expect{{envID: "envA", rate: 100, mean10: 100, conn: 1}},
 				},
 			},
 		},
@@ -465,27 +466,26 @@ func TestCollectorEwmaThroughTicks(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(1_700_000_000, 0)
 
-	// Tick 1 seeds the EWMA with the baseline rate 0.
+	// Tick 1 is baseline-only: the EWMA stays unseeded (rate unknown, not 0).
 	src.stats = []model.FrontendStat{fe("fe1", 0, 1)}
 	got := c.Tick(ctx, now)
 	if !almostEqual(got[0].Ewma60Bps, 0) {
-		t.Fatalf("tick 1: Ewma60Bps = %v, want 0", got[0].Ewma60Bps)
+		t.Fatalf("tick 1: Ewma60Bps = %v, want 0 (unseeded)", got[0].Ewma60Bps)
 	}
 
-	// Tick 2 rate 61: 0 + (2/61)*(61-0) = 2.
+	// Tick 2 rate 61 is the first real measurement: it SEEDS the EWMA at 61
+	// instead of averaging against a phantom 0 from the baseline tick.
 	src.stats = []model.FrontendStat{fe("fe1", 61, 1)}
 	got = c.Tick(ctx, now.Add(time.Second))
-	if !almostEqual(got[0].Ewma60Bps, 2) {
-		t.Fatalf("tick 2: Ewma60Bps = %v, want 2", got[0].Ewma60Bps)
+	if !almostEqual(got[0].Ewma60Bps, 61) {
+		t.Fatalf("tick 2: Ewma60Bps = %v, want 61 (seeded by first measurement)", got[0].Ewma60Bps)
 	}
 
-	// A failed tick keeps the EWMA moving on the held rate:
-	// 2 + (2/61)*(61-2) = 2 + 118/61.
+	// A failed tick keeps the EWMA moving on the held rate (61 → stays 61).
 	src.err = errors.New("timeout")
 	got = c.Tick(ctx, now.Add(2*time.Second))
-	want := 2 + 118.0/61.0
-	if !almostEqual(got[0].Ewma60Bps, want) {
-		t.Fatalf("failed tick: Ewma60Bps = %v, want %v", got[0].Ewma60Bps, want)
+	if !almostEqual(got[0].Ewma60Bps, 61) {
+		t.Fatalf("failed tick: Ewma60Bps = %v, want 61 (held rate)", got[0].Ewma60Bps)
 	}
 }
 

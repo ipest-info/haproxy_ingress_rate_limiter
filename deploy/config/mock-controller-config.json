@@ -1,0 +1,12 @@
+{
+  "mode": "dry-run",
+  "envs": [
+    {
+      "env_id": "env-a",
+      "frontends": ["fe_env_a"],
+      "quota_bps": 200000000
+    }
+  ],
+  "report_interval_s": 5,
+  "heartbeat_interval_s": 10
+}
