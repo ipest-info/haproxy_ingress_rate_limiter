@@ -129,7 +129,9 @@ class Collector:
         """整体替换 Target→env 映射（配置下发时调用）。输入 dict 被拷贝
         一份，调用方之后可以继续改动自己的副本。"""
         self._mapping = dict(target_to_env)
-        self._log.debug("target mapping replaced target_count=%d", len(self._mapping))
+        self._log.debug(
+            "已整体替换 Target→环境 映射配置，后续采样按新映射聚合各环境用量 target_count=%d",
+            len(self._mapping))
 
     def degraded_nodes(self) -> set[str]:
         """返回当前处于 degraded 状态（连续失败 ≥ 阈值）的节点名集合。
@@ -166,7 +168,9 @@ class Collector:
                 # 或 YAML 漏配）。warn 一次后忽略该 Target——它永远采不到数。
                 self._logged_missing_node.add(target)
                 self._log.warning(
-                    "target references unknown haproxy node; ignoring node=%s frontend=%s env=%s",
+                    "映射中的 target 引用了未在本地配置的 HAProxy 节点（疑似节点名拼写不一致或"
+                    "配置漏项），该 target 永远无法采样，予以忽略（仅首次提示） "
+                    "node=%s frontend=%s env=%s",
                     target.node, target.frontend, env_id)
 
         ok_nodes: set[str] = set()
@@ -194,8 +198,9 @@ class Collector:
                 del self._targets[target]
                 self._target_ewma.pop(target, None)
                 self._log.info(
-                    "dropping counter baseline for absent frontend node=%s frontend=%s "
-                    "absent_ticks=%d absent_tick_limit=%d",
+                    "frontend 已连续多个采样周期未出现，超过保留上限，淘汰其计数差分基线与"
+                    "加权分配用的 per-Target EWMA；此后同名 frontend 再出现将按首次采样重建基线 "
+                    "node=%s frontend=%s absent_ticks=%d absent_tick_limit=%d",
                     target.node, target.frontend, ts.absent_ticks, ABSENT_TICK_LIMIT)
 
         # 聚合状态生命周期：mapping 里不再出现的 env，其窗口/EWMA 一并
@@ -204,7 +209,9 @@ class Collector:
         for env_id in list(self._envs):
             if env_id not in sums:
                 del self._envs[env_id]
-                self._log.debug("dropping aggregation state for unmapped env env=%s", env_id)
+                self._log.debug(
+                    "环境已不在映射中，丢弃其滑动窗口与 EWMA 聚合状态，"
+                    "避免将来重新上线时携带过期历史 env=%s", env_id)
         for target in list(self._target_ewma):
             if target not in mapping:
                 del self._target_ewma[target]
@@ -246,7 +253,8 @@ class Collector:
         if self._log.isEnabledFor(logging.DEBUG):
             for u in usages:
                 self._log.debug(
-                    "tick env usage env=%s rate_bps=%.1f mean10_bps=%.1f ewma60_bps=%.1f "
+                    "本秒采样完成，输出该环境的全局聚合用量样本 "
+                    "env=%s rate_bps=%.1f mean10_bps=%.1f ewma60_bps=%.1f "
                     "conn_cur=%d degraded=%s",
                     u.env_id, u.rate_bps, u.mean10_bps, u.ewma60_bps, u.conn_cur, u.degraded)
         return usages
@@ -299,12 +307,15 @@ class Collector:
                 agg.baselined = True
 
         self._log.warning(
-            "stats sample failed; holding last rates node=%s err=%s consecutive_failures=%d "
+            "节点采样失败，该节点上各已映射 target 本秒沿用上一秒速率与连接数继续参与聚合"
+            "（fail-static，避免速率骤降为零诱导快环误放松限速） "
+            "node=%s err=%s consecutive_failures=%d "
             "degraded_threshold=%d degraded=%s held_targets=%d",
             node, err, failures, DEGRADED_FAILURE_THRESHOLD, degraded, held)
         if crossed:
             self._log.error(
-                "collector node degraded: consecutive stats sample failures reached threshold "
+                "节点连续采样失败达到降级阈值，该节点进入降级状态，"
+                "挂载其上的各环境整形值将被冻结（fail-static），直至采样恢复 "
                 "node=%s threshold=%d consecutive_failures=%d",
                 node, DEGRADED_FAILURE_THRESHOLD, failures)
 
@@ -323,12 +334,14 @@ class Collector:
             self._degraded.discard(node)
             if was_degraded:
                 self._log.info(
-                    "stats sampling recovered node=%s previous_consecutive_failures=%d "
+                    "节点采样恢复正常，解除降级状态并清零连续失败计数，"
+                    "差分基线在失联期间未动、速率立即恢复连续 "
+                    "node=%s previous_consecutive_failures=%d "
                     "degraded_threshold=%d",
                     node, prev_failures, DEGRADED_FAILURE_THRESHOLD)
             else:
                 self._log.debug(
-                    "stats sampling recovered before degradation node=%s "
+                    "节点采样在达到降级阈值前恢复正常，清零连续失败计数，未触发降级 node=%s "
                     "previous_consecutive_failures=%d",
                     node, prev_failures)
 
@@ -345,7 +358,8 @@ class Collector:
                     if target not in self._logged_unmapped:
                         self._logged_unmapped.add(target)
                         self._log.debug(
-                            "ignoring unmapped frontend node=%s frontend=%s bytes_out=%d conn_cur=%d",
+                            "发现未映射到任何环境的 frontend，不建差分基线并忽略其流量"
+                            "（仅首次提示） node=%s frontend=%s bytes_out=%d conn_cur=%d",
                             node, fs.name, fs.bytes_out, fs.conn_cur)
                     continue
                 # 首次采样：只有一个累计值、没有前值可差分，速率未知，本
@@ -355,7 +369,8 @@ class Collector:
                 agg.conn += fs.conn_cur
                 agg.baselined = True
                 self._log.info(
-                    "baselined new frontend node=%s frontend=%s env=%s bytes_out=%d conn_cur=%d",
+                    "首次采样到新 frontend，本秒仅建立计数差分基线（速率未知不喂窗口），"
+                    "下一秒起正常产出速率 node=%s frontend=%s env=%s bytes_out=%d conn_cur=%d",
                     node, fs.name, env_id, fs.bytes_out, fs.conn_cur)
                 continue
 
@@ -368,7 +383,9 @@ class Collector:
                 # 累计值重建基线，下一秒差分即恢复正常。
                 rate = ts.last_rate
                 self._log.info(
-                    "bytes_out counter went backwards; holding previous rate node=%s frontend=%s "
+                    "检测到 bytes_out 计数器回绕（多为 HAProxy reload 后计数清零），"
+                    "本秒沿用上一秒速率并用新累计值重建差分基线，下一秒差分即恢复正常 "
+                    "node=%s frontend=%s "
                     "previous_bytes_out=%d current_bytes_out=%d held_rate_bps=%.1f",
                     node, fs.name, ts.last_bytes_out, fs.bytes_out, ts.last_rate)
             ts.last_bytes_out = fs.bytes_out

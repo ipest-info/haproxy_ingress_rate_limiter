@@ -149,7 +149,7 @@ async def test_node_failure_hold_degraded_threshold_and_recovery(caplog):
     # 越线的那一次（且仅那一次）发 error 日志。
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1
-    assert "degraded" in errors[0].getMessage()
+    assert "降级" in errors[0].getMessage()
 
     # 恢复：一次成功采样即清零失败计数并解除降级；失联期间基线未动，差分
     # 立即恢复连续（计数器在故障期间照常增长）。
@@ -162,7 +162,7 @@ async def test_node_failure_hold_degraded_threshold_and_recovery(caplog):
     assert col.degraded_nodes() == set()
     assert us["env1"].degraded is False
     assert us["env1"].rate_bps == pytest.approx(12345.0)  # 与故障前基线的连续差分
-    assert any("recovered" in r.getMessage() for r in caplog.records)
+    assert any("采样恢复正常" in r.getMessage() for r in caplog.records)
 
 
 async def test_failure_before_any_measurement_stays_baseline_only():
@@ -301,7 +301,7 @@ async def test_unmapped_frontend_logged_once(caplog):
         n1.add("fe_x", 100)
         await col.tick(2.0)
         await col.tick(3.0)
-    hits = [r for r in caplog.records if "ignoring unmapped frontend" in r.getMessage()]
+    hits = [r for r in caplog.records if "未映射到任何环境的 frontend" in r.getMessage()]
     assert len(hits) == 1  # 只在首次出现时记一条，防刷屏
 
 
@@ -374,7 +374,7 @@ async def test_absent_target_evicted_after_limit(caplog):
     with caplog.at_level(logging.INFO, logger="rl_limiter.collector"):
         for i in range(ABSENT_TICK_LIMIT):
             await col.tick(3.0 + i)
-    assert any("dropping counter baseline" in r.getMessage() for r in caplog.records)
+    assert any("淘汰其计数差分基线" in r.getMessage() for r in caplog.records)
 
     # 同名 frontend 再出现：按首次采样重新建基线（baseline-only），巨大的
     # 新累计值不会被差分成一次天文数字的速率尖峰。
@@ -439,7 +439,7 @@ async def test_target_on_unknown_node_warned_once_and_ignored(caplog):
         us = by_env(await col.tick(2.0))
     assert sorted(us) == ["env1", "env_g"]
     assert us["env_g"].rate_bps == 0.0
-    warns = [r for r in caplog.records if "unknown haproxy node" in r.getMessage()]
+    warns = [r for r in caplog.records if "未在本地配置的 HAProxy 节点" in r.getMessage()]
     assert len(warns) == 1
 
 

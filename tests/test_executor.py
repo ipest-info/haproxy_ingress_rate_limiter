@@ -81,7 +81,7 @@ async def test_dry_run_logs_without_io(caplog):
     assert total_calls(clients) == 0, "dry-run performed I/O"
 
     msgs = [r.getMessage() for r in caplog.records]
-    assert any("DRY-RUN would set bwlim" in m and "env-a" in m for m in msgs)
+    assert any("【DRY-RUN 演练】本应下发整形值" in m and "env-a" in m for m in msgs)
     assert not any("env-b" in m for m in msgs), "unchanged decision was logged"
 
     snap = s.snapshot()
@@ -138,7 +138,7 @@ async def test_failed_write_retried_on_unchanged_decision(caplog):
     assert errs == []
     assert len(c1.calls) == 2, "want initial failure + one retry"
     assert s.snapshot()["env-a"] == 1000.0
-    assert any("pending bwlim retry succeeded" in r.getMessage() for r in caplog.records)
+    assert any("重试队列中的环境整形值写入成功" in r.getMessage() for r in caplog.records)
 
     # 收敛后 unchanged 决策重新变成 no-op。
     assert await s.apply(unchanged) == []
@@ -197,7 +197,7 @@ async def test_unknown_node_counts_as_target_failure(caplog):
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         errs = await s.apply(items)
     assert len(errs) == 1
-    assert any("target write failed" in r.getMessage() for r in caplog.records)
+    assert any("该挂载点写入失败" in r.getMessage() for r in caplog.records)
     assert "env-g" not in s.snapshot()
     # 处于 pending：changed=False 也会再次尝试（仍失败，因为节点仍缺失）。
     errs = await s.apply([(decision("env-g", [ghost], 500.0, False), {ghost: 500})])
@@ -208,7 +208,7 @@ async def test_invalid_mode_falls_back_to_dry_run(caplog):
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         s, _ = new_executor("bogus")
     assert s.mode() == model.MODE_DRY_RUN
-    assert any("invalid executor mode; falling back to dry-run" in r.getMessage()
+    assert any("运行模式配置非法，已安全降级为 dry-run" in r.getMessage()
                for r in caplog.records)
 
     s.set_mode(model.MODE_ENFORCE)
@@ -297,7 +297,7 @@ async def test_enforce_env_without_targets_warns_and_skips(caplog):
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         assert await s.apply(items) == []
     assert total_calls(clients) == 0
-    assert any("decision has no targets" in r.getMessage() for r in caplog.records)
+    assert any("决策不含任何挂载点" in r.getMessage() for r in caplog.records)
     assert s.snapshot() == {}
 
 

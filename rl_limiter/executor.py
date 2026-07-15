@@ -100,7 +100,7 @@ class Executor:
         写错时宁可"不动 HAProxy"也不能"意外真实写入"。"""
         if mode in (model.MODE_DRY_RUN, model.MODE_ENFORCE):
             return mode
-        self._log.warning("invalid executor mode; falling back to dry-run mode=%s", mode)
+        self._log.warning("运行模式配置非法，已安全降级为 dry-run（只记录不写入 HAProxy） mode=%s", mode)
         return model.MODE_DRY_RUN
 
     def set_mode(self, mode: str) -> None:
@@ -122,7 +122,8 @@ class Executor:
             # 回到 enforce 时由 resync 全量重写并重建基准。
             self._last_alloc = {}
         self._log.info(
-            "executor mode changed mode_from=%s mode_to=%s resync_armed=%s",
+            "执行模式已切换（切至 enforce 时武装 resync，下一拍全量重写） "
+            "mode_from=%s mode_to=%s resync_armed=%s",
             prev, m, self._resync,
         )
 
@@ -168,7 +169,8 @@ class Executor:
 
         if resync and items:
             self._log.info(
-                "resync triggered; rewriting all decisions mode=%s decision_count=%d",
+                "切换到 enforce 后首拍全量重写：真实 map 状态一致性未知，无条件下发全部环境的整形值 "
+                "mode=%s decision_count=%d",
                 mode, len(items),
             )
 
@@ -192,7 +194,8 @@ class Executor:
                 drift = self._alloc_drift(d.env_id, alloc)
                 if drift > REBALANCE_EPSILON:
                     self._log.info(
-                        "allocation drift rebalance env=%s max_drift=%.3f alloc=%s",
+                        "挂载点分配相对上次落地值漂移超过阈值，触发跨节点再平衡重写 "
+                        "env=%s max_drift=%.3f alloc=%s",
                         d.env_id, drift,
                         {str(t): v for t, v in alloc.items()},
                     )
@@ -209,14 +212,15 @@ class Executor:
                     # dry-run 下没有真实写入需要重试，直接跳过。
                     continue
                 self._log.info(
-                    "DRY-RUN would set bwlim env=%s state=%s bwlim_bytes_per_sec=%s targets=%s",
+                    "【DRY-RUN 演练】本应下发整形值（未真实写入 HAProxy） "
+                    "env=%s state=%s bwlim_bytes_per_sec=%s targets=%s",
                     d.env_id, d.state, d.bwlim_bps, [str(t) for t in d.targets],
                 )
                 applied[d.env_id] = d.bwlim_bps
                 continue
             if not d.targets:
                 self._log.warning(
-                    "decision has no targets; nothing to apply env=%s", d.env_id
+                    "决策不含任何挂载点，无法执行（请检查环境的 targets 配置） env=%s", d.env_id
                 )
                 continue
 
@@ -236,14 +240,14 @@ class Executor:
             if not env_errs:
                 if retry:
                     self._log.info(
-                        "pending bwlim retry succeeded env=%s bwlim_bytes_per_s=%s",
+                        "重试队列中的环境整形值写入成功，移出队列恢复正常 env=%s bwlim_bytes_per_s=%s",
                         d.env_id, d.bwlim_bps,
                     )
                 applied[d.env_id] = d.bwlim_bps
                 applied_alloc[d.env_id] = {t: int(alloc.get(t, 0)) for t in d.targets}
             else:
                 self._log.warning(
-                    "bwlim write failed; env queued for retry env=%s failed_targets=%d",
+                    "整形值写入失败，该环境已加入重试队列（下一拍强制重写） env=%s failed_targets=%d",
                     d.env_id, len(env_errs),
                 )
                 failed.add(d.env_id)
@@ -299,7 +303,8 @@ class Executor:
         map_path = self._map_paths.get(t.node)
         if client is None or map_path is None:
             self._log.error(
-                "no runtime client or map path for node; target write failed "
+                "节点未配置 runtime client 或 map 路径，该挂载点写入失败"
+                "（配置不一致，环境将进入重试队列等待配置修复） "
                 "env=%s target=%s node=%s",
                 env_id, t, t.node,
             )
@@ -310,6 +315,6 @@ class Executor:
             # 保留原始异常链，外层收集后由调用方决定日志级别。
             raise RuntimeError(f"set bwlim env={env_id} target={t}: {exc}") from exc
         self._log.info(
-            "bwlim map entry written env=%s target=%s value_bytes_per_s=%d map_path=%s",
+            "整形值已写入节点 map env=%s target=%s value_bytes_per_s=%d map_path=%s",
             env_id, t, value, map_path,
         )

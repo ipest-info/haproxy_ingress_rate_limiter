@@ -95,7 +95,7 @@ class Governor:
         seen: set[str] = set()
         for e in envs:
             if e.env_id in seen:
-                self._log.warning("duplicate env in config ignored env=%s", e.env_id)
+                self._log.warning("配置中出现重复的 env_id，仅第一条生效，后续重复项已忽略 env=%s", e.env_id)
                 continue
             seen.add(e.env_id)
 
@@ -114,7 +114,8 @@ class Governor:
                     bwlim=ceil,
                 )
                 self._log.info(
-                    "env added env=%s quota_bytes_per_s=%s ceil_bytes_per_s=%s "
+                    "新增受控环境，整形值初始化为弹性上限，等待首拍用量数据后开始调节 "
+                    "env=%s quota_bytes_per_s=%s ceil_bytes_per_s=%s "
                     "bwlim_bytes_per_s=%s targets=%s params=%s",
                     e.env_id, quota, ceil, ceil,
                     [str(t) for t in targets], params.to_dict(),
@@ -133,7 +134,7 @@ class Governor:
                 st.state = model.GovState.NORMAL
                 st.emitted = False  # 强制重新发射重置后的值
                 self._log.info(
-                    "env quota/params changed; bwlim reset to ceiling env=%s "
+                    "环境配额/参数变更，控制状态整体重置，整形值重置为新配额下的弹性上限 env=%s "
                     "old_quota_bytes_per_s=%s new_quota_bytes_per_s=%s "
                     "ceil_bytes_per_s=%s bwlim_old=%s bwlim_new=%s params=%s",
                     e.env_id, old_quota, quota, ceil, old_bwlim, st.bwlim,
@@ -149,7 +150,7 @@ class Governor:
         for env_id in list(self._envs):
             if env_id not in seen:
                 del self._envs[env_id]
-                self._log.info("env removed env=%s", env_id)
+                self._log.info("环境已从配置中移除，停止对其限速控制并丢弃其控制状态 env=%s", env_id)
 
     def tick(self, now: float, usages: list[model.EnvUsage]) -> list[model.Decision]:
         """对每个用量样本推进一步 AIMD，并为每个"已配置且有样本"的环境
@@ -178,7 +179,8 @@ class Governor:
             # （比如误把已经回落的流量继续收紧），因此冻结 bwlim、状态和
             # 持续性计数，changed=False，等待数据恢复后再继续推进。
             self._log.debug(
-                "tick env degraded; state frozen env=%s state=%s bwlim_bytes_per_s=%s",
+                "采样链路降级，本拍数据为陈旧保持值，冻结该环境的整形值与状态等待数据恢复 "
+                "env=%s state=%s bwlim_bytes_per_s=%s",
                 u.env_id, st.state, st.bwlim,
             )
             return model.Decision(
@@ -243,7 +245,8 @@ class Governor:
         # 状态变迁日志：NORMAL/TIGHTENING/RECOVERING 任意互转都记录一条。
         if st.state != old_state:
             self._log.info(
-                "governor state transition env=%s state_from=%s state_to=%s "
+                "环境 10 秒均值触发限速状态变迁（utilization 为 mean10/配额比值） "
+                "env=%s state_from=%s state_to=%s "
                 "mean10_bytes_per_s=%s quota_bytes_per_s=%s utilization=%s "
                 "bwlim_old=%s bwlim_new=%s over_secs=%d under_secs=%d",
                 u.env_id, old_state, st.state, m, q, _utilization(m, q),
@@ -253,13 +256,13 @@ class Governor:
         # 不算调整），收紧与放松使用不同的消息便于检索。
         if st.bwlim < old_bwlim:
             self._log.info(
-                "bwlim tightened env=%s bwlim_old=%s bwlim_new=%s "
+                "均值持续超配额，乘性收紧整形值以压回承诺口径 env=%s bwlim_old=%s bwlim_new=%s "
                 "mean10_bytes_per_s=%s quota_bytes_per_s=%s utilization=%s over_secs=%d",
                 u.env_id, old_bwlim, st.bwlim, m, q, _utilization(m, q), st.over_secs,
             )
         elif st.bwlim > old_bwlim:
             self._log.info(
-                "bwlim relaxed env=%s bwlim_old=%s bwlim_new=%s "
+                "均值回落至低水位，加性放松整形值逐步归还带宽 env=%s bwlim_old=%s bwlim_new=%s "
                 "mean10_bytes_per_s=%s quota_bytes_per_s=%s utilization=%s under_secs=%d",
                 u.env_id, old_bwlim, st.bwlim, m, q, _utilization(m, q), st.under_secs,
             )
@@ -274,7 +277,7 @@ class Governor:
 
         # 每拍 per-env 摘要（debug 级），用于问题排查时还原完整时间线。
         self._log.debug(
-            "tick env summary env=%s state=%s mean10_bytes_per_s=%s "
+            "本拍环境控制状态摘要（用于排查时还原时间线） env=%s state=%s mean10_bytes_per_s=%s "
             "quota_bytes_per_s=%s utilization=%s bwlim_bytes_per_s=%s "
             "over_secs=%d under_secs=%d changed=%s",
             u.env_id, st.state, m, q, _utilization(m, q), st.bwlim,

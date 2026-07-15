@@ -320,7 +320,7 @@ def test_duplicate_env_id_ignored(caplog):
             env_quota("env-a", QUOTA_BITS),          # quota → ceil 1.1×10MB/s
             env_quota("env-a", 4 * QUOTA_BITS),      # 重复：必须被忽略
         ])
-    assert any("duplicate env in config ignored" in r.getMessage() for r in caplog.records)
+    assert any("配置中出现重复的 env_id" in r.getMessage() for r in caplog.records)
 
     d = tick_one(g, T0, usage("env-a", 0.95 * QUOTA_BYTES))
     ceil = QUOTA_BYTES * model.GovParams().elastic_ceiling
@@ -342,6 +342,6 @@ def test_state_transition_and_adjustment_logs(caplog):
             tick_one(g, now, usage("env-a", 0.5 * QUOTA_BYTES))
             now += 1.0
     msgs = [r.getMessage() for r in caplog.records]
-    assert any("governor state transition" in m for m in msgs)
-    assert any("bwlim tightened" in m for m in msgs)
-    assert any("bwlim relaxed" in m for m in msgs)
+    assert any("触发限速状态变迁" in m for m in msgs)
+    assert any("乘性收紧整形值" in m for m in msgs)
+    assert any("加性放松整形值" in m for m in msgs)

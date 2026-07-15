@@ -231,7 +231,7 @@ async def test_apply_errors_logged_but_loop_continues(monkeypatch, caplog):
         await run_until(ctl, None, lambda: col.ticks >= 3)
 
     errors = [r for r in caplog.records
-              if r.levelno == logging.ERROR and "executor apply failed" in r.getMessage()]
+              if r.levelno == logging.ERROR and "本拍下发整形值时发生错误" in r.getMessage()]
     # 每拍 2 条错误，至少跑了 3 拍。
     assert len(errors) >= 6
     assert "tick=" in errors[0].getMessage()
@@ -266,7 +266,7 @@ async def test_status_summary_every_60_ticks(monkeypatch, caplog):
         await run_until(ctl, None, lambda: col.ticks >= 61, interval=0.001)
 
     summaries = [r.getMessage() for r in caplog.records
-                 if "status summary" in r.getMessage()]
+                 if "运行状态周期汇总" in r.getMessage()]
     assert summaries, "expected a status summary at tick 60"
     assert "tick=60" in summaries[0]
     assert "config_version=9" in summaries[0]

@@ -107,7 +107,7 @@ class RuntimeClient:
 
         out = raw.decode("utf-8", errors="replace").strip()
         self._log.debug(
-            "haproxy runtime command executed cmd=%r duration_ms=%d reply_bytes=%d",
+            "已执行 HAProxy runtime API 命令并完整读取回包 cmd=%r duration_ms=%d reply_bytes=%d",
             cmd, int((time.monotonic() - start) * 1000), len(raw))
         if _is_error_reply(out):
             raise CommandError(cmd, out)
@@ -146,7 +146,8 @@ class RuntimeClient:
             # key 不存在不算错误，是"首次写入"的正常路径；记 info 便于确认
             # map 冷启动/重建后的首次填充时点。
             self._log.info(
-                "set map entry missing, falling back to add map map_path=%s key=%s value=%s",
+                "map 条目不存在（多为 map 冷启动或 HAProxy reload 后重建），回退为新增条目（add map）"
+                "，对调用方语义等同写入成功 map_path=%s key=%s value=%s",
                 map_path, key, value)
             add_cmd = f"add map {map_path} {key} {value}"
             out = await self.exec_cmd(add_cmd)  # CommandError 直接上抛（回退只做一次）

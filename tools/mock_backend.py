@@ -91,17 +91,18 @@ async def watch_config(path: str, store: Store) -> None:
         try:
             mtime = int(os.stat(path).st_mtime)
         except OSError as e:
-            log.warning("config stat failed; keeping current config path=%s err=%s", path, e)
+            log.warning("读取配置文件属性失败，沿用当前配置继续服务 path=%s err=%s", path, e)
             continue
         if mtime == store.cfg.version:
             continue
         try:
             cfg = load_config(path)
         except Exception as e:
-            log.error("config reload failed; keeping current config path=%s err=%s", path, e)
+            log.error("配置文件重新加载失败（可能编辑到一半），沿用当前配置继续服务 path=%s err=%s", path, e)
             continue
         store.set(cfg)
-        log.info("config reloaded version=%s mode=%s envs=%d",
+        log.info("检测到配置文件变化并已重新加载，即将广播给所有挂起的长轮询 "
+                 "version=%s mode=%s envs=%d",
                  cfg.version, cfg.mode, len(cfg.envs))
 
 
@@ -127,7 +128,8 @@ def make_handle_config(store: Store):
             cfg, changed = store.snapshot()
             if cfg.version != client_ver:
                 log.info(
-                    "config served node_id=%s remote=%s client_version=%d "
+                    "已向限速服务下发配置（长轮询返回 200） "
+                    "node_id=%s remote=%s client_version=%d "
                     "version=%s mode=%s envs=%d waited_ms=%d",
                     node_id, request.remote, client_ver,
                     cfg.version, cfg.mode, len(cfg.envs),
@@ -159,11 +161,11 @@ async def handle_metrics(request: web.Request) -> web.StreamResponse:
     try:
         m = await _decode_loose(request)
     except Exception as e:
-        log.warning("metrics decode failed remote=%s err=%s", request.remote, e)
+        log.warning("用量上报请求体解析失败，返回 400 remote=%s err=%s", request.remote, e)
         return web.Response(status=400)
     samples = m.get("samples")
     n = len(samples) if isinstance(samples, list) else 0
-    log.info("metrics received node_id=%s remote=%s samples=%d",
+    log.info("收到用量样本批次（桩仅记录条数后丢弃） node_id=%s remote=%s samples=%d",
              m.get("node_id"), request.remote, n)
     return web.Response(status=204)
 
@@ -174,10 +176,11 @@ async def handle_heartbeat(request: web.Request) -> web.StreamResponse:
     try:
         m = await _decode_loose(request)
     except Exception as e:
-        log.warning("heartbeat decode failed remote=%s err=%s", request.remote, e)
+        log.warning("心跳请求体解析失败，返回 400 remote=%s err=%s", request.remote, e)
         return web.Response(status=400)
     log.info(
-        "heartbeat received node_id=%s remote=%s service_version=%s mode=%s config_version=%s",
+        "收到限速服务心跳（可据此核对配置是否推送到位） "
+        "node_id=%s remote=%s service_version=%s mode=%s config_version=%s",
         m.get("node_id"), request.remote,
         m.get("service_version", m.get("agent_version")),
         m.get("mode"), m.get("config_version"))
@@ -214,7 +217,7 @@ def main() -> None:
     host, port = parse_addr(args.addr)
 
     store = Store(cfg)
-    log.info("config loaded path=%s version=%s mode=%s envs=%d",
+    log.info("配置文件加载完成（version 取文件 mtime） path=%s version=%s mode=%s envs=%d",
              args.config, cfg.version, cfg.mode, len(cfg.envs))
 
     app = web.Application(client_max_size=MAX_BODY_BYTES)
@@ -234,11 +237,11 @@ def main() -> None:
 
     app.cleanup_ctx.append(_start_watcher)
 
-    log.info("mock-backend listening addr=%s:%d config=%s", host, port, args.config)
+    log.info("管理后台桩已开始监听，等待限速服务接入 addr=%s:%d config=%s", host, port, args.config)
     # access_log=None：请求级日志由各 handler 自己按 key=value 输出，
     # 关闭 aiohttp 默认访问日志避免长轮询刷屏。
     web.run_app(app, host=host, port=port, access_log=None, print=None)
-    log.info("mock-backend stopped")
+    log.info("管理后台桩已停止")
 
 
 if __name__ == "__main__":

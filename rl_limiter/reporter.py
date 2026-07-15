@@ -119,7 +119,8 @@ def _build_ssl_context(
                 raise ValueError("client TLS requires both cert and key files")
             ctx.load_cert_chain(opts.cert_file, opts.key_file)
         log.info(
-            "tls client configured ca_file=%s cert_file=%s mutual_tls=%s",
+            "TLS 客户端已配置完成，与管理后台的通信将走加密链路 "
+            "ca_file=%s cert_file=%s mutual_tls=%s",
             opts.ca_file,
             opts.cert_file,
             bool(opts.cert_file),
@@ -127,7 +128,8 @@ def _build_ssl_context(
         return ctx
     except Exception as e:
         log.error(
-            "tls client config failed; falling back to default http client "
+            "TLS 客户端证书材料加载失败，降级为默认 HTTP 客户端继续运行"
+            "（服务不因此退出，证书问题需运维修复） "
             "err=%s ca_file=%s cert_file=%s key_file=%s",
             e,
             opts.ca_file,
@@ -250,7 +252,7 @@ class Reporter:
             # 节流告警，避免刷屏。
             if self._drop_events == 1 or self._drop_events % DROP_LOG_EVERY == 0:
                 self._log.warning(
-                    "metrics buffer full; dropped oldest samples "
+                    "上报缓冲区已满，丢弃最旧样本（后台长时间不可达） "
                     "dropped_now=%d dropped_total=%d buffer_cap=%d",
                     dropped,
                     self._dropped_total,
@@ -265,7 +267,10 @@ class Reporter:
         兜底防止空地址被拼进 URL。
         """
         if not self._base_url:
-            self._log.warning("reporter has no base URL; backend sync disabled")
+            self._log.warning(
+                "上报器未配置管理后台地址，禁用配置长轮询/指标上报/心跳"
+                "（服务按纯本地独立模式运行）"
+            )
             await asyncio.Event().wait()  # 挂起直到被取消
             return
         try:
@@ -302,7 +307,8 @@ class Reporter:
                 # （aiohttp 的总超时抛 asyncio.TimeoutError，3.11 起就是
                 # 内建 TimeoutError。）
                 self._log.debug(
-                    "config long poll timed out; re-polling version=%d",
+                    "配置长轮询挂满到期且后台无变更，立即重新发起下一轮"
+                    "（属正常静默，非失败） version=%d",
                     self._version,
                 )
                 backoff = 0.0
@@ -313,7 +319,8 @@ class Reporter:
                 backoff = _next_backoff(backoff)
                 d = _with_jitter(backoff)
                 self._log.warning(
-                    "config poll failed err=%s retry_in=%.2fs "
+                    "配置长轮询失败，按指数退避后重试（断联期间按既有配置"
+                    "继续限速） err=%s retry_in=%.2fs "
                     "consecutive_failures=%d",
                     e,
                     d,
@@ -328,8 +335,8 @@ class Reporter:
             else:
                 # 204：后台明确表示"当前版本即最新"，立即重新挂起等待。
                 self._log.debug(
-                    "config long poll returned no content; re-polling "
-                    "version=%d",
+                    "配置长轮询返回无更新（204，当前版本即最新），立即重新"
+                    "挂起等待 version=%d",
                     self._version,
                 )
 
@@ -369,14 +376,16 @@ class Reporter:
         except Exception as e:
             # 配置仍然在内存中生效；受影响的只有 fail-static 缓存（变旧）。
             self._log.error(
-                "persist config cache failed err=%s path=%s",
+                "fail-static 配置缓存落盘失败（新配置仍在内存生效，但断联"
+                "引导将退化为上一份缓存） err=%s path=%s",
                 e,
                 self._opts.cache_path,
             )
         self._push_config(cfg)
         self._version = cfg.version
         self._log.info(
-            "controller config received version_old=%d version_new=%d "
+            "收到管理后台下发的新配置，已投递给核心循环应用 "
+            "version_old=%d version_new=%d "
             "mode=%s envs=%d",
             version_old,
             cfg.version,
@@ -413,7 +422,7 @@ class Reporter:
                 pass
             raise
         self._log.debug(
-            "config cache written path=%s bytes=%d",
+            "配置缓存已原子落盘（断联时据此 fail-static 引导） path=%s bytes=%d",
             self._opts.cache_path,
             len(data),
         )
@@ -469,7 +478,7 @@ class Reporter:
             if len(self._samples) > MAX_BUFFERED_SAMPLES:
                 del self._samples[: len(self._samples) - MAX_BUFFERED_SAMPLES]
             self._log.warning(
-                "metrics flush failed; keeping samples err=%s samples=%d "
+                "用量上报失败，样本保留在缓冲区待下轮补送 err=%s samples=%d "
                 "buffered=%d buffer_cap=%d",
                 e,
                 len(batch),
@@ -478,7 +487,7 @@ class Reporter:
             )
             return
         self._log.debug(
-            "metrics flushed samples=%d duration=%.3fs",
+            "用量样本已批量上报管理后台 samples=%d duration=%.3fs",
             len(batch),
             time.monotonic() - start,
         )
@@ -511,7 +520,7 @@ class Reporter:
         except Exception as e:
             self._heartbeat_failures += 1
             self._log.warning(
-                "heartbeat failed err=%s consecutive_failures=%d",
+                "心跳上报失败，下个周期自然重发 err=%s consecutive_failures=%d",
                 e,
                 self._heartbeat_failures,
             )

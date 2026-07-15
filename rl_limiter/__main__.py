@@ -123,19 +123,21 @@ async def _amain(cfg, log: logging.Logger) -> None:
             ctl.seed(cached)
             seeded = True
             log.info(
-                "seeded from backend cache path=%s version=%s mode=%s envs=%d",
+                "已用本地缓存的后台配置完成引导（fail-static，重启前后限速"
+                "行为连续） path=%s version=%s mode=%s envs=%d",
                 cache_path, cached.version, cached.mode, len(cached.envs))
         else:
-            log.warning("backend cache unavailable path=%s err=%s",
+            log.warning("后台配置缓存不可用（首次部署或缓存损坏），转本地"
+                        "静态配额兜底 path=%s err=%s",
                         cache_path, cache_err if cache_err is not None else "empty")
     if not seeded and cfg.envs:
         ctl.seed(model.ControllerConfig(version=0, mode=cfg.mode, envs=cfg.envs))
         seeded = True
-        log.info("seeded from local envs mode=%s envs=%d envs_detail=%s",
+        log.info("已用本地静态环境配额完成引导 mode=%s envs=%d envs_detail=%s",
                  cfg.mode, len(cfg.envs), _summarize_envs(cfg.envs))
     if not seeded:
         log.warning(
-            "no bootstrap config: starting unlimited, waiting for backend "
+            "无任何引导配置，暂不限速，等待后台首次下发（注意此空窗期） "
             "backend_base_url=%s",
             getattr(backend, "base_url", "") if backend is not None else "")
 
@@ -144,7 +146,7 @@ async def _amain(cfg, log: logging.Logger) -> None:
     ev = asyncio.get_running_loop()
 
     def _on_signal(name: str) -> None:
-        log.info("shutdown signal received signal=%s", name)
+        log.info("收到退出信号，开始优雅停机 signal=%s", name)
         stop.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -162,7 +164,8 @@ async def _amain(cfg, log: logging.Logger) -> None:
     if rep is not None:
         tasks.append(asyncio.create_task(rep.run(), name="reporter"))
 
-    log.info("rl-limiter started node_id=%s mode=%s nodes=%d backend=%s version=%s",
+    log.info("rl-limiter 服务已启动，快环与上报器开始运行 "
+             "node_id=%s mode=%s nodes=%d backend=%s version=%s",
              cfg.node_id, executor_mode(exe), len(cfg.nodes),
              getattr(backend, "base_url", "") if backend is not None else "",
              SERVICE_VERSION)
@@ -174,7 +177,8 @@ async def _amain(cfg, log: logging.Logger) -> None:
         [stop_task, *tasks], return_when=asyncio.FIRST_COMPLETED)
     for t in done:
         if t is not stop_task and t.exception() is not None:
-            log.error("task crashed task=%s err=%s", t.get_name(), t.exception())
+            log.error("常驻任务异常退出，服务整体退出交由 systemd 拉起 "
+                      "task=%s err=%s", t.get_name(), t.exception())
     for t in (stop_task, *tasks):
         t.cancel()
     await asyncio.gather(stop_task, *tasks, return_exceptions=True)
@@ -203,8 +207,8 @@ def main() -> None:
         raise SystemExit(1)
 
     # 日志配置：级别来自配置文件（debug/info/warning/error），格式固定为
-    # "时间 级别 消息"三段；消息本体统一为英文短语 + key=value 键值对，
-    # 便于 grep 与日志采集系统按字段解析。
+    # "时间 级别 消息"三段；消息本体统一为中文描述 + 英文 snake_case 的
+    # key=value 键值对，便于 grep 与日志采集系统按字段解析。
     level = getattr(logging, str(cfg.log_level).upper(), logging.INFO)
     logging.basicConfig(
         stream=sys.stderr,
@@ -218,7 +222,8 @@ def main() -> None:
     # 服务身份、模式、受控节点清单与配额来源。
     backend = getattr(cfg, "backend", None)
     log.info(
-        "config loaded path=%s node_id=%s mode=%s log_level=%s tick_interval_s=%s "
+        "服务配置加载完成，以下为完整配置摘要（排障第一条要看的日志） "
+        "path=%s node_id=%s mode=%s log_level=%s tick_interval_s=%s "
         "nodes=%d nodes_detail=%s envs=%d envs_detail=%s "
         "backend_configured=%s backend_base_url=%s cache_path=%s",
         args.config, cfg.node_id, cfg.mode, cfg.log_level,
@@ -234,7 +239,7 @@ def main() -> None:
         asyncio.run(_amain(cfg, log))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
-    log.info("shutting down")
+    log.info("rl-limiter 服务已停止")
 
 
 if __name__ == "__main__":

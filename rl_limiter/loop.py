@@ -105,7 +105,8 @@ class ControlLoop:
         self._executor.set_mode(cfg.mode)
         self._version = cfg.version
         self._log.info(
-            "config applied version=%s mode=%s envs=%d env_quotas=%s",
+            "配置已应用到快环（映射/配额/模式已更新） "
+            "version=%s mode=%s envs=%d env_quotas=%s",
             cfg.version, cfg.mode, len(cfg.envs), _summarize_quotas(cfg.envs),
         )
 
@@ -171,7 +172,9 @@ class ControlLoop:
         # （安全方向）。executor 按契约把逐条错误收集成列表返回而不抛出。
         errs = await self._executor.apply(batch)
         for err in errs or []:
-            self._log.error("executor apply failed tick=%d err=%s", self._ticks, err)
+            self._log.error(
+                "本拍下发整形值时发生错误（循环继续，不中断限速，下拍自然重试） "
+                "tick=%d err=%s", self._ticks, err)
 
         # 上报：把本 tick 的完整结果交给可选的 sampler 回调（上报器缓冲）。
         if self._sampler is not None:
@@ -182,7 +185,8 @@ class ControlLoop:
         if self._ticks % STATUS_SUMMARY_EVERY_TICKS == 0:
             degraded = sorted(self._collector.degraded_nodes())
             self._log.info(
-                "status summary tick=%d config_version=%s mode=%s envs=%d "
+                "运行状态周期汇总（每 60 拍输出一次） "
+                "tick=%d config_version=%s mode=%s envs=%d "
                 "degraded_nodes=%s envs_summary=%s",
                 self._ticks, self._version, executor_mode(self._executor),
                 len(usages), ",".join(degraded) if degraded else "-",

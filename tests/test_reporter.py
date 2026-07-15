@@ -266,7 +266,7 @@ def test_add_sample_buffer_cap_and_drop_throttle(caplog):
     # 保新弃旧：最旧的 5 个（ts 1000..1004）被丢弃。
     assert rep._samples[0]["ts"] == 1005
     assert rep._samples[-1]["ts"] == 1604
-    drops = [r for r in caplog.records if "metrics buffer full" in r.getMessage()]
+    drops = [r for r in caplog.records if "上报缓冲区已满" in r.getMessage()]
     assert len(drops) == 1  # 5 次丢弃事件只告警首次
 
 
@@ -394,7 +394,7 @@ def test_tls_config_failure_degrades_to_default(tmp_path, caplog):
             log=log,
         )
     assert rep._ssl is None
-    assert any("tls client config failed" in r.getMessage() for r in caplog.records)
+    assert any("TLS 客户端证书材料加载失败" in r.getMessage() for r in caplog.records)
 
 
 def test_tls_cert_without_key_degrades(tmp_path, caplog):

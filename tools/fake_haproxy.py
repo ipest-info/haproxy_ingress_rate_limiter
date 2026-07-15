@@ -89,7 +89,8 @@ class FakeHAProxy:
         self.maps[(map_path, key)] = value
         if old != value:
             # 值发生变化才打日志：这是观察限速值真实下发的主要窗口。
-            log.info("map entry updated peer=%s map=%s key=%s old=%s new=%s",
+            log.info("收到 map 更新，本节点限速值已改写（enforce 下发的观察窗口） "
+                     "peer=%s map=%s key=%s old=%s new=%s",
                      peer, map_path, key, old if old is not None else "-", value)
         return "\n"
 
@@ -105,18 +106,18 @@ class FakeHAProxy:
             cmd = raw.decode("utf-8", "replace").strip()
             if cmd.startswith("show stat"):
                 reply = self.show_stat()
-                log.debug("show stat served peer=%s frontends=%d", peer, len(self.frontends))
+                log.debug("已应答一次 show stat 采样请求 peer=%s frontends=%d", peer, len(self.frontends))
             elif cmd.startswith("set map") or cmd.startswith("add map"):
                 reply = self.set_map(cmd, peer)
             elif cmd == "":
                 reply = ""
             else:
                 reply = f"Unknown command: {cmd}\n"
-                log.warning("unknown command peer=%s cmd=%s", peer, cmd)
+                log.warning("收到无法识别的命令，已按错误应答 peer=%s cmd=%s", peer, cmd)
             writer.write(reply.encode("utf-8"))
             await writer.drain()
         except asyncio.TimeoutError:
-            log.warning("read timeout peer=%s", peer)
+            log.warning("等待客户端命令超时，关闭本次连接 peer=%s", peer)
         except (ConnectionResetError, BrokenPipeError):
             pass  # 客户端提前断开：演示场景无需关心
         finally:
@@ -147,7 +148,8 @@ def parse_frontends(spec: str, jitter: float) -> list[FakeFrontend]:
 async def amain(args: argparse.Namespace) -> None:
     fake = FakeHAProxy(parse_frontends(args.frontends, args.jitter))
     server = await asyncio.start_server(fake.handle, host=args.host, port=args.port)
-    log.info("fake haproxy listening addr=%s:%d frontends=%s jitter=%.2f",
+    log.info("假 HAProxy stats socket 已开始监听，等待 rl-limiter 接入 "
+             "addr=%s:%d frontends=%s jitter=%.2f",
              args.host, args.port,
              ",".join(f"{f.name}:{f.rate_bps:.0f}" for f in fake.frontends.values()),
              args.jitter)
@@ -175,7 +177,7 @@ def main() -> None:
     try:
         asyncio.run(amain(args))
     except KeyboardInterrupt:
-        log.info("fake haproxy stopped")
+        log.info("假 HAProxy 已停止")
 
 
 if __name__ == "__main__":
