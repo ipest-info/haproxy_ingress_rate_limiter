@@ -213,8 +213,8 @@ class Executor:
                     continue
                 self._log.info(
                     "【DRY-RUN 演练】本应下发整形值（未真实写入 HAProxy） "
-                    "env=%s state=%s bwlim_bytes_per_sec=%s targets=%s",
-                    d.env_id, d.state, d.bwlim_bps, [str(t) for t in d.targets],
+                    "env=%s state=%s bwlim_mbps=%.2f targets=%s",
+                    d.env_id, d.state, model.to_mbps(d.bwlim_bps), [str(t) for t in d.targets],
                 )
                 applied[d.env_id] = d.bwlim_bps
                 continue
@@ -240,8 +240,8 @@ class Executor:
             if not env_errs:
                 if retry:
                     self._log.info(
-                        "重试队列中的环境整形值写入成功，移出队列恢复正常 env=%s bwlim_bytes_per_s=%s",
-                        d.env_id, d.bwlim_bps,
+                        "重试队列中的环境整形值写入成功，移出队列恢复正常 env=%s bwlim_mbps=%.2f",
+                        d.env_id, model.to_mbps(d.bwlim_bps),
                     )
                 applied[d.env_id] = d.bwlim_bps
                 applied_alloc[d.env_id] = {t: int(alloc.get(t, 0)) for t in d.targets}
@@ -315,6 +315,6 @@ class Executor:
             # 保留原始异常链，外层收集后由调用方决定日志级别。
             raise RuntimeError(f"set bwlim env={env_id} target={t}: {exc}") from exc
         self._log.info(
-            "整形值已写入节点 map env=%s target=%s value_bytes_per_s=%d map_path=%s",
-            env_id, t, value, map_path,
+            "整形值已写入节点 map env=%s target=%s value_mbps=%.2f map_path=%s",
+            env_id, t, model.to_mbps(value), map_path,
         )

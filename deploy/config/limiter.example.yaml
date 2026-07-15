@@ -4,8 +4,8 @@
 # 连接并控制多台 HAProxy——因此这里维护的是"受控节点清单"，而环境
 # （envs）的挂载点是 (节点, frontend) 二元组，同一环境可横跨多台节点。
 #
-# 单位约定：quota_bps 一律为 bit/s（运维口径，200000000 = 200 Mbps），
-# 服务内部统一换算为 bytes/s（唯一换算点在 model.EnvQuota）。
+# 单位约定：带宽一律用 quota_mbps（兆比特每秒 Mbps，如 200 表示 200 Mbps，
+# 允许小数），这是给人读写的统一带宽单位；服务内部自动换算为 bytes/s。
 
 node_id: rl-limiter-01          # 本服务实例的唯一标识（心跳/上报时携带，与后台记录对应）
 mode: dry-run                   # dry-run = 只打日志不写 map；enforce = 真实下发限速
@@ -32,7 +32,7 @@ haproxy_nodes:
 # 本地静态环境配额：standalone / 首启引导用；后台下发配置后以下发为准。
 envs:
   - env_id: env-a               # 环境 ID
-    quota_bps: 200000000        # 约定带宽（bit/s），200 Mbps
+    quota_mbps: 200             # 约定带宽，200 Mbps（允许小数，如 200.5）
     targets:                    # 该环境的全部挂载点：可横跨多台 HAProxy
       - node: hap-1
         frontend: fe_env_a      # 该节点上的 frontend 名（stats 输出的 pxname 列）

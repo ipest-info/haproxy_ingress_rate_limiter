@@ -115,9 +115,9 @@ class Governor:
                 )
                 self._log.info(
                     "新增受控环境，整形值初始化为弹性上限，等待首拍用量数据后开始调节 "
-                    "env=%s quota_bytes_per_s=%s ceil_bytes_per_s=%s "
-                    "bwlim_bytes_per_s=%s targets=%s params=%s",
-                    e.env_id, quota, ceil, ceil,
+                    "env=%s quota_mbps=%.2f ceil_mbps=%.2f "
+                    "bwlim_mbps=%.2f targets=%s params=%s",
+                    e.env_id, model.to_mbps(quota), model.to_mbps(ceil), model.to_mbps(ceil),
                     [str(t) for t in targets], params.to_dict(),
                 )
                 continue
@@ -135,9 +135,10 @@ class Governor:
                 st.emitted = False  # 强制重新发射重置后的值
                 self._log.info(
                     "环境配额/参数变更，控制状态整体重置，整形值重置为新配额下的弹性上限 env=%s "
-                    "old_quota_bytes_per_s=%s new_quota_bytes_per_s=%s "
-                    "ceil_bytes_per_s=%s bwlim_old=%s bwlim_new=%s params=%s",
-                    e.env_id, old_quota, quota, ceil, old_bwlim, st.bwlim,
+                    "old_quota_mbps=%.2f new_quota_mbps=%.2f "
+                    "ceil_mbps=%.2f bwlim_old_mbps=%.2f bwlim_new_mbps=%.2f params=%s",
+                    e.env_id, model.to_mbps(old_quota), model.to_mbps(quota),
+                    model.to_mbps(ceil), model.to_mbps(old_bwlim), model.to_mbps(st.bwlim),
                     params.to_dict(),
                 )
             if st.targets != targets:
@@ -180,8 +181,8 @@ class Governor:
             # 持续性计数，changed=False，等待数据恢复后再继续推进。
             self._log.debug(
                 "采样链路降级，本拍数据为陈旧保持值，冻结该环境的整形值与状态等待数据恢复 "
-                "env=%s state=%s bwlim_bytes_per_s=%s",
-                u.env_id, st.state, st.bwlim,
+                "env=%s state=%s bwlim_mbps=%.2f",
+                u.env_id, st.state, model.to_mbps(st.bwlim),
             )
             return model.Decision(
                 env_id=u.env_id,
@@ -247,24 +248,26 @@ class Governor:
             self._log.info(
                 "环境 10 秒均值触发限速状态变迁（utilization 为 mean10/配额比值） "
                 "env=%s state_from=%s state_to=%s "
-                "mean10_bytes_per_s=%s quota_bytes_per_s=%s utilization=%s "
-                "bwlim_old=%s bwlim_new=%s over_secs=%d under_secs=%d",
-                u.env_id, old_state, st.state, m, q, _utilization(m, q),
-                old_bwlim, st.bwlim, st.over_secs, st.under_secs,
+                "mean10_mbps=%.2f quota_mbps=%.2f utilization=%s "
+                "bwlim_old_mbps=%.2f bwlim_new_mbps=%.2f over_secs=%d under_secs=%d",
+                u.env_id, old_state, st.state, model.to_mbps(m), model.to_mbps(q), _utilization(m, q),
+                model.to_mbps(old_bwlim), model.to_mbps(st.bwlim), st.over_secs, st.under_secs,
             )
         # bwlim 实际调整日志：只有数值真的变了才记（触底/到顶后的空转
         # 不算调整），收紧与放松使用不同的消息便于检索。
         if st.bwlim < old_bwlim:
             self._log.info(
-                "均值持续超配额，乘性收紧整形值以压回承诺口径 env=%s bwlim_old=%s bwlim_new=%s "
-                "mean10_bytes_per_s=%s quota_bytes_per_s=%s utilization=%s over_secs=%d",
-                u.env_id, old_bwlim, st.bwlim, m, q, _utilization(m, q), st.over_secs,
+                "均值持续超配额，乘性收紧整形值以压回承诺口径 env=%s bwlim_old_mbps=%.2f bwlim_new_mbps=%.2f "
+                "mean10_mbps=%.2f quota_mbps=%.2f utilization=%s over_secs=%d",
+                u.env_id, model.to_mbps(old_bwlim), model.to_mbps(st.bwlim),
+                model.to_mbps(m), model.to_mbps(q), _utilization(m, q), st.over_secs,
             )
         elif st.bwlim > old_bwlim:
             self._log.info(
-                "均值回落至低水位，加性放松整形值逐步归还带宽 env=%s bwlim_old=%s bwlim_new=%s "
-                "mean10_bytes_per_s=%s quota_bytes_per_s=%s utilization=%s under_secs=%d",
-                u.env_id, old_bwlim, st.bwlim, m, q, _utilization(m, q), st.under_secs,
+                "均值回落至低水位，加性放松整形值逐步归还带宽 env=%s bwlim_old_mbps=%.2f bwlim_new_mbps=%.2f "
+                "mean10_mbps=%.2f quota_mbps=%.2f utilization=%s under_secs=%d",
+                u.env_id, model.to_mbps(old_bwlim), model.to_mbps(st.bwlim),
+                model.to_mbps(m), model.to_mbps(q), _utilization(m, q), st.under_secs,
             )
 
         # 发射判定：首次必发（emitted=False），此后仅当与上次发射值的
@@ -277,10 +280,11 @@ class Governor:
 
         # 每拍 per-env 摘要（debug 级），用于问题排查时还原完整时间线。
         self._log.debug(
-            "本拍环境控制状态摘要（用于排查时还原时间线） env=%s state=%s mean10_bytes_per_s=%s "
-            "quota_bytes_per_s=%s utilization=%s bwlim_bytes_per_s=%s "
+            "本拍环境控制状态摘要（用于排查时还原时间线） env=%s state=%s mean10_mbps=%.2f "
+            "quota_mbps=%.2f utilization=%s bwlim_mbps=%.2f "
             "over_secs=%d under_secs=%d changed=%s",
-            u.env_id, st.state, m, q, _utilization(m, q), st.bwlim,
+            u.env_id, st.state, model.to_mbps(m), model.to_mbps(q),
+            _utilization(m, q), model.to_mbps(st.bwlim),
             st.over_secs, st.under_secs, changed,
         )
 

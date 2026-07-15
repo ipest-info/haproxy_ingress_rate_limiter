@@ -34,17 +34,17 @@ def executor_mode(executor) -> str:
 
 
 def _summarize_quotas(envs: list[model.EnvQuota]) -> str:
-    """把环境配额压缩成单个日志字段，格式 "env1=200000000;env2=..."，
-    数值为配置口径的 bits/s。"""
-    return ";".join(f"{e.env_id}={e.quota_bits_per_sec}" for e in envs)
+    """把环境配额压缩成单个日志字段，格式 "env1=200.00Mbps;env2=..."，
+    数值为人类可读的 Mbps（保留两位小数）。"""
+    return ";".join(f"{e.env_id}={e.quota_mbps:.2f}Mbps" for e in envs)
 
 
 def _summarize_usages(usages: list[model.EnvUsage]) -> str:
     """把各环境用量压缩成单个日志字段，格式
-    "env1:mean10_bytes_per_s=12345,conn=6;env2:..."。mean10 为计费口径的
-    10 秒滑动均值（bytes/s），conn 为当前并发连接数之和。"""
+    "env1:mean10=98.76Mbps,conn=6;env2:..."。mean10 为计费口径的 10 秒
+    滑动均值（换算为 Mbps 展示），conn 为当前并发连接数之和。"""
     return ";".join(
-        f"{u.env_id}:mean10_bytes_per_s={u.mean10_bps:.0f},conn={u.conn_cur}"
+        f"{u.env_id}:mean10={model.to_mbps(u.mean10_bps):.2f}Mbps,conn={u.conn_cur}"
         for u in usages
     )
 

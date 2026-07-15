@@ -45,11 +45,11 @@ def _summarize_nodes(nodes: list[model.NodeConfig]) -> str:
 
 def _summarize_envs(envs: list[model.EnvQuota]) -> str:
     """把环境清单压缩成单个日志字段，格式：
-    "env_id=e1,quota_bps=200000000,targets=hap-1/fe_a|hap-2/fe_a;..."。
-    quota_bps 为配置口径的 bits/s；targets 为 节点/前端 二元组。"""
+    "env_id=e1,quota_mbps=200.00,targets=hap-1/fe_a|hap-2/fe_a;..."。
+    quota 以 Mbps 展示（人类可读口径）；targets 为 节点/前端 二元组。"""
     return ";".join(
-        "env_id={},quota_bps={},targets={}".format(
-            e.env_id, e.quota_bits_per_sec, "|".join(str(t) for t in e.targets))
+        "env_id={},quota_mbps={:.2f},targets={}".format(
+            e.env_id, e.quota_mbps, "|".join(str(t) for t in e.targets))
         for e in envs
     )
 

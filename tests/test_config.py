@@ -40,14 +40,14 @@ haproxy_nodes:
     port: 9999
 envs:
   - env_id: env-a
-    quota_bps: 200000000
+    quota_mbps: 200
     targets:
       - {node: lb-1, frontend: fe_a}
       - {node: lb-2, frontend: fe_a}
     params:
       md_factor: 0.8
   - env_id: env-b
-    quota_bps: 100000000
+    quota_mbps: 100
     targets:
       - {node: lb-1, frontend: fe_b}
 backend:
@@ -80,8 +80,8 @@ def test_load_full_config(tmp_path):
 
     assert [e.env_id for e in cfg.envs] == ["env-a", "env-b"]
     ea = cfg.envs[0]
-    assert ea.quota_bits_per_sec == 200_000_000
-    # 配额单位是 bits/s，quota_bytes_per_sec 是唯一的换算边界（÷8）。
+    assert ea.quota_mbps == 200
+    # 配额单位是 Mbps，quota_bytes_per_sec 是唯一的换算边界（×125000）。
     assert ea.quota_bytes_per_sec == pytest.approx(25_000_000.0)
     assert ea.targets == [
         model.Target("lb-1", "fe_a"),
@@ -140,7 +140,7 @@ haproxy_nodes:
   - {name: lb-1, host: 10.0.0.1, port: 9999}
 envs:
   - env_id: env-a
-    quota_bps: 200000000
+    quota_mbps: 200
     targets:
       - {node: lb-1, frontend: fe_a}
 """
@@ -221,7 +221,7 @@ envs:
         pytest.param(
             BASE
             + "  - env_id: env-a\n"
-            "    quota_bps: 100000000\n"
+            "    quota_mbps: 100\n"
             "    targets:\n"
             "      - {node: lb-1, frontend: fe_b}\n",
             r"envs\[1\].*'env-a'.*重复",
@@ -229,20 +229,20 @@ envs:
         ),
         # 配额必须为正（0 与负数都会把环境限死或让计算失去基准）。
         pytest.param(
-            BASE.replace("quota_bps: 200000000", "quota_bps: 0"),
-            r"env-a.*quota_bps 必须 > 0",
+            BASE.replace("quota_mbps: 200", "quota_mbps: 0"),
+            r"env-a.*quota_mbps 必须 > 0",
             id="quota-zero",
         ),
         pytest.param(
-            BASE.replace("quota_bps: 200000000", "quota_bps: -5"),
-            r"env-a.*quota_bps 必须 > 0.*-5",
+            BASE.replace("quota_mbps: 200", "quota_mbps: -5"),
+            r"env-a.*quota_mbps 必须 > 0.*-5",
             id="quota-negative",
         ),
         # targets 非空。
         pytest.param(
             "node_id: svc-1\nhaproxy_nodes:\n"
             "  - {name: lb-1, host: 10.0.0.1, port: 9999}\n"
-            "envs:\n  - {env_id: env-a, quota_bps: 200000000}\n",
+            "envs:\n  - {env_id: env-a, quota_mbps: 200}\n",
             r"env-a.*至少需要一个 target",
             id="targets-missing",
         ),
@@ -250,7 +250,7 @@ envs:
             "node_id: svc-1\nhaproxy_nodes:\n"
             "  - {name: lb-1, host: 10.0.0.1, port: 9999}\n"
             "envs:\n"
-            "  - {env_id: env-a, quota_bps: 200000000, targets: []}\n",
+            "  - {env_id: env-a, quota_mbps: 200, targets: []}\n",
             r"env-a.*至少需要一个 target",
             id="targets-empty",
         ),
@@ -270,7 +270,7 @@ envs:
         pytest.param(
             BASE
             + "  - env_id: env-b\n"
-            "    quota_bps: 100000000\n"
+            "    quota_mbps: 100\n"
             "    targets:\n"
             "      - {node: lb-1, frontend: fe_a}\n",
             r"lb-1/fe_a 同时映射到环境 'env-a' 与 'env-b'",

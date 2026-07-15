@@ -5,7 +5,7 @@
 # 一个监听内网 TCP 的 stats socket（真实部署中对应 haproxy.cfg 的
 # `stats socket ipv4@<内网IP>:9999 level admin`）。rl-limiter 连上来后：
 #   - "show stat -1 1 -1"：返回带 "# " 列头的 CSV，其中各 frontend 的
-#     bytes_out 计数器按 --frontends 指定的速率 × 真实流逝时间持续增长
+#     bytes_out 计数器按 --frontends 指定的下行速率(Mbps) × 真实流逝时间持续增长
 #     （附带 --jitter 抖动），scur 在 5~50 之间随机游走，模拟真实流量；
 #   - "set map <path> <key> <value>" / "add map ..."：记录到内存 map 并在
 #     值变化时打 info 日志（这就是观察 enforce 模式下发效果的窗口），
@@ -15,8 +15,8 @@
 # 一条命令，应答完即由服务端关闭连接——客户端每条命令都要重新拨号。
 #
 # 用法示例（模拟两台 HAProxy，见 docs/03-限速服务运行指南.md）：
-#   python3 tools/fake_haproxy.py --port 19991 --frontends fe_env_a:2000000,fe_env_b:500000
-#   python3 tools/fake_haproxy.py --port 19992 --frontends fe_env_a:1500000
+#   python3 tools/fake_haproxy.py --port 19991 --frontends fe_env_a:16,fe_env_b:4
+#   python3 tools/fake_haproxy.py --port 19992 --frontends fe_env_a:12
 
 from __future__ import annotations
 
@@ -128,18 +128,24 @@ class FakeHAProxy:
                 pass
 
 
+# 1 Mbps = 1_000_000 bit/s = 125_000 byte/s（十进制兆，网络带宽惯例）。
+_BYTES_PER_MBIT = 125_000
+
+
 def parse_frontends(spec: str, jitter: float) -> list[FakeFrontend]:
-    """解析 --frontends 参数："fe_a:2000000,fe_b:500000" →
-    每个 frontend 一个 (名称, 每秒增长字节数) 的模拟器。"""
+    """解析 --frontends 参数："fe_a:16,fe_b:4" → 每个 frontend 一个模拟器。
+
+    冒号后的数值是**下行速率 Mbps**（人类可读口径，如 16 表示 16 Mbps），
+    内部换算成 bytes/s 驱动 bytes_out 计数器增长。"""
     frontends: list[FakeFrontend] = []
     for item in spec.split(","):
         item = item.strip()
         if not item:
             continue
-        name, _, rate = item.partition(":")
-        if not name or not rate:
-            raise ValueError(f"bad frontend spec: {item!r} (expected name:bytes_per_sec)")
-        frontends.append(FakeFrontend(name, float(rate), jitter))
+        name, _, mbps = item.partition(":")
+        if not name or not mbps:
+            raise ValueError(f"bad frontend spec: {item!r} (expected name:mbps)")
+        frontends.append(FakeFrontend(name, float(mbps) * _BYTES_PER_MBIT, jitter))
     if not frontends:
         raise ValueError("no frontends specified")
     return frontends
@@ -151,7 +157,8 @@ async def amain(args: argparse.Namespace) -> None:
     log.info("假 HAProxy stats socket 已开始监听，等待 rl-limiter 接入 "
              "addr=%s:%d frontends=%s jitter=%.2f",
              args.host, args.port,
-             ",".join(f"{f.name}:{f.rate_bps:.0f}" for f in fake.frontends.values()),
+             ",".join(f"{f.name}:{f.rate_bps / _BYTES_PER_MBIT:.2f}Mbps"
+                      for f in fake.frontends.values()),
              args.jitter)
     async with server:
         await server.serve_forever()
@@ -163,8 +170,8 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 %(default)s）")
     parser.add_argument("--port", type=int, required=True, help="监听端口（模拟内网 TCP stats socket）")
     parser.add_argument(
-        "--frontends", default="fe_env_a:2000000",
-        help="frontend 清单：name:每秒增长字节数，逗号分隔（默认 %(default)s）")
+        "--frontends", default="fe_env_a:16",
+        help="frontend 清单：name:下行速率Mbps，逗号分隔（如 fe_a:16,fe_b:4；默认 %(default)s）")
     parser.add_argument(
         "--jitter", type=float, default=0.2,
         help="流量抖动幅度，0.2 表示 ±20%%（默认 %(default)s）")

@@ -3,17 +3,26 @@
   "envs": [
     {
       "env_id": "env-a",
-      "quota_bps": 200000000,
+      "quota_mbps": 200.0,
       "targets": [
-        { "node": "hap-1", "frontend": "fe_env_a" },
-        { "node": "hap-2", "frontend": "fe_env_a" }
+        {
+          "node": "hap-1",
+          "frontend": "fe_env_a"
+        },
+        {
+          "node": "hap-2",
+          "frontend": "fe_env_a"
+        }
       ]
     },
     {
       "env_id": "env-b",
-      "quota_bps": 50000000,
+      "quota_mbps": 50.0,
       "targets": [
-        { "node": "hap-1", "frontend": "fe_env_b" }
+        {
+          "node": "hap-1",
+          "frontend": "fe_env_b"
+        }
       ]
     }
   ],

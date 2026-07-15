@@ -6,19 +6,49 @@
 # 多台 HAProxy 上的流量全局聚合后做 AIMD 决策，再按各挂载点近期用量加权
 # 把整形值分配写回各节点（原慢环的加权分配算法降级为执行路径的一步）。
 #
-# 单位约定（非常重要，混淆会带来 8 倍误差）：
-#   - 内部所有速率一律为「字节每秒」（bytes/s，float）。HAProxy stats 的
-#     bytes_out 本身就是字节计数，内部保持字节口径避免反复换算。
-#   - 配置中的配额（本地 YAML 与管理后台 JSON 的 quota_bps 字段）一律为
-#     「比特每秒」（bits/s），遵循运维习惯：200_000_000 表示 200 Mbps。
-#   - 两种口径只在 EnvQuota.quota_bytes_per_sec 这一处转换（除以 8），
-#     其余代码不得再做单位换算。
+# 单位约定（非常重要，混淆会带来量级误差）——分三层，各司其职：
+#   1. 内部计算口径：一律「字节每秒」（bytes/s，float）。HAProxy stats 的
+#      bytes_out 本身就是字节计数，内部保持字节口径避免反复换算。所有算法
+#      （采集差分、AIMD、加权分配）都在这一口径上进行。
+#   2. 人类可读口径：一律「兆比特每秒」（Mbps）。凡是给人看的地方——配置
+#      文件字段（quota_mbps）、日志里的带宽字段（*_mbps）、CLI 参数、文档
+#      ——统一用 Mbps，且保留两位小数，符合运维/商务对带宽的日常认知。
+#   3. 机器交换口径：metrics/heartbeat 上报 payload 里的速率仍保留精确的
+#      bytes/s（后台需要精确值做计费/对账，自行按需换算展示），不因展示
+#      需要而损失精度。
+#
+# 换算集中在本模块的 to_mbps / mbps_to_bytes_per_sec 两个函数，其余代码
+# 不得自行写 *8/1e6 之类的散装换算。EnvQuota 以 Mbps 存储配额，只在
+# quota_bytes_per_sec 属性处转成内部计算口径。
 
 from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
+
+# 1 Mbps = 1_000_000 bits/s = 125_000 bytes/s（十进制兆，网络带宽惯例，
+# 不是 1024 进制）。带宽换算全服务只认这一个常量。
+BITS_PER_MBIT = 1_000_000
+BYTES_PER_MBIT = BITS_PER_MBIT / 8  # 125_000
+
+
+def to_mbps(bytes_per_sec: float) -> float:
+    """内部计算口径（bytes/s）→ 人类可读口径（Mbps）。
+
+    用于日志与任何展示场景：调用方通常再 `%.2f` 保留两位小数。
+    例：25_000_000 bytes/s → 200.0 Mbps。
+    """
+    return bytes_per_sec * 8 / BITS_PER_MBIT
+
+
+def mbps_to_bytes_per_sec(mbps: float) -> float:
+    """人类可读口径（Mbps）→ 内部计算口径（bytes/s）。
+
+    用于配置入口把 quota_mbps 转成算法用的 bytes/s。
+    例：200 Mbps → 25_000_000 bytes/s。
+    """
+    return mbps * BYTES_PER_MBIT
 
 # 执行器（executor）的两种运行模式：
 #   - dry-run：只计算并记录本应写入的整形值，不真正改动 HAProxy，
@@ -182,17 +212,18 @@ class EnvQuota:
     """
 
     env_id: str
-    # 环境配额，单位「比特每秒」（bits/s，运维口径）。全代码库唯一以
-    # bits/s 存储的速率字段，进入内部计算前必须经 quota_bytes_per_sec。
-    quota_bits_per_sec: int
+    # 环境配额，单位「兆比特每秒」（Mbps，人类可读口径），如 200 或
+    # 200.5。这是配置与展示的统一带宽单位；进入内部计算前经
+    # quota_bytes_per_sec 属性转成 bytes/s。允许小数。
+    quota_mbps: float
     targets: list[Target] = field(default_factory=list)
     # 快环参数覆盖；None 表示整体使用默认参数。
     params: GovParams | None = None
 
     @property
     def quota_bytes_per_sec(self) -> float:
-        """bits/s → bytes/s 的唯一换算边界（除以 8）。"""
-        return self.quota_bits_per_sec / 8.0
+        """Mbps → bytes/s 的唯一换算边界（进入内部计算口径）。"""
+        return mbps_to_bytes_per_sec(self.quota_mbps)
 
     def effective_params(self) -> GovParams:
         """返回实际生效参数：无覆盖用默认；有覆盖经 normalize 补齐。"""
@@ -209,7 +240,7 @@ class EnvQuota:
         ]
         return cls(
             env_id=d.get("env_id", ""),
-            quota_bits_per_sec=int(d.get("quota_bps", 0)),
+            quota_mbps=float(d.get("quota_mbps", 0)),
             targets=targets,
             params=GovParams.from_dict(d.get("params")),
         )
@@ -217,7 +248,7 @@ class EnvQuota:
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "env_id": self.env_id,
-            "quota_bps": self.quota_bits_per_sec,
+            "quota_mbps": self.quota_mbps,
             "targets": [{"node": t.node, "frontend": t.frontend} for t in self.targets],
         }
         if self.params is not None:

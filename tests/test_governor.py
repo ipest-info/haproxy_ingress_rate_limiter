@@ -32,7 +32,9 @@ def env_quota(
 ) -> model.EnvQuota:
     return model.EnvQuota(
         env_id=env_id,
-        quota_bits_per_sec=bits,
+        # 入参沿用 bits/s（历史用法，便于与 QUOTA_BYTES 等常量对齐），
+        # 换算为配置口径的 Mbps：quota_bytes_per_sec 结果不变（bits/8）。
+        quota_mbps=bits / 1_000_000,
         targets=list(targets) or [model.Target("n1", "fe_a")],
         params=params,
     )

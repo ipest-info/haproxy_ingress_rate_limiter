@@ -124,7 +124,7 @@ def make_config(version: int, mode: str = model.MODE_DRY_RUN,
                 quota: int = 80_000_000) -> model.ControllerConfig:
     return model.ControllerConfig(
         version=version, mode=mode,
-        envs=[model.EnvQuota(env_id="env-a", quota_bits_per_sec=quota,
+        envs=[model.EnvQuota(env_id="env-a", quota_mbps=quota,
                              targets=[T1, T2])])
 
 
@@ -186,7 +186,7 @@ async def test_config_applied_before_first_tick(monkeypatch):
     assert ctl.version == 2
     assert exe.mode() == model.MODE_ENFORCE
     # 第一拍决策时 governor 看到的已经是 version=2 的配额。
-    assert gov.seen_at_tick[0][0].quota_bits_per_sec == 999
+    assert gov.seen_at_tick[0][0].quota_mbps == 999
     # 事件顺序：seed 的 set_mapping → 队列配置的 set_mapping → 第一拍采集。
     kinds = [e[0] for e in col.events]
     assert kinds[:3] == ["set_mapping", "set_mapping", "collector.tick"]
@@ -213,7 +213,7 @@ async def test_config_queue_updates_version_mid_run(monkeypatch):
 
     assert ctl.version == 7
     # 应用新配置之后的某一拍，governor 看到的是新配额。
-    assert any(envs and envs[0].quota_bits_per_sec == 555
+    assert any(envs and envs[0].quota_mbps == 555
                for envs in gov.seen_at_tick)
 
 

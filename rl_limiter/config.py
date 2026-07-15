@@ -11,8 +11,9 @@
 #   4. 引导配额（envs）：standalone 模式下的唯一配额来源；接入后台时仅作
 #      首启引导，后台下发配置后以下发为准。
 #
-# 单位约定：配额一律按运维口径的「比特每秒」（quota_bps，200000000 =
-# 200 Mbps）书写，内部统一换算为 bytes/s（见 model.EnvQuota）。
+# 单位约定：配额一律按「兆比特每秒」（quota_mbps，如 200 表示 200 Mbps，
+# 允许小数）书写——这是给人读写的带宽单位；内部统一换算为 bytes/s
+# （见 model.EnvQuota / model.mbps_to_bytes_per_sec）。
 #
 # 加载流程：读文件 → yaml.safe_load → 补默认值 → 校验。load 本身不打日志，
 # 成功日志由 main 统一输出；失败通过异常信息精确指出问题字段、当前值与
@@ -228,7 +229,7 @@ def _validate(cfg: ServiceConfig) -> None:
     - tick_interval_s 必须 > 0：它是采样差分与 AIMD 判据窗口的时基；
     - 节点 name 唯一且非空：Target.node 以名字引用节点，重名会让引用
       二义、空名无法引用；host 非空、port 1-65535 是 TCP 接线的底线；
-    - env_id 必填且唯一、quota_bps > 0：配额是限速计算的分母/基准，
+    - env_id 必填且唯一、quota_mbps > 0：配额是限速计算的分母/基准，
       零或负配额无意义且会把环境限死；
     - 每个环境至少一个 target，target.node 必须已在 haproxy_nodes 中
       声明：引用未声明的节点意味着采不到用量也无处写限速值；
@@ -295,11 +296,11 @@ def _validate(cfg: ServiceConfig) -> None:
                 f"envs[{seen_env_ids[e.env_id]}] 重复：环境标识必须唯一"
             )
         seen_env_ids[e.env_id] = i
-        if e.quota_bits_per_sec <= 0:
+        if e.quota_mbps <= 0:
             raise ValueError(
-                f"envs[{i}] ({e.env_id}): quota_bps 必须 > 0，"
-                f"当前值 {e.quota_bits_per_sec!r}"
-                f"（单位为比特每秒，例如 200000000 表示 200 Mbps）"
+                f"envs[{i}] ({e.env_id}): quota_mbps 必须 > 0，"
+                f"当前值 {e.quota_mbps!r}"
+                f"（单位为兆比特每秒 Mbps，例如 200 表示 200 Mbps，允许小数）"
             )
         if not e.targets:
             raise ValueError(

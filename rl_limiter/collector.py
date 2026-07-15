@@ -254,9 +254,10 @@ class Collector:
             for u in usages:
                 self._log.debug(
                     "本秒采样完成，输出该环境的全局聚合用量样本 "
-                    "env=%s rate_bps=%.1f mean10_bps=%.1f ewma60_bps=%.1f "
+                    "env=%s rate_mbps=%.2f mean10_mbps=%.2f ewma60_mbps=%.2f "
                     "conn_cur=%d degraded=%s",
-                    u.env_id, u.rate_bps, u.mean10_bps, u.ewma60_bps, u.conn_cur, u.degraded)
+                    u.env_id, model.to_mbps(u.rate_bps), model.to_mbps(u.mean10_bps),
+                    model.to_mbps(u.ewma60_bps), u.conn_cur, u.degraded)
         return usages
 
     # ------------------------------------------------------------------
@@ -386,8 +387,8 @@ class Collector:
                     "检测到 bytes_out 计数器回绕（多为 HAProxy reload 后计数清零），"
                     "本秒沿用上一秒速率并用新累计值重建差分基线，下一秒差分即恢复正常 "
                     "node=%s frontend=%s "
-                    "previous_bytes_out=%d current_bytes_out=%d held_rate_bps=%.1f",
-                    node, fs.name, ts.last_bytes_out, fs.bytes_out, ts.last_rate)
+                    "previous_bytes_out=%d current_bytes_out=%d held_rate_mbps=%.2f",
+                    node, fs.name, ts.last_bytes_out, fs.bytes_out, model.to_mbps(ts.last_rate))
             ts.last_bytes_out = fs.bytes_out
             ts.last_rate = rate
             ts.last_conn = fs.conn_cur

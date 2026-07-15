@@ -28,14 +28,14 @@ from rl_limiter.config import BackendOptions
 NODE_ID = "svc-1"
 SERVICE_VERSION = "v-test"
 
-# 两份可下发的配置文档（管理后台 JSON 口径：quota_bps 为 bits/s）。
+# 两份可下发的配置文档（管理后台 JSON 口径：quota_mbps 为 Mbps）。
 CFG_V1 = {
     "version": 1,
     "mode": "enforce",
     "envs": [
         {
             "env_id": "env-a",
-            "quota_bps": 200_000_000,
+            "quota_mbps": 200,
             "targets": [{"node": "lb-1", "frontend": "fe_a"}],
         }
     ],
@@ -48,12 +48,12 @@ CFG_V2 = {
     "envs": [
         {
             "env_id": "env-a",
-            "quota_bps": 100_000_000,
+            "quota_mbps": 100,
             "targets": [{"node": "lb-1", "frontend": "fe_a"}],
         },
         {
             "env_id": "env-b",
-            "quota_bps": 50_000_000,
+            "quota_mbps": 50,
             "targets": [{"node": "lb-1", "frontend": "fe_b"}],
         },
     ],
@@ -376,7 +376,7 @@ async def test_load_cache_roundtrip_and_normalize(tmp_path):
     assert cfg.version == 1
     assert cfg.mode == model.MODE_DRY_RUN
     assert len(cfg.envs) == 1
-    assert cfg.envs[0].quota_bits_per_sec == 200_000_000
+    assert cfg.envs[0].quota_mbps == 200
 
 
 def test_tls_config_failure_degrades_to_default(tmp_path, caplog):
