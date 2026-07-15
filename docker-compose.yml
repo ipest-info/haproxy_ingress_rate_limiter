@@ -1,0 +1,96 @@
+# docker compose 一键演示环境：MySQL 配置源 + 真实 HAProxy 整形 + 模拟
+# 业务后端 + 可调并发压测服务。详细玩法见 docs/04-DockerCompose演示.md。
+#
+#   启动：docker compose up -d --build
+#   观察：docker compose logs -f rl-limiter loadgen
+#   调并发：curl -X PUT http://localhost:8081/concurrency -d '{"concurrency": 32}'
+#   改配额：docker compose exec mysql \
+#             mysql -url -prl_pass rl_limiter \
+#             -e "UPDATE envs SET quota_bps=40000000 WHERE env_id='env-a';"
+#   收场：docker compose down -v
+#
+# 流量路径：loadgen ==并发HTTP==> haproxy:8080 (fe_env_a, bwlim-out 整形)
+#                                   └──> web:9000（随机大小响应）
+# 控制路径：rl-limiter ──轮询──> mysql（配置）
+#           rl-limiter ──show stat / set map──> haproxy:9999（采样与下发）
+
+services:
+  # ---- 配置源：MySQL（表结构与演示种子数据见 deploy/mysql/init.sql）----
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pass
+      MYSQL_DATABASE: rl_limiter
+      MYSQL_USER: rl
+      MYSQL_PASSWORD: rl_pass
+    volumes:
+      - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - mysql-data:/var/lib/mysql
+    # 只在本机回环暴露 3306，方便宿主机直接用 mysql 客户端改配置。
+    ports:
+      - "127.0.0.1:3306:3306"
+    healthcheck:
+      # TCP ping：初始化阶段的临时实例只监听 unix socket，ping 通 TCP
+      # 即表示真实实例（含 init.sql 灌数）已就绪。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    restart: unless-stopped
+
+  # ---- HAProxy 后端：模拟业务 web 服务（每次请求返回随机大小响应）----
+  web:
+    build: .
+    command: python3 tools/random_web.py --port 9000
+    environment:
+      # 响应体大小区间（字节）：默认 256 KiB ~ 2 MiB，可按需覆盖。
+      WEB_MIN_BYTES: ${WEB_MIN_BYTES:-262144}
+      WEB_MAX_BYTES: ${WEB_MAX_BYTES:-2097152}
+    restart: unless-stopped
+
+  # ---- 数据面：真实 HAProxy 2.8（bwlim-out 整形 + admin 级 stats socket）----
+  haproxy:
+    image: haproxy:2.8
+    volumes:
+      - ./deploy/docker/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./deploy/docker/maps:/etc/haproxy/maps:ro
+    ports:
+      - "8080:8080"   # 环境 env-a 的业务入口（宿主机可 curl 体验限速）
+    # 9999（runtime API，admin 权限）不映射宿主机：仅 compose 网络内可达。
+    depends_on:
+      - web
+    restart: unless-stopped
+
+  # ---- 控制面：rl-limiter（配置来自 MySQL，轮询热更新）----
+  rl-limiter:
+    build: .
+    environment:
+      RL_MYSQL_HOST: mysql
+      RL_MYSQL_PORT: "3306"
+      RL_MYSQL_USER: rl
+      RL_MYSQL_PASSWORD: rl_pass
+      RL_MYSQL_DB: rl_limiter
+      RL_MYSQL_POLL_S: "3"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      haproxy:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---- 客户端群：可在线调节并发数的压测服务（模拟并发带宽）----
+  loadgen:
+    build: .
+    command: python3 tools/loadgen.py --target http://haproxy:8080/ --control-port 8081
+    environment:
+      # 初始并发：LOADGEN_CONCURRENCY=32 docker compose up -d 即可改；
+      # 运行中用控制端口在线调节（见文件头速查）。
+      LOADGEN_CONCURRENCY: ${LOADGEN_CONCURRENCY:-8}
+    ports:
+      - "8081:8081"   # 控制端口：GET /status、PUT /concurrency
+    depends_on:
+      - haproxy
+    restart: unless-stopped
+
+volumes:
+  mysql-data:

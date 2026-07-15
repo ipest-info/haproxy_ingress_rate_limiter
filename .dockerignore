@@ -1,0 +1,11 @@
+.git
+.gitignore
+docs
+tests
+deploy
+Makefile
+README.md
+docker-compose.yml
+Dockerfile
+**/__pycache__
+*.egg-info

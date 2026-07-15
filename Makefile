@@ -8,7 +8,7 @@
 
 PY ?= python3
 
-.PHONY: all install test
+.PHONY: all install test demo-up demo-logs demo-down
 
 all: test
 
@@ -18,3 +18,14 @@ install:
 
 test:
 	$(PY) -m pytest -q
+
+# docker compose 一键演示环境（MySQL 配置 + 真实 HAProxy + 模拟后端 +
+# 可调并发压测），玩法详见 docs/04-DockerCompose演示.md。
+demo-up:
+	docker compose up -d --build
+
+demo-logs:
+	docker compose logs -f rl-limiter loadgen
+
+demo-down:
+	docker compose down -v
