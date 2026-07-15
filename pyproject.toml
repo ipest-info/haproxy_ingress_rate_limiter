@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-limiter"
+version = "0.2.0"
+description = "集中式 HAProxy 入口带宽限速服务：远程控制多台 HAProxy，保证各环境下行带宽不超约定配额"
+requires-python = ">=3.11"
+dependencies = [
+    "PyYAML>=6.0",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+rl-limiter = "rl_limiter.__main__:main"
+
+[tool.setuptools]
+packages = ["rl_limiter"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
