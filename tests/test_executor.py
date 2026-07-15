@@ -299,3 +299,78 @@ async def test_enforce_env_without_targets_warns_and_skips(caplog):
     assert total_calls(clients) == 0
     assert any("decision has no targets" in r.getMessage() for r in caplog.records)
     assert s.snapshot() == {}
+
+
+# ---------------------------------------------------------------------------
+# 分配漂移再平衡（v2.0 承接原慢环"节点间配额再平衡"职责）
+# ---------------------------------------------------------------------------
+
+
+async def test_allocation_drift_rebalances_without_changed():
+    """稳态下（changed=False、bwlim 不变）节点间流量倾斜导致分配结果
+    漂移超过 REBALANCE_EPSILON 时，必须重写整个 env 的分配。"""
+    exe, clients = new_executor(model.MODE_ENFORCE)
+    targets = [TA1, model.Target("n2", "fe_a1")]
+    d_first = decision("env-a", targets, 27_500_000, True)
+    # 首拍：ewma 尚空，均分落地。
+    alloc_even = {targets[0]: 13_750_000, targets[1]: 13_750_000}
+    assert await exe.apply([(d_first, alloc_even)]) == []
+    n_after_first = total_calls(clients)
+
+    # 稳态拍：changed=False 且分配未变 → 零写入。
+    d_steady = decision("env-a", targets, 27_500_000, False)
+    assert await exe.apply([(d_steady, alloc_even)]) == []
+    assert total_calls(clients) == n_after_first
+
+    # 流量倾斜后 allocator 产出加权分配（漂移远超 5%）→ 强制重写。
+    alloc_skewed = {targets[0]: 21_000_000, targets[1]: 6_500_000}
+    assert await exe.apply([(d_steady, alloc_skewed)]) == []
+    assert total_calls(clients) == n_after_first + 2
+    assert clients["n1"].values_for("fe_a1")[-1] == "21000000"
+    assert clients["n2"].values_for("fe_a1")[-1] == "6500000"
+
+    # 再平衡后的新分配成为基准：相同分配不再触发写入。
+    assert await exe.apply([(d_steady, alloc_skewed)]) == []
+    assert total_calls(clients) == n_after_first + 2
+
+
+async def test_allocation_small_drift_below_epsilon_skipped():
+    """漂移低于阈值时不重写：防止每秒抖动写 map。"""
+    exe, clients = new_executor(model.MODE_ENFORCE)
+    targets = [TA1, model.Target("n2", "fe_a1")]
+    base = {targets[0]: 10_000_000, targets[1]: 10_000_000}
+    await exe.apply([(decision("env-a", targets, 20_000_000, True), base)])
+    n0 = total_calls(clients)
+
+    # 2% 漂移 < 5% 阈值 → 跳过。
+    small = {targets[0]: 10_200_000, targets[1]: 9_800_000}
+    await exe.apply([(decision("env-a", targets, 20_000_000, False), small)])
+    assert total_calls(clients) == n0
+
+
+async def test_allocation_target_set_change_forces_rewrite():
+    """Target 集合变化（挂载点增删）视为无穷大漂移，立即重写。"""
+    exe, clients = new_executor(model.MODE_ENFORCE)
+    t_extra = model.Target("n2", "fe_a1")
+    await exe.apply([(decision("env-a", [TA1], 10_000_000, True), {TA1: 10_000_000})])
+    n0 = total_calls(clients)
+
+    d2 = decision("env-a", [TA1, t_extra], 10_000_000, False)
+    await exe.apply([(d2, {TA1: 5_000_000, t_extra: 5_000_000})])
+    assert total_calls(clients) == n0 + 2
+
+
+async def test_drift_baseline_cleared_on_dry_run_switch():
+    """切到 dry-run 清空落地基准；回到 enforce 由 resync 全量重建。"""
+    exe, clients = new_executor(model.MODE_ENFORCE)
+    alloc = {TA1: 10_000_000}
+    await exe.apply([(decision("env-a", [TA1], 10_000_000, True), alloc)])
+    n0 = total_calls(clients)
+
+    exe.set_mode(model.MODE_DRY_RUN)
+    exe.set_mode(model.MODE_ENFORCE)  # 武装 resync
+    await exe.apply([(decision("env-a", [TA1], 10_000_000, False), alloc)])
+    assert total_calls(clients) == n0 + 1  # resync 重写一次并重建基准
+
+    await exe.apply([(decision("env-a", [TA1], 10_000_000, False), alloc)])
+    assert total_calls(clients) == n0 + 1  # 基准一致，不再写

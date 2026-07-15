@@ -37,6 +37,20 @@ from typing import Any
 
 from . import model
 
+# 分配漂移再平衡阈值（相对变化比例）。
+#
+# 背景：v2.0 把原慢环"每 5~10s 无条件重新切分节点配额"合并进了执行
+# 路径，但 apply 默认只在 changed=True（聚合整形值变化）时写 map。
+# 稳态下（用量低于配额、bwlim 长期停在弹性上限不变）changed 恒为
+# False——此时若节点间流量发生倾斜（DNS 打流变化），各节点 map 里
+# 还是旧的分配值，繁忙节点会被过小的份额冤枉限速，而 governor 看到
+# 的环境总量并未超限、永远不会触发重写。因此 executor 必须自己感知
+# "分配结果相对上次落地值的漂移"：任一 Target 的分配值相对变化超过
+# 该阈值（或 Target 集合变化）即强制重写整个 env 的分配。阈值过小会
+# 造成每秒写 map 的抖动，过大会让倾斜迟迟得不到纠正，5% 与 AIStepFrac
+# 同量级，实测每次显著倾斜后 1~2 秒内完成再平衡。
+REBALANCE_EPSILON = 0.05
+
 
 class Executor:
     """可热切换 dry-run / enforce 的执行器（Go 版 Switchable 的移植）。
@@ -76,6 +90,10 @@ class Executor:
         # last_applied 是每个 env 最近一次成功落地（enforce）或记录
         # （dry-run）的聚合 bwlim，bytes/s，供 snapshot 对外暴露。
         self._last_applied: dict[str, float] = {}
+        # last_alloc 是每个 env 最近一次**成功写入 HAProxy** 的按 Target
+        # 分配结果（enforce 专用），用于分配漂移再平衡的比较基准（见
+        # REBALANCE_EPSILON 注释）。dry-run 不追踪——没有真实落地值。
+        self._last_alloc: dict[str, dict[model.Target, int]] = {}
         self._mode = self._valid_mode(mode)
 
     def _valid_mode(self, mode: str) -> str:
@@ -102,6 +120,9 @@ class Executor:
         self._resync = m == model.MODE_ENFORCE
         if m == model.MODE_DRY_RUN:
             self._pending = set()
+            # 落地值基准一并清空：dry-run 期间真实 map 状态会与内存脱节，
+            # 回到 enforce 时由 resync 全量重写并重建基准。
+            self._last_alloc = {}
         self._log.info(
             "executor mode changed mode_from=%s mode_to=%s resync_armed=%s",
             prev, m, self._resync,
@@ -157,10 +178,33 @@ class Executor:
         # —— 第二段：逐决策执行 I/O（不触碰共享可变状态）——
         errs: list[Exception] = []
         applied: dict[str, float] = {}
+        applied_alloc: dict[str, dict[model.Target, int]] = {}
         failed: set[str] = set()
 
         for d, alloc in items:
-            if not d.changed and not resync and d.env_id not in pending:
+            # 分配漂移再平衡（仅 enforce 有意义）：changed/resync/pending
+            # 都未触发时，检查本拍分配结果相对上次成功落地值的漂移，
+            # 承接原慢环"节点间配额再平衡"的职责（见 REBALANCE_EPSILON）。
+            drift = 0.0
+            if (
+                mode == model.MODE_ENFORCE
+                and not d.changed
+                and not resync
+                and d.env_id not in pending
+            ):
+                drift = self._alloc_drift(d.env_id, alloc)
+                if drift > REBALANCE_EPSILON:
+                    self._log.info(
+                        "allocation drift rebalance env=%s max_drift=%.3f alloc=%s",
+                        d.env_id, drift,
+                        {str(t): v for t, v in alloc.items()},
+                    )
+            if (
+                not d.changed
+                and not resync
+                and d.env_id not in pending
+                and drift <= REBALANCE_EPSILON
+            ):
                 continue
             if mode == model.MODE_DRY_RUN:
                 if not d.changed and not resync:
@@ -199,6 +243,7 @@ class Executor:
                         d.env_id, d.bwlim_bps,
                     )
                 applied[d.env_id] = d.bwlim_bps
+                applied_alloc[d.env_id] = {t: int(alloc.get(t, 0)) for t in d.targets}
             else:
                 self._log.warning(
                     "bwlim write failed; env queued for retry env=%s failed_targets=%d",
@@ -212,9 +257,36 @@ class Executor:
         for env_id, v in applied.items():
             self._last_applied[env_id] = v
             self._pending.discard(env_id)
+        for env_id, a in applied_alloc.items():
+            self._last_alloc[env_id] = a
         for env_id in failed:
             self._pending.add(env_id)
         return errs
+
+    def _alloc_drift(self, env_id: str, alloc: dict[model.Target, int]) -> float:
+        """计算本拍分配结果相对上次成功落地值的最大相对漂移。
+
+        返回值语义：0.0 表示无基准或完全一致；Target 集合发生增删视为
+        无穷大漂移（返回一个必然超阈值的常数）——集合变化意味着挂载点
+        拓扑变了，必须立即重写。相对漂移分母取旧值；旧值为 0 而新值
+        非 0 时同样视为必然超阈值（从"无份额"到"有份额"没有比例可言）。
+        """
+        last = self._last_alloc.get(env_id)
+        if last is None:
+            # 无基准：首次写入必然由 changed=True（governor 首拍强制发射）
+            # 或 resync 触发，这里不重复触发。
+            return 0.0
+        if set(last.keys()) != set(alloc.keys()):
+            return float("inf")
+        drift = 0.0
+        for t, new in alloc.items():
+            old = last[t]
+            if old == 0:
+                if new != 0:
+                    return float("inf")
+                continue
+            drift = max(drift, abs(new - old) / old)
+        return drift
 
     async def _write_target(self, env_id: str, t: model.Target, value: int) -> None:
         """把单个 Target 的整数 map 值写入其所在节点的 HAProxy。

@@ -1,0 +1,22 @@
+{
+  "mode": "dry-run",
+  "envs": [
+    {
+      "env_id": "env-a",
+      "quota_bps": 200000000,
+      "targets": [
+        { "node": "hap-1", "frontend": "fe_env_a" },
+        { "node": "hap-2", "frontend": "fe_env_a" }
+      ]
+    },
+    {
+      "env_id": "env-b",
+      "quota_bps": 50000000,
+      "targets": [
+        { "node": "hap-1", "frontend": "fe_env_b" }
+      ]
+    }
+  ],
+  "report_interval_s": 5,
+  "heartbeat_interval_s": 10
+}

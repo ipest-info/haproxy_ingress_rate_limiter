@@ -1,0 +1,33 @@
+# rl-limiter systemd unit（v2.0 集中部署）。
+#
+# 部署形态：本服务与 HAProxy 分离，独立部署在限速服务器上，通过内网 TCP
+# 控制多台 HAProxy。崩溃由 systemd 拉起（设计 §3.7）；服务宕机期间各台
+# HAProxy 保持最后写入的 map 限速值不变，且 tc 内核兜底仍在各 HAProxy
+# 机器上生效——限速不会因本服务离线而放开。
+#
+# 安装：
+#   cp rl-limiter.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now rl-limiter
+
+[Unit]
+Description=rl-limiter - centralized HAProxy ingress bandwidth rate limiter
+Documentation=https://github.com/ipest-info/haproxy_ingress_rate_limiter
+# 需要通往各 HAProxy 节点与管理后台的网络路径。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rl-limiter -c /etc/rl-limiter/config.yaml
+Restart=always
+RestartSec=2
+# 自动创建 /var/lib/rl-limiter（fail-static 配置缓存 cache_path 放在这里）。
+StateDirectory=rl-limiter
+# 注意：不再需要 CAP_NET_ADMIN——tc 内核兜底（deploy/tc/backstop.sh）在
+# v2.0 里部署于各台 HAProxy 机器本机，与本服务无关；本服务只通过内网
+# TCP 调用 HAProxy runtime API，无需任何附加特权。
+NoNewPrivileges=yes
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
