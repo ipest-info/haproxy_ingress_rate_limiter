@@ -1,5 +1,5 @@
 # rl_limiter.governor —— 每秒执行一次的快环 AIMD 控制器（设计文档 §3.3
-# "本地快环控制算法"，自 Go 版 agent/internal/governor 完整移植）。
+# "本地快环控制算法"）。
 #
 # 架构位置：governor 位于服务核心循环的"决策"环节——上游是 collector
 # 每秒产出的各环境用量（10s 滑动均值等），下游是 allocator + executor
@@ -7,10 +7,9 @@
 # 是纯决策组件：既不接触 HAProxy，也不读系统时钟，因此可以被完全确定
 # 性地单测。
 #
-# v2.0 与 Go 版的唯一结构差异：决策携带的挂载点从"本节点 frontend 名
-# 列表"升级为 Target（节点, frontend）列表——同一环境的 frontend 可能
-# 分布在多台 HAProxy 上，AIMD 针对环境全局聚合值决策，分配与写回交给
-# 下游。算法分支语义与 Go 版逐行等价。
+# v2.0 的挂载点模型：决策携带的挂载点是 Target（节点, frontend）列表
+# ——同一环境的 frontend 可能分布在多台 HAProxy 上，AIMD 针对环境全局
+# 聚合值决策，分配与写回交给下游。
 #
 # 控制目标（承诺口径）：10 秒滑动均值 ≤ 约定配额，瞬时允许冲高到弹性
 # 上限（默认 quota × 1.10）。由于整形常驻生效，算法退化为对整形值
@@ -30,9 +29,9 @@
 # 假定核心循环固定 1 秒一拍，因此持续性计数器（over_secs / under_secs）
 # 直接以 tick 计数充当秒数。
 #
-# 并发说明：Go 版用互斥锁保护 envs 表（配置热更新与核心循环来自不同
-# goroutine）；Python 版运行在单线程 asyncio 事件循环内，update_config
-# 与 tick 都是同步方法、不含 await 点，天然原子，无需加锁。
+# 并发说明：本模块运行在单线程 asyncio 事件循环内，update_config 与
+# tick 都是同步方法、不含 await 点，执行期间不会让出控制权，天然原子，
+# 配置热更新与核心循环不会交错访问 envs 表，无需加锁。
 
 from __future__ import annotations
 
@@ -70,10 +69,10 @@ class _EnvState:
 
 
 class Governor:
-    """持有全部已配置环境的快环控制状态（Go 版 Governor 的移植）。"""
+    """持有全部已配置环境的快环控制状态。"""
 
     def __init__(self, log: logging.Logger | None = None) -> None:
-        # 传入 None 时回退到模块级 logger（对应 Go 版的 slog.Default()）。
+        # 传入 None 时回退到模块级 logger。
         self._log = log if log is not None else logging.getLogger(__name__)
         self._envs: dict[str, _EnvState] = {}
 
@@ -172,7 +171,7 @@ class Governor:
 
     def _step(self, st: _EnvState, u: model.EnvUsage) -> model.Decision:
         """将单个环境推进一拍并产出该环境的决策。这里是 AIMD 状态机的
-        全部分支逻辑所在（与 Go 版 step 逐分支等价）。"""
+        全部分支逻辑所在。"""
         if u.degraded:
             # 降级冻结：采样链路持续失败，collector 送来的是"保持上次
             # 良好值"的陈旧数据。基于陈旧数据做任何调整都可能放大错误

@@ -14,9 +14,10 @@
 # "最后一次下发的配置"，在后台不可达期间继续按既有配额限速，绝不因断联
 # 而放开为不限速。
 #
-# 与 Go 版（agent/internal/reporter）的实现差异：goroutine → asyncio task，
-# channel → asyncio.Queue(1)（同样的合并语义），互斥锁省略——所有共享
-# 状态只在事件循环单线程内被触碰，天然无数据竞争。
+# 并发模型：三条链路各自是一个常驻 asyncio task；配置投递用
+# asyncio.Queue(1) 做"只保留最新一份"的合并——消费方来不及取时，新
+# 配置直接覆盖队列里的旧配置，核心循环永远拿到最新版本。不加锁——
+# 所有共享状态只在事件循环单线程内被触碰，天然无数据竞争。
 
 from __future__ import annotations
 
@@ -181,8 +182,8 @@ class Reporter:
         # 心跳连续失败计数（仅心跳协程读写）。
         self._heartbeat_failures = 0
 
-        # 两个周期通过构造参数暴露，便于测试调短（对应 Go 版把 interval
-        # 做成字段"便于测试在 Run 之前调短"的用法）。
+        # 两个周期通过构造参数暴露为公开属性，便于测试在 run 之前调短，
+        # 让上报/心跳循环在秒级内可观测。
         self.flush_interval = flush_interval_s
         self.heartbeat_interval = heartbeat_interval_s
 
@@ -225,7 +226,8 @@ class Reporter:
                     "mean10_bps": u.mean10_bps,
                     "ewma60_bps": u.ewma60_bps,
                     "conn_cur": u.conn_cur,
-                    # 无对应决策时与 Go 版零值语义一致：0 / "" / False。
+                    # 无对应决策时统一填零值：0 / "" / False，后台按
+                    # "本拍无决策"解读。
                     "bwlim_bps": d.bwlim_bps if d is not None else 0.0,
                     "state": str(d.state) if d is not None else "",
                     "changed": d.changed if d is not None else False,
@@ -335,8 +337,8 @@ class Reporter:
         """发起一次长轮询请求，query 携带 node_id 与本地已应用的配置版本。
 
         返回 None 表示 204（"暂无更新"）。响应体读取受 MAX_RESPONSE_BYTES
-        限制（超长响应会被截断而在 JSON 解析处失败，等价于 Go 版的
-        LimitReader 防护）。
+        限制——超长响应会被截断而在 JSON 解析处失败，防止异常/恶意的
+        超大回包耗尽内存。
         """
         session = self._ensure_session()
         url = (

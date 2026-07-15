@@ -1,7 +1,6 @@
 # Collector（多节点采集聚合）的行为测试。用假 RuntimeClient（内存 dict，
-# 无真网络）驱动，语义对照 Go 版 agent/internal/collector/collector.go 的
-# 多节点扩展：单节点失败隔离、per-Target 差分基线、baseline-only 跳过、
-# per-Target EWMA、稳定 env 集合等。
+# 无真网络）驱动，覆盖：单节点失败隔离、per-Target 差分基线、
+# baseline-only 跳过、per-Target EWMA、稳定 env 集合等场景。
 
 import logging
 
@@ -272,8 +271,8 @@ async def test_mapping_hot_swap_drops_old_env_and_keeps_baseline_continuity():
     # 第一个 tick 速率就连续正确，不必重走"首采样建基线"。
     assert us["env2"].rate_bps == pytest.approx(700.0)
     assert us["env2"].mean10_bps == pytest.approx(700.0)  # 全新窗口，只有本样本
-    # fe2 此前"未映射且从未建过基线"（Go 版为省状态不给无映射 frontend 建
-    # 基线）：新映射进来的第一个 tick 是 baseline-only，速率未知为 0。
+    # fe2 此前"未映射且从未建过基线"（采集器为省状态不给无映射 frontend
+    # 建基线）：新映射进来的第一个 tick 是 baseline-only，速率未知为 0。
     assert us["env3"].rate_bps == 0.0
     assert us["env3"].mean10_bps == 0.0  # baseline-only 不喂窗口
 

@@ -1,14 +1,16 @@
 #!/bin/sh
 # tc TBF backstop (design doc §3.2, layer L3): kernel-level hard cap on the
-# public NIC, independent of HAProxy and the agent. Rate should be ~115% of
+# public NIC, independent of HAProxy and rl-limiter. Rate should be ~115% of
 # the node quota so it never fights the elastic ceiling (110%) and only bites
-# when agent/HAProxy shaping has failed.
+# when rl-limiter/HAProxy shaping has failed.
 #
 # Usage:
 #   ./backstop.sh <iface> <rate_mbit>   # e.g. ./backstop.sh eth0 230
 #   ./backstop.sh <iface> clear         # remove the backstop
 #
-# Requires CAP_NET_ADMIN (root or the rl-agent service's ambient capability).
+# Deployed on each HAProxy machine and run by ops or configuration
+# management (rl-limiter is deployed separately and does not manage tc).
+# Requires root or CAP_NET_ADMIN.
 set -eu
 
 usage() {

@@ -20,7 +20,7 @@ class SlidingWindow:
 
     def __init__(self, capacity: int):
         # capacity 必须为正；<= 0 的值被钳制为 1，保证 push/mean 永不因
-        # 空缓冲崩溃（与 Go 版 NewSlidingWindow 的防御一致）。
+        # 空缓冲崩溃——窗口是纯内部工具类，防御性钳制好过在热路径抛错。
         if capacity <= 0:
             capacity = 1
         self._buf = [0.0] * capacity

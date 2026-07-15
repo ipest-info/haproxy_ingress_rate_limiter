@@ -3,8 +3,8 @@
 # Target(node, frontend) → env 映射聚合成各环境的**全局**用量样本，供
 # governor（快环限速决策）与执行路径（加权分配）消费。
 #
-# 与 Go 版（agent/internal/collector）的关系：本模块是其"多节点版"。v2.0
-# 下同一环境的 frontend 可能分布在多台 HAProxy 上，因此：
+# 多节点设计要点：v2.0 下同一环境的 frontend 可能分布在多台 HAProxy
+# 上，因此：
 #   - 差分基线从 per-frontend 升级为 per-Target（(node, frontend) 二元组）；
 #   - 采样失败的容错从"整体降级"细化为**单节点失败隔离**：一台 HAProxy
 #     失联不影响其他节点的测量，只有失联节点上的 Target 沿用上一秒速率

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# tools/mock_backend.py —— 管理后台的开发替身（移植 Go 版 mock-controller 语义）。
+# tools/mock_backend.py —— 管理后台的开发替身。
 #
 # 用一个 JSON 文件充当配置源，实现设计文档 §3.6 定义的三个服务端点：
 #
@@ -51,9 +51,10 @@ MAX_BODY_BYTES = 8 << 20
 class Store:
     """持有当前配置，并在配置变化时唤醒所有挂起的长轮询。
 
-    唤醒采用"置位并替换事件"的广播手法（对应 Go 版关闭并替换通道）：
-    每个等待者持有当前 event，set() 置位旧 event（唤醒所有人）并换上
-    新 event 供下一轮等待。单线程 asyncio 下 snapshot/set 天然原子。"""
+    唤醒采用"置位并替换事件"的广播手法：每个等待者持有当前 event，
+    set() 置位旧 event（一次唤醒所有等待者）并换上新 event 供下一轮
+    等待——事件置位后无法复位重用，替换是让"每次变化广播一次"语义
+    成立的关键。单线程 asyncio 下 snapshot/set 天然原子。"""
 
     def __init__(self, cfg: model.ControllerConfig):
         self.cfg = cfg

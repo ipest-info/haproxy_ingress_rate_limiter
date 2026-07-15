@@ -175,7 +175,7 @@ async def test_seed_normalizes_illegal_mode(monkeypatch):
 
 async def test_config_applied_before_first_tick(monkeypatch):
     # 配置优先于 tick：启动前排队的配置必须在第一拍流水线之前生效，
-    # 否则该拍会按旧配额/旧模式多放行一秒（参照 Go 版嵌套 select 注释）。
+    # 否则该拍会按旧配额/旧模式多放行一秒。
     ctl, col, gov, exe, _ = make_loop(monkeypatch)
     ctl.seed(make_config(1, quota=100))
     queue: asyncio.Queue = asyncio.Queue()

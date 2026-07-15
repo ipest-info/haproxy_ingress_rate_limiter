@@ -1,5 +1,6 @@
-# tests/test_governor.py —— governor 快环 AIMD 的单元测试，
-# 逐场景移植自 Go 版 agent/internal/governor/governor_test.go。
+# tests/test_governor.py —— governor 快环 AIMD 的单元测试。
+# 覆盖状态机各分支（正常/收紧/恢复）、滞回计数、弹性上限、
+# 配置热更新与日志输出等场景。
 
 from __future__ import annotations
 
@@ -327,7 +328,7 @@ def test_duplicate_env_id_ignored(caplog):
 
 
 def test_state_transition_and_adjustment_logs(caplog):
-    """状态变迁与收紧/放松动作各自产生 info 日志（与 Go 版消息等价）。"""
+    """状态变迁与收紧/放松动作各自产生 info 日志。"""
     g = new_governor()
     g.update_config([env_quota("env-a", QUOTA_BITS)])
     p = model.GovParams()

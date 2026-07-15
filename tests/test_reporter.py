@@ -288,7 +288,7 @@ async def test_flush_payload_structure(tmp_path):
         assert s["ts"] == 1234  # Unix 秒（截断）
         assert s["mode"] == "enforce"
         assert s["config_version"] == 5
-        # 环境切片字段与 Go 版 envSample 等价。
+        # 环境切片字段逐项核对上报协议约定。
         assert s["envs"] == [
             {
                 "env_id": "env-a",
@@ -324,7 +324,7 @@ async def test_flush_failure_keeps_samples_then_delivers(tmp_path):
 
 
 async def test_sample_without_decision_uses_zero_values(tmp_path):
-    """无对应决策的环境样本取零值（与 Go 版结构体零值语义一致）。"""
+    """无对应决策的环境样本各字段取零值（0 / "" / False）。"""
     rep = reporter.Reporter(
         BackendOptions(), node_id=NODE_ID, service_version=SERVICE_VERSION
     )

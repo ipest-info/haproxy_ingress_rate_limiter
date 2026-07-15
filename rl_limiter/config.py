@@ -158,7 +158,8 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
                 f"当前值 {timeout_ms_raw!r}"
             ) from None
         # timeout_ms（运维口径，毫秒）在这里一次性换算为内部口径的秒；
-        # 非正值兜底为默认 500ms（与 Go 版 applyDefaults 语义一致）。
+        # 非正值（缺省或写错）兜底为默认 500ms，而非报错——超时属于可
+        # 安全取默认值的调优项。
         if timeout_ms <= 0:
             timeout_ms = DEFAULT_TIMEOUT_MS
         cfg.nodes.append(

@@ -6,8 +6,6 @@
 # §3.3），再按各挂载点近期用量加权把整形值写回各节点的 bwlim map
 # （dry-run 模式下只记录不写入）。与管理后台断联时按最后一次下发的
 # 配置继续限速（fail-static，§3.7）。
-#
-# 对应 Go 版 agent/cmd/rl-agent/main.go 的语义移植；差异见各处注释。
 
 from __future__ import annotations
 
@@ -91,7 +89,7 @@ async def _amain(cfg, log: logging.Logger) -> None:
         )
 
     # Sampler 闭包引用 ctl.version；ctl 在下方完成赋值，而 sampler 只会在
-    # ctl.run 的 tick 中被调用，因此延迟捕获是安全的（与 Go 版同理）。
+    # ctl.run 的 tick 中被调用——首次调用必然晚于赋值，延迟捕获是安全的。
     ctl: ControlLoop
     if rep is not None:
         # 接入后台：每个 tick 的结果交给上报器缓冲，按下发的间隔批量上报。
@@ -102,7 +100,7 @@ async def _amain(cfg, log: logging.Logger) -> None:
     ctl = ControlLoop(col, gov, exe, sampler=sampler, log=log)
 
     # --- 启动引导（seed）优先级：后台缓存 > 本地静态 envs > 无限速等待。
-    # 与 Go 版 rl-agent main 一致，原因逐条说明：
+    # 原因逐条说明：
     #  1. 配置了后台时优先用本地缓存的最后一次下发配置引导——这正是
     #     fail-static（§3.7）在"重启后后台恰好不可达"场景下的延伸：缓存里
     #     的配额比本地静态配置新，用它引导可保证重启前后限速行为连续，

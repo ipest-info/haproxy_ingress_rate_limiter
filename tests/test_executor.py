@@ -1,6 +1,6 @@
-# tests/test_executor.py —— 执行器的单元测试，
-# 逐场景移植自 Go 版 agent/internal/executor/executor_test.go，
-# 并针对 v2.0 多节点结构（clients/map_paths 按节点、分配值按 Target）扩展。
+# tests/test_executor.py —— 执行器的单元测试。
+# 覆盖 v2.0 多节点结构（clients/map_paths 按节点、分配值按 Target）下的
+# dry-run/enforce 模式切换、按 Target 写回去重、节点失败与重同步等场景。
 
 from __future__ import annotations
 

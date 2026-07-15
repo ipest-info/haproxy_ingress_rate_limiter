@@ -1,6 +1,5 @@
 # rl_limiter.executor —— 把 governor 的决策落地到各台 HAProxy 的
-# per-frontend bwlim map（设计文档 §3.2 "限速执行机制"，自 Go 版
-# agent/internal/executor 完整移植）。
+# per-frontend bwlim map（设计文档 §3.2 "限速执行机制"）。
 #
 # 架构位置：executor 是核心循环"采集 → 决策 → 分配 → 执行"四段中的
 # 最后一段——governor 只产出环境聚合目标值，allocator 把聚合值按各
@@ -8,20 +7,19 @@
 # 更新 map 条目，haproxy 配置里的 filter bwlim-out 以 map_str_int 查表
 # 的方式实时读取该值完成聚合整形。
 #
-# v2.0 与 Go 版的结构差异：
-#   - Go 版单节点单 map（一个 rt + 一个 mapPath）；v2.0 集中式服务
-#     控制多台 HAProxy，因此按节点名持有 clients 与 map_paths 两张表，
-#     每个 Target 用其所在节点的 client 写该节点自己的 map 路径；
-#   - Go 版在 executor 内做"聚合值 ÷ frontend 数"的均分（骨架期策略）；
-#     v2.0 的拆分由 allocator 按用量加权完成，apply 直接消费分配好的
-#     整数值，不再自行均分；
-#   - Go 版用互斥锁保护内存状态（Apply 与 SetMode 来自不同 goroutine）；
-#     Python 版运行在单线程 asyncio 事件循环内，无需锁——但 apply 是
-#     协程，会在 await 处让出控制权，set_mode 可能在两个 await 之间被
-#     其他任务调用。因此沿用 Go 版"先取内存快照、再做 I/O、最后回写"
-#     的三段结构：mode/resync/pending 在第一个 await 之前一次性取好，
-#     I/O 期间的状态变更不影响本拍语义；快照/pending 的回写放在所有
-#     I/O 结束之后一次完成，与 Go 版持锁回写等价。
+# v2.0 的结构要点：
+#   - 集中式服务控制多台 HAProxy，因此按节点名持有 clients 与
+#     map_paths 两张表，每个 Target 用其所在节点的 client 写该节点
+#     自己的 map 路径；
+#   - 聚合值到各 Target 的拆分由 allocator 按用量加权完成，apply
+#     直接消费分配好的整数值，不在 executor 内自行均分；
+#   - 并发约定：本模块运行在单线程 asyncio 事件循环内，不需要锁——
+#     但 apply 是协程，会在 await 处让出控制权，set_mode 可能在两个
+#     await 之间被其他任务调用。因此采用"先取内存快照 → I/O →
+#     末尾统一回写"的三段结构：mode/resync/pending 在第一个 await
+#     之前一次性取好，保证本拍语义完全由快照时刻决定，I/O 期间的
+#     状态变更只影响下一拍；快照/pending 的回写放在所有 I/O 结束
+#     之后一次完成，避免半途让出控制权时暴露不一致的中间状态。
 #
 # 运行模式可在 dry-run（只记日志，不碰 HAProxy）与 enforce（真实写
 # map）之间热切换。从 dry-run 切到 enforce 时会武装一次性的 resync
@@ -53,7 +51,7 @@ REBALANCE_EPSILON = 0.05
 
 
 class Executor:
-    """可热切换 dry-run / enforce 的执行器（Go 版 Switchable 的移植）。
+    """可热切换 dry-run / enforce 的执行器。
 
     clients:   节点名 → runtime client。client 只需提供
                `async set_map_entry(map_path, key, value)` 方法
@@ -160,7 +158,6 @@ class Executor:
         单点失败不阻断其他写入。
         """
         # —— 第一段：取内存快照（第一个 await 之前，原子）——
-        # 对应 Go 版持锁读取 mode/resync/pending 后立即放锁的结构：
         # 本拍的行为完全由这一刻的快照决定，I/O 期间其他任务对模式的
         # 修改只影响下一拍。
         mode = self._mode
@@ -252,8 +249,9 @@ class Executor:
                 failed.add(d.env_id)
 
         # —— 第三段：回写快照与重试集合（所有 I/O 结束之后一次完成，
-        # 对应 Go 版持锁回写）：写成功的 env 更新快照并移出 pending，
-        # 写失败的 env 记入 pending 留待下一拍强制重写。——
+        # 不与 I/O 交错，避免在 await 让出点暴露中间状态）：写成功的
+        # env 更新快照并移出 pending，写失败的 env 记入 pending 留待
+        # 下一拍强制重写。——
         for env_id, v in applied.items():
             self._last_applied[env_id] = v
             self._pending.discard(env_id)
@@ -294,8 +292,8 @@ class Executor:
         节点不在 clients / map_paths 中属于配置不一致（Target 引用了
         未声明的节点），记 error 日志并抛异常——按"该 Target 写失败"
         处理，使整个 env 进入 pending，等待配置修复后由重试路径收敛。
-        map 值以十进制字符串下发（与 Go 版 strconv.FormatInt 一致，
-        runtime API 的 set map 命令按文本协议传值）。
+        map 值以十进制字符串下发——runtime API 的 set map 命令按
+        文本协议传值。
         """
         client = self._clients.get(t.node)
         map_path = self._map_paths.get(t.node)

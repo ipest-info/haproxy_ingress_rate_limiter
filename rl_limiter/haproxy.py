@@ -45,7 +45,7 @@ class CommandError(RuntimeAPIError):
     """命令被 HAProxy 明确拒绝（回包命中已知错误前缀）。
 
     保留 cmd 与完整回包原文（reply），便于上层记录与 set_map_entry 的
-    回退判断——Go 版 Exec 在报错时同时返回回包原文，这里用异常属性等价。
+    回退判断——回退逻辑需要检查回包的具体措辞，仅有异常消息不够用。
     """
 
     def __init__(self, cmd: str, reply: str, detail: str | None = None):
@@ -83,9 +83,9 @@ class RuntimeClient:
         错误前缀则抛 CommandError（回包原文在异常属性上，便于上层记录）；
         其余回包原样返回，由调用方按命令语义解析。
 
-        超时用 asyncio.timeout 统一覆盖整个过程——与 Go 版把 context 截止
-        时间同步到连接 deadline 等价，asyncio 的取消机制天然能唤醒阻塞中的
-        读写，无需哨兵协程。
+        超时用 asyncio.timeout 统一覆盖整个过程——连接、写命令、读回包
+        共享同一个截止时刻，asyncio 的取消机制天然能唤醒阻塞中的读写，
+        无需哨兵协程。
         """
         start = time.monotonic()
         # timeout <= 0 时传 None：asyncio.timeout(None) 即"无超时"。
@@ -138,8 +138,8 @@ class RuntimeClient:
         try:
             out = await self.exec_cmd(cmd)
         except CommandError as e:
-            # 与 Go 版一致：即使回包命中错误前缀，也先检查是否属于"条目
-            # 不存在"的措辞变体，再决定是回退还是上抛。
+            # 即使回包命中错误前缀，也先检查是否属于"条目不存在"的
+            # 措辞变体，再决定是回退还是上抛。
             out, err = e.reply, e
 
         if _is_missing_entry_reply(out):

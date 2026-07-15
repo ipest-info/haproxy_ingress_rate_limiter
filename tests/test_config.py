@@ -304,8 +304,8 @@ def test_error_message_contains_path(tmp_path):
 
 
 def test_timeout_ms_nonpositive_falls_back_to_default(tmp_path):
-    """timeout_ms 显式写 0/负数按"缺失"处理回落默认（与 Go 版
-    applyDefaults 对非正超时的兜底语义一致）。"""
+    """timeout_ms 显式写 0/负数按"缺失"处理回落默认（对非正超时兜底，
+    避免 0/负超时穿透到网络层）。"""
     cfg = load_from(
         tmp_path,
         "node_id: svc-1\nhaproxy_nodes:\n"

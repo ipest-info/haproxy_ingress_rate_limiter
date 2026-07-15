@@ -1,5 +1,5 @@
-# 平滑原语（SlidingWindow / Ewma）的单元测试，语义对照 Go 版
-# agent/internal/collector/window.go。
+# 平滑原语（SlidingWindow / Ewma）的单元测试。
+# 覆盖滑动窗口未满/回绕/重置与 EWMA 首样本、收敛等场景。
 
 import pytest
 

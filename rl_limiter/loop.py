@@ -1,10 +1,10 @@
 # rl_limiter.loop —— 集中式快环（v2.0 主控制循环）。
 #
-# 对应 Go 版 agent/internal/core/loop.go 的语义移植：每个 tick 按固定流水线
-# 执行"采集 → 决策 → 分配 → 执行 → 上报"。v2.0 与 Go 版的差异在于多了
-# "分配"一步：决策器产出的是环境级聚合整形值（bwlim_bps），需要按各挂载点
-# （Target = 节点 × frontend）近期用量加权拆分后才能写回各台 HAProxy——
-# 原慢环的加权分配算法在 v2.0 降级为执行路径的一步（见 model.py 顶部说明）。
+# 每个 tick 按固定流水线执行"采集 → 决策 → 分配 → 执行 → 上报"。
+# 其中"分配"一步的由来：决策器产出的是环境级聚合整形值（bwlim_bps），
+# 需要按各挂载点（Target = 节点 × frontend）近期用量加权拆分后才能写回
+# 各台 HAProxy——原慢环的加权分配算法在 v2.0 降级为执行路径的一步
+# （见 model.py 顶部说明）。
 #
 # 并发模型：整个循环运行在单个 asyncio 任务中，组件间不会并发访问，
 # 因此无需任何锁；配置通过 asyncio.Queue 注入，时间通过 tick_interval_s
@@ -35,7 +35,7 @@ def executor_mode(executor) -> str:
 
 def _summarize_quotas(envs: list[model.EnvQuota]) -> str:
     """把环境配额压缩成单个日志字段，格式 "env1=200000000;env2=..."，
-    数值为配置口径的 bits/s（与 Go 版 summarizeQuotas 一致）。"""
+    数值为配置口径的 bits/s。"""
     return ";".join(f"{e.env_id}={e.quota_bits_per_sec}" for e in envs)
 
 
@@ -117,9 +117,9 @@ class ControlLoop:
           独立运行模式下传 None，循环退化为纯 tick 驱动。
         - 顺序保证：某个 tick 之前已经送达的配置，一定在处理该 tick 之前
           被应用——每拍开头先非阻塞地把队列里排队的配置全部排空再跑流水
-          线（参照 Go 版 Run 内嵌套 select 的注释：若先按旧配置执行本 tick，
-          这一秒就会按旧配额/旧模式做决策，对"后台刚下调配额"或"dry-run
-          切 enforce"这类变更意味着多放行一秒流量）。
+          线。理由：若先按旧配置执行本 tick，这一秒就会按旧配额/旧模式做
+          决策，对"后台刚下调配额"或"dry-run 切 enforce"这类变更意味着
+          多放行一秒流量。
         - 节拍对齐：用"计算下一拍的绝对时刻再 sleep 差值"的方式推进，
           单拍处理耗时不会累积成节拍漂移。
         """
