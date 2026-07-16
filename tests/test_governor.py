@@ -62,7 +62,7 @@ def test_sustained_overload_converges_to_floor():
     g.update_config([env_quota("env-a", QUOTA_BITS)])
 
     p = model.GovParams()
-    floor = QUOTA_BYTES * p.tighten_floor  # 0.95q
+    floor = QUOTA_BYTES * p.tighten_floor  # 默认 1.00q
     ceil = QUOTA_BYTES * p.elastic_ceiling
     now = T0
 
@@ -82,7 +82,7 @@ def test_sustained_overload_converges_to_floor():
             assert approx(d.bwlim_bps, floor), f"tick {i}: should stay at floor"
             assert not d.changed, f"tick {i}: changed=True while parked at floor"
 
-    # 默认参数下：第 3 拍 ceil×0.9=0.99q，第 4 拍触底。
+    # 默认参数下（floor=1.00）：第 3 拍 max(1.0q, 1.1q×0.9=0.99q) 即触底。
     assert 0 < reached_floor_at <= p.tighten_after_s + 3
 
 

@@ -167,6 +167,9 @@ class StatusHub:
             "config_version": self._version_fn(),
             "uptime_s": time.time() - self._started,
             "env_config": self._env_config,
+            # AIMD 参数的默认值：页面参数表单以此为占位符/说明，
+            # 不在前端硬编码，跟随 model.GovParams 演进。
+            "default_params": model.GovParams().to_dict(),
             "latest": self._history[-1] if self._history else None,
         }
 

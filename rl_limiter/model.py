@@ -112,7 +112,7 @@ class Decision:
 class GovParams:
     """本地快环控制参数（设计文档 §3.3），可由管理后台下发并按环境覆盖。
 
-    默认值即 §3.3 拍板组合：1.10 / 0.90 / 3s / 5s / ×0.9 / 0.95 / +5%。
+    默认值即 §3.3 拍板组合：1.10 / 0.90 / 3s / 5s / ×0.9 / 1.00 / +5%。
     """
 
     # 弹性上限系数：ceil = quota × elastic_ceiling。常态下允许冲高到
@@ -129,7 +129,9 @@ class GovParams:
     # 乘性收紧系数：bwlim = max(quota × tighten_floor, bwlim × md_factor)。
     md_factor: float = 0.9
     # 收紧下限系数：整形值永不低于 quota × tighten_floor，防止过度惩罚。
-    tighten_floor: float = 0.95
+    # 默认 1.00：收紧最多压回配额本身，稳态吞吐即约定带宽（曾为 0.95，
+    # 会让稳态吞吐停在配额的 95%，对用户不友好）。
+    tighten_floor: float = 1.00
     # 加性恢复步长：每秒放松 quota × ai_step_frac，直至回到弹性上限。
     ai_step_frac: float = 0.05
 

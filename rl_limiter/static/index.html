@@ -99,7 +99,12 @@ button.primary { background: var(--series-rate); border-color: var(--series-rate
 button:disabled { opacity: .5; cursor: not-allowed; }
 details.params { margin-top: 10px; font-size: 13px; }
 details.params summary { cursor: pointer; color: var(--text-secondary); }
-details.params textarea { width: 100%; min-height: 84px; margin-top: 8px; font-family: ui-monospace, monospace; font-size: 12.5px; }
+.params-table { border-collapse: collapse; margin: 6px 0 10px; }
+.params-table td { padding: 4px 14px 4px 0; vertical-align: middle; }
+.params-table td.pname { font-weight: 600; white-space: nowrap; }
+.params-table td.pdesc { color: var(--text-secondary); font-size: 12.5px; max-width: 460px; }
+.params-table input { width: 90px; }
+input.dirty { border-color: var(--status-warning); }
 .hint { font-size: 12px; color: var(--text-muted); }
 .state { font-weight: 600; }
 /* 日志面板 */
@@ -163,6 +168,33 @@ const cssVar = name => getComputedStyle(document.documentElement).getPropertyVal
 const STATE_LABEL = { normal: "常态", tightening: "收紧中", recovering: "恢复中" };
 const STATE_COLOR = { normal: "--status-good", tightening: "--status-serious", recovering: "--status-warning" };
 
+/* AIMD 参数表单定义：key 与后端 GovParams 字段一一对应，默认值占位符
+   取自 /api/overview 的 default_params（不在前端硬编码）。 */
+const PARAM_DEFS = [
+  { key: "elastic_ceiling", name: "弹性上限系数", step: "0.01",
+    desc: "常态整形值 = 配额 × 该值；1.10 即允许瞬时冲高到配额的 110%" },
+  { key: "low_watermark", name: "恢复水位系数", step: "0.01",
+    desc: "10s 均值低于 配额 × 该值 并持续足够秒数后才开始放松" },
+  { key: "tighten_after_s", name: "收紧触发秒数", step: "1",
+    desc: "均值持续超配额达到该秒数后触发乘性收紧（整数秒）" },
+  { key: "recover_after_s", name: "恢复触发秒数", step: "1",
+    desc: "均值持续低于水位达到该秒数后触发加性放松（整数秒，急收慢放）" },
+  { key: "md_factor", name: "乘性收紧系数", step: "0.01",
+    desc: "每次收紧：整形值 × 该值（0~1 之间，越小收得越狠）" },
+  { key: "tighten_floor", name: "收紧下限系数", step: "0.01",
+    desc: "整形值不低于 配额 × 该值；1.00 = 最多压回配额本身" },
+  { key: "ai_step_frac", name: "恢复步长系数", step: "0.01",
+    desc: "恢复期每秒放松 配额 × 该值，直至回到弹性上限" },
+];
+
+/* 输入框"脏"标记：用户改过且尚未提交的输入不被实时刷新覆盖。 */
+function markDirtyOnInput(el) {
+  el.addEventListener("input", () => { el._dirty = true; el.classList.add("dirty"); });
+}
+function clearDirty(el) { el._dirty = false; el.classList.remove("dirty"); }
+/* 可安全回填 = 用户没在编辑（未聚焦）且没有未提交的修改。 */
+const canSync = el => !el._dirty && document.activeElement !== el;
+
 function toast(msg, isErr) {
   const t = $("#toast");
   t.textContent = msg;
@@ -188,6 +220,7 @@ const state = {
   windowS: 300,
   envs: new Map(),        // env_id → { card, buf: [snapEnv+ts...], counters }
   envConfig: {},
+  defaultParams: {},      // GovParams 默认值（来自 /api/overview）
   mode: null,
   logsAfter: 0,
   lvlOn: { DEBUG: true, INFO: true, WARNING: true, ERROR: true, CRITICAL: true },
@@ -230,14 +263,21 @@ function envCard(envId) {
     <div class="controls">
       <label>配额 <input type="number" class="quota-in" min="1" step="1"> Mbps</label>
       <button class="primary quota-apply">应用配额</button>
-      <span class="hint">写入 MySQL，一个轮询周期内热生效</span>
+      <button class="quota-reset" title="放弃输入，恢复为当前生效值">还原</button>
+      <span class="hint quota-live"></span>
     </div>
     <details class="params">
-      <summary>AIMD 参数覆盖（JSON，留空 = 清除覆盖用默认值）</summary>
-      <textarea class="params-in" spellcheck="false"></textarea>
+      <summary>AIMD 参数覆盖（按项填写，留空的项使用默认值）</summary>
+      <p class="hint" style="margin:8px 0 4px">
+        只需填写想覆盖的参数，其余留空即用默认值（灰色占位符即默认值）；
+        全部留空并保存 = 清除该环境的全部覆盖。示例：想让收紧更狠、恢复更慢，
+        可把「乘性收紧系数」填 0.8、「恢复触发秒数」填 10。
+      </p>
+      <table class="params-table"></table>
       <div class="controls">
-        <button class="params-apply">保存参数</button>
-        <span class="hint">可用键：elastic_ceiling / low_watermark / tighten_after_s / recover_after_s / md_factor / tighten_floor / ai_step_frac</span>
+        <button class="primary params-apply">保存参数</button>
+        <button class="params-clear">清除全部覆盖</button>
+        <span class="hint">写入 MySQL，一个轮询周期内热生效</span>
       </div>
     </details>`;
   $(".env-name", card).textContent = envId;
@@ -246,25 +286,59 @@ function envCard(envId) {
   e = { id: envId, card, buf: [], tightens: 0, overSecs: 0, lastState: null, tooltipIdx: -1 };
   state.envs.set(envId, e);
 
+  // 参数表单：按 PARAM_DEFS 生成行（名称 / 输入框 / 说明）。
+  const ptable = $(".params-table", card);
+  for (const def of PARAM_DEFS) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="pname">${def.name}</td>
+      <td><input type="number" class="p-in" data-key="${def.key}" step="${def.step}"></td>
+      <td class="pdesc">${def.desc}</td>`;
+    ptable.appendChild(tr);
+  }
+
+  const qin = $(".quota-in", card);
+  markDirtyOnInput(qin);
+  for (const pin of card.querySelectorAll(".p-in")) markDirtyOnInput(pin);
+
   $(".quota-apply", card).onclick = async () => {
-    const v = parseFloat($(".quota-in", card).value);
+    const v = parseFloat(qin.value);
     if (!(v > 0)) return toast("配额必须是 > 0 的数值（Mbps）", true);
     try {
       const r = await apiPut(`/api/envs/${encodeURIComponent(envId)}/quota`, { quota_bps: Math.round(v * 1e6) });
+      clearDirty(qin);
       toast(`配额已提交为 ${v} Mbps；${r.note}`);
     } catch (err) { toast("配额修改失败：" + err.message, true); }
   };
-  $(".params-apply", card).onclick = async () => {
-    const raw = $(".params-in", card).value.trim();
-    let params = null;
-    if (raw) {
-      try { params = JSON.parse(raw); }
-      catch (err) { return toast("参数 JSON 解析失败：" + err.message, true); }
-    }
+  $(".quota-reset", card).onclick = () => {
+    clearDirty(qin);
+    const conf = state.envConfig[envId];
+    if (conf) qin.value = (conf.quota_bps / 1e6).toString();
+  };
+
+  const submitParams = async params => {
     try {
       const r = await apiPut(`/api/envs/${encodeURIComponent(envId)}/params`, { params });
+      for (const pin of card.querySelectorAll(".p-in")) clearDirty(pin);
       toast(`参数覆盖已提交；${r.note}`);
     } catch (err) { toast("参数修改失败：" + err.message, true); }
+  };
+  $(".params-apply", card).onclick = () => {
+    const params = {};
+    for (const pin of card.querySelectorAll(".p-in")) {
+      const raw = pin.value.trim();
+      if (!raw) continue;
+      const num = Number(raw);
+      const def = PARAM_DEFS.find(d => d.key === pin.dataset.key);
+      if (!Number.isFinite(num)) return toast(`「${def.name}」必须是数值，当前输入 ${raw}`, true);
+      params[pin.dataset.key] = num;
+    }
+    // 全空 = 清除覆盖（与"清除全部覆盖"按钮等价，后端收 null）。
+    submitParams(Object.keys(params).length ? params : null);
+  };
+  $(".params-clear", card).onclick = () => {
+    if (!confirm("清除该环境的全部参数覆盖，恢复默认值？")) return;
+    for (const pin of card.querySelectorAll(".p-in")) { pin.value = ""; clearDirty(pin); }
+    submitParams(null);
   };
 
   const canvas = $("canvas.chart", card);
@@ -320,11 +394,20 @@ function updateCard(e, d) {
   const conf = state.envConfig[e.id];
   if (conf) {
     $(".targets", c).textContent = (conf.targets || []).join(" | ") || "–";
+    $(".quota-live", c).textContent =
+      `当前生效 ${(conf.quota_bps / 1e6).toString()} Mbps（写入 MySQL，一个轮询周期内热生效）`;
+    // 回填仅在"用户没在编辑且无未提交修改"时进行——实时刷新绝不覆盖
+    // 正在输入的值（脏输入框以黄色边框提示尚未提交）。
     const qin = $(".quota-in", c);
-    if (document.activeElement !== qin) qin.value = (conf.quota_bps / 1e6).toString();
-    const pin = $(".params-in", c);
-    if (document.activeElement !== pin && !pin._touched) {
-      pin.value = conf.params ? JSON.stringify(conf.params, null, 2) : "";
+    if (canSync(qin)) qin.value = (conf.quota_bps / 1e6).toString();
+    for (const pin of c.querySelectorAll(".p-in")) {
+      const key = pin.dataset.key;
+      const dflt = state.defaultParams[key];
+      if (dflt !== undefined) pin.placeholder = `默认 ${dflt}`;
+      if (canSync(pin)) {
+        const ov = conf.params && conf.params[key];
+        pin.value = ov === undefined || ov === null ? "" : String(ov);
+      }
     }
   }
 }
@@ -440,6 +523,7 @@ function setSse(ok, text) {
 async function loadOverview() {
   const r = await fetch("/api/overview"); const o = await r.json();
   state.envConfig = o.env_config || {};
+  state.defaultParams = o.default_params || {};
   $("#svc-version").textContent = o.service_version || "–";
   $("#mode-text").textContent = o.mode || "–";
   $("#cfg-version").textContent = o.config_version ?? "–";
@@ -517,9 +601,6 @@ $("#window-sel").onchange = ev => {
   state.windowS = parseInt(ev.target.value, 10);
   for (const e of state.envs.values()) drawChart(e);
 };
-document.addEventListener("input", ev => {
-  if (ev.target.classList && ev.target.classList.contains("params-in")) ev.target._touched = true;
-});
 setInterval(loadOverview, 10000);
 bootstrap().catch(err => toast("初始化失败：" + err.message, true));
 pollLogs();

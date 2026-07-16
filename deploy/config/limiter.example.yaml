@@ -44,7 +44,7 @@ envs:
     #   tighten_after_s: 3      # 均值超配额持续秒数 → 触发收紧
     #   recover_after_s: 5      # 均值低于水位持续秒数 → 触发放松
     #   md_factor: 0.9          # 乘性收紧系数
-    #   tighten_floor: 0.95     # 收紧下限：不低于 配额 × 该值
+    #   tighten_floor: 1.00     # 收紧下限：不低于 配额 × 该值
     #   ai_step_frac: 0.05      # 加性放松步长（每秒，配额的比例）
 
 # 管理后台（可选）：留空/注释掉整段则进入 standalone 模式，只用上方 envs。
