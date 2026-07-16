@@ -59,7 +59,8 @@ class ControlLoop:
         -> list[Decision]
       - allocator.allocate(bwlim_bps, targets, target_ewma) -> dict[Target, int]
       - async executor.apply(list[tuple[Decision, dict[Target, int]]])
-        -> list[Exception]；executor.set_mode(mode)
+        -> list[Exception]；executor.set_mode(mode, node_modes)
+        （mode 为全局默认；node_modes 为按节点覆盖，未覆盖的节点继承默认）
       - sampler 可选回调：sampler(now, usages, decisions)，供上报器缓冲样本。
     """
 
@@ -102,12 +103,14 @@ class ControlLoop:
         cfg.normalize()
         self._governor.update_config(cfg.envs)
         self._collector.set_mapping(cfg.target_to_env())
-        self._executor.set_mode(cfg.mode)
+        self._executor.set_mode(cfg.mode, cfg.node_modes)
         self._version = cfg.version
         self._log.info(
             "配置已应用到快环（映射/配额/模式已更新） "
-            "version=%s mode=%s envs=%d env_quotas=%s",
-            cfg.version, cfg.mode, len(cfg.envs), _summarize_quotas(cfg.envs),
+            "version=%s mode=%s node_modes=%s envs=%d env_quotas=%s",
+            cfg.version, cfg.mode,
+            ";".join(f"{n}={m}" for n, m in sorted(cfg.node_modes.items())) or "-",
+            len(cfg.envs), _summarize_quotas(cfg.envs),
         )
 
     async def run(self, config_queue: asyncio.Queue | None,

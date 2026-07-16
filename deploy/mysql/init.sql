@@ -41,6 +41,10 @@ CREATE TABLE IF NOT EXISTS haproxy_nodes (
     bwlim_map_path  VARCHAR(255) NOT NULL DEFAULT '/etc/haproxy/maps/bwlim.map',
     -- 单次 runtime API 命令超时（连接 + 读写，毫秒）；<=0 按默认 500 处理。
     timeout_ms      INT          NOT NULL DEFAULT 500,
+    -- 节点级模式覆盖：NULL = 继承全局 service_config.mode；
+    -- 'dry-run'/'enforce' = 覆盖。生产灰度用：逐台节点打开 enforce。
+    -- 本列是节点行里唯一**热生效**的列（其余为接线字段，改后需重启）。
+    mode            VARCHAR(16)  NULL DEFAULT NULL,
     updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
                                  ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -84,17 +88,25 @@ CREATE TABLE IF NOT EXISTS env_targets (
 INSERT INTO service_config (id, node_id, mode, log_level, tick_interval_s)
 VALUES (1, 'rl-limiter-01', 'enforce', 'info', 1.0);
 
--- compose 里的 haproxy 服务：容器内 9999 端口为 admin 级 TCP stats socket。
-INSERT INTO haproxy_nodes (name, host, port, bwlim_map_path, timeout_ms)
-VALUES ('hap-1', 'haproxy', 9999, '/etc/haproxy/maps/bwlim.map', 500);
+-- compose 里的两台 HAProxy：容器内 9999 端口为 admin 级 TCP stats socket。
+-- mode 为 NULL = 继承全局模式；演示逐节点灰度时改这一列即可。
+INSERT INTO haproxy_nodes (name, host, port, bwlim_map_path, timeout_ms, mode)
+VALUES ('hap-1', 'haproxy1', 9999, '/etc/haproxy/maps/bwlim.map', 500, NULL),
+       ('hap-2', 'haproxy2', 9999, '/etc/haproxy/maps/bwlim.map', 500, NULL);
 
--- 演示环境 env-a：约定带宽 80 Mbps（= 10 MB/s 下行）。压测服务默认并发
--- 就能轻松打满，便于观察 AIMD 收紧过程。
+-- 演示环境两套（展示跨节点全局聚合限速）：
+--   env-a：80 Mbps，挂载在两台 HAProxy 的 fe_env_a 上——两台的流量
+--          全局聚合后统一限速，压一台另一台会自动多分到份额；
+--   env-b：40 Mbps，同样横跨两台的 fe_env_b。
 INSERT INTO envs (env_id, quota_bps, params_json)
-VALUES ('env-a', 80000000, NULL);
+VALUES ('env-a', 80000000, NULL),
+       ('env-b', 40000000, NULL);
 
 INSERT INTO env_targets (env_id, node, frontend)
-VALUES ('env-a', 'hap-1', 'fe_env_a');
+VALUES ('env-a', 'hap-1', 'fe_env_a'),
+       ('env-a', 'hap-2', 'fe_env_a'),
+       ('env-b', 'hap-1', 'fe_env_b'),
+       ('env-b', 'hap-2', 'fe_env_b');
 
 -- ===========================================================================
 -- 运行期常用操作速查（在宿主机执行；改完等一个轮询周期即热生效）
@@ -104,8 +116,12 @@ VALUES ('env-a', 'hap-1', 'fe_env_a');
 --   调整配额（80 Mbps → 40 Mbps）：
 --     UPDATE envs SET quota_bps = 40000000 WHERE env_id = 'env-a';
 --
---   dry-run / enforce 热切换：
+--   dry-run / enforce 全局默认热切换：
 --     UPDATE service_config SET mode = 'dry-run' WHERE id = 1;
+--
+--   按节点覆盖模式（生产灰度：先只放 hap-1 真实生效）：
+--     UPDATE haproxy_nodes SET mode = 'enforce' WHERE name = 'hap-1';
+--     UPDATE haproxy_nodes SET mode = NULL WHERE name = 'hap-1';  -- 恢复继承
 --
 --   按环境覆盖快环参数（示例：收紧更狠、恢复更慢）：
 --     UPDATE envs SET params_json =

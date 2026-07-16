@@ -73,14 +73,19 @@ class ServiceConfig:
 
     # 本服务实例的唯一标识，随配置轮询/指标/心跳上报，须与管理后台记录一致。
     node_id: str
-    # 运行模式：dry-run（只算不写，观测模式）或 enforce（真实下发限速）。
-    # 默认 dry-run，确保误部署时不产生任何数据面影响。
+    # 全局默认运行模式：dry-run（只算不写，观测模式）或 enforce（真实
+    # 下发限速）。默认 dry-run，确保误部署时不产生任何数据面影响。
     mode: str = model.MODE_DRY_RUN
     log_level: str = DEFAULT_LOG_LEVEL
     # 快环 tick 周期（秒）。
     tick_interval_s: float = DEFAULT_TICK_INTERVAL_S
     # 受控 HAProxy 节点清单（基础设施配置，仅本地维护）。
     nodes: list[model.NodeConfig] = field(default_factory=list)
+    # 按节点覆盖运行模式（节点名 → dry-run/enforce；未覆盖的节点继承
+    # 全局 mode）。来自 haproxy_nodes[].mode，属于**可热更**的运行开关，
+    # 刻意不放进 NodeConfig——NodeConfig 只装接线字段，其相等性比较被
+    # 用作"节点接线变化需重启"的判据，模式切换不应触发该告警。
+    node_modes: dict[str, str] = field(default_factory=dict)
     # 本地静态/引导配额。
     envs: list[model.EnvQuota] = field(default_factory=list)
     backend: BackendOptions = field(default_factory=BackendOptions)
@@ -179,9 +184,10 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
         # 安全取默认值的调优项。
         if timeout_ms <= 0:
             timeout_ms = DEFAULT_TIMEOUT_MS
+        name = str(n.get("name", "") or "")
         cfg.nodes.append(
             model.NodeConfig(
-                name=str(n.get("name", "") or ""),
+                name=name,
                 host=str(n.get("host", "") or ""),
                 port=port,
                 bwlim_map_path=str(n.get("bwlim_map_path", "") or "")
@@ -189,6 +195,11 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
                 timeout_s=timeout_ms / 1000.0,
             )
         )
+        # 节点级模式覆盖（可选）：空/缺省 = 继承全局 mode。取值校验放在
+        # _validate（与其它枚举字段一致，带上下文报错）。
+        node_mode = str(n.get("mode", "") or "")
+        if node_mode:
+            cfg.node_modes[name] = node_mode
 
     # ---- envs：引导配额（结构与管理后台下发一致，直接复用 from_dict）----
     envs_raw = raw.get("envs") or []
@@ -298,6 +309,13 @@ def _validate(cfg: ServiceConfig) -> None:
             raise ValueError(
                 f"haproxy_nodes[{i}] ({n.name}): port 必须在 1-65535 范围内，"
                 f"当前值 {n.port!r}"
+            )
+        node_mode = cfg.node_modes.get(n.name, "")
+        if node_mode and node_mode not in (model.MODE_DRY_RUN, model.MODE_ENFORCE):
+            raise ValueError(
+                f"haproxy_nodes[{i}] ({n.name}): mode 值非法：{node_mode!r}，"
+                f"必须是 {model.MODE_DRY_RUN!r} 或 {model.MODE_ENFORCE!r}"
+                f"（留空表示继承全局 mode；写错模式的后果不对称，不做静默回落）"
             )
 
     # Target → env_id 的归属表，用于检出跨环境（或同环境重复书写）的冲突。

@@ -22,10 +22,12 @@
 #     之后一次完成，避免半途让出控制权时暴露不一致的中间状态。
 #
 # 运行模式可在 dry-run（只记日志，不碰 HAProxy）与 enforce（真实写
-# map）之间热切换。从 dry-run 切到 enforce 时会武装一次性的 resync
-# 标志：dry-run 期间 HAProxy 里的真实 map 值没有被更新过，可能已经
-# 与 governor 的目标值脱节，因此切换后的第一个非空 apply 必须无条件
-# 全量重写，使真实状态一次性收敛到目标状态。
+# map）之间热切换，且粒度到**单个节点**：全局默认模式 + 按节点覆盖
+# （node_modes），生产灰度时可以逐台 HAProxy 打开 enforce、其余节点
+# 留在 dry-run 观察。某节点从 dry-run 切到 enforce 时武装该节点的
+# 一次性 resync 标志：dry-run 期间该节点 map 里的真实值没有被更新过，
+# 可能已与 governor 目标脱节，切换后的第一个非空 apply 必须无条件
+# 重写涉及该节点的全部环境，使真实状态一次性收敛。
 
 from __future__ import annotations
 
@@ -67,16 +69,17 @@ class Executor:
         map_paths: dict[str, str],
         mode: str,
         log: logging.Logger | None = None,
+        node_modes: dict[str, str] | None = None,
     ) -> None:
         self._clients = dict(clients)
         self._map_paths = dict(map_paths)
         self._log = log if log is not None else logging.getLogger(__name__)
-        # resync 在切换到 enforce 时被武装（一次性标志）：下一个非空
-        # apply 会把所有决策一律视为"已变化"全量重写。语义上它表示
-        # "HAProxy 的真实 map 状态与 governor 目标状态之间的一致性
-        # 未知，需要一次全量收敛"。空 apply 不消费该标志——没有决策
-        # 可写时"重写"无从谈起，标志必须留到真正有决策的那一拍。
-        self._resync = False
+        # resync 集合：某节点从 dry-run 切到 enforce 时被记入（一次性）。
+        # 下一个非空 apply 会把涉及这些节点的决策一律视为"已变化"重写。
+        # 语义上它表示"该节点 HAProxy 的真实 map 状态与 governor 目标
+        # 状态之间的一致性未知，需要一次全量收敛"。空 apply 不消费——
+        # 没有决策可写时"重写"无从谈起，标志必须留到真正有决策的那拍。
+        self._resync_nodes: set[str] = set()
         # pending 记录"上一次 enforce 写入失败"的环境集合。它存在的
         # 根本原因是：governor 的 last_emitted 在发射 changed 决策时就
         # 自行推进了，并不关心 executor 是否写成功；如果 executor 不
@@ -89,10 +92,13 @@ class Executor:
         # （dry-run）的聚合 bwlim，bytes/s，供 snapshot 对外暴露。
         self._last_applied: dict[str, float] = {}
         # last_alloc 是每个 env 最近一次**成功写入 HAProxy** 的按 Target
-        # 分配结果（enforce 专用），用于分配漂移再平衡的比较基准（见
-        # REBALANCE_EPSILON 注释）。dry-run 不追踪——没有真实落地值。
+        # 分配结果（仅含 enforce 节点上的 Target），用于分配漂移再平衡的
+        # 比较基准（见 REBALANCE_EPSILON 注释）。dry-run 不追踪——没有
+        # 真实落地值。
         self._last_alloc: dict[str, dict[model.Target, int]] = {}
         self._mode = self._valid_mode(mode)
+        # 按节点覆盖（节点名 → 模式）；字典中不存在的节点继承 _mode。
+        self._node_modes: dict[str, str] = self._valid_node_modes(node_modes or {})
 
     def _valid_mode(self, mode: str) -> str:
         """把任意输入收敛到受支持的模式：除两个已知模式外一律降级到
@@ -103,33 +109,76 @@ class Executor:
         self._log.warning("运行模式配置非法，已安全降级为 dry-run（只记录不写入 HAProxy） mode=%s", mode)
         return model.MODE_DRY_RUN
 
-    def set_mode(self, mode: str) -> None:
-        """切换运行模式。真正切到 enforce 时武装 resync 标志，让下一个
-        apply 全量重写（dry-run 期间只记了日志，HAProxy 的 map 里可能
-        是陈旧值）；切到 dry-run 时清空 pending 重试状态——只记日志的
-        模式下没有需要收敛的真实状态，留着重试记录反而会在下次回到
-        enforce 时造成误重试（届时 resync 会做一次全量覆盖，pending
-        已无意义）。"""
-        m = self._valid_mode(mode)
-        if m == self._mode:
+    def _valid_node_modes(self, node_modes: dict[str, str]) -> dict[str, str]:
+        """逐项收敛节点覆盖，非法值降级 dry-run（与 _valid_mode 同向）。"""
+        return {n: self._valid_mode(m) for n, m in node_modes.items()}
+
+    def _effective_mode(self, node: str) -> str:
+        """节点的实际生效模式：覆盖优先，未覆盖继承全局默认。"""
+        return self._node_modes.get(node, self._mode)
+
+    def set_mode(self, mode: str, node_modes: dict[str, str] | None = None) -> None:
+        """应用一份完整的模式期望状态：全局默认 + 按节点覆盖（None 视作
+        无覆盖）。按**每个节点的生效模式变化**决定动作：
+
+        - 某节点 dry-run → enforce：把该节点记入 resync 集合，下一拍
+          重写涉及它的全部环境（dry-run 期间该节点 map 里可能是陈旧值）；
+        - 全部节点都变为 dry-run：清空 pending 重试与落地基准——只记
+          日志的模式下没有需要收敛的真实状态，留着反而会在下次回到
+          enforce 时造成误重试（届时 resync 会全量覆盖，pending 无意义）；
+        - 生效模式完全没变：no-op，不武装任何 resync。
+        """
+        new_mode = self._valid_mode(mode)
+        new_overrides = self._valid_node_modes(node_modes or {})
+
+        # 已知节点全集上的生效模式对比（clients 即受控节点清单）。
+        def eff(default: str, ov: dict[str, str], n: str) -> str:
+            return ov.get(n, default)
+
+        changed_nodes = {
+            n for n in self._clients
+            if eff(self._mode, self._node_modes, n)
+            != eff(new_mode, new_overrides, n)
+        }
+        if not changed_nodes and new_mode == self._mode \
+                and new_overrides == self._node_modes:
             return
-        prev = self._mode
-        self._mode = m
-        self._resync = m == model.MODE_ENFORCE
-        if m == model.MODE_DRY_RUN:
+
+        prev_mode, prev_overrides = self._mode, self._node_modes
+        self._mode, self._node_modes = new_mode, new_overrides
+
+        armed = {
+            n for n in changed_nodes
+            if eff(prev_mode, prev_overrides, n) == model.MODE_DRY_RUN
+            and self._effective_mode(n) == model.MODE_ENFORCE
+        }
+        self._resync_nodes |= armed
+
+        if all(self._effective_mode(n) == model.MODE_DRY_RUN
+               for n in self._clients):
             self._pending = set()
             # 落地值基准一并清空：dry-run 期间真实 map 状态会与内存脱节，
-            # 回到 enforce 时由 resync 全量重写并重建基准。
+            # 回到 enforce 时由 resync 重写并重建基准。
             self._last_alloc = {}
+            self._resync_nodes = set()
+
         self._log.info(
-            "执行模式已切换（切至 enforce 时武装 resync，下一拍全量重写） "
-            "mode_from=%s mode_to=%s resync_armed=%s",
-            prev, m, self._resync,
+            "执行模式已切换（dry-run→enforce 的节点武装 resync，下一拍重写涉及它的环境） "
+            "default_from=%s default_to=%s node_overrides=%s "
+            "changed_nodes=%s resync_armed=%s",
+            prev_mode, new_mode,
+            ";".join(f"{n}={m}" for n, m in sorted(new_overrides.items())) or "-",
+            ",".join(sorted(changed_nodes)) or "-",
+            ",".join(sorted(armed)) or "-",
         )
 
     def mode(self) -> str:
-        """返回当前运行模式。"""
+        """返回全局默认运行模式（未被覆盖的节点继承它）。"""
         return self._mode
+
+    def node_modes(self) -> dict[str, str]:
+        """返回按节点的模式覆盖副本（控制台展示用）。"""
+        return dict(self._node_modes)
 
     def snapshot(self) -> dict[str, float]:
         """返回每个 env 最近一次落地/记录的聚合 bwlim（bytes/s）的
@@ -144,34 +193,44 @@ class Executor:
         分配结果由 allocator 产出，给出该环境每个 Target 的整数 map 值
         （bytes/s）。
 
-        跳过规则：changed=False 的决策默认跳过，但有两个例外——
-        (a) 切换到 enforce 后武装的一次性 resync 生效中（全量重写）；
+        每个 Target 按其**所在节点的生效模式**处理：enforce 节点真实
+        写 map，dry-run 节点只记演练日志——同一环境可以横跨两种模式的
+        节点（生产灰度的常态）。
+
+        跳过规则：changed=False 的决策默认跳过，但有三个例外——
+        (a) 该环境有 Target 落在刚切到 enforce 的节点上（节点级一次性
+        resync，重写该环境）；
         (b) 该 env 上一次 enforce 写入失败，处于 pending 重试（governor
         发射后即自行推进 last_emitted，不会替 executor 重发，重试责任
         必须由 executor 承担，否则 HAProxy 会一直挂着旧限速值直到目标
-        值下次漂移，详见 _pending 字段注释）。
+        值下次漂移，详见 _pending 字段注释）；
+        (c) enforce 侧分配结果相对上次落地值漂移超过阈值（再平衡）。
 
         错误语义：enforce 写失败不会中断本拍——同一 env 的其余 Target
         与其余决策照常执行，所有异常收集后一并返回（列表，调用方决定
-        日志级别）；只有该 env 全部 Target 都写成功才计入 snapshot，
-        任一失败则整个 env 进入 pending。同一 env 的多个 Target 用
-        asyncio.gather 并发写（分布在不同节点，socket 往返可重叠），
-        单点失败不阻断其他写入。
+        日志级别）；只有该 env 全部 enforce Target 都写成功才计入
+        snapshot，任一失败则整个 env 进入 pending。同一 env 的多个
+        Target 用 asyncio.gather 并发写（分布在不同节点，socket 往返
+        可重叠），单点失败不阻断其他写入。
         """
         # —— 第一段：取内存快照（第一个 await 之前，原子）——
         # 本拍的行为完全由这一刻的快照决定，I/O 期间其他任务对模式的
         # 修改只影响下一拍。
-        mode = self._mode
-        resync = self._resync
+        default_mode = self._mode
+        node_modes = dict(self._node_modes)
+        resync_nodes = set(self._resync_nodes)
         if items:
-            self._resync = False  # 一次性消费；空拍不得消费（无决策可重写）
+            self._resync_nodes = set()  # 一次性消费；空拍不得消费
         pending = set(self._pending)
 
-        if resync and items:
+        def eff(node: str) -> str:
+            return node_modes.get(node, default_mode)
+
+        if resync_nodes and items:
             self._log.info(
-                "切换到 enforce 后首拍全量重写：真实 map 状态一致性未知，无条件下发全部环境的整形值 "
-                "mode=%s decision_count=%d",
-                mode, len(items),
+                "节点切换到 enforce 后的首拍重写：这些节点真实 map 状态一致性未知，"
+                "无条件下发涉及它们的环境整形值 resync_nodes=%s decision_count=%d",
+                ",".join(sorted(resync_nodes)), len(items),
             )
 
         # —— 第二段：逐决策执行 I/O（不触碰共享可变状态）——
@@ -181,56 +240,70 @@ class Executor:
         failed: set[str] = set()
 
         for d, alloc in items:
-            # 分配漂移再平衡（仅 enforce 有意义）：changed/resync/pending
-            # 都未触发时，检查本拍分配结果相对上次成功落地值的漂移，
-            # 承接原慢环"节点间配额再平衡"的职责（见 REBALANCE_EPSILON）。
-            drift = 0.0
-            if (
-                mode == model.MODE_ENFORCE
-                and not d.changed
-                and not resync
-                and d.env_id not in pending
-            ):
-                drift = self._alloc_drift(d.env_id, alloc)
-                if drift > REBALANCE_EPSILON:
-                    self._log.info(
-                        "挂载点分配相对上次落地值漂移超过阈值，触发跨节点再平衡重写 "
-                        "env=%s max_drift=%.3f alloc=%s",
-                        d.env_id, drift,
-                        {str(t): v for t, v in alloc.items()},
-                    )
-            if (
-                not d.changed
-                and not resync
-                and d.env_id not in pending
-                and drift <= REBALANCE_EPSILON
-            ):
-                continue
-            if mode == model.MODE_DRY_RUN:
-                if not d.changed and not resync:
-                    # pending 是上一段 enforce 期间留下的陈旧状态，
-                    # dry-run 下没有真实写入需要重试，直接跳过。
-                    continue
-                self._log.info(
-                    "【DRY-RUN 演练】本应下发整形值（未真实写入 HAProxy） "
-                    "env=%s state=%s bwlim_bytes_per_sec=%s targets=%s",
-                    d.env_id, d.state, d.bwlim_bps, [str(t) for t in d.targets],
-                )
-                applied[d.env_id] = d.bwlim_bps
-                continue
             if not d.targets:
                 self._log.warning(
                     "决策不含任何挂载点，无法执行（请检查环境的 targets 配置） env=%s", d.env_id
                 )
                 continue
 
+            # 按节点生效模式把挂载点分成"真实写入"与"演练"两组。
+            enf_targets = [t for t in d.targets if eff(t.node) == model.MODE_ENFORCE]
+            dry_targets = [t for t in d.targets if eff(t.node) == model.MODE_DRY_RUN]
+            node_resync = any(t.node in resync_nodes for t in enf_targets)
+
+            # 分配漂移再平衡（仅 enforce 侧有意义）：changed/resync/pending
+            # 都未触发时，检查本拍 enforce 侧分配结果相对上次成功落地值的
+            # 漂移，承接原慢环"节点间配额再平衡"的职责（REBALANCE_EPSILON）。
+            # 比较基准 _last_alloc 只含 enforce Target：节点模式翻转会改变
+            # 集合构成，_alloc_drift 视集合变化为必然超阈值，自然触发重写。
+            drift = 0.0
+            if (
+                enf_targets
+                and not d.changed
+                and not node_resync
+                and d.env_id not in pending
+            ):
+                enf_alloc = {t: int(alloc.get(t, 0)) for t in enf_targets}
+                drift = self._alloc_drift(d.env_id, enf_alloc)
+                if drift > REBALANCE_EPSILON:
+                    self._log.info(
+                        "挂载点分配相对上次落地值漂移超过阈值，触发跨节点再平衡重写 "
+                        "env=%s max_drift=%.3f alloc=%s",
+                        d.env_id, drift,
+                        {str(t): v for t, v in enf_alloc.items()},
+                    )
+            if (
+                not d.changed
+                and not node_resync
+                and d.env_id not in pending
+                and drift <= REBALANCE_EPSILON
+            ):
+                continue
+
+            # 演练侧：只在决策变化或 resync 时记日志（漂移/pending 是
+            # enforce 侧的触发原因，替演练节点刷日志只会制造噪音）。
+            if dry_targets and (d.changed or node_resync):
+                self._log.info(
+                    "【DRY-RUN 演练】本应下发整形值（未真实写入 HAProxy） "
+                    "env=%s state=%s bwlim_bytes_per_sec=%s targets=%s alloc=%s",
+                    d.env_id, d.state, d.bwlim_bps,
+                    [str(t) for t in dry_targets],
+                    {str(t): int(alloc.get(t, 0)) for t in dry_targets},
+                )
+
+            if not enf_targets:
+                # 纯演练环境：记录为"已应用"（含把遗留 pending 洗掉——
+                # 没有 enforce 挂载点就没有需要重试的真实写入）。
+                applied[d.env_id] = d.bwlim_bps
+                continue
+
             retry = d.env_id in pending
-            # 并发写该 env 的全部 Target：return_exceptions=True 保证
-            # 单点失败不取消其余写入，异常随结果一起返回。
+            # 并发写该 env 的全部 enforce Target：return_exceptions=True
+            # 保证单点失败不取消其余写入，异常随结果一起返回。
             results = await asyncio.gather(
                 *(
                     self._write_target(d.env_id, t, int(alloc.get(t, 0)))
-                    for t in d.targets
+                    for t in enf_targets
                 ),
                 return_exceptions=True,
             )
@@ -244,7 +317,9 @@ class Executor:
                         d.env_id, d.bwlim_bps,
                     )
                 applied[d.env_id] = d.bwlim_bps
-                applied_alloc[d.env_id] = {t: int(alloc.get(t, 0)) for t in d.targets}
+                applied_alloc[d.env_id] = {
+                    t: int(alloc.get(t, 0)) for t in enf_targets
+                }
             else:
                 self._log.warning(
                     "整形值写入失败，该环境已加入重试队列（下一拍强制重写） env=%s failed_targets=%d",

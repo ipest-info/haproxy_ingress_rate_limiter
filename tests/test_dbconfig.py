@@ -7,9 +7,10 @@ import pytest
 
 from rl_limiter import config, dbconfig, model
 
-# 与 deploy/mysql/init.sql 种子数据同构的行样本。
+# 与 deploy/mysql/init.sql 种子数据同构的行样本（节点行末列为模式覆盖，
+# NULL = 继承全局）。
 SERVICE_ROW = ("rl-limiter-01", "enforce", "info", 1.0)
-NODE_ROWS = [("hap-1", "haproxy", 9999, "/etc/haproxy/maps/bwlim.map", 500)]
+NODE_ROWS = [("hap-1", "haproxy1", 9999, "/etc/haproxy/maps/bwlim.map", 500, None)]
 ENV_ROWS = [("env-a", 80_000_000, None)]
 TARGET_ROWS = [("env-a", "hap-1", "fe_env_a")]
 
@@ -28,8 +29,9 @@ def test_rows_roundtrip_to_service_config():
     assert cfg.log_level == "info"
     assert cfg.tick_interval_s == 1.0
     assert len(cfg.nodes) == 1
+    assert cfg.node_modes == {}  # mode 列为 NULL → 无覆盖，继承全局
     n = cfg.nodes[0]
-    assert (n.name, n.host, n.port) == ("hap-1", "haproxy", 9999)
+    assert (n.name, n.host, n.port) == ("hap-1", "haproxy1", 9999)
     assert n.bwlim_map_path == "/etc/haproxy/maps/bwlim.map"
     assert n.timeout_s == 0.5  # timeout_ms=500 → 秒口径
     assert len(cfg.envs) == 1
@@ -45,7 +47,7 @@ def test_service_row_defaults_and_timeout_fallback():
     YAML 管线的兜底行为一字不差。"""
     cfg = build(
         service_row=("node-x", None, None, None),
-        node_rows=[("hap-1", "haproxy", 9999, "", 0)],
+        node_rows=[("hap-1", "haproxy", 9999, "", 0, None)],
     )
     assert cfg.mode == model.MODE_DRY_RUN
     assert cfg.log_level == "info"
@@ -156,3 +158,31 @@ def test_canonical_config_is_exact_identity():
     assert base == dbconfig.canonical_config(cfg.mode, cfg.envs)
     changed = build(env_rows=[("env-a", 40_000_000, None)])
     assert dbconfig.canonical_config(changed.mode, changed.envs) != base
+
+
+def test_node_mode_column_maps_to_node_modes():
+    """节点行的 mode 列进入 ServiceConfig.node_modes（不进 NodeConfig，
+    保持节点接线相等性比较不受模式切换影响）。"""
+    cfg = build(node_rows=[
+        ("hap-1", "haproxy1", 9999, "", 500, "enforce"),
+        ("hap-2", "haproxy2", 9999, "", 500, None),
+    ], target_rows=[("env-a", "hap-1", "fe_env_a"),
+                    ("env-a", "hap-2", "fe_env_a")])
+    assert cfg.node_modes == {"hap-1": "enforce"}
+    # NodeConfig 本体不含模式字段：两行除接线字段外完全同构。
+    assert not hasattr(cfg.nodes[0], "mode")
+
+
+def test_bad_node_mode_rejected():
+    with pytest.raises(ValueError, match="mode 值非法"):
+        build(node_rows=[("hap-1", "haproxy1", 9999, "", 500, "observe")])
+
+
+def test_checksum_sensitive_to_node_modes():
+    """节点模式覆盖属于可热更内容：变化必须反映进 canonical/校验和。"""
+    cfg = build()
+    base = dbconfig.config_checksum(cfg.mode, cfg.envs, cfg.node_modes)
+    overridden = build(node_rows=[
+        ("hap-1", "haproxy1", 9999, "/etc/haproxy/maps/bwlim.map", 500, "dry-run")])
+    assert dbconfig.config_checksum(
+        overridden.mode, overridden.envs, overridden.node_modes) != base

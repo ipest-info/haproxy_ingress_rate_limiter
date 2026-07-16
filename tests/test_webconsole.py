@@ -70,7 +70,9 @@ def test_hub_snapshot_merges_usage_decision_and_quota():
     assert env["state"] == "normal"
     # 配额来自 update_config 缓存的配置视图（bits → bytes 已换算）。
     assert env["quota_bytes_per_s"] == 10_000_000.0
-    assert ov["env_config"]["env-a"]["targets"] == ["hap-1/fe_env_a"]
+    # targets 以结构化对象暴露（控制台挂载点编辑需要 node/frontend 字段）。
+    assert ov["env_config"]["env-a"]["targets"] == [
+        {"node": "hap-1", "frontend": "fe_env_a"}]
 
 
 def test_hub_history_is_bounded():
@@ -126,3 +128,27 @@ async def test_update_env_params_validates_locally(params, match):
     opts = dbconfig.MySQLOptions(host="unused")
     with pytest.raises(ValueError, match=match):
         await dbconfig.update_env_params(opts, "env-a", params)
+
+
+def test_hub_nodes_view_effective_mode_and_degraded():
+    """节点视图：覆盖优先、未覆盖继承全局；失联集合来自 degraded_fn。"""
+    nodes = [
+        model.NodeConfig(name="hap-1", host="haproxy1", port=9999),
+        model.NodeConfig(name="hap-2", host="haproxy2", port=9999),
+    ]
+    hub = webconsole.StatusHub(
+        "test", mode_fn=lambda: "dry-run", version_fn=lambda: 1,
+        nodes=nodes, degraded_fn=lambda: {"hap-2"})
+    hub.update_config(model.ControllerConfig(
+        version=1, mode="dry-run", envs=[_quota()],
+        node_modes={"hap-1": "enforce"}))
+    view = hub.overview()["nodes"]
+    assert view["hap-1"] == {
+        "host": "haproxy1", "port": 9999,
+        "override": "enforce", "mode": "enforce", "degraded": False}
+    assert view["hap-2"]["override"] is None
+    assert view["hap-2"]["mode"] == "dry-run"   # 继承全局
+    assert view["hap-2"]["degraded"] is True
+    # 快照同样携带节点视图（SSE 帧里实时可见模式与健康）。
+    hub.record(1.0, [_usage()], [_decision()])
+    assert hub.history()[-1]["nodes"]["hap-1"]["mode"] == "enforce"

@@ -239,8 +239,13 @@ class ControllerConfig:
     """
 
     version: int = 0
+    # 全局默认运行模式：未被 node_modes 覆盖的节点继承它。
     mode: str = MODE_DRY_RUN
     envs: list[EnvQuota] = field(default_factory=list)
+    # 按节点覆盖运行模式（节点名 → dry-run/enforce）。生产灰度的关键
+    # 能力：可以逐台 HAProxy 打开 enforce，其余节点留在 dry-run 观察。
+    # 字典中不存在的节点继承全局 mode。
+    node_modes: dict[str, str] = field(default_factory=dict)
     report_interval_s: int = 5    # 用量样本上报间隔（秒）
     heartbeat_interval_s: int = 10  # 心跳间隔（秒）
 
@@ -250,6 +255,11 @@ class ControllerConfig:
         加载）都必须先经过这里。"""
         if self.mode != MODE_ENFORCE:
             self.mode = MODE_DRY_RUN
+        # 节点覆盖同样按安全方向归一：写错的覆盖值降级为 dry-run 而不是
+        # 静默移除——移除意味着继承全局（可能是 enforce），比降级危险。
+        for n, m in list(self.node_modes.items()):
+            if m not in (MODE_DRY_RUN, MODE_ENFORCE):
+                self.node_modes[n] = MODE_DRY_RUN
         if self.report_interval_s <= 0:
             self.report_interval_s = 5
         if self.heartbeat_interval_s <= 0:
@@ -273,6 +283,9 @@ class ControllerConfig:
             version=int(d.get("version", 0)),
             mode=d.get("mode", MODE_DRY_RUN),
             envs=[EnvQuota.from_dict(e) for e in d.get("envs", [])],
+            node_modes={
+                str(k): str(v) for k, v in (d.get("node_modes") or {}).items()
+            },
             report_interval_s=int(d.get("report_interval_s", 5)),
             heartbeat_interval_s=int(d.get("heartbeat_interval_s", 10)),
         )
@@ -284,6 +297,7 @@ class ControllerConfig:
             "version": self.version,
             "mode": self.mode,
             "envs": [e.to_dict() for e in self.envs],
+            "node_modes": dict(self.node_modes),
             "report_interval_s": self.report_interval_s,
             "heartbeat_interval_s": self.heartbeat_interval_s,
         }

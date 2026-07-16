@@ -2,8 +2,9 @@
 # tools/loadgen.py —— 可在线调节并发数的 HTTP 压测服务（模拟并发带宽）。
 #
 # 角色：docker compose 演示环境里的"客户端群"替身。维持 N 个并发 worker
-# 持续请求目标 URL（经 HAProxy 入口），把响应体完整读完并累计字节数——
-# 制造出可控强度的下行带宽压力，供观察 rl-limiter 的 AIMD 收紧/恢复行为。
+# 持续请求目标 URL（经 HAProxy 入口，可给多个、逗号分隔，每请求随机挑一），
+# 把响应体完整读完并累计字节数——制造出可控强度的下行带宽压力，供观察
+# rl-limiter 的 AIMD 收紧/恢复与跨节点聚合限速行为。
 #
 # 并发数可两种方式调节：
 #   - 启动参数 --concurrency / 环境变量 LOADGEN_CONCURRENCY：初始并发；
@@ -53,11 +54,14 @@ class LoadGen:
     """维持目标并发数的压测核心：worker 池 + 吞吐计数器。
 
     单事件循环内使用，无锁；set_concurrency 同步增删 worker 任务，
-    计数器由各 worker 直接累加。
+    计数器由各 worker 直接累加。targets 支持多个入口（多台 HAProxy ×
+    多个 frontend）：worker 按序轮转固定绑定到入口——每个入口有独立的
+    客户端群，被整形变慢的入口不会把 worker 都吸走、饿死其它入口
+    （随机每请求挑目标会出现这种排队效应）。
     """
 
-    def __init__(self, target: str, session: aiohttp.ClientSession):
-        self._target = target
+    def __init__(self, targets: list[str], session: aiohttp.ClientSession):
+        self._targets = list(targets)
         self._session = session
         self._workers: list[asyncio.Task] = []
         # 生命周期累计值（/status 展示；速率由报告循环差分得出）。
@@ -79,14 +83,15 @@ class LoadGen:
         n = max(0, min(int(n), MAX_CONCURRENCY))
         while len(self._workers) < n:
             wid = len(self._workers)
-            self._workers.append(
-                asyncio.create_task(self._worker(), name=f"loadgen-worker-{wid}"))
+            target = self._targets[wid % len(self._targets)]  # 轮转绑定入口
+            self._workers.append(asyncio.create_task(
+                self._worker(target), name=f"loadgen-worker-{wid}"))
         while len(self._workers) > n:
             self._workers.pop().cancel()
         return n
 
-    async def _worker(self) -> None:
-        """单个"客户端"：循环请求目标并把响应体完整读完。
+    async def _worker(self, target: str) -> None:
+        """单个"客户端"：循环请求绑定的目标并把响应体完整读完。
 
         读响应用分块迭代而不是 read()——限速生效时单个响应会拖长到
         数秒，分块累计让吞吐统计平滑跟随实际到达的字节，而不是在
@@ -94,7 +99,7 @@ class LoadGen:
         """
         while True:
             try:
-                async with self._session.get(self._target) as resp:
+                async with self._session.get(target) as resp:
                     if resp.status == 200:
                         async for chunk in resp.content.iter_chunked(64 * 1024):
                             self.bytes_total += len(chunk)
@@ -141,7 +146,7 @@ class LoadGen:
 
     def status(self) -> dict:
         return {
-            "target": self._target,
+            "targets": self._targets,
             "concurrency": self.concurrency,
             "max_concurrency": MAX_CONCURRENCY,
             "rate_bytes_per_s": round(self.rate_bytes_per_s),
@@ -191,9 +196,13 @@ async def amain(args: argparse.Namespace) -> None:
     # total=None：限速压到很低时单响应可能拖到分钟级，压测器不设总超时；
     # 连接阶段仍给 10s，防止对无路由地址无限等待。
     timeout = aiohttp.ClientTimeout(total=None, connect=10.0)
-    connector = aiohttp.TCPConnector(limit=0)  # 并发度只由 worker 数决定
+    # force_close：每个请求用新 TCP 连接。两个原因——(1) TCP L4 整形的
+    # 每连接限速在建连时定格，短连接让 rl-limiter 的新整形值秒级生效；
+    # (2) fe_conn 均分随请求实时反映真实并发。limit=0：并发只由 worker 数决定。
+    connector = aiohttp.TCPConnector(limit=0, force_close=True)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        gen = LoadGen(args.target, session)
+        targets = [u.strip() for u in args.target.split(",") if u.strip()]
+        gen = LoadGen(targets, session)
         applied = gen.set_concurrency(args.concurrency)
 
         runner = web.AppRunner(make_control_app(gen))
@@ -202,9 +211,9 @@ async def amain(args: argparse.Namespace) -> None:
         await site.start()
 
         log.info(
-            "压测服务已启动 target=%s concurrency=%d control_port=%d "
+            "压测服务已启动 targets=%s concurrency=%d control_port=%d "
             "（在线调节：curl -X PUT http://<host>:%d/concurrency -d '{\"concurrency\": N}'）",
-            args.target, applied, args.control_port, args.control_port)
+            ",".join(targets), applied, args.control_port, args.control_port)
         try:
             await gen.report_loop(args.report_s)
         finally:
@@ -217,7 +226,9 @@ def main() -> None:
         description="可在线调节并发数的 HTTP 压测服务：N 个并发 worker "
                     "持续请求目标 URL 以模拟并发带宽")
     parser.add_argument("--target", required=True,
-                        help="压测目标 URL（经 HAProxy 入口，例如 http://haproxy:8080/）")
+                        help="压测目标 URL，逗号分隔可给多个（经 HAProxy 入口，"
+                             "例如 http://haproxy1:8080/,http://haproxy2:8080/），"
+                             "每个请求随机挑一个目标")
     parser.add_argument("--concurrency", type=int,
                         default=env_int("LOADGEN_CONCURRENCY", DEFAULT_CONCURRENCY, "loadgen"),
                         help="初始并发数（默认 %(default)s，环境变量 LOADGEN_CONCURRENCY）")

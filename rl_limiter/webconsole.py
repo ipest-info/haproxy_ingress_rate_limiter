@@ -93,15 +93,23 @@ class StatusHub:
         service_version: str,
         mode_fn: Callable[[], str],
         version_fn: Callable[[], int],
+        nodes: list[model.NodeConfig] | None = None,
+        degraded_fn: Callable[[], set] | None = None,
     ):
         self._service_version = service_version
         self._mode_fn = mode_fn
         self._version_fn = version_fn
+        # 受控节点接线视图（启动时定型，与 RuntimeClient 集合一致）。
+        self._nodes = list(nodes or [])
+        # 采样已持续失败的节点集合（collector.degraded_nodes 闭包）。
+        self._degraded_fn = degraded_fn if degraded_fn is not None else (lambda: set())
         self._history: collections.deque[dict[str, Any]] = collections.deque(
             maxlen=HISTORY_TICKS)
         self._subs: set[asyncio.Queue] = set()
         # env_id → 配置视图（quota/targets/params），来自最近一次应用的配置。
         self._env_config: dict[str, dict[str, Any]] = {}
+        # 节点名 → 模式覆盖（不含 = 继承全局默认），随配置热更。
+        self._node_modes: dict[str, str] = {}
         self._started = time.time()
 
     # ---- 配置与数据注入 ----
@@ -111,10 +119,27 @@ class StatusHub:
             e.env_id: {
                 "quota_bps": e.quota_bits_per_sec,
                 "quota_bytes_per_s": e.quota_bytes_per_sec,
-                "targets": [str(t) for t in e.targets],
+                "targets": [{"node": t.node, "frontend": t.frontend}
+                            for t in e.targets],
                 "params": e.params.to_dict() if e.params is not None else None,
             }
             for e in cfg.envs
+        }
+        self._node_modes = dict(cfg.node_modes)
+
+    def _nodes_view(self) -> dict[str, Any]:
+        """节点视图：接线 + 生效模式（覆盖或继承全局）+ 采样健康。"""
+        degraded = self._degraded_fn()
+        default_mode = self._mode_fn()
+        return {
+            n.name: {
+                "host": n.host,
+                "port": n.port,
+                "override": self._node_modes.get(n.name),
+                "mode": self._node_modes.get(n.name) or default_mode,
+                "degraded": n.name in degraded,
+            }
+            for n in self._nodes
         }
 
     def record(self, now: float, usages, decisions) -> None:
@@ -139,6 +164,7 @@ class StatusHub:
             "mode": self._mode_fn(),
             "config_version": self._version_fn(),
             "envs": envs,
+            "nodes": self._nodes_view(),
         }
         self._history.append(snap)
         for q in list(self._subs):
@@ -167,6 +193,7 @@ class StatusHub:
             "config_version": self._version_fn(),
             "uptime_s": time.time() - self._started,
             "env_config": self._env_config,
+            "nodes": self._nodes_view(),
             # AIMD 参数的默认值：页面参数表单以此为占位符/说明，
             # 不在前端硬编码，跟随 model.GovParams 演进。
             "default_params": model.GovParams().to_dict(),
@@ -179,14 +206,6 @@ class StatusHub:
 
 def _json_error(status: int, message: str) -> web.Response:
     return web.json_response({"error": message}, status=status)
-
-
-async def _read_json(request: web.Request) -> Any:
-    body = await request.content.read(MAX_BODY_BYTES)
-    try:
-        return json.loads(body)
-    except ValueError as e:
-        raise ValueError(f"请求体不是合法的 JSON: {e}") from None
 
 
 def build_app(
@@ -256,13 +275,21 @@ def build_app(
                 "控制台调参依赖 MySQL 配置源，请改用数据库配置模式")
         return None
 
-    async def _mutate(request: web.Request, action) -> web.Response:
+    async def _mutate(request: web.Request, action,
+                      allow_empty_body: bool = False) -> web.Response:
         """调参公共骨架：DB 模式检查 → 解析 JSON → 执行 → 统一应答/报错。"""
         denied = _require_db()
         if denied is not None:
             return denied
         try:
-            payload = await _read_json(request)
+            body = await request.content.read(MAX_BODY_BYTES)
+            if allow_empty_body and not body.strip():
+                payload = None  # DELETE 类端点：无请求体是常态
+            else:
+                try:
+                    payload = json.loads(body)
+                except ValueError as e:
+                    raise ValueError(f"请求体不是合法的 JSON: {e}") from None
             await action(payload)
         except ValueError as e:
             return _json_error(400, str(e))
@@ -303,6 +330,51 @@ def build_app(
             await dbconfig.update_env_params(db_opts, env_id, payload["params"])
         return await _mutate(request, action)
 
+    async def handle_set_node_mode(request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+
+        async def action(payload):
+            if not isinstance(payload, dict) or "mode" not in payload:
+                raise ValueError(
+                    '请求体须为 {"mode": "dry-run"|"enforce"|null}（null=继承全局）')
+            mode = payload["mode"]
+            await dbconfig.update_node_mode(
+                db_opts, name, None if mode is None else str(mode))
+        return await _mutate(request, action)
+
+    async def handle_set_targets(request: web.Request) -> web.Response:
+        env_id = request.match_info["env_id"]
+
+        async def action(payload):
+            if not isinstance(payload, dict) or "targets" not in payload:
+                raise ValueError(
+                    '请求体须为 {"targets": [{"node": …, "frontend": …}, …]}')
+            await dbconfig.update_env_targets(db_opts, env_id, payload["targets"])
+        return await _mutate(request, action)
+
+    async def handle_create_env(request: web.Request) -> web.Response:
+        async def action(payload):
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    '请求体须为 {"env_id": …, "quota_bps": …, "targets": […]}')
+            try:
+                quota = int(payload.get("quota_bps", 0))
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"quota_bps 必须是整数（比特每秒），"
+                    f"当前值 {payload.get('quota_bps')!r}") from None
+            await dbconfig.create_env(
+                db_opts, str(payload.get("env_id", "")), quota,
+                payload.get("targets"))
+        return await _mutate(request, action)
+
+    async def handle_delete_env(request: web.Request) -> web.Response:
+        env_id = request.match_info["env_id"]
+
+        async def action(_payload):
+            await dbconfig.delete_env(db_opts, env_id)
+        return await _mutate(request, action, allow_empty_body=True)
+
     app = web.Application(client_max_size=MAX_BODY_BYTES)
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/overview", handle_overview)
@@ -310,8 +382,12 @@ def build_app(
     app.router.add_get("/api/logs", handle_logs)
     app.router.add_get("/api/stream", handle_stream)
     app.router.add_put("/api/mode", handle_set_mode)
+    app.router.add_put("/api/nodes/{name}/mode", handle_set_node_mode)
+    app.router.add_post("/api/envs", handle_create_env)
     app.router.add_put("/api/envs/{env_id}/quota", handle_set_quota)
     app.router.add_put("/api/envs/{env_id}/params", handle_set_params)
+    app.router.add_put("/api/envs/{env_id}/targets", handle_set_targets)
+    app.router.add_delete("/api/envs/{env_id}", handle_delete_env)
     return app
 
 

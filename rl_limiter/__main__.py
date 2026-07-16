@@ -112,7 +112,9 @@ async def _amain(cfg, log: logging.Logger,
         hub = webconsole.StatusHub(
             SERVICE_VERSION,
             mode_fn=lambda: executor_mode(exe),
-            version_fn=lambda: ctl.version)
+            version_fn=lambda: ctl.version,
+            nodes=cfg.nodes,
+            degraded_fn=col.degraded_nodes)
 
     # Sampler 闭包引用 ctl.version；ctl 在下方完成赋值，而 sampler 只会在
     # ctl.run 的 tick 中被调用——首次调用必然晚于赋值，延迟捕获是安全的。
@@ -167,12 +169,15 @@ async def _amain(cfg, log: logging.Logger,
                         cache_path, cache_err if cache_err is not None else "empty")
     # 数据库配置模式：引导配置的版本号取内容校验和，并把它作为轮询任务的
     # 变更检测基准——首轮轮询读到同样内容时不会再触发一次重复应用。
+    node_modes = dict(getattr(cfg, "node_modes", {}) or {})
     seed_version = (
-        dbconfig.config_checksum(cfg.mode, cfg.envs) if db_opts is not None else 0
+        dbconfig.config_checksum(cfg.mode, cfg.envs, node_modes)
+        if db_opts is not None else 0
     )
     if not seeded and cfg.envs:
         seed_cfg = model.ControllerConfig(
-            version=seed_version, mode=cfg.mode, envs=cfg.envs)
+            version=seed_version, mode=cfg.mode, envs=cfg.envs,
+            node_modes=node_modes)
         ctl.seed(seed_cfg)
         if hub is not None:
             hub.update_config(seed_cfg)

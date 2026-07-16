@@ -374,3 +374,85 @@ async def test_drift_baseline_cleared_on_dry_run_switch():
 
     await exe.apply([(decision("env-a", [TA1], 10_000_000, False), alloc)])
     assert total_calls(clients) == n0 + 1  # 基准一致，不再写
+
+
+# ---------------------------------------------------------------------------
+# 按节点模式（node_modes）：全局默认 + 节点覆盖，生产灰度的核心能力。
+# ---------------------------------------------------------------------------
+
+async def test_node_modes_split_write_and_drill():
+    """混合模式环境：enforce 节点真实写入，dry-run 节点只演练。
+    env 横跨 n1(enforce 覆盖) 与 n2(继承全局 dry-run)。"""
+    s, clients = new_executor(model.MODE_DRY_RUN)
+    s.set_mode(model.MODE_DRY_RUN, {"n1": model.MODE_ENFORCE})
+
+    d = decision("env-a", [TA1, TA3], 1000.0, changed=True)  # TA1@n1, TA3@n2
+    errs = await s.apply([(d, even_alloc([TA1, TA3], 1000.0))])
+    assert errs == []
+    # n1 被真实写入，n2 零 I/O。
+    assert clients["n1"].values_for("fe_a1") == ["500"]
+    assert len(clients["n2"].calls) == 0
+    # 环境整体计入 snapshot（enforce 侧全部成功）。
+    assert s.snapshot() == {"env-a": 1000.0}
+
+
+async def test_node_flip_to_enforce_arms_per_node_resync():
+    """单个节点 dry→enforce：只重写涉及该节点的环境，其它环境不动。"""
+    s, clients = new_executor(model.MODE_ENFORCE)
+    # n2 先覆盖为 dry-run：env-b(纯 n2) 演练，env-a(纯 n1) 真实写入。
+    s.set_mode(model.MODE_ENFORCE, {"n2": model.MODE_DRY_RUN})
+    da = decision("env-a", [TA1], 1000.0, changed=True)
+    db = decision("env-b", [TB1], 2000.0, changed=True)
+    await s.apply([(da, even_alloc([TA1], 1000.0)),
+                   (db, even_alloc([TB1], 2000.0))])
+    assert len(clients["n2"].calls) == 0
+    n1_calls = len(clients["n1"].calls)
+
+    # 撤销 n2 的覆盖 → n2 生效模式 dry→enforce，武装 n2 的 resync。
+    s.set_mode(model.MODE_ENFORCE, {})
+    da2 = decision("env-a", [TA1], 1000.0, changed=False)
+    db2 = decision("env-b", [TB1], 2000.0, changed=False)
+    await s.apply([(da2, even_alloc([TA1], 1000.0)),
+                   (db2, even_alloc([TB1], 2000.0))])
+    # env-b 因 n2 resync 被重写；env-a 无触发条件，不重复写。
+    assert clients["n2"].values_for("fe_b1") == ["2000"]
+    assert len(clients["n1"].calls) == n1_calls
+
+
+async def test_same_effective_modes_is_noop():
+    """覆盖值与全局默认相同：生效模式没变，不武装 resync。"""
+    s, clients = new_executor(model.MODE_ENFORCE)
+    d = decision("env-a", [TA1], 1000.0, changed=True)
+    await s.apply([(d, even_alloc([TA1], 1000.0))])
+    n1_calls = len(clients["n1"].calls)
+
+    s.set_mode(model.MODE_ENFORCE, {"n1": model.MODE_ENFORCE})  # 生效面等价
+    d2 = decision("env-a", [TA1], 1000.0, changed=False)
+    await s.apply([(d2, even_alloc([TA1], 1000.0))])
+    assert len(clients["n1"].calls) == n1_calls, "等价模式切换不得触发重写"
+
+
+async def test_all_nodes_dry_clears_pending():
+    """所有节点生效模式都变为 dry-run 时清空 pending（与全局切 dry 同义）。"""
+    c1 = FakeClient(errs={"fe_a1": RuntimeError("boom")})
+    s, clients = new_executor(model.MODE_ENFORCE, clients={"n1": c1, "n2": FakeClient()})
+    d = decision("env-a", [TA1], 1000.0, changed=True)
+    errs = await s.apply([(d, even_alloc([TA1], 1000.0))])
+    assert errs, "注入的写失败必须上报"
+
+    # 逐节点全部覆盖为 dry-run（全局默认仍是 enforce）→ 等效全 dry。
+    s.set_mode(model.MODE_ENFORCE,
+               {"n1": model.MODE_DRY_RUN, "n2": model.MODE_DRY_RUN})
+    c1.errs = {}
+    d2 = decision("env-a", [TA1], 1000.0, changed=False)
+    errs = await s.apply([(d2, even_alloc([TA1], 1000.0))])
+    # pending 已被清空：unchanged 决策在纯演练下不触发任何写。
+    assert errs == [] and c1.values_for("fe_a1") == ["1000"] * 1
+
+
+async def test_node_modes_accessor_and_invalid_override():
+    """node_modes() 返回覆盖副本；非法覆盖值按安全方向降级 dry-run。"""
+    s, _ = new_executor(model.MODE_ENFORCE)
+    s.set_mode(model.MODE_ENFORCE, {"n1": "garbage"})
+    assert s.node_modes() == {"n1": model.MODE_DRY_RUN}
+    assert s.mode() == model.MODE_ENFORCE

@@ -83,11 +83,13 @@ class FakeGovernor:
 class FakeExecutor:
     def __init__(self):
         self._mode = ""
+        self.node_modes: dict[str, str] = {}
         self.applied: list[list] = []
         self.errs: list[Exception] = []
 
-    def set_mode(self, mode):
+    def set_mode(self, mode, node_modes=None):
         self._mode = mode
+        self.node_modes = dict(node_modes or {})
 
     def mode(self):  # 契约允许"mode 属性或 mode()"，这里用方法形态
         return self._mode

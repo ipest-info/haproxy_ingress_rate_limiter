@@ -105,6 +105,23 @@ details.params summary { cursor: pointer; color: var(--text-secondary); }
 .params-table td.pdesc { color: var(--text-secondary); font-size: 12.5px; max-width: 460px; }
 .params-table input { width: 90px; }
 input.dirty { border-color: var(--status-warning); }
+/* 节点面板 */
+.nodes-table { border-collapse: collapse; margin-top: 8px; min-width: 560px; }
+.nodes-table td, .nodes-table th { padding: 5px 22px 5px 0; text-align: left; }
+.nodes-table th { color: var(--text-muted); font-size: 12px; font-weight: 500; }
+.nodes-table td.nname { font-weight: 600; }
+.nodes-table td.naddr { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+/* 挂载点 chips */
+.targets-box { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.tchip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px;
+  border: 1px solid var(--border); border-radius: 999px; font-size: 12.5px;
+  color: var(--text-secondary); font-variant-numeric: tabular-nums;
+}
+.tchip b { color: var(--text-primary); font-weight: 600; }
+.tchip .x { cursor: pointer; color: var(--text-muted); font-weight: 700; padding: 0 2px; }
+.tchip .x:hover { color: var(--status-critical); }
+button.danger { color: var(--status-critical); border-color: var(--status-critical); background: transparent; }
 .hint { font-size: 12px; color: var(--text-muted); }
 .state { font-weight: 600; }
 /* 日志面板 */
@@ -127,7 +144,7 @@ input.dirty { border-color: var(--status-warning); }
 <header>
   <h1>rl-limiter 控制台</h1>
   <span class="badge" id="sse-badge"><span class="dot" id="sse-dot" style="background:var(--status-critical)"></span><span id="sse-text">连接中…</span></span>
-  <span class="badge">模式 <b id="mode-text">–</b> <button id="mode-btn" style="padding:1px 8px;font-size:12px">切换</button></span>
+  <span class="badge" title="未被节点覆盖的 HAProxy 继承此模式">全局默认 <b id="mode-text">–</b> <button id="mode-btn" style="padding:1px 8px;font-size:12px">切换</button></span>
   <span class="meta">配置版本 <b id="cfg-version">–</b></span>
   <span class="meta">运行时长 <b id="uptime">–</b></span>
   <span class="meta">服务版本 <b id="svc-version">–</b></span>
@@ -140,7 +157,27 @@ input.dirty { border-color: var(--status-warning); }
   </span>
 </header>
 <main>
+  <div class="card">
+    <div class="row">
+      <h2>HAProxy 节点</h2>
+      <span class="hint">模式可按节点单独控制（生产灰度：逐台打开 enforce）；「继承全局」跟随头部的全局默认模式</span>
+    </div>
+    <table class="nodes-table" id="nodes-table"></table>
+  </div>
   <div id="envs"></div>
+  <div class="card">
+    <div class="row">
+      <h2>新建环境</h2>
+      <span class="hint">新环境必须携带至少一个挂载点（节点 × frontend）；frontend 名须与 HAProxy 配置及 bwlim map 键一致</span>
+    </div>
+    <div class="controls" style="margin-top:12px">
+      <label>环境 ID <input type="text" id="new-env-id" placeholder="env-c" style="width:110px"></label>
+      <label>配额 <input type="number" id="new-env-quota" min="1" step="1" placeholder="100" style="width:90px"> Mbps</label>
+      <label>节点 <select id="new-env-node"></select></label>
+      <label>frontend <input type="text" id="new-env-frontend" placeholder="fe_env_c" style="width:130px"></label>
+      <button class="primary" id="new-env-create">创建</button>
+    </div>
+  </div>
   <div class="card">
     <div class="row">
       <h2>运行日志</h2>
@@ -221,10 +258,72 @@ const state = {
   envs: new Map(),        // env_id → { card, buf: [snapEnv+ts...], counters }
   envConfig: {},
   defaultParams: {},      // GovParams 默认值（来自 /api/overview）
+  nodes: {},              // 节点视图：name → {host,port,mode,override,degraded}
   mode: null,
   logsAfter: 0,
   lvlOn: { DEBUG: true, INFO: true, WARNING: true, ERROR: true, CRITICAL: true },
 };
+
+/* ================= 调参后的配置回读 ================= */
+function refreshSoon() {
+  // 写库后热生效需要一个轮询周期（约 3s）：先立即刷一次（拿 note），
+  // 再在生效窗口之后刷一次，让页面的配置视图跟上。
+  loadOverview();
+  setTimeout(loadOverview, 4500);
+}
+
+/* ================= 节点面板（按节点模式控制） ================= */
+function renderNodes() {
+  const table = $("#nodes-table");
+  // 用户正在操作某个节点下拉时不重建表格，避免选择被打断。
+  if (table.contains(document.activeElement)) return;
+  const names = Object.keys(state.nodes);
+  if (!names.length) { table.innerHTML = ""; return; }
+  table.innerHTML = `<tr><th>节点</th><th>地址（runtime API）</th><th>模式</th><th>生效</th><th>采样状态</th></tr>`;
+  for (const name of names) {
+    const n = state.nodes[name];
+    const tr = document.createElement("tr");
+    const ovVal = n.override || "";
+    tr.innerHTML = `
+      <td class="nname">${name}</td>
+      <td class="naddr">${n.host}:${n.port}</td>
+      <td><select class="node-mode" data-node="${name}">
+        <option value="">继承全局</option>
+        <option value="dry-run">dry-run</option>
+        <option value="enforce">enforce</option>
+      </select></td>
+      <td><span class="state" style="color:var(${n.mode === "enforce" ? "--status-serious" : "--status-good"})">${n.mode}</span></td>
+      <td>${n.degraded
+        ? '<span class="dot" style="background:var(--status-critical)"></span>失联（fail-static）'
+        : '<span class="dot" style="background:var(--status-good)"></span>正常'}</td>`;
+    const sel = tr.querySelector(".node-mode");
+    sel.value = ovVal;
+    sel.onchange = async () => {
+      const v = sel.value;
+      try {
+        const r = await apiPut(`/api/nodes/${encodeURIComponent(name)}/mode`,
+                               { mode: v || null });
+        toast(`节点 ${name} 模式已提交为 ${v || "继承全局"}；${r.note}`);
+        refreshSoon();
+      } catch (err) {
+        toast(`节点 ${name} 模式切换失败：` + err.message, true);
+        sel.value = ovVal; // 失败回滚显示
+      }
+    };
+    table.appendChild(tr);
+  }
+}
+
+function nodeOptions(sel) {
+  if (document.activeElement === sel) return;  // 用户展开中不打断
+  const names = Object.keys(state.nodes);
+  const want = names.join(",");
+  if (sel._opts === want) return;              // 集合没变不重建
+  sel._opts = want;
+  const cur = sel.value;
+  sel.innerHTML = names.map(n => `<option value="${n}">${n}</option>`).join("");
+  if (cur && names.includes(cur)) sel.value = cur;
+}
 
 /* ================= 环境卡片 ================= */
 function envCard(envId) {
@@ -237,7 +336,8 @@ function envCard(envId) {
       <h2>环境 <span class="env-name"></span></h2>
       <span class="badge"><span class="dot state-dot"></span><span class="state">–</span></span>
       <span class="badge degraded" style="display:none"><span class="dot" style="background:var(--status-critical)"></span>节点失联（fail-static）</span>
-      <span class="meta">挂载点 <b class="targets">–</b></span>
+      <span style="flex:1"></span>
+      <button class="danger env-delete" title="删除环境（解除限速并移除全部挂载点）">删除环境</button>
     </div>
     <div class="stats">
       <span class="stat"><div class="k">实时速率</div><div class="v rate">–<span class="u"> Mbps</span></div></span>
@@ -265,6 +365,14 @@ function envCard(envId) {
       <button class="primary quota-apply">应用配额</button>
       <button class="quota-reset" title="放弃输入，恢复为当前生效值">还原</button>
       <span class="hint quota-live"></span>
+    </div>
+    <div class="controls">
+      <span style="font-weight:600">挂载点</span>
+      <span class="targets-box"></span>
+      <select class="target-node"></select>
+      <input type="text" class="target-frontend" placeholder="fe_xxx" style="width:120px">
+      <button class="target-add">添加挂载点</button>
+      <span class="hint">迁移挂载点 = 从原环境 ✕ 移除，再到目标环境添加</span>
     </div>
     <details class="params">
       <summary>AIMD 参数覆盖（按项填写，留空的项使用默认值）</summary>
@@ -315,6 +423,46 @@ function envCard(envId) {
     if (conf) qin.value = (conf.quota_bps / 1e6).toString();
   };
 
+  $(".env-delete", card).onclick = async () => {
+    if (!confirm(`删除环境 ${envId}？将解除该环境的限速并移除全部挂载点。`)) return;
+    try {
+      const resp = await fetch(`/api/envs/${encodeURIComponent(envId)}`, { method: "DELETE" });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
+      toast(`环境 ${envId} 已删除；${data.note || ""}`);
+      refreshSoon();
+    } catch (err) { toast("删除环境失败：" + err.message, true); }
+  };
+
+  const submitTargets = async targets => {
+    const r = await apiPut(`/api/envs/${encodeURIComponent(envId)}/targets`, { targets });
+    toast(`挂载点已更新；${r.note}`);
+    refreshSoon();
+  };
+  $(".target-add", card).onclick = async () => {
+    const node = $(".target-node", card).value;
+    const frontend = $(".target-frontend", card).value.trim();
+    if (!node || !frontend) return toast("请选择节点并填写 frontend 名", true);
+    const cur = (state.envConfig[envId] || {}).targets || [];
+    if (cur.some(t => t.node === node && t.frontend === frontend)) {
+      return toast("该挂载点已存在于本环境", true);
+    }
+    try {
+      await submitTargets([...cur, { node, frontend }]);
+      $(".target-frontend", card).value = "";
+    } catch (err) { toast("添加挂载点失败：" + err.message, true); }
+  };
+  e.removeTarget = async (node, frontend) => {
+    const cur = (state.envConfig[envId] || {}).targets || [];
+    const next = cur.filter(t => !(t.node === node && t.frontend === frontend));
+    if (!next.length) {
+      return toast("环境至少要保留一个挂载点（要停用整个环境请用「删除环境」）", true);
+    }
+    if (!confirm(`从环境 ${envId} 移除挂载点 ${node}/${frontend}？`)) return;
+    try { await submitTargets(next); }
+    catch (err) { toast("移除挂载点失败：" + err.message, true); }
+  };
+
   const submitParams = async params => {
     try {
       const r = await apiPut(`/api/envs/${encodeURIComponent(envId)}/params`, { params });
@@ -357,6 +505,16 @@ function applySnapshot(snap, isLive) {
   $("#mode-text").textContent = snap.mode || "–";
   $("#cfg-version").textContent = snap.config_version ?? "–";
   state.mode = snap.mode;
+  if (snap.nodes) { state.nodes = snap.nodes; if (isLive) renderNodes(); }
+  if (isLive) {
+    // 环境被删除后回收其卡片（快照里不再出现该 env）。
+    for (const [envId, e] of [...state.envs]) {
+      if (!(envId in (snap.envs || {}))) {
+        e.card.remove();
+        state.envs.delete(envId);
+      }
+    }
+  }
   for (const [envId, d] of Object.entries(snap.envs || {})) {
     const e = envCard(envId);
     e.buf.push({ ts: snap.ts, ...d });
@@ -393,7 +551,21 @@ function updateCard(e, d) {
   $(".degraded", c).style.display = d.degraded ? "" : "none";
   const conf = state.envConfig[e.id];
   if (conf) {
-    $(".targets", c).textContent = (conf.targets || []).join(" | ") || "–";
+    // 挂载点 chips：内容变化才重建（避免每帧闪动）。
+    const tjson = JSON.stringify(conf.targets || []);
+    if (e._targetsJson !== tjson) {
+      e._targetsJson = tjson;
+      const box = $(".targets-box", c);
+      box.innerHTML = "";
+      for (const t of conf.targets || []) {
+        const chip = document.createElement("span");
+        chip.className = "tchip";
+        chip.innerHTML = `<b>${t.node}</b>/${t.frontend}<span class="x" title="移除">✕</span>`;
+        chip.querySelector(".x").onclick = () => e.removeTarget(t.node, t.frontend);
+        box.appendChild(chip);
+      }
+    }
+    nodeOptions($(".target-node", c));
     $(".quota-live", c).textContent =
       `当前生效 ${(conf.quota_bps / 1e6).toString()} Mbps（写入 MySQL，一个轮询周期内热生效）`;
     // 回填仅在"用户没在编辑且无未提交修改"时进行——实时刷新绝不覆盖
@@ -524,6 +696,7 @@ async function loadOverview() {
   const r = await fetch("/api/overview"); const o = await r.json();
   state.envConfig = o.env_config || {};
   state.defaultParams = o.default_params || {};
+  if (o.nodes) { state.nodes = o.nodes; renderNodes(); nodeOptions($("#new-env-node")); }
   $("#svc-version").textContent = o.service_version || "–";
   $("#mode-text").textContent = o.mode || "–";
   $("#cfg-version").textContent = o.config_version ?? "–";
@@ -546,17 +719,45 @@ async function bootstrap() {
   es.onmessage = ev => applySnapshot(JSON.parse(ev.data), true);
 }
 
-/* ================= 模式切换 ================= */
+/* ================= 全局默认模式切换 ================= */
 $("#mode-btn").onclick = async () => {
   const target = state.mode === "enforce" ? "dry-run" : "enforce";
   const warn = target === "enforce"
-    ? "切换到 enforce 将真实下发限速值到 HAProxy，确认？"
-    : "切换到 dry-run 后停止更新限速值（已下发的整形值将继续生效，fail-static），确认？";
+    ? "切换全局默认为 enforce：所有「继承全局」的节点将真实下发限速值，确认？"
+    : "切换全局默认为 dry-run：所有「继承全局」的节点停止更新限速值（已下发的整形值继续生效，fail-static），确认？";
   if (!confirm(warn)) return;
   try {
     const r = await apiPut("/api/mode", { mode: target });
-    toast(`模式已提交为 ${target}；${r.note}`);
+    toast(`全局默认模式已提交为 ${target}；${r.note}`);
+    refreshSoon();
   } catch (err) { toast("模式切换失败：" + err.message, true); }
+};
+
+/* ================= 新建环境 ================= */
+$("#new-env-create").onclick = async () => {
+  const envId = $("#new-env-id").value.trim();
+  const quota = parseFloat($("#new-env-quota").value);
+  const node = $("#new-env-node").value;
+  const frontend = $("#new-env-frontend").value.trim();
+  if (!envId) return toast("请填写环境 ID", true);
+  if (!(quota > 0)) return toast("配额必须是 > 0 的数值（Mbps）", true);
+  if (!node || !frontend) return toast("请选择节点并填写 frontend 名", true);
+  try {
+    const resp = await fetch("/api/envs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        env_id: envId,
+        quota_bps: Math.round(quota * 1e6),
+        targets: [{ node, frontend }],
+      }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
+    toast(`环境 ${envId} 已创建；${data.note || ""}`);
+    $("#new-env-id").value = ""; $("#new-env-quota").value = ""; $("#new-env-frontend").value = "";
+    refreshSoon();
+  } catch (err) { toast("创建环境失败：" + err.message, true); }
 };
 
 /* ================= 日志 ================= */

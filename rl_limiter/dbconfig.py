@@ -68,7 +68,7 @@ _SQL_SERVICE = (
     "FROM service_config WHERE id = 1"
 )
 _SQL_NODES = (
-    "SELECT name, host, port, bwlim_map_path, timeout_ms "
+    "SELECT name, host, port, bwlim_map_path, timeout_ms, mode "
     "FROM haproxy_nodes ORDER BY name"
 )
 _SQL_ENVS = "SELECT env_id, quota_bps, params_json FROM envs ORDER BY env_id"
@@ -184,8 +184,11 @@ def rows_to_raw(
             "port": port,
             "bwlim_map_path": bwlim_map_path or "",
             "timeout_ms": timeout_ms or 0,
+            # 节点级模式覆盖：NULL/空 = 继承全局 service_config.mode。
+            # 这是节点行里唯一**可热更**的列（其余为接线字段，重启生效）。
+            "mode": mode or "",
         }
-        for name, host, port, bwlim_map_path, timeout_ms in node_rows
+        for name, host, port, bwlim_map_path, timeout_ms, mode in node_rows
     ]
 
     targets_by_env: dict[str, list[dict[str, Any]]] = {}
@@ -219,22 +222,34 @@ def rows_to_raw(
     return raw
 
 
-def canonical_config(mode: str, envs: list[model.EnvQuota]) -> str:
-    """把可热更新部分（mode + envs）序列化为规范化 JSON（键排序、紧凑
-    分隔符），作为配置内容的精确身份。
+def canonical_config(
+    mode: str,
+    envs: list[model.EnvQuota],
+    node_modes: dict[str, str] | None = None,
+) -> str:
+    """把可热更新部分（mode + envs + node_modes）序列化为规范化 JSON
+    （键排序、紧凑分隔符），作为配置内容的精确身份。
 
     变更检测必须比较这个字符串本身而不是它的哈希：32 位校验和存在碰撞
     窗口（~2^-32/次，且非密码学哈希对结构化输入可能更差），一旦新旧内容
     碰撞，该次变更会被静默丢弃且永不自愈——watch 手里本就持有全量内容，
     没有理由用有损比较。envs 查询带 ORDER BY，行序稳定，字符串可复现。
     """
-    payload = {"mode": mode, "envs": [e.to_dict() for e in envs]}
+    payload = {
+        "mode": mode,
+        "envs": [e.to_dict() for e in envs],
+        "node_modes": dict(node_modes or {}),
+    }
     return json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
 
 
-def config_checksum(mode: str, envs: list[model.EnvQuota]) -> int:
+def config_checksum(
+    mode: str,
+    envs: list[model.EnvQuota],
+    node_modes: dict[str, str] | None = None,
+) -> int:
     """内容校验和 = canonical_config 的 CRC32，充当配置版本号。
 
     数据库没有现成的单调版本号可用（要求运维每次改配置手动 bump 版本，
@@ -242,7 +257,7 @@ def config_checksum(mode: str, envs: list[model.EnvQuota]) -> int:
     ControllerConfig.version 的展示/核对（日志、心跳），变更检测一律用
     canonical_config 字符串精确比较（见其 docstring），不依赖此哈希。
     """
-    return zlib.crc32(canonical_config(mode, envs).encode("utf-8"))
+    return zlib.crc32(canonical_config(mode, envs, node_modes).encode("utf-8"))
 
 
 async def _fetch_raw(opts: MySQLOptions) -> dict[str, Any]:
@@ -376,13 +391,29 @@ async def load_service_config(
 # 永远与库一致，重启也不丢，且天然复用统一校验管线（写坏的参数会在
 # 下一轮 fetch 被拒绝并 fail-static，绝不会让坏配置进入快环）。
 
-async def _exec_write(opts: MySQLOptions, sql: str, args: tuple) -> int:
-    """执行一条写语句并提交，返回**匹配**行数（FOUND_ROWS 口径）。
+# MySQL 完整性错误号 → 运维能看懂的中文解释（IntegrityError.args[0]）。
+_INTEGRITY_HINTS = {
+    1062: "该挂载点已属于其它环境（同一 节点/frontend 只能属于一个环境）"
+          "或主键重复",
+    1452: "引用的节点不存在于 haproxy_nodes 表",
+    1451: "存在引用该记录的数据，无法删除",
+}
+
+
+async def _exec_tx(
+    opts: MySQLOptions, statements: list[tuple[str, tuple]],
+) -> list[int]:
+    """在单个事务里顺序执行多条写语句并提交，返回各语句的**匹配**行数
+    （FOUND_ROWS 口径）。任一语句失败整个事务回滚。
 
     必须用 FOUND_ROWS 而不是默认的"实际改变行数"：把配额 UPDATE 成与
     当前相同的值时默认口径返回 0，会被调用方误判为"环境不存在"。
+
+    完整性冲突（重复挂载点、引用不存在的节点等）转译成带中文解释的
+    ValueError——它们是用户输入问题，调用方（控制台 API）按 400 应答。
     """
     import aiomysql  # 延迟导入，理由见 _fetch_raw
+    import pymysql
     from pymysql.constants import CLIENT  # pymysql 是 aiomysql 的既有依赖
 
     async with asyncio.timeout(FETCH_TIMEOUT_S):
@@ -394,23 +425,57 @@ async def _exec_write(opts: MySQLOptions, sql: str, args: tuple) -> int:
             client_flag=CLIENT.FOUND_ROWS,
         )
         try:
-            async with conn.cursor() as cur:
-                await cur.execute(sql, args)
-                rowcount = cur.rowcount
-            await conn.commit()
+            counts: list[int] = []
+            try:
+                async with conn.cursor() as cur:
+                    await conn.begin()
+                    for sql, args in statements:
+                        await cur.execute(sql, args)
+                        counts.append(cur.rowcount)
+                await conn.commit()
+            except pymysql.err.IntegrityError as e:
+                await conn.rollback()
+                errno = e.args[0] if e.args else 0
+                hint = _INTEGRITY_HINTS.get(errno, "违反数据完整性约束")
+                raise ValueError(f"{hint}（MySQL 错误 {errno}）") from None
         finally:
             conn.close()
-    return rowcount
+    return counts
+
+
+async def _exec_write(opts: MySQLOptions, sql: str, args: tuple) -> int:
+    """单语句便捷入口：见 _exec_tx。"""
+    return (await _exec_tx(opts, [(sql, args)]))[0]
 
 
 async def update_mode(opts: MySQLOptions, mode: str) -> None:
-    """热切换运行模式（dry-run/enforce）。非法值在这里就拦下，不落库。"""
+    """热切换全局默认运行模式（dry-run/enforce）。非法值在这里就拦下，
+    不落库。未被 haproxy_nodes.mode 覆盖的节点继承该值。"""
     if mode not in (model.MODE_DRY_RUN, model.MODE_ENFORCE):
         raise ValueError(
             f"mode 值非法：{mode!r}，必须是 {model.MODE_DRY_RUN!r} 或 "
             f"{model.MODE_ENFORCE!r}")
     await _exec_write(
         opts, "UPDATE service_config SET mode = %s WHERE id = 1", (mode,))
+
+
+async def update_node_mode(
+    opts: MySQLOptions, name: str, mode: str | None,
+) -> None:
+    """设置单个 HAProxy 节点的模式覆盖；None/空 = 清除覆盖、继承全局。
+
+    生产灰度的入口：逐台把节点切到 enforce，其余留在 dry-run 观察。
+    """
+    if mode is not None and mode != "" and \
+            mode not in (model.MODE_DRY_RUN, model.MODE_ENFORCE):
+        raise ValueError(
+            f"节点 mode 值非法：{mode!r}，必须是 {model.MODE_DRY_RUN!r}、"
+            f"{model.MODE_ENFORCE!r} 或 null（继承全局）")
+    n = await _exec_write(
+        opts, "UPDATE haproxy_nodes SET mode = %s WHERE name = %s",
+        (mode or None, name))
+    if n == 0:
+        raise ValueError(f"节点 {name!r} 不存在于 haproxy_nodes 表")
 
 
 async def update_env_quota(opts: MySQLOptions, env_id: str, quota_bps: int) -> None:
@@ -454,6 +519,78 @@ async def update_env_params(
         raise ValueError(f"环境 {env_id!r} 不存在于 envs 表")
 
 
+def _validate_targets(targets: Any) -> list[tuple[str, str]]:
+    """把 API 传入的 targets 载荷校验/规整为 (node, frontend) 元组表。"""
+    if not isinstance(targets, list) or not targets:
+        raise ValueError(
+            "targets 必须是非空列表（每个环境至少一个挂载点：没有挂载点的"
+            "环境既采不到用量也无处下发限速，统一校验管线会拒绝整份配置）")
+    out: list[tuple[str, str]] = []
+    for i, t in enumerate(targets):
+        if not isinstance(t, dict) or not t.get("node") or not t.get("frontend"):
+            raise ValueError(
+                f"targets[{i}] 必须是 {{\"node\": 节点名, \"frontend\": 前端名}}")
+        pair = (str(t["node"]), str(t["frontend"]))
+        if pair in out:
+            raise ValueError(f"targets[{i}] 与列表中前面的挂载点重复：{pair}")
+        out.append(pair)
+    return out
+
+
+async def update_env_targets(
+    opts: MySQLOptions, env_id: str, targets: Any,
+) -> None:
+    """整体替换环境的挂载点列表（单事务：先删后插，失败全回滚）。
+
+    "挂载点迁移"由两次调用组成：先从原环境的列表移除，再加入目标环境
+    ——顺序不可反（同一挂载点同时属于两个环境会被唯一键拒绝）。
+    """
+    pairs = _validate_targets(targets)
+    statements: list[tuple[str, tuple]] = [
+        ("SELECT env_id FROM envs WHERE env_id = %s FOR UPDATE", (env_id,)),
+        ("DELETE FROM env_targets WHERE env_id = %s", (env_id,)),
+    ]
+    statements += [
+        ("INSERT INTO env_targets (env_id, node, frontend) VALUES (%s, %s, %s)",
+         (env_id, node, frontend))
+        for node, frontend in pairs
+    ]
+    counts = await _exec_tx(opts, statements)
+    if counts[0] == 0:
+        raise ValueError(f"环境 {env_id!r} 不存在于 envs 表")
+
+
+async def create_env(
+    opts: MySQLOptions, env_id: str, quota_bps: int, targets: Any,
+) -> None:
+    """新建环境（配额 + 初始挂载点，单事务）。必须携带至少一个挂载点：
+    统一校验管线拒绝零挂载点的环境，缺挂载点的新环境会让整份配置快照
+    无法生效（fail-static 卡住所有后续变更）。"""
+    if not env_id or not str(env_id).strip():
+        raise ValueError("env_id 不能为空")
+    if quota_bps <= 0:
+        raise ValueError(f"quota_bps 必须 > 0（比特每秒），当前值 {quota_bps!r}")
+    pairs = _validate_targets(targets)
+    statements: list[tuple[str, tuple]] = [
+        ("INSERT INTO envs (env_id, quota_bps) VALUES (%s, %s)",
+         (str(env_id).strip(), int(quota_bps))),
+    ]
+    statements += [
+        ("INSERT INTO env_targets (env_id, node, frontend) VALUES (%s, %s, %s)",
+         (str(env_id).strip(), node, frontend))
+        for node, frontend in pairs
+    ]
+    await _exec_tx(opts, statements)
+
+
+async def delete_env(opts: MySQLOptions, env_id: str) -> None:
+    """删除环境（挂载点由外键级联删除）。删除即解除该环境的限速。"""
+    n = await _exec_write(
+        opts, "DELETE FROM envs WHERE env_id = %s", (env_id,))
+    if n == 0:
+        raise ValueError(f"环境 {env_id!r} 不存在于 envs 表")
+
+
 async def watch(
     opts: MySQLOptions,
     queue: "asyncio.Queue[model.ControllerConfig]",
@@ -478,7 +615,8 @@ async def watch(
     - 任何失败（连接断、校验不过）都保留当前配置继续限速（fail-static），
       下一轮再试。
     """
-    last_canonical = canonical_config(boot_cfg.mode, boot_cfg.envs)
+    last_canonical = canonical_config(
+        boot_cfg.mode, boot_cfg.envs, boot_cfg.node_modes)
     last_nodes = list(boot_cfg.nodes)  # NodeConfig 是 dataclass，逐字段相等
     # 启动时完成接线（构建了 RuntimeClient）的节点集合：热更新的硬边界。
     wired_nodes = frozenset(n.name for n in boot_cfg.nodes)
@@ -500,7 +638,7 @@ async def watch(
                 "热更新不生效，请重启 rl-limiter 使其生效 nodes=%d", len(cfg.nodes))
             last_nodes = list(cfg.nodes)  # 只在变化那一轮告警一次
 
-        canonical = canonical_config(cfg.mode, cfg.envs)
+        canonical = canonical_config(cfg.mode, cfg.envs, cfg.node_modes)
         if canonical == last_canonical:
             continue
 
@@ -521,8 +659,13 @@ async def watch(
         last_canonical = canonical
         last_rejected = None
         version = zlib.crc32(canonical.encode("utf-8"))
-        ctl = model.ControllerConfig(version=version, mode=cfg.mode, envs=cfg.envs)
+        ctl = model.ControllerConfig(
+            version=version, mode=cfg.mode, envs=cfg.envs,
+            node_modes=dict(cfg.node_modes))
         queue.put_nowait(ctl)
         log.info(
             "检测到数据库配置变化，已提交主循环热生效 "
-            "version=%s mode=%s envs=%d", version, cfg.mode, len(cfg.envs))
+            "version=%s mode=%s node_modes=%s envs=%d",
+            version, cfg.mode,
+            ";".join(f"{n}={m}" for n, m in sorted(cfg.node_modes.items())) or "-",
+            len(cfg.envs))
