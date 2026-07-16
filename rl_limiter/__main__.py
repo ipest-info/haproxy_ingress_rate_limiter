@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -19,6 +20,7 @@ from . import config as configmod
 from . import dbconfig
 from . import haproxy, model
 from . import reporter as reportermod
+from . import webconsole
 from .collector import Collector
 from .executor import Executor
 from .governor import Governor
@@ -56,13 +58,19 @@ def _summarize_envs(envs: list[model.EnvQuota]) -> str:
 
 
 async def _amain(cfg, log: logging.Logger,
-                 db_opts: dbconfig.MySQLOptions | None = None) -> None:
+                 db_opts: dbconfig.MySQLOptions | None = None,
+                 console_port: int = 0,
+                 logbuf: "webconsole.LogBuffer | None" = None) -> None:
     """事件循环内的主体：组装组件、引导配置、并发运行快环与配置源/上报器。
 
     db_opts 非 None 表示配置来自 MySQL（数据库配置模式）：额外运行一个
     数据库轮询任务，把 mode/envs 的变化经配置队列热应用到快环——角色上
     等价于管理后台的配置长轮询，两者不会同时启用（数据库配置里没有
     backend 段，reporter 天然关闭）。
+
+    console_port 非 0 时启动内置 Web 控制台（实时观测 + 在线调参，见
+    webconsole 模块）：快环 sampler 每拍向 StatusHub 发布一帧快照，配置
+    热更经中继队列同步给控制台的配置视图。
     """
     # --- 组装与各台 HAProxy 的 runtime API 客户端（v2.0：内网 TCP） ---
     # 客户端字典以节点名为键，与 Target.node / NodeConfig.name 对齐；
@@ -96,13 +104,30 @@ async def _amain(cfg, log: logging.Logger,
             log=log,
         )
 
+    # --- Web 控制台（可选）：StatusHub 是快环数据的发布枢纽。
+    # mode_fn/version_fn 与 reporter 同款延迟求值闭包（ctl 在下方赋值）。
+    ctl: ControlLoop
+    hub: webconsole.StatusHub | None = None
+    if console_port:
+        hub = webconsole.StatusHub(
+            SERVICE_VERSION,
+            mode_fn=lambda: executor_mode(exe),
+            version_fn=lambda: ctl.version)
+
     # Sampler 闭包引用 ctl.version；ctl 在下方完成赋值，而 sampler 只会在
     # ctl.run 的 tick 中被调用——首次调用必然晚于赋值，延迟捕获是安全的。
-    ctl: ControlLoop
+    # 上报器与控制台各自消费同一拍数据，组合成单个回调交给快环。
+    sample_sinks = []
     if rep is not None:
         # 接入后台：每个 tick 的结果交给上报器缓冲，按下发的间隔批量上报。
+        sample_sinks.append(lambda now, usages, decisions: rep.add_sample(
+            now, usages, decisions, executor_mode(exe), ctl.version))
+    if hub is not None:
+        sample_sinks.append(hub.record)
+    if sample_sinks:
         def sampler(now, usages, decisions):
-            rep.add_sample(now, usages, decisions, executor_mode(exe), ctl.version)
+            for sink in sample_sinks:
+                sink(now, usages, decisions)
     else:
         sampler = None
     ctl = ControlLoop(col, gov, exe, sampler=sampler, log=log)
@@ -129,6 +154,8 @@ async def _amain(cfg, log: logging.Logger,
             cache_err = e
         if cached is not None:
             ctl.seed(cached)
+            if hub is not None:
+                hub.update_config(cached)
             seeded = True
             log.info(
                 "已用本地缓存的后台配置完成引导（fail-static，重启前后限速"
@@ -144,8 +171,11 @@ async def _amain(cfg, log: logging.Logger,
         dbconfig.config_checksum(cfg.mode, cfg.envs) if db_opts is not None else 0
     )
     if not seeded and cfg.envs:
-        ctl.seed(model.ControllerConfig(
-            version=seed_version, mode=cfg.mode, envs=cfg.envs))
+        seed_cfg = model.ControllerConfig(
+            version=seed_version, mode=cfg.mode, envs=cfg.envs)
+        ctl.seed(seed_cfg)
+        if hub is not None:
+            hub.update_config(seed_cfg)
         seeded = True
         log.info("已用%s环境配额完成引导 version=%s mode=%s envs=%d envs_detail=%s",
                  "数据库下发的" if db_opts is not None else "本地静态",
@@ -170,23 +200,48 @@ async def _amain(cfg, log: logging.Logger,
         except NotImplementedError:  # pragma: no cover - 非 Unix 平台兜底
             signal.signal(sig, lambda *_a, _n=sig.name: _on_signal(_n))
 
-    # --- 并发运行：快环 + 配置源（数据库轮询或后台上报器，二选一）。
-    # config_queue 是快环的配置入口（配置优先于 tick）：数据库模式下由
-    # 轮询任务投递内容变化；后台模式下由上报器的长轮询投递下发配置。
-    config_queue: asyncio.Queue | None = None
+    # --- 并发运行：快环 + 配置源（数据库轮询或后台上报器，二选一）+
+    # 可选的 Web 控制台。config_queue 是快环的配置入口（配置优先于 tick）：
+    # 数据库模式下由轮询任务投递内容变化；后台模式下由上报器的长轮询投递。
     tick_interval_s = getattr(cfg, "tick_interval_s", 1.0) or 1.0
     tasks: list[asyncio.Task] = []
+
+    source_queue: asyncio.Queue | None = None
     if db_opts is not None:
-        config_queue = asyncio.Queue()
-        tasks.append(asyncio.create_task(
-            dbconfig.watch(db_opts, config_queue, cfg, log),
-            name="db-config-watch"))
+        source_queue = asyncio.Queue()
     elif rep is not None:
-        config_queue = rep.configs
-    tasks.insert(0, asyncio.create_task(
+        source_queue = rep.configs
+
+    # 控制台需要跟随配置热更（配额参考线、参数展示）：在源队列与快环
+    # 之间加一级中继，把每份新配置先喂给 hub 再原样转投快环——配置视图
+    # 与快环实际应用的内容出自同一份对象，永不发散。无控制台时直连。
+    config_queue = source_queue
+    if hub is not None and source_queue is not None:
+        relay_queue: asyncio.Queue = asyncio.Queue()
+
+        async def _config_relay(src: asyncio.Queue, dst: asyncio.Queue):
+            while True:
+                c = await src.get()
+                hub.update_config(c)
+                dst.put_nowait(c)
+
+        tasks.append(asyncio.create_task(
+            _config_relay(source_queue, relay_queue),
+            name="console-config-relay"))
+        config_queue = relay_queue
+
+    tasks.append(asyncio.create_task(
         ctl.run(config_queue, tick_interval_s), name="control-loop"))
+    if db_opts is not None:
+        tasks.append(asyncio.create_task(
+            dbconfig.watch(db_opts, source_queue, cfg, log),
+            name="db-config-watch"))
     if rep is not None:
         tasks.append(asyncio.create_task(rep.run(), name="reporter"))
+    if hub is not None:
+        tasks.append(asyncio.create_task(
+            webconsole.run_console(console_port, hub, logbuf, db_opts, log),
+            name="web-console"))
 
     log.info("rl-limiter 服务已启动，快环与上报器开始运行 "
              "node_id=%s mode=%s nodes=%d backend=%s version=%s",
@@ -240,6 +295,26 @@ def main() -> None:
     )
     log = logging.getLogger("rl_limiter")
 
+    # 内置 Web 控制台（可选）：设置 RL_CONSOLE_PORT 即启用。日志环形缓冲
+    # 在这里（配置加载之前）就挂上根 logger，启动阶段的日志也能在页面回看。
+    console_port = 0
+    raw_console = (os.environ.get("RL_CONSOLE_PORT") or "").strip()
+    if raw_console:
+        try:
+            console_port = int(raw_console)
+        except ValueError:
+            print(f"rl-limiter: 环境变量 RL_CONSOLE_PORT 必须是整数，"
+                  f"当前值 {raw_console!r}", file=sys.stderr)
+            raise SystemExit(1)
+        if console_port < 1 or console_port > 65535:
+            print(f"rl-limiter: 环境变量 RL_CONSOLE_PORT 必须在 1-65535 "
+                  f"范围内，当前值 {console_port}", file=sys.stderr)
+            raise SystemExit(1)
+    logbuf: webconsole.LogBuffer | None = None
+    if console_port:
+        logbuf = webconsole.LogBuffer()
+        logging.getLogger().addHandler(logbuf)
+
     # 配置来源判定：RL_MYSQL_HOST 已设置 → 数据库配置模式；否则本地 YAML。
     try:
         db_opts = dbconfig.from_env()
@@ -288,7 +363,8 @@ def main() -> None:
     )
 
     try:
-        asyncio.run(_amain(cfg, log, db_opts))
+        asyncio.run(_amain(cfg, log, db_opts,
+                           console_port=console_port, logbuf=logbuf))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
     log.info("rl-limiter 服务已停止")

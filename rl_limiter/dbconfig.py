@@ -369,6 +369,91 @@ async def load_service_config(
             await asyncio.sleep(min(STARTUP_RETRY_INTERVAL_S, remaining))
 
 
+# ---- 配置写回（Web 控制台的"调参"落点）--------------------------------
+#
+# 控制台的所有参数修改都写数据库而不是直接改进程内存：MySQL 是配置的
+# 唯一事实源，写库后由 watch 的既有轮询链路热生效——页面看到的参数
+# 永远与库一致，重启也不丢，且天然复用统一校验管线（写坏的参数会在
+# 下一轮 fetch 被拒绝并 fail-static，绝不会让坏配置进入快环）。
+
+async def _exec_write(opts: MySQLOptions, sql: str, args: tuple) -> int:
+    """执行一条写语句并提交，返回**匹配**行数（FOUND_ROWS 口径）。
+
+    必须用 FOUND_ROWS 而不是默认的"实际改变行数"：把配额 UPDATE 成与
+    当前相同的值时默认口径返回 0，会被调用方误判为"环境不存在"。
+    """
+    import aiomysql  # 延迟导入，理由见 _fetch_raw
+    from pymysql.constants import CLIENT  # pymysql 是 aiomysql 的既有依赖
+
+    async with asyncio.timeout(FETCH_TIMEOUT_S):
+        conn = await aiomysql.connect(
+            host=opts.host, port=opts.port, user=opts.user,
+            password=opts.password, db=opts.database,
+            connect_timeout=opts.connect_timeout_s,
+            charset="utf8mb4", autocommit=False,
+            client_flag=CLIENT.FOUND_ROWS,
+        )
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, args)
+                rowcount = cur.rowcount
+            await conn.commit()
+        finally:
+            conn.close()
+    return rowcount
+
+
+async def update_mode(opts: MySQLOptions, mode: str) -> None:
+    """热切换运行模式（dry-run/enforce）。非法值在这里就拦下，不落库。"""
+    if mode not in (model.MODE_DRY_RUN, model.MODE_ENFORCE):
+        raise ValueError(
+            f"mode 值非法：{mode!r}，必须是 {model.MODE_DRY_RUN!r} 或 "
+            f"{model.MODE_ENFORCE!r}")
+    await _exec_write(
+        opts, "UPDATE service_config SET mode = %s WHERE id = 1", (mode,))
+
+
+async def update_env_quota(opts: MySQLOptions, env_id: str, quota_bps: int) -> None:
+    """更新环境配额（bits/s，运维口径）。环境不存在按错误报出，
+    而不是静默 0 行更新——控制台上的拼写错误必须立刻可见。"""
+    if quota_bps <= 0:
+        raise ValueError(f"quota_bps 必须 > 0（比特每秒），当前值 {quota_bps!r}")
+    n = await _exec_write(
+        opts, "UPDATE envs SET quota_bps = %s WHERE env_id = %s",
+        (int(quota_bps), env_id))
+    if n == 0:
+        raise ValueError(f"环境 {env_id!r} 不存在于 envs 表")
+
+
+async def update_env_params(
+    opts: MySQLOptions, env_id: str, params: dict[str, Any] | None,
+) -> None:
+    """更新环境的快环参数覆盖（None 表示清除覆盖、回到默认参数）。
+
+    键集合与数值先在这里按 GovParams 校验（未知键/非数值直接拒绝），
+    避免把"下一轮 fetch 才发现的坏 JSON"写进库触发 fail-static 告警。
+    """
+    params_json: str | None = None
+    if params is not None:
+        if not isinstance(params, dict):
+            raise ValueError(
+                f"params 必须是键值映射或 null，当前为 {type(params).__name__}")
+        allowed = set(model.GovParams.__dataclass_fields__)
+        unknown = sorted(set(params) - allowed)
+        if unknown:
+            raise ValueError(
+                f"params 含未知键 {unknown}，可用键：{sorted(allowed)}")
+        for k, v in params.items():
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(f"params.{k} 必须是数值，当前值 {v!r}")
+        params_json = json.dumps(params, ensure_ascii=False)
+    n = await _exec_write(
+        opts, "UPDATE envs SET params_json = %s WHERE env_id = %s",
+        (params_json, env_id))
+    if n == 0:
+        raise ValueError(f"环境 {env_id!r} 不存在于 envs 表")
+
+
 async def watch(
     opts: MySQLOptions,
     queue: "asyncio.Queue[model.ControllerConfig]",

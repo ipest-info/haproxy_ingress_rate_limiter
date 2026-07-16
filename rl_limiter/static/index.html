@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rl-limiter 控制台</title>
+<style>
+/* ---- 主题令牌（亮/暗双模式，调色板经 dataviz 校验器验证） ---- */
+:root {
+  color-scheme: light dark;
+  --surface-0: #f4f4f2;      /* 页面底 */
+  --surface-1: #fcfcfb;      /* 卡片面（图表 surface） */
+  --border:    #e2e1dd;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #8a8983;
+  --series-rate:   #2a78d6;  /* 实时速率（slot1 blue） */
+  --series-mean:   #008300;  /* 10s 均值（slot2 green） */
+  --series-bwlim:  #e87ba4;  /* 整形值（slot3 magenta，亮面低对比 → 图例+悬浮直标兜底） */
+  --ref-quota:     #52514e;  /* 配额参考线（中性，非序列色） */
+  --status-good:     #0ca30c;
+  --status-warning:  #fab219;
+  --status-serious:  #ec835a;
+  --status-critical: #d03b3b;
+  --grid: rgba(0,0,0,.07);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --border:    #33332f;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #85847c;
+    --series-rate:  #3987e5;
+    --series-mean:  #008300;
+    --series-bwlim: #d55181;
+    --ref-quota:    #c3c2b7;
+    --grid: rgba(255,255,255,.08);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--surface-0); color: var(--text-primary);
+  font: 14px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+}
+header {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;
+  padding: 12px 20px; background: var(--surface-1);
+  border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 5;
+}
+header h1 { font-size: 16px; margin: 0 8px 0 0; }
+.meta { color: var(--text-secondary); font-size: 12.5px; }
+.meta b { color: var(--text-primary); font-weight: 600; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: 1px; }
+.badge {
+  display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px;
+  border-radius: 999px; border: 1px solid var(--border); font-size: 12.5px;
+  color: var(--text-secondary); background: transparent;
+}
+main { max-width: 1180px; margin: 0 auto; padding: 16px 20px 40px; }
+.card {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px; margin-bottom: 16px;
+}
+.card h2 { font-size: 15px; margin: 0; }
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.stats { display: flex; flex-wrap: wrap; gap: 6px 22px; margin: 10px 0 2px; }
+.stat .k { font-size: 12px; color: var(--text-muted); }
+.stat .v { font-size: 17px; font-variant-numeric: tabular-nums; font-weight: 600; }
+.stat .u { font-size: 12px; color: var(--text-secondary); font-weight: 400; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 10px 0 4px; font-size: 12.5px; color: var(--text-secondary); }
+.legend .chip { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: 3px; margin-right: 6px; }
+.legend .val { color: var(--text-primary); font-variant-numeric: tabular-nums; margin-left: 4px; }
+.chart-wrap { position: relative; }
+canvas.chart { display: block; width: 100%; height: 230px; cursor: crosshair; }
+.tooltip {
+  position: absolute; pointer-events: none; display: none; z-index: 3;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.18);
+  min-width: 170px;
+}
+.tooltip .t { color: var(--text-muted); margin-bottom: 4px; }
+.tooltip .r { display: flex; justify-content: space-between; gap: 14px; }
+.tooltip .r .n { color: var(--text-secondary); }
+.tooltip .r .v { font-variant-numeric: tabular-nums; color: var(--text-primary); }
+.controls { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-top: 10px; }
+input[type=number], textarea, select {
+  background: var(--surface-0); color: var(--text-primary);
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font: inherit;
+}
+input[type=number] { width: 110px; }
+button {
+  background: var(--surface-0); color: var(--text-primary); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 14px; font: inherit; cursor: pointer;
+}
+button:hover { border-color: var(--text-muted); }
+button.primary { background: var(--series-rate); border-color: var(--series-rate); color: #fff; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+details.params { margin-top: 10px; font-size: 13px; }
+details.params summary { cursor: pointer; color: var(--text-secondary); }
+details.params textarea { width: 100%; min-height: 84px; margin-top: 8px; font-family: ui-monospace, monospace; font-size: 12.5px; }
+.hint { font-size: 12px; color: var(--text-muted); }
+.state { font-weight: 600; }
+/* 日志面板 */
+.logbox { max-height: 320px; overflow: auto; margin-top: 10px; font: 12px/1.55 ui-monospace, Menlo, Consolas, monospace; }
+.logbox table { width: 100%; border-collapse: collapse; }
+.logbox td { padding: 1px 8px 1px 0; vertical-align: top; white-space: nowrap; }
+.logbox td.msg { white-space: pre-wrap; word-break: break-all; }
+.logbox tr.WARNING td { color: var(--status-warning); }
+.logbox tr.ERROR td, .logbox tr.CRITICAL td { color: var(--status-critical); }
+.lvlbtn.off { opacity: .4; }
+.toast {
+  position: fixed; right: 18px; bottom: 18px; z-index: 9; display: none;
+  background: var(--surface-1); border: 1px solid var(--border); border-left: 4px solid var(--status-good);
+  border-radius: 8px; padding: 10px 14px; max-width: 420px; box-shadow: 0 6px 20px rgba(0,0,0,.25);
+}
+.toast.err { border-left-color: var(--status-critical); }
+</style>
+</head>
+<body>
+<header>
+  <h1>rl-limiter 控制台</h1>
+  <span class="badge" id="sse-badge"><span class="dot" id="sse-dot" style="background:var(--status-critical)"></span><span id="sse-text">连接中…</span></span>
+  <span class="badge">模式 <b id="mode-text">–</b> <button id="mode-btn" style="padding:1px 8px;font-size:12px">切换</button></span>
+  <span class="meta">配置版本 <b id="cfg-version">–</b></span>
+  <span class="meta">运行时长 <b id="uptime">–</b></span>
+  <span class="meta">服务版本 <b id="svc-version">–</b></span>
+  <span class="meta">窗口
+    <select id="window-sel">
+      <option value="60">1 分钟</option>
+      <option value="300" selected>5 分钟</option>
+      <option value="600">10 分钟</option>
+    </select>
+  </span>
+</header>
+<main>
+  <div id="envs"></div>
+  <div class="card">
+    <div class="row">
+      <h2>运行日志</h2>
+      <span id="lvl-filters">
+        <button class="lvlbtn" data-lvl="INFO">INFO</button>
+        <button class="lvlbtn" data-lvl="WARNING">WARNING</button>
+        <button class="lvlbtn" data-lvl="ERROR">ERROR</button>
+      </span>
+      <label class="hint"><input type="checkbox" id="log-follow" checked> 自动滚动</label>
+    </div>
+    <div class="logbox"><table id="log-table"></table></div>
+  </div>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+/* ================= 工具 ================= */
+const $ = (sel, el) => (el || document).querySelector(sel);
+const mbps = b => b == null ? null : b * 8 / 1e6;          // bytes/s → Mbps
+const fmtMbps = v => v == null ? "–" : (v >= 100 ? v.toFixed(0) : v.toFixed(1));
+const fmtTime = ts => new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour12: false });
+const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+const STATE_LABEL = { normal: "常态", tightening: "收紧中", recovering: "恢复中" };
+const STATE_COLOR = { normal: "--status-good", tightening: "--status-serious", recovering: "--status-warning" };
+
+function toast(msg, isErr) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "toast" + (isErr ? " err" : "");
+  t.style.display = "block";
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => { t.style.display = "none"; }, 4000);
+}
+
+async function apiPut(path, body) {
+  const resp = await fetch(path, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
+  return data;
+}
+
+/* ================= 全局状态 ================= */
+const state = {
+  windowS: 300,
+  envs: new Map(),        // env_id → { card, buf: [snapEnv+ts...], counters }
+  envConfig: {},
+  mode: null,
+  logsAfter: 0,
+  lvlOn: { DEBUG: true, INFO: true, WARNING: true, ERROR: true, CRITICAL: true },
+};
+
+/* ================= 环境卡片 ================= */
+function envCard(envId) {
+  let e = state.envs.get(envId);
+  if (e) return e;
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `
+    <div class="row">
+      <h2>环境 <span class="env-name"></span></h2>
+      <span class="badge"><span class="dot state-dot"></span><span class="state">–</span></span>
+      <span class="badge degraded" style="display:none"><span class="dot" style="background:var(--status-critical)"></span>节点失联（fail-static）</span>
+      <span class="meta">挂载点 <b class="targets">–</b></span>
+    </div>
+    <div class="stats">
+      <span class="stat"><div class="k">实时速率</div><div class="v rate">–<span class="u"> Mbps</span></div></span>
+      <span class="stat"><div class="k">10s 均值（计费口径）</div><div class="v mean">–<span class="u"> Mbps</span></div></span>
+      <span class="stat"><div class="k">配额</div><div class="v quota">–<span class="u"> Mbps</span></div></span>
+      <span class="stat"><div class="k">当前整形值</div><div class="v bwlim">–<span class="u"> Mbps</span></div></span>
+      <span class="stat"><div class="k">利用率（均值/配额）</div><div class="v util">–<span class="u"> %</span></div></span>
+      <span class="stat"><div class="k">并发连接</div><div class="v conn">–</div></span>
+      <span class="stat"><div class="k">收紧次数<span class="u">（本页）</span></div><div class="v tightens">0</div></span>
+      <span class="stat"><div class="k">超配额秒数<span class="u">（本页）</span></div><div class="v oversecs">0</div></span>
+    </div>
+    <div class="legend">
+      <span><span class="chip" style="background:var(--series-rate)"></span>实时速率<span class="val l-rate">–</span></span>
+      <span><span class="chip" style="background:var(--series-mean)"></span>10s 均值<span class="val l-mean">–</span></span>
+      <span><span class="chip" style="background:var(--series-bwlim)"></span>整形值<span class="val l-bwlim">–</span></span>
+      <span><span class="chip" style="background:var(--ref-quota);height:0;border-top:2px dashed var(--ref-quota)"></span>配额<span class="val l-quota">–</span></span>
+      <span class="hint">单位 Mbps</span>
+    </div>
+    <div class="chart-wrap">
+      <canvas class="chart"></canvas>
+      <div class="tooltip"></div>
+    </div>
+    <div class="controls">
+      <label>配额 <input type="number" class="quota-in" min="1" step="1"> Mbps</label>
+      <button class="primary quota-apply">应用配额</button>
+      <span class="hint">写入 MySQL，一个轮询周期内热生效</span>
+    </div>
+    <details class="params">
+      <summary>AIMD 参数覆盖（JSON，留空 = 清除覆盖用默认值）</summary>
+      <textarea class="params-in" spellcheck="false"></textarea>
+      <div class="controls">
+        <button class="params-apply">保存参数</button>
+        <span class="hint">可用键：elastic_ceiling / low_watermark / tighten_after_s / recover_after_s / md_factor / tighten_floor / ai_step_frac</span>
+      </div>
+    </details>`;
+  $(".env-name", card).textContent = envId;
+  $("#envs").appendChild(card);
+
+  e = { id: envId, card, buf: [], tightens: 0, overSecs: 0, lastState: null, tooltipIdx: -1 };
+  state.envs.set(envId, e);
+
+  $(".quota-apply", card).onclick = async () => {
+    const v = parseFloat($(".quota-in", card).value);
+    if (!(v > 0)) return toast("配额必须是 > 0 的数值（Mbps）", true);
+    try {
+      const r = await apiPut(`/api/envs/${encodeURIComponent(envId)}/quota`, { quota_bps: Math.round(v * 1e6) });
+      toast(`配额已提交为 ${v} Mbps；${r.note}`);
+    } catch (err) { toast("配额修改失败：" + err.message, true); }
+  };
+  $(".params-apply", card).onclick = async () => {
+    const raw = $(".params-in", card).value.trim();
+    let params = null;
+    if (raw) {
+      try { params = JSON.parse(raw); }
+      catch (err) { return toast("参数 JSON 解析失败：" + err.message, true); }
+    }
+    try {
+      const r = await apiPut(`/api/envs/${encodeURIComponent(envId)}/params`, { params });
+      toast(`参数覆盖已提交；${r.note}`);
+    } catch (err) { toast("参数修改失败：" + err.message, true); }
+  };
+
+  const canvas = $("canvas.chart", card);
+  canvas.addEventListener("mousemove", ev => {
+    const rect = canvas.getBoundingClientRect();
+    e.tooltipX = ev.clientX - rect.left;
+    drawChart(e);
+  });
+  canvas.addEventListener("mouseleave", () => { e.tooltipX = null; drawChart(e); });
+  new ResizeObserver(() => drawChart(e)).observe(canvas);
+  return e;
+}
+
+/* ================= 快照消费 ================= */
+function applySnapshot(snap, isLive) {
+  $("#mode-text").textContent = snap.mode || "–";
+  $("#cfg-version").textContent = snap.config_version ?? "–";
+  state.mode = snap.mode;
+  for (const [envId, d] of Object.entries(snap.envs || {})) {
+    const e = envCard(envId);
+    e.buf.push({ ts: snap.ts, ...d });
+    const cutoff = snap.ts - 660;                      // 略多于最大窗口
+    while (e.buf.length && e.buf[0].ts < cutoff) e.buf.shift();
+    if (isLive) {
+      if (d.state === "tightening" && e.lastState !== "tightening") e.tightens++;
+      if (d.quota_bytes_per_s && d.mean10_bytes_per_s > d.quota_bytes_per_s) e.overSecs++;
+      e.lastState = d.state;
+      updateCard(e, d);
+      drawChart(e);
+    }
+  }
+}
+
+function updateCard(e, d) {
+  const c = e.card;
+  $(".rate", c).firstChild.nodeValue = fmtMbps(mbps(d.rate_bytes_per_s));
+  $(".mean", c).firstChild.nodeValue = fmtMbps(mbps(d.mean10_bytes_per_s));
+  $(".quota", c).firstChild.nodeValue = fmtMbps(mbps(d.quota_bytes_per_s));
+  $(".bwlim", c).firstChild.nodeValue = fmtMbps(mbps(d.bwlim_bytes_per_s));
+  const util = d.quota_bytes_per_s ? d.mean10_bytes_per_s / d.quota_bytes_per_s * 100 : null;
+  $(".util", c).firstChild.nodeValue = util == null ? "–" : util.toFixed(0);
+  $(".conn", c).firstChild.nodeValue = d.conn ?? "–";
+  $(".tightens", c).textContent = e.tightens;
+  $(".oversecs", c).textContent = e.overSecs;
+  $(".l-rate", c).textContent = fmtMbps(mbps(d.rate_bytes_per_s));
+  $(".l-mean", c).textContent = fmtMbps(mbps(d.mean10_bytes_per_s));
+  $(".l-bwlim", c).textContent = fmtMbps(mbps(d.bwlim_bytes_per_s));
+  $(".l-quota", c).textContent = fmtMbps(mbps(d.quota_bytes_per_s));
+  const st = $(".state", c), dot = $(".state-dot", c);
+  st.textContent = STATE_LABEL[d.state] || d.state || "–";
+  dot.style.background = `var(${STATE_COLOR[d.state] || "--text-muted"})`;
+  $(".degraded", c).style.display = d.degraded ? "" : "none";
+  const conf = state.envConfig[e.id];
+  if (conf) {
+    $(".targets", c).textContent = (conf.targets || []).join(" | ") || "–";
+    const qin = $(".quota-in", c);
+    if (document.activeElement !== qin) qin.value = (conf.quota_bps / 1e6).toString();
+    const pin = $(".params-in", c);
+    if (document.activeElement !== pin && !pin._touched) {
+      pin.value = conf.params ? JSON.stringify(conf.params, null, 2) : "";
+    }
+  }
+}
+
+/* ================= 图表（canvas 折线：2px 线、隐性网格、悬浮十字线+提示） ================= */
+const SERIES = [
+  { key: "rate_bytes_per_s",   name: "实时速率", varName: "--series-rate" },
+  { key: "mean10_bytes_per_s", name: "10s 均值",  varName: "--series-mean" },
+  { key: "bwlim_bytes_per_s",  name: "整形值",    varName: "--series-bwlim" },
+];
+const PAD = { l: 46, r: 10, t: 8, b: 20 };
+
+function drawChart(e) {
+  const canvas = $("canvas.chart", e.card);
+  const tipEl = $(".tooltip", e.card);
+  const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
+  if (!cssW) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== cssW * dpr) { canvas.width = cssW * dpr; canvas.height = cssH * dpr; }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const now = e.buf.length ? e.buf[e.buf.length - 1].ts : Date.now() / 1000;
+  const t0 = now - state.windowS;
+  const pts = e.buf.filter(p => p.ts >= t0);
+  const plotW = cssW - PAD.l - PAD.r, plotH = cssH - PAD.t - PAD.b;
+
+  // y 轴上界：各序列与配额的最大值 × 1.15，最低 1 Mbps。
+  let yMax = 1;
+  for (const p of pts) {
+    for (const s of SERIES) yMax = Math.max(yMax, mbps(p[s.key]) || 0);
+    yMax = Math.max(yMax, mbps(p.quota_bytes_per_s) || 0);
+  }
+  yMax *= 1.15;
+  const X = ts => PAD.l + (ts - t0) / state.windowS * plotW;
+  const Y = v => PAD.t + plotH - v / yMax * plotH;
+
+  // 网格与坐标标签（隐性：细线、次要墨色）。
+  ctx.strokeStyle = cssVar("--grid"); ctx.lineWidth = 1;
+  ctx.fillStyle = cssVar("--text-muted"); ctx.font = "11px sans-serif";
+  const ySteps = 4;
+  for (let i = 0; i <= ySteps; i++) {
+    const v = yMax / ySteps * i, y = Y(v);
+    ctx.beginPath(); ctx.moveTo(PAD.l, y); ctx.lineTo(cssW - PAD.r, y); ctx.stroke();
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    ctx.fillText(fmtMbps(v), PAD.l - 6, y);
+  }
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let i = 0; i <= 4; i++) {
+    const ts = t0 + state.windowS / 4 * i;
+    ctx.fillText(fmtTime(ts), X(ts), PAD.t + plotH + 5);
+  }
+
+  if (pts.length >= 2) {
+    // 配额参考线（虚线、中性色）。
+    const q = mbps(pts[pts.length - 1].quota_bytes_per_s);
+    if (q) {
+      ctx.save();
+      ctx.strokeStyle = cssVar("--ref-quota"); ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(PAD.l, Y(q)); ctx.lineTo(cssW - PAD.r, Y(q)); ctx.stroke();
+      ctx.restore();
+    }
+    // 数据序列：2px 折线。
+    for (const s of SERIES) {
+      ctx.strokeStyle = cssVar(s.varName); ctx.lineWidth = 2;
+      ctx.beginPath();
+      let started = false;
+      for (const p of pts) {
+        const v = mbps(p[s.key]);
+        if (v == null) { started = false; continue; }
+        const x = X(p.ts), y = Y(v);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  }
+
+  // 悬浮层：十字线 + 全序列提示（dataviz：折线图默认带 crosshair+tooltip）。
+  if (e.tooltipX != null && pts.length) {
+    const tsAt = t0 + (e.tooltipX - PAD.l) / plotW * state.windowS;
+    let best = null;
+    for (const p of pts) if (!best || Math.abs(p.ts - tsAt) < Math.abs(best.ts - tsAt)) best = p;
+    if (best && e.tooltipX >= PAD.l && e.tooltipX <= cssW - PAD.r) {
+      const x = X(best.ts);
+      ctx.strokeStyle = cssVar("--text-muted"); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, PAD.t + plotH); ctx.stroke();
+      for (const s of SERIES) {
+        const v = mbps(best[s.key]);
+        if (v == null) continue;
+        ctx.fillStyle = cssVar(s.varName);
+        ctx.beginPath(); ctx.arc(x, Y(v), 3.5, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = cssVar("--surface-1"); ctx.lineWidth = 2; ctx.stroke(); // 2px surface ring
+      }
+      const rows = SERIES.map(s =>
+        `<div class="r"><span class="n"><span class="chip" style="background:${cssVar(s.varName)};display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:5px;vertical-align:2px"></span>${s.name}</span><span class="v">${fmtMbps(mbps(best[s.key]))} Mbps</span></div>`).join("");
+      tipEl.innerHTML = `<div class="t">${fmtTime(best.ts)} · 连接 ${best.conn ?? "–"} · ${STATE_LABEL[best.state] || best.state || "–"}</div>${rows}
+        <div class="r"><span class="n">配额</span><span class="v">${fmtMbps(mbps(best.quota_bytes_per_s))} Mbps</span></div>`;
+      tipEl.style.display = "block";
+      const wrapW = canvas.clientWidth;
+      tipEl.style.left = Math.min(x + 12, wrapW - tipEl.offsetWidth - 4) + "px";
+      tipEl.style.top = "12px";
+    } else tipEl.style.display = "none";
+  } else tipEl.style.display = "none";
+}
+
+/* ================= SSE 与数据加载 ================= */
+function setSse(ok, text) {
+  $("#sse-dot").style.background = ok ? "var(--status-good)" : "var(--status-critical)";
+  $("#sse-text").textContent = text;
+}
+
+async function loadOverview() {
+  const r = await fetch("/api/overview"); const o = await r.json();
+  state.envConfig = o.env_config || {};
+  $("#svc-version").textContent = o.service_version || "–";
+  $("#mode-text").textContent = o.mode || "–";
+  $("#cfg-version").textContent = o.config_version ?? "–";
+  state.mode = o.mode;
+  const up = Math.floor(o.uptime_s || 0);
+  $("#uptime").textContent = up >= 3600 ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
+}
+
+async function bootstrap() {
+  await loadOverview();
+  const r = await fetch("/api/history"); const h = await r.json();
+  for (const snap of h.snapshots || []) applySnapshot(snap, false);
+  for (const e of state.envs.values()) {
+    const last = e.buf[e.buf.length - 1];
+    if (last) { e.lastState = last.state; updateCard(e, last); drawChart(e); }
+  }
+  const es = new EventSource("/api/stream");
+  es.onopen = () => setSse(true, "实时连接");
+  es.onerror = () => setSse(false, "已断开，自动重连…");
+  es.onmessage = ev => applySnapshot(JSON.parse(ev.data), true);
+}
+
+/* ================= 模式切换 ================= */
+$("#mode-btn").onclick = async () => {
+  const target = state.mode === "enforce" ? "dry-run" : "enforce";
+  const warn = target === "enforce"
+    ? "切换到 enforce 将真实下发限速值到 HAProxy，确认？"
+    : "切换到 dry-run 后停止更新限速值（已下发的整形值将继续生效，fail-static），确认？";
+  if (!confirm(warn)) return;
+  try {
+    const r = await apiPut("/api/mode", { mode: target });
+    toast(`模式已提交为 ${target}；${r.note}`);
+  } catch (err) { toast("模式切换失败：" + err.message, true); }
+};
+
+/* ================= 日志 ================= */
+for (const btn of document.querySelectorAll(".lvlbtn")) {
+  btn.onclick = () => {
+    const lvl = btn.dataset.lvl;
+    state.lvlOn[lvl] = !state.lvlOn[lvl];
+    btn.classList.toggle("off", !state.lvlOn[lvl]);
+    for (const tr of $("#log-table").querySelectorAll("tr." + lvl)) {
+      tr.style.display = state.lvlOn[lvl] ? "" : "none";
+    }
+  };
+}
+async function pollLogs() {
+  try {
+    const r = await fetch(`/api/logs?after=${state.logsAfter}`);
+    const { logs } = await r.json();
+    if (logs && logs.length) {
+      const table = $("#log-table");
+      for (const e of logs) {
+        state.logsAfter = Math.max(state.logsAfter, e.seq);
+        const lvl = e.level === "CRITICAL" ? "ERROR" : e.level;
+        const tr = document.createElement("tr");
+        tr.className = e.level;
+        tr.style.display = state.lvlOn[lvl] === false ? "none" : "";
+        tr.innerHTML = `<td>${fmtTime(e.ts)}</td><td>${e.level}</td><td class="msg"></td>`;
+        tr.querySelector(".msg").textContent = e.msg;
+        table.appendChild(tr);
+      }
+      while (table.rows.length > 600) table.deleteRow(0);
+      if ($("#log-follow").checked) {
+        const box = table.closest(".logbox");
+        box.scrollTop = box.scrollHeight;
+      }
+    }
+  } catch (_) { /* 断线由 SSE 徽标提示，这里静默等下一轮 */ }
+  setTimeout(pollLogs, 2000);
+}
+
+/* ================= 启动 ================= */
+$("#window-sel").onchange = ev => {
+  state.windowS = parseInt(ev.target.value, 10);
+  for (const e of state.envs.values()) drawChart(e);
+};
+document.addEventListener("input", ev => {
+  if (ev.target.classList && ev.target.classList.contains("params-in")) ev.target._touched = true;
+});
+setInterval(loadOverview, 10000);
+bootstrap().catch(err => toast("初始化失败：" + err.message, true));
+pollLogs();
+</script>
+</body>
+</html>

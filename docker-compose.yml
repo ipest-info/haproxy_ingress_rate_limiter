@@ -61,7 +61,7 @@ services:
       - web
     restart: unless-stopped
 
-  # ---- 控制面：rl-limiter（配置来自 MySQL，轮询热更新）----
+  # ---- 控制面：rl-limiter（配置来自 MySQL，轮询热更新；内置 Web 控制台）----
   rl-limiter:
     build: .
     environment:
@@ -71,6 +71,10 @@ services:
       RL_MYSQL_PASSWORD: rl_pass
       RL_MYSQL_DB: rl_limiter
       RL_MYSQL_POLL_S: "3"
+      # 内置 Web 控制台：实时带宽/连接数/AIMD 状态曲线 + 在线调参 + 日志。
+      RL_CONSOLE_PORT: "8090"
+    ports:
+      - "8090:8090"   # 控制台（浏览器打开 http://localhost:8090）
     depends_on:
       mysql:
         condition: service_healthy

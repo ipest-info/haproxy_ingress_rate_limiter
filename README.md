@@ -29,6 +29,7 @@ rl_limiter/       # Python 3.11 + asyncio 集中限速服务
   reporter.py     #   管理后台长轮询/上报/心跳、fail-static 缓存
   config.py       #   配置解析与校验（YAML 与数据库共用同一管线）
   dbconfig.py     #   MySQL 配置源（启动加载 + 轮询热更新，RL_MYSQL_* 接线）
+  webconsole.py   #   内置 Web 控制台（实时曲线/在线调参/日志，RL_CONSOLE_PORT 启用）
   loop.py         #   1s 主循环
 tools/            # fake_haproxy.py（联调假节点）、mock_backend.py（后台桩）
                   # random_web.py（随机大小响应的模拟后端）、loadgen.py（可调并发压测）
@@ -56,6 +57,8 @@ make test       # 全量单元测试
 
 make demo-up    # docker compose 一键演示：MySQL 配置 + 真实 HAProxy 整形
                 # + 随机大小响应后端 + 可调并发压测（玩法见 docs/04）
+                # 浏览器打开 http://localhost:8090 进入 Web 控制台：
+                # 实时带宽/连接数/AIMD 状态曲线 + 在线调参 + 日志
 make demo-logs  # 观察 rl-limiter 决策与 loadgen 吞吐被压回配额的过程
 make demo-down  # 收场（含 MySQL 数据卷）
 ```

@@ -29,7 +29,7 @@
 | `mysql` | 配置库（表结构与种子数据：`deploy/mysql/init.sql`） | `127.0.0.1:3306` |
 | `haproxy` | 真实 HAProxy 2.8，`fe_env_a` 整形入口（配置：`deploy/docker/haproxy.cfg`） | `8080` |
 | `web` | 模拟业务后端，每次请求返回 256 KiB～2 MiB 随机大小响应（`tools/random_web.py`） | 无 |
-| `rl-limiter` | 限速服务，配置来自 MySQL（`RL_MYSQL_*` 环境变量接线），enforce 模式 | 无 |
+| `rl-limiter` | 限速服务，配置来自 MySQL（`RL_MYSQL_*` 环境变量接线），enforce 模式；内置 Web 控制台 | `8090`（控制台） |
 | `loadgen` | 压测服务，N 个并发 worker 持续打流，并发数可在线调节（`tools/loadgen.py`） | `8081`（控制口） |
 
 演示种子配额：环境 `env-a` = **80 Mbps**（10 MB/s 下行）。
@@ -51,6 +51,36 @@ docker compose logs -f loadgen      # 看吞吐被压回配额的过程
 对应地，`docker compose logs -f rl-limiter` 能看到采样/决策/写 map 的
 全过程（收紧时有"整形值已写入节点 map"日志）。宿主机也可以直接体验：
 `curl -o /dev/null http://localhost:8080/`。
+
+## Web 控制台（实时观测 + 在线调参）
+
+浏览器打开 **http://localhost:8090**（rl-limiter 内置，`RL_CONSOLE_PORT`
+启用，无需额外服务）：
+
+- **实时曲线**：每个环境一张图，实时速率 / 10s 均值（计费口径）/ 整形值
+  三条线与配额虚线画在同一条 1s 粒度的时间轴上——曲线被压在配额线下
+  即限速生效的直接证据；悬浮显示十字线与各序列数值；窗口可切 1/5/10 分钟；
+- **生效证据计数**：AIMD 状态徽标（常态/收紧中/恢复中）、收紧次数、
+  超配额秒数、利用率（均值/配额）、并发连接数、节点失联标记；
+- **在线调参**：配额（Mbps）、dry-run/enforce 切换、AIMD 参数覆盖
+  （JSON）。所有修改**写入 MySQL**（配置唯一事实源），经既有轮询链路
+  在一个轮询周期内热生效——页面显示的参数永远与库一致；
+- **运行日志**：最近 1000 条结构化日志增量流式展示，按级别过滤。
+
+对应的 HTTP API（页面之外也可脚本化调用）：
+
+```bash
+curl http://localhost:8090/api/overview            # 最新状态 + 配置视图
+curl http://localhost:8090/api/history             # 最近 10 分钟逐拍快照
+curl -N http://localhost:8090/api/stream           # SSE 实时流（每拍一帧）
+curl http://localhost:8090/api/logs?after=0        # 日志增量拉取
+curl -X PUT http://localhost:8090/api/envs/env-a/quota -d '{"quota_bps": 40000000}'
+curl -X PUT http://localhost:8090/api/mode -d '{"mode": "dry-run"}'
+curl -X PUT http://localhost:8090/api/envs/env-a/params -d '{"params": {"md_factor": 0.8}}'
+```
+
+安全提示：控制台无鉴权，定位与 HAProxy stats socket 相同——只允许绑定
+内网/受防火墙保护的端口，不要暴露公网。
 
 ## 调节并发（模拟不同强度的客户端群）
 

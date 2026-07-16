@@ -24,6 +24,10 @@ rl-limiter = "rl_limiter.__main__:main"
 [tool.setuptools]
 packages = ["rl_limiter"]
 
+[tool.setuptools.package-data]
+# Web 控制台的静态页面随包分发（webconsole 按包内相对路径读取）。
+rl_limiter = ["static/*.html"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
