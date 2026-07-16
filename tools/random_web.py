@@ -23,29 +23,18 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import random
 import sys
 
 from aiohttp import web
+
+from _common import env_int
 
 log = logging.getLogger("random_web")
 
 DEFAULT_PORT = 9000
 DEFAULT_MIN_BYTES = 256 * 1024       # 256 KiB
 DEFAULT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        print(f"random-web: 环境变量 {name} 必须是整数，当前值 {raw!r}",
-              file=sys.stderr)
-        raise SystemExit(1)
 
 
 def make_app(min_bytes: int, max_bytes: int) -> web.Application:
@@ -59,8 +48,11 @@ def make_app(min_bytes: int, max_bytes: int) -> web.Application:
 
     async def handle_any(_request: web.Request) -> web.Response:
         n = random.randint(min_bytes, max_bytes)
+        # memoryview 切片是 O(1) 零拷贝（bytes 切片会 memcpy 一份最多
+        # 2 MiB 的新对象，压测下白烧 CPU），aiohttp 原生接受 memoryview
+        # 作为响应体。
         return web.Response(
-            body=pool[:n],
+            body=memoryview(pool)[:n],
             content_type="application/octet-stream",
             headers={
                 "X-Payload-Bytes": str(n),
@@ -80,13 +72,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="HAProxy 后端模拟 web 服务：每次请求返回随机大小的响应体")
     parser.add_argument("--port", type=int,
-                        default=_env_int("WEB_PORT", DEFAULT_PORT),
+                        default=env_int("WEB_PORT", DEFAULT_PORT, "random-web"),
                         help="监听端口（默认 %(default)s，可用环境变量 WEB_PORT 覆盖）")
     parser.add_argument("--min-bytes", type=int,
-                        default=_env_int("WEB_MIN_BYTES", DEFAULT_MIN_BYTES),
+                        default=env_int("WEB_MIN_BYTES", DEFAULT_MIN_BYTES, "random-web"),
                         help="响应体最小字节数（默认 %(default)s，环境变量 WEB_MIN_BYTES）")
     parser.add_argument("--max-bytes", type=int,
-                        default=_env_int("WEB_MAX_BYTES", DEFAULT_MAX_BYTES),
+                        default=env_int("WEB_MAX_BYTES", DEFAULT_MAX_BYTES, "random-web"),
                         help="响应体最大字节数（默认 %(default)s，环境变量 WEB_MAX_BYTES）")
     args = parser.parse_args()
 

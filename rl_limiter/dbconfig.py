@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import zlib
 from dataclasses import dataclass
@@ -50,6 +51,12 @@ DEFAULT_DB = "rl_limiter"
 DEFAULT_POLL_INTERVAL_S = 5.0
 # 单次连接建立的超时；轮询周期内完不成会被当作本轮失败，下轮重试。
 DEFAULT_CONNECT_TIMEOUT_S = 10.0
+# 单次全量拉取（建连 + 四条 SELECT + 提交）的端到端超时。必须存在的原因：
+# aiomysql 的 connect_timeout 只覆盖建连阶段，查询读结果没有任何超时——
+# 已建立的连接遇到静默丢包的网络分区会阻塞到内核 TCP 重传上限（几十分钟
+# 起），期间轮询循环整个卡死且 fail-static 告警一条都发不出来。用整体
+# 超时把这类停摆转化为可观测、可重试的普通失败。
+FETCH_TIMEOUT_S = 15.0
 # 启动阶段允许等待数据库就绪的总时长：docker compose 里 MySQL 首次初始化
 # （建库+灌 init.sql）可能需要几十秒，rl-limiter 不应比它先放弃。
 STARTUP_RETRY_FOR_S = 120.0
@@ -128,9 +135,13 @@ def from_env(env: Mapping[str, str] | None = None) -> MySQLOptions | None:
     )
     if opts.port < 1 or opts.port > 65535:
         raise ValueError(f"环境变量 {ENV_PORT} 必须在 1-65535 范围内，当前值 {opts.port}")
-    if opts.poll_interval_s <= 0:
+    # isfinite 与 <=0 缺一不可：float("nan") 与任何数比较都是 False、
+    # float("inf") > 0，两者都能溜过纯 <=0 判断，而 asyncio.sleep(nan/inf)
+    # 永不返回——轮询任务会静默挂死，配置热更新从此失效。
+    if not math.isfinite(opts.poll_interval_s) or opts.poll_interval_s <= 0:
         raise ValueError(
-            f"环境变量 {ENV_POLL_S} 必须 > 0（秒），当前值 {opts.poll_interval_s}"
+            f"环境变量 {ENV_POLL_S} 必须是 > 0 的有限数值（秒），"
+            f"当前值 {opts.poll_interval_s}"
         )
     return opts
 
@@ -208,82 +219,130 @@ def rows_to_raw(
     return raw
 
 
-def config_checksum(mode: str, envs: list[model.EnvQuota]) -> int:
-    """计算可热更新部分（mode + envs）的内容校验和，充当配置版本号。
+def canonical_config(mode: str, envs: list[model.EnvQuota]) -> str:
+    """把可热更新部分（mode + envs）序列化为规范化 JSON（键排序、紧凑
+    分隔符），作为配置内容的精确身份。
 
-    数据库没有现成的单调版本号可用（要求运维每次改配置手动 bump 版本，
-    既繁琐又容易忘），因此用内容指纹代替：canonical JSON（键排序、紧凑
-    分隔符）的 CRC32。内容不变则校验和恒定（envs 查询带 ORDER BY 保证
-    行序稳定），内容一变校验和必变——ControlLoop 只拿它做相等比较与
-    日志展示，不要求单调递增。
+    变更检测必须比较这个字符串本身而不是它的哈希：32 位校验和存在碰撞
+    窗口（~2^-32/次，且非密码学哈希对结构化输入可能更差），一旦新旧内容
+    碰撞，该次变更会被静默丢弃且永不自愈——watch 手里本就持有全量内容，
+    没有理由用有损比较。envs 查询带 ORDER BY，行序稳定，字符串可复现。
     """
     payload = {"mode": mode, "envs": [e.to_dict() for e in envs]}
-    canonical = json.dumps(
+    return json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
-    return zlib.crc32(canonical.encode("utf-8"))
+
+
+def config_checksum(mode: str, envs: list[model.EnvQuota]) -> int:
+    """内容校验和 = canonical_config 的 CRC32，充当配置版本号。
+
+    数据库没有现成的单调版本号可用（要求运维每次改配置手动 bump 版本，
+    既繁琐又容易忘），因此用内容指纹代替。注意角色边界：它只用于
+    ControllerConfig.version 的展示/核对（日志、心跳），变更检测一律用
+    canonical_config 字符串精确比较（见其 docstring），不依赖此哈希。
+    """
+    return zlib.crc32(canonical_config(mode, envs).encode("utf-8"))
 
 
 async def _fetch_raw(opts: MySQLOptions) -> dict[str, Any]:
     """连接数据库，在单个事务里拉取四张表的一致快照并组装为原始 dict。
+
+    整个过程包在 FETCH_TIMEOUT_S 的整体超时里：aiomysql 的 connect_timeout
+    只覆盖建连，查询读结果没有超时，已建立连接上的静默网络分区会永久
+    阻塞（见 FETCH_TIMEOUT_S 注释）。超时抛 TimeoutError，由调用方按
+    普通失败处理（启动路径重试 / 轮询路径 fail-static 告警）。
 
     aiomysql 在函数内延迟导入：只有启用数据库配置模式才需要该依赖，
     纯 YAML 部署与单元测试不必安装。
     """
     import aiomysql  # 延迟导入，见 docstring
 
-    conn = await aiomysql.connect(
-        host=opts.host,
-        port=opts.port,
-        user=opts.user,
-        password=opts.password,
-        db=opts.database,
-        connect_timeout=opts.connect_timeout_s,
-        charset="utf8mb4",
-        autocommit=False,
-    )
-    try:
-        async with conn.cursor() as cur:
-            # 显式事务包住四条 SELECT：InnoDB 默认 REPEATABLE READ 下，
-            # 事务内读到的是同一时刻的快照，避免"改到一半的配置"（比如
-            # 先插了 env 还没插 target）被拼成半新半旧的组合。
-            await conn.begin()
-            await cur.execute(_SQL_SERVICE)
-            service_row = await cur.fetchone()
-            await cur.execute(_SQL_NODES)
-            node_rows = await cur.fetchall()
-            await cur.execute(_SQL_ENVS)
-            env_rows = await cur.fetchall()
-            await cur.execute(_SQL_TARGETS)
-            target_rows = await cur.fetchall()
-            await conn.commit()
-    finally:
-        conn.close()
+    async with asyncio.timeout(FETCH_TIMEOUT_S):
+        conn = await aiomysql.connect(
+            host=opts.host,
+            port=opts.port,
+            user=opts.user,
+            password=opts.password,
+            db=opts.database,
+            connect_timeout=opts.connect_timeout_s,
+            charset="utf8mb4",
+            autocommit=False,
+        )
+        try:
+            async with conn.cursor() as cur:
+                # 显式事务包住四条 SELECT：InnoDB 默认 REPEATABLE READ 下，
+                # 事务内读到的是同一时刻的快照，避免"改到一半的配置"（比如
+                # 先插了 env 还没插 target）被拼成半新半旧的组合。
+                await conn.begin()
+                await cur.execute(_SQL_SERVICE)
+                service_row = await cur.fetchone()
+                await cur.execute(_SQL_NODES)
+                node_rows = await cur.fetchall()
+                await cur.execute(_SQL_ENVS)
+                env_rows = await cur.fetchall()
+                await cur.execute(_SQL_TARGETS)
+                target_rows = await cur.fetchall()
+                await conn.commit()
+        finally:
+            conn.close()
     return rows_to_raw(service_row, node_rows, env_rows, target_rows)
 
 
 async def fetch_service_config(opts: MySQLOptions) -> configmod.ServiceConfig:
-    """拉取一次全量配置并走统一校验管线，返回 ServiceConfig。"""
-    raw = await _fetch_raw(opts)
+    """拉取一次全量配置并走统一校验管线，返回 ServiceConfig。
+
+    rows_to_raw 阶段的 ValueError（如 params_json 写坏）发生在 from_raw
+    的来源包装之前，这里补上同样的来源前缀——保证"所有配置内容错误都
+    带来源描述"的承诺对数据库路径同样成立（多实例对接不同配置库时靠它
+    定位是哪个库写坏了）。
+    """
+    try:
+        raw = await _fetch_raw(opts)
+    except ValueError as e:
+        raise ValueError(f"{opts.describe()} 无效: {e}") from None
     return configmod.from_raw(raw, source=opts.describe())
+
+
+# pymysql/MySQL 的"重试也不会好"的错误码：库/凭据配置写错，属于部署
+# 错误而非"MySQL 仍在初始化"。1044 = 无库权限，1045 = 拒绝访问（密码错），
+# 1049 = 未知数据库，1698 = auth_socket 拒绝。
+_PERMANENT_MYSQL_ERRNOS = frozenset({1044, 1045, 1049, 1698})
+
+
+def _is_permanent_error(e: Exception) -> bool:
+    """判断启动阶段的失败是否属于重试无意义的永久性错误。
+
+    - ImportError/ModuleNotFoundError：aiomysql 没装，环境问题；
+    - pymysql 的 OperationalError/ProgrammingError 携带上述错误码：
+      凭据或库名写错。pymysql 异常的 args[0] 即 MySQL errno，靠它判断
+      可以不在本模块引入 pymysql 依赖。
+    其余（连接拒绝、DNS 未就绪、超时等）视作暂态，交给重试。
+    """
+    if isinstance(e, ImportError):
+        return True
+    args = getattr(e, "args", None)
+    return bool(args) and args[0] in _PERMANENT_MYSQL_ERRNOS
 
 
 async def load_service_config(
     opts: MySQLOptions,
     log: logging.Logger,
-    retry_for_s: float = STARTUP_RETRY_FOR_S,
-    retry_interval_s: float = STARTUP_RETRY_INTERVAL_S,
 ) -> configmod.ServiceConfig:
-    """启动阶段的配置加载：数据库暂不可达时在 retry_for_s 内周期重试。
+    """启动阶段的配置加载：数据库暂不可达时在 STARTUP_RETRY_FOR_S 内重试。
 
     为什么要重试而不是立刻失败：docker compose / 服务器重启场景下
     rl-limiter 与 MySQL 几乎同时拉起，MySQL 首次初始化（建库、执行
     init.sql）需要几十秒；把"等待依赖就绪"做进服务比要求编排层精确
-    串行更皮实。注意只重试**连接类**失败——配置内容校验失败（ValueError）
-    立即上抛：表里的数据写错了，重试一万次也不会自己变对。
+    串行更皮实。两类失败立即上抛、绝不重试：
+      - 配置内容校验失败（ValueError）：表里的数据写错了，重试一万次
+        也不会自己变对；
+      - 永久性环境/凭据错误（_is_permanent_error）：aiomysql 未安装、
+        密码错、库名错——重试只会用"MySQL 可能仍在初始化"的告警刷屏
+        两分钟，掩盖真实原因。
     """
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + retry_for_s
+    deadline = loop.time() + STARTUP_RETRY_FOR_S
     attempt = 0
     while True:
         attempt += 1
@@ -292,45 +351,54 @@ async def load_service_config(
         except ValueError:
             raise  # 配置内容错误：重试无意义，带着 from_raw 的中文诊断直接失败
         except Exception as e:
+            if _is_permanent_error(e):
+                raise RuntimeError(
+                    f"{opts.describe()} 连接失败且属于永久性错误"
+                    f"（凭据/库名/依赖问题，重试无意义）：{e}"
+                ) from e
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise RuntimeError(
-                    f"{opts.describe()} 在 {retry_for_s:.0f}s 内始终不可用，"
-                    f"放弃启动（共尝试 {attempt} 次，最后错误：{e}）"
+                    f"{opts.describe()} 在 {STARTUP_RETRY_FOR_S:.0f}s 内始终"
+                    f"不可用，放弃启动（共尝试 {attempt} 次，最后错误：{e}）"
                 ) from e
             log.warning(
                 "数据库暂不可用，等待后重试（MySQL 可能仍在初始化） "
                 "attempt=%d remaining_s=%.0f err=%s",
                 attempt, remaining, e)
-            await asyncio.sleep(min(retry_interval_s, remaining))
+            await asyncio.sleep(min(STARTUP_RETRY_INTERVAL_S, remaining))
 
 
 async def watch(
     opts: MySQLOptions,
     queue: "asyncio.Queue[model.ControllerConfig]",
-    initial_version: int,
+    boot_cfg: configmod.ServiceConfig,
     log: logging.Logger,
-    initial_nodes: list[model.NodeConfig] | None = None,
 ) -> None:
     """常驻轮询任务：发现配置内容变化就把新 ControllerConfig 投入 queue。
 
-    - 版本判定用 config_checksum（内容指纹），initial_version 是启动引导
-      配置的校验和——首轮轮询读到同样内容时不会重复触发一次空应用；
-    - 只热更 mode 与 envs（ControllerConfig 的能力边界，与管理后台下发
-      一致）；haproxy_nodes 属于基础设施接线，进程内的 TCP 客户端在启动
-      时构建，检测到节点表变化时记 warning 提示需要重启生效；
+    boot_cfg 是启动时加载并已应用的引导配置，watch 从它自行派生全部
+    变更检测基线（内容、节点接线、可写节点集合）——基线与实际已应用的
+    内容出自同一份数据，不存在两个模块各算一份、日后悄悄发散的风险。
+
+    - 变更判定：canonical_config 字符串精确比较（不是哈希，见其
+      docstring）；首轮轮询读到与引导相同的内容时不会重复触发空应用；
+    - 能力边界：只热更 mode 与 envs（与管理后台下发一致）。haproxy_nodes
+      属于基础设施接线，进程内的 TCP 客户端在启动时构建：
+        * 节点行内容变化 → 记 warning 提示需要重启生效；
+        * envs 引用了启动时不存在的节点 → **拒绝应用整份快照**（保留
+          当前配置，fail-static）。此时校验虽通过（新节点行在同一快照
+          里），但进程内没有它的 client：应用了只会让该环境既采不到量
+          也写不进限速值，即实际不受限——比"暂不生效"危险得多；
     - 任何失败（连接断、校验不过）都保留当前配置继续限速（fail-static），
       下一轮再试。
     """
-    last_version = initial_version
-    # 节点接线的变更检测基准：比较 (name, host, port, map, timeout) 五元组。
-    def _nodes_key(nodes: list[model.NodeConfig]) -> tuple:
-        return tuple(
-            (n.name, n.host, n.port, n.bwlim_map_path, n.timeout_s)
-            for n in nodes
-        )
-
-    last_nodes_key = _nodes_key(initial_nodes) if initial_nodes is not None else None
+    last_canonical = canonical_config(boot_cfg.mode, boot_cfg.envs)
+    last_nodes = list(boot_cfg.nodes)  # NodeConfig 是 dataclass，逐字段相等
+    # 启动时完成接线（构建了 RuntimeClient）的节点集合：热更新的硬边界。
+    wired_nodes = frozenset(n.name for n in boot_cfg.nodes)
+    # 已拒绝快照的内容身份：同一份坏配置只告警一次，避免每轮刷屏。
+    last_rejected: str | None = None
     while True:
         await asyncio.sleep(opts.poll_interval_s)
         try:
@@ -341,17 +409,33 @@ async def watch(
                 "poll_interval_s=%s err=%s", opts.poll_interval_s, e)
             continue
 
-        nodes_key = _nodes_key(cfg.nodes)
-        if last_nodes_key is not None and nodes_key != last_nodes_key:
+        if cfg.nodes != last_nodes:
             log.warning(
                 "检测到 haproxy_nodes 表发生变化：节点接线在进程启动时构建，"
                 "热更新不生效，请重启 rl-limiter 使其生效 nodes=%d", len(cfg.nodes))
-            last_nodes_key = nodes_key  # 只在变化那一轮告警一次，避免每轮刷屏
+            last_nodes = list(cfg.nodes)  # 只在变化那一轮告警一次
 
-        version = config_checksum(cfg.mode, cfg.envs)
-        if version == last_version:
+        canonical = canonical_config(cfg.mode, cfg.envs)
+        if canonical == last_canonical:
             continue
-        last_version = version
+
+        # 热更新硬边界检查：新 envs 只能挂在启动时已接线的节点上。
+        unwired = sorted(
+            {t.node for e in cfg.envs for t in e.targets} - wired_nodes)
+        if unwired:
+            if canonical != last_rejected:
+                last_rejected = canonical
+                log.error(
+                    "数据库新配置引用了启动时未接线的节点，拒绝热应用并保留当前配置"
+                    "（fail-static）：这些节点没有运行期客户端，应用后对应环境将"
+                    "既采不到用量也写不进限速值（实际不受限）。请重启 rl-limiter "
+                    "完成新节点接线 unwired_nodes=%s envs=%d",
+                    ",".join(unwired), len(cfg.envs))
+            continue
+
+        last_canonical = canonical
+        last_rejected = None
+        version = zlib.crc32(canonical.encode("utf-8"))
         ctl = model.ControllerConfig(version=version, mode=cfg.mode, envs=cfg.envs)
         queue.put_nowait(ctl)
         log.info(

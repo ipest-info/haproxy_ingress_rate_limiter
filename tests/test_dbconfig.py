@@ -137,8 +137,22 @@ def test_from_env_defaults_and_overrides():
     ({"RL_MYSQL_HOST": "m", "RL_MYSQL_PORT": "0"}, "1-65535"),
     ({"RL_MYSQL_HOST": "m", "RL_MYSQL_POLL_S": "x"}, "RL_MYSQL_POLL_S"),
     ({"RL_MYSQL_HOST": "m", "RL_MYSQL_POLL_S": "-1"}, "RL_MYSQL_POLL_S"),
+    # NaN 与任何数比较都是 False、inf > 0：单纯的 <=0 守卫拦不住它们，
+    # 而 asyncio.sleep(nan/inf) 永不返回会让轮询任务静默挂死。
+    ({"RL_MYSQL_HOST": "m", "RL_MYSQL_POLL_S": "nan"}, "RL_MYSQL_POLL_S"),
+    ({"RL_MYSQL_HOST": "m", "RL_MYSQL_POLL_S": "inf"}, "RL_MYSQL_POLL_S"),
 ])
 def test_from_env_rejects_bad_values(env, match):
     """host 已设置但数值写错：半吊子的数据库配置必须在启动时拦下。"""
     with pytest.raises(ValueError, match=match):
         dbconfig.from_env(env)
+
+
+def test_canonical_config_is_exact_identity():
+    """变更检测的身份是规范化 JSON 字符串本身（精确比较，不经哈希），
+    同内容恒等、任一字段变化必不等。"""
+    cfg = build()
+    base = dbconfig.canonical_config(cfg.mode, cfg.envs)
+    assert base == dbconfig.canonical_config(cfg.mode, cfg.envs)
+    changed = build(env_rows=[("env-a", 40_000_000, None)])
+    assert dbconfig.canonical_config(changed.mode, changed.envs) != base

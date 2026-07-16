@@ -77,7 +77,9 @@ docker compose exec mysql mysql -url -prl_pass rl_limiter
 -- 配额 80 Mbps → 40 Mbps（等一个轮询周期≈3s，loadgen 吞吐随即腰斩）
 UPDATE envs SET quota_bps = 40000000 WHERE env_id = 'env-a';
 
--- enforce ↔ dry-run 热切换（dry-run 只记日志不写 map，吞吐立刻放开）
+-- enforce ↔ dry-run 热切换。注意：dry-run 只是停止更新 map，enforce
+-- 期间最后写入的整形值仍留在 HAProxy 里继续限速（fail-static 设计，
+-- 服务绝不主动放开限速）；切回 enforce 时会触发一次全量重写（resync）。
 UPDATE service_config SET mode = 'dry-run' WHERE id = 1;
 
 -- 按环境覆盖快环参数（字段见 rl_limiter/model.py GovParams）

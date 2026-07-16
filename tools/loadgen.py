@@ -31,12 +31,13 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import sys
 import time
 
 import aiohttp
 from aiohttp import web
+
+from _common import env_int
 
 log = logging.getLogger("loadgen")
 
@@ -46,18 +47,6 @@ DEFAULT_REPORT_S = 2.0
 # 并发上限：防御性钳制，防止一条打错的 curl（比如 32000）把演示环境
 # 的文件描述符耗尽。演示所需并发远低于此。
 MAX_CONCURRENCY = 1024
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        print(f"loadgen: 环境变量 {name} 必须是整数，当前值 {raw!r}",
-              file=sys.stderr)
-        raise SystemExit(1)
 
 
 class LoadGen:
@@ -106,13 +95,17 @@ class LoadGen:
         while True:
             try:
                 async with self._session.get(self._target) as resp:
-                    async for chunk in resp.content.iter_chunked(64 * 1024):
-                        self.bytes_total += len(chunk)
                     if resp.status == 200:
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            self.bytes_total += len(chunk)
                         self.requests_total += 1
                     else:
-                        # 非 200（如后端未就绪时 HAProxy 的 503）也要退避：
-                        # 这类响应几乎瞬时返回，不退避会变成紧密循环刷错误。
+                        # 非 200（如后端未就绪时 HAProxy 的 503）：错误页
+                        # 字节不计入吞吐——它没走整形数据路径，混进
+                        # bytes_total 会让 /status 在故障窗口显示虚假流量。
+                        # 排空响应体后小睡退避：这类响应几乎瞬时返回，
+                        # 不退避会变成紧密循环刷错误。
+                        await resp.read()
                         self.errors_total += 1
                         await asyncio.sleep(0.5)
             except asyncio.CancelledError:
@@ -226,10 +219,10 @@ def main() -> None:
     parser.add_argument("--target", required=True,
                         help="压测目标 URL（经 HAProxy 入口，例如 http://haproxy:8080/）")
     parser.add_argument("--concurrency", type=int,
-                        default=_env_int("LOADGEN_CONCURRENCY", DEFAULT_CONCURRENCY),
+                        default=env_int("LOADGEN_CONCURRENCY", DEFAULT_CONCURRENCY, "loadgen"),
                         help="初始并发数（默认 %(default)s，环境变量 LOADGEN_CONCURRENCY）")
     parser.add_argument("--control-port", type=int,
-                        default=_env_int("LOADGEN_CONTROL_PORT", DEFAULT_CONTROL_PORT),
+                        default=env_int("LOADGEN_CONTROL_PORT", DEFAULT_CONTROL_PORT, "loadgen"),
                         help="控制端口：GET /status 查询、PUT /concurrency 调节"
                              "（默认 %(default)s，环境变量 LOADGEN_CONTROL_PORT）")
     parser.add_argument("--report-s", type=float, default=DEFAULT_REPORT_S,

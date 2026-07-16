@@ -179,8 +179,7 @@ async def _amain(cfg, log: logging.Logger,
     if db_opts is not None:
         config_queue = asyncio.Queue()
         tasks.append(asyncio.create_task(
-            dbconfig.watch(db_opts, config_queue, seed_version, log,
-                           initial_nodes=cfg.nodes),
+            dbconfig.watch(db_opts, config_queue, cfg, log),
             name="db-config-watch"))
     elif rep is not None:
         config_queue = rep.configs
@@ -255,6 +254,13 @@ def main() -> None:
             cfg = asyncio.run(dbconfig.load_service_config(db_opts, log))
         else:
             cfg = configmod.load(args.config)
+    except KeyboardInterrupt:
+        # 等待数据库就绪的重试窗口（最长两分钟）里按 Ctrl-C 是常规操作，
+        # 必须干净退出；KeyboardInterrupt 是 BaseException，不加这条会
+        # 绕过下面的 except Exception 直接冲出 main 打印原始 traceback。
+        print("rl-limiter: 启动在配置加载阶段被中断（Ctrl-C），已退出",
+              file=sys.stderr)
+        raise SystemExit(130)
     except Exception as e:
         print(f"rl-limiter: {e}", file=sys.stderr)
         raise SystemExit(1)
