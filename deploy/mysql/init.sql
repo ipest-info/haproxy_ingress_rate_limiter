@@ -88,16 +88,19 @@ CREATE TABLE IF NOT EXISTS env_targets (
 INSERT INTO service_config (id, node_id, mode, log_level, tick_interval_s)
 VALUES (1, 'rl-limiter-01', 'enforce', 'info', 1.0);
 
--- compose 里的两台 HAProxy：容器内 9999 端口为 admin 级 TCP stats socket。
+-- compose 里的三台 HAProxy：容器内 9999 端口为 admin 级 TCP stats socket。
 -- mode 为 NULL = 继承全局模式；演示逐节点灰度时改这一列即可。
+-- 归属约定（校验强制）：节点是环境的独占资源——一个环境可横跨多台
+-- HAProxy，但一台 HAProxy 只允许服务一个环境。
 INSERT INTO haproxy_nodes (name, host, port, bwlim_map_path, timeout_ms, mode)
 VALUES ('hap-1', 'haproxy1', 9999, '/etc/haproxy/maps/bwlim.map', 500, NULL),
-       ('hap-2', 'haproxy2', 9999, '/etc/haproxy/maps/bwlim.map', 500, NULL);
+       ('hap-2', 'haproxy2', 9999, '/etc/haproxy/maps/bwlim.map', 500, NULL),
+       ('hap-3', 'haproxy3', 9999, '/etc/haproxy/maps/bwlim.map', 500, NULL);
 
--- 演示环境两套（展示跨节点全局聚合限速）：
---   env-a：80 Mbps，挂载在两台 HAProxy 的 fe_env_a 上——两台的流量
---          全局聚合后统一限速，压一台另一台会自动多分到份额；
---   env-b：40 Mbps，同样横跨两台的 fe_env_b。
+-- 演示环境两套：
+--   env-a：80 Mbps，独占 hap-1 + hap-2（跨节点全局聚合限速：两台的
+--          流量聚合后统一限速，压一台另一台会自动多分到份额）；
+--   env-b：40 Mbps，独占 hap-3（单节点环境）。
 INSERT INTO envs (env_id, quota_bps, params_json)
 VALUES ('env-a', 80000000, NULL),
        ('env-b', 40000000, NULL);
@@ -105,8 +108,7 @@ VALUES ('env-a', 80000000, NULL),
 INSERT INTO env_targets (env_id, node, frontend)
 VALUES ('env-a', 'hap-1', 'fe_env_a'),
        ('env-a', 'hap-2', 'fe_env_a'),
-       ('env-b', 'hap-1', 'fe_env_b'),
-       ('env-b', 'hap-2', 'fe_env_b');
+       ('env-b', 'hap-3', 'fe_env_b');
 
 -- ===========================================================================
 -- 运行期常用操作速查（在宿主机执行；改完等一个轮询周期即热生效）

@@ -537,27 +537,89 @@ def _validate_targets(targets: Any) -> list[tuple[str, str]]:
     return out
 
 
+async def _write_targets_tx(
+    opts: MySQLOptions,
+    env_id: str,
+    pairs: list[tuple[str, str]],
+    create_quota_bps: int | None,
+) -> None:
+    """create_env / update_env_targets 的共同事务体。
+
+    第一步在事务内做**节点独占检查**（一台 HAProxy 只允许服务一个
+    环境）：SELECT ... FOR UPDATE 锁住冲突行，两个并发写不会同时把
+    同一节点写进两个环境。必须在写入口就拦下而不是留给下一轮 fetch
+    的统一校验——校验失败是 fail-static 拒绝**整份**快照，会把所有
+    后续配置变更一起卡死，直到有人手工修表。
+    """
+    import aiomysql
+    import pymysql
+    from pymysql.constants import CLIENT
+
+    async with asyncio.timeout(FETCH_TIMEOUT_S):
+        conn = await aiomysql.connect(
+            host=opts.host, port=opts.port, user=opts.user,
+            password=opts.password, db=opts.database,
+            connect_timeout=opts.connect_timeout_s,
+            charset="utf8mb4", autocommit=False,
+            client_flag=CLIENT.FOUND_ROWS,
+        )
+        try:
+            try:
+                async with conn.cursor() as cur:
+                    await conn.begin()
+                    # 节点独占检查：目标节点当前被其它环境占用即拒绝。
+                    nodes = sorted({node for node, _ in pairs})
+                    ph = ",".join(["%s"] * len(nodes))
+                    await cur.execute(
+                        f"SELECT DISTINCT node, env_id FROM env_targets "
+                        f"WHERE node IN ({ph}) AND env_id <> %s FOR UPDATE",
+                        (*nodes, env_id))
+                    conflicts = await cur.fetchall()
+                    if conflicts:
+                        detail = "；".join(
+                            f"节点 {n!r} 已属于环境 {o!r}" for n, o in conflicts)
+                        raise ValueError(
+                            f"{detail}——一台 HAProxy 只允许服务一个环境"
+                            f"（一个环境可横跨多台节点，反向不行）。如需"
+                            f"迁移节点，先从原环境移除该节点的全部挂载点")
+                    if create_quota_bps is not None:
+                        await cur.execute(
+                            "INSERT INTO envs (env_id, quota_bps) VALUES (%s, %s)",
+                            (env_id, int(create_quota_bps)))
+                    else:
+                        await cur.execute(
+                            "SELECT env_id FROM envs WHERE env_id = %s FOR UPDATE",
+                            (env_id,))
+                        if cur.rowcount == 0:
+                            raise ValueError(f"环境 {env_id!r} 不存在于 envs 表")
+                        await cur.execute(
+                            "DELETE FROM env_targets WHERE env_id = %s", (env_id,))
+                    for node, frontend in pairs:
+                        await cur.execute(
+                            "INSERT INTO env_targets (env_id, node, frontend) "
+                            "VALUES (%s, %s, %s)", (env_id, node, frontend))
+                await conn.commit()
+            except pymysql.err.IntegrityError as e:
+                await conn.rollback()
+                errno = e.args[0] if e.args else 0
+                hint = _INTEGRITY_HINTS.get(errno, "违反数据完整性约束")
+                raise ValueError(f"{hint}（MySQL 错误 {errno}）") from None
+            except ValueError:
+                await conn.rollback()
+                raise
+        finally:
+            conn.close()
+
+
 async def update_env_targets(
     opts: MySQLOptions, env_id: str, targets: Any,
 ) -> None:
-    """整体替换环境的挂载点列表（单事务：先删后插，失败全回滚）。
-
-    "挂载点迁移"由两次调用组成：先从原环境的列表移除，再加入目标环境
-    ——顺序不可反（同一挂载点同时属于两个环境会被唯一键拒绝）。
+    """整体替换环境的挂载点列表（单事务：独占检查 → 先删后插，失败全
+    回滚）。"节点迁移"由两次调用组成：先从原环境的列表移除该节点的
+    挂载点，再加入目标环境——顺序不可反（节点独占检查会拒绝反序）。
     """
     pairs = _validate_targets(targets)
-    statements: list[tuple[str, tuple]] = [
-        ("SELECT env_id FROM envs WHERE env_id = %s FOR UPDATE", (env_id,)),
-        ("DELETE FROM env_targets WHERE env_id = %s", (env_id,)),
-    ]
-    statements += [
-        ("INSERT INTO env_targets (env_id, node, frontend) VALUES (%s, %s, %s)",
-         (env_id, node, frontend))
-        for node, frontend in pairs
-    ]
-    counts = await _exec_tx(opts, statements)
-    if counts[0] == 0:
-        raise ValueError(f"环境 {env_id!r} 不存在于 envs 表")
+    await _write_targets_tx(opts, env_id, pairs, create_quota_bps=None)
 
 
 async def create_env(
@@ -566,21 +628,13 @@ async def create_env(
     """新建环境（配额 + 初始挂载点，单事务）。必须携带至少一个挂载点：
     统一校验管线拒绝零挂载点的环境，缺挂载点的新环境会让整份配置快照
     无法生效（fail-static 卡住所有后续变更）。"""
-    if not env_id or not str(env_id).strip():
+    env_id = str(env_id).strip()
+    if not env_id:
         raise ValueError("env_id 不能为空")
     if quota_bps <= 0:
         raise ValueError(f"quota_bps 必须 > 0（比特每秒），当前值 {quota_bps!r}")
     pairs = _validate_targets(targets)
-    statements: list[tuple[str, tuple]] = [
-        ("INSERT INTO envs (env_id, quota_bps) VALUES (%s, %s)",
-         (str(env_id).strip(), int(quota_bps))),
-    ]
-    statements += [
-        ("INSERT INTO env_targets (env_id, node, frontend) VALUES (%s, %s, %s)",
-         (str(env_id).strip(), node, frontend))
-        for node, frontend in pairs
-    ]
-    await _exec_tx(opts, statements)
+    await _write_targets_tx(opts, env_id, pairs, create_quota_bps=int(quota_bps))
 
 
 async def delete_env(opts: MySQLOptions, env_id: str) -> None:

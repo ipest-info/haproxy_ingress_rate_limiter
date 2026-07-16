@@ -168,7 +168,7 @@ button.danger { color: var(--status-critical); border-color: var(--status-critic
   <div class="card">
     <div class="row">
       <h2>新建环境</h2>
-      <span class="hint">新环境必须携带至少一个挂载点（节点 × frontend）；frontend 名须与 HAProxy 配置及 bwlim map 键一致</span>
+      <span class="hint">新环境必须携带至少一个挂载点（节点 × frontend）；节点是环境的独占资源，下拉只列出未分配的节点；frontend 名须与 HAProxy 配置及 bwlim map 键一致</span>
     </div>
     <div class="controls" style="margin-top:12px">
       <label>环境 ID <input type="text" id="new-env-id" placeholder="env-c" style="width:110px"></label>
@@ -272,6 +272,16 @@ function refreshSoon() {
   setTimeout(loadOverview, 4500);
 }
 
+/* ================= 节点归属（独占规则：一台节点只服务一个环境） ================= */
+function nodeOwners() {
+  // 节点 → env_id 的独占归属表，由配置视图推导（服务端校验强制唯一）。
+  const owners = {};
+  for (const [envId, conf] of Object.entries(state.envConfig)) {
+    for (const t of conf.targets || []) owners[t.node] = envId;
+  }
+  return owners;
+}
+
 /* ================= 节点面板（按节点模式控制） ================= */
 function renderNodes() {
   const table = $("#nodes-table");
@@ -279,7 +289,8 @@ function renderNodes() {
   if (table.contains(document.activeElement)) return;
   const names = Object.keys(state.nodes);
   if (!names.length) { table.innerHTML = ""; return; }
-  table.innerHTML = `<tr><th>节点</th><th>地址（runtime API）</th><th>模式</th><th>生效</th><th>采样状态</th></tr>`;
+  const owners = nodeOwners();
+  table.innerHTML = `<tr><th>节点</th><th>地址（runtime API）</th><th>所属环境</th><th>模式</th><th>生效</th><th>采样状态</th></tr>`;
   for (const name of names) {
     const n = state.nodes[name];
     const tr = document.createElement("tr");
@@ -287,6 +298,7 @@ function renderNodes() {
     tr.innerHTML = `
       <td class="nname">${name}</td>
       <td class="naddr">${n.host}:${n.port}</td>
+      <td>${owners[name] ? `<b>${owners[name]}</b>` : '<span class="hint">未分配</span>'}</td>
       <td><select class="node-mode" data-node="${name}">
         <option value="">继承全局</option>
         <option value="dry-run">dry-run</option>
@@ -314,14 +326,20 @@ function renderNodes() {
   }
 }
 
-function nodeOptions(sel) {
+function nodeOptions(sel, forEnv) {
+  // 独占规则过滤：环境卡的添加下拉只给「本环境已占用或未分配」的节点；
+  // 新建环境（forEnv 为 null）只给「未分配」的节点。
   if (document.activeElement === sel) return;  // 用户展开中不打断
-  const names = Object.keys(state.nodes);
+  const owners = nodeOwners();
+  const names = Object.keys(state.nodes).filter(n =>
+    forEnv === null ? !owners[n] : (!owners[n] || owners[n] === forEnv));
   const want = names.join(",");
   if (sel._opts === want) return;              // 集合没变不重建
   sel._opts = want;
   const cur = sel.value;
-  sel.innerHTML = names.map(n => `<option value="${n}">${n}</option>`).join("");
+  sel.innerHTML = names.length
+    ? names.map(n => `<option value="${n}">${n}</option>`).join("")
+    : `<option value="">（无可用节点）</option>`;
   if (cur && names.includes(cur)) sel.value = cur;
 }
 
@@ -372,7 +390,7 @@ function envCard(envId) {
       <select class="target-node"></select>
       <input type="text" class="target-frontend" placeholder="fe_xxx" style="width:120px">
       <button class="target-add">添加挂载点</button>
-      <span class="hint">迁移挂载点 = 从原环境 ✕ 移除，再到目标环境添加</span>
+      <span class="hint">节点独占：下拉只列本环境节点与未分配节点；迁移节点 = 原环境 ✕ 移除后再到目标环境添加</span>
     </div>
     <details class="params">
       <summary>AIMD 参数覆盖（按项填写，留空的项使用默认值）</summary>
@@ -565,7 +583,7 @@ function updateCard(e, d) {
         box.appendChild(chip);
       }
     }
-    nodeOptions($(".target-node", c));
+    nodeOptions($(".target-node", c), e.id);
     $(".quota-live", c).textContent =
       `当前生效 ${(conf.quota_bps / 1e6).toString()} Mbps（写入 MySQL，一个轮询周期内热生效）`;
     // 回填仅在"用户没在编辑且无未提交修改"时进行——实时刷新绝不覆盖
@@ -696,7 +714,7 @@ async function loadOverview() {
   const r = await fetch("/api/overview"); const o = await r.json();
   state.envConfig = o.env_config || {};
   state.defaultParams = o.default_params || {};
-  if (o.nodes) { state.nodes = o.nodes; renderNodes(); nodeOptions($("#new-env-node")); }
+  if (o.nodes) { state.nodes = o.nodes; renderNodes(); nodeOptions($("#new-env-node"), null); }
   $("#svc-version").textContent = o.service_version || "–";
   $("#mode-text").textContent = o.mode || "–";
   $("#cfg-version").textContent = o.config_version ?? "–";

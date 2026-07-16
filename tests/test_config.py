@@ -38,6 +38,9 @@ haproxy_nodes:
   - name: lb-2
     host: 10.0.0.2
     port: 9999
+  - name: lb-3
+    host: 10.0.0.3
+    port: 9999
 envs:
   - env_id: env-a
     quota_bps: 200000000
@@ -49,7 +52,7 @@ envs:
   - env_id: env-b
     quota_bps: 100000000
     targets:
-      - {node: lb-1, frontend: fe_b}
+      - {node: lb-3, frontend: fe_b}
 backend:
   base_url: https://backend:9090/
   cache_path: /tmp/cache.json
@@ -67,8 +70,8 @@ def test_load_full_config(tmp_path):
     assert cfg.log_level == "debug"
     assert cfg.tick_interval_s == 0.5
 
-    assert [n.name for n in cfg.nodes] == ["lb-1", "lb-2"]
-    n1, n2 = cfg.nodes
+    assert [n.name for n in cfg.nodes] == ["lb-1", "lb-2", "lb-3"]
+    n1, n2, _n3 = cfg.nodes
     assert n1.host == "10.0.0.1"
     assert n1.port == 9999
     assert n1.bwlim_map_path == "/etc/haproxy/maps/custom.map"
@@ -314,3 +317,24 @@ def test_timeout_ms_nonpositive_falls_back_to_default(tmp_path):
     assert cfg.nodes[0].timeout_s == pytest.approx(
         config.DEFAULT_TIMEOUT_MS / 1000.0
     )
+
+
+def test_node_exclusive_to_single_env(tmp_path):
+    """节点是环境的独占资源：一个环境可横跨多台 HAProxy，但一台 HAProxy
+    只允许服务一个环境（不同 frontend 也不行）。"""
+    yaml_text = (
+        "node_id: svc-1\n"
+        "haproxy_nodes:\n"
+        "  - {name: lb-1, host: 10.0.0.1, port: 9999}\n"
+        "envs:\n"
+        "  - env_id: env-a\n"
+        "    quota_bps: 100000000\n"
+        "    targets:\n"
+        "      - {node: lb-1, frontend: fe_a}\n"
+        "  - env_id: env-b\n"
+        "    quota_bps: 100000000\n"
+        "    targets:\n"
+        "      - {node: lb-1, frontend: fe_b}\n"
+    )
+    with pytest.raises(ValueError, match="只允许服务一个环境"):
+        load_from(tmp_path, yaml_text)

@@ -7,14 +7,15 @@
 #   调并发：curl -X PUT http://localhost:8084/concurrency -d '{"concurrency": 32}'
 #   收场：docker compose down -v
 #
-# 拓扑（两台 TCP L4 HAProxy，环境跨节点全局聚合限速）：
-#   loadgen ==随机打散==> haproxy1:8080/8081 (fe_env_a / fe_env_b, L4 整形)
-#                        haproxy2:8080/8081 (fe_env_a / fe_env_b, L4 整形)
-#                              └──> web:9000（随机大小响应）
+# 拓扑（三台 TCP L4 HAProxy；节点是环境的独占资源——一个环境可横跨
+# 多台节点，一台节点只服务一个环境）：
+#   loadgen ==打散==> haproxy1:8080、haproxy2:8080 (fe_env_a → env-a 独占)
+#                    haproxy3:8080 (fe_env_b → env-b 独占)
+#                          └──> web:9000（随机大小响应）
 #   rl-limiter ──轮询──> mysql（配置：节点/环境/挂载点/模式）
-#   rl-limiter ──show stat / set map──> haproxy1:9999、haproxy2:9999
-# env-a（80Mbps）与 env-b（40Mbps）都横跨两台节点：同一环境两台的流量
-# 聚合后统一限速；模式可全局或按节点（haproxy_nodes.mode）控制。
+#   rl-limiter ──show stat / set map──> haproxy{1,2,3}:9999
+# env-a（80Mbps）独占 hap-1+hap-2（跨节点聚合限速）；env-b（40Mbps）
+# 独占 hap-3；模式可全局或按节点（haproxy_nodes.mode）控制。
 
 services:
   # ---- 配置源：MySQL（表结构与演示种子数据见 deploy/mysql/init.sql）----
@@ -50,17 +51,17 @@ services:
       WEB_MAX_BYTES: ${WEB_MAX_BYTES:-2097152}
     restart: unless-stopped
 
-  # ---- 数据面：两台真实 HAProxy 2.8（TCP L4 + bwlim-out 整形 + admin
-  # 级 stats socket），共用同一份配置，各自承载 fe_env_a 与 fe_env_b。
+  # ---- 数据面：三台真实 HAProxy 2.8（TCP L4 + bwlim-out 整形 + admin
+  # 级 stats socket）。节点独占环境：haproxy1/haproxy2 只跑 env-a 的
+  # fe_env_a（一环境横跨两节点），haproxy3 只跑 env-b 的 fe_env_b。
   # 9999（runtime API，admin 权限）不映射宿主机：仅 compose 网络内可达。
   haproxy1:
     image: haproxy:2.8
     volumes:
-      - ./deploy/docker/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./deploy/docker/haproxy-env-a.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - ./deploy/docker/maps:/etc/haproxy/maps:ro
     ports:
       - "8080:8080"   # hap-1 / fe_env_a（宿主机可 curl 体验限速）
-      - "8081:8081"   # hap-1 / fe_env_b
     depends_on:
       - web
     restart: unless-stopped
@@ -68,11 +69,21 @@ services:
   haproxy2:
     image: haproxy:2.8
     volumes:
-      - ./deploy/docker/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./deploy/docker/haproxy-env-a.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - ./deploy/docker/maps:/etc/haproxy/maps:ro
     ports:
       - "8082:8080"   # hap-2 / fe_env_a
-      - "8083:8081"   # hap-2 / fe_env_b
+    depends_on:
+      - web
+    restart: unless-stopped
+
+  haproxy3:
+    image: haproxy:2.8
+    volumes:
+      - ./deploy/docker/haproxy-env-b.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./deploy/docker/maps:/etc/haproxy/maps:ro
+    ports:
+      - "8083:8080"   # hap-3 / fe_env_b
     depends_on:
       - web
     restart: unless-stopped
@@ -98,16 +109,18 @@ services:
         condition: service_started
       haproxy2:
         condition: service_started
+      haproxy3:
+        condition: service_started
     restart: unless-stopped
 
   # ---- 客户端群：可在线调节并发数的压测服务（模拟并发带宽）----
   loadgen:
     build: .
-    # 四个入口（2 节点 × 2 环境）随机打散：既能观察跨节点聚合限速，
-    # 也能观察两环境相互独立的配额。
+    # 三个入口（env-a×2 节点 + env-b×1 节点）：worker 轮转绑定入口，
+    # 既能观察跨节点聚合限速，也能观察两环境相互独立的配额。
     command: >-
       python3 tools/loadgen.py
-      --target http://haproxy1:8080/,http://haproxy1:8081/,http://haproxy2:8080/,http://haproxy2:8081/
+      --target http://haproxy1:8080/,http://haproxy2:8080/,http://haproxy3:8080/
       --control-port 8081
     environment:
       # 初始并发：LOADGEN_CONCURRENCY=32 docker compose up -d 即可改；
@@ -118,6 +131,7 @@ services:
     depends_on:
       - haproxy1
       - haproxy2
+      - haproxy3
     restart: unless-stopped
 
 volumes:

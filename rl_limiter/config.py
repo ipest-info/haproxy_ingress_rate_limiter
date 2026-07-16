@@ -262,7 +262,11 @@ def _validate(cfg: ServiceConfig) -> None:
       声明：引用未声明的节点意味着采不到用量也无处写限速值；
     - 同一 Target 不得映射到两个环境：采集按 Target → env 归并用量、
       执行按 env 写整形值，一对多映射会导致同一份流量被重复计入两个
-      环境、限速值互相覆盖，必须拒绝。
+      环境、限速值互相覆盖，必须拒绝；
+    - 节点是环境的独占资源：一个环境可以横跨多台 HAProxy，但一台
+      HAProxy 只允许服务一个环境。混挂会让节点级模式切换（灰度）与
+      环境的配额边界失去意义——对节点切 enforce/dry-run 会同时影响
+      两个环境，节点上的非本环境 frontend 也逃出了配额视野。
     """
     if not cfg.node_id:
         raise ValueError(
@@ -320,6 +324,8 @@ def _validate(cfg: ServiceConfig) -> None:
 
     # Target → env_id 的归属表，用于检出跨环境（或同环境重复书写）的冲突。
     target_owner: dict[model.Target, str] = {}
+    # 节点 → env_id 的独占归属表：一台 HAProxy 只允许服务一个环境。
+    node_env_owner: dict[str, str] = {}
     seen_env_ids: dict[str, int] = {}
     for i, e in enumerate(cfg.envs):
         if not e.env_id:
@@ -360,3 +366,13 @@ def _validate(cfg: ServiceConfig) -> None:
                     f"否则同一份流量会被重复计入两个环境、限速值互相覆盖"
                 )
             target_owner[t] = e.env_id
+            node_owner = node_env_owner.get(t.node)
+            if node_owner is not None and node_owner != e.env_id:
+                raise ValueError(
+                    f"envs[{i}] ({e.env_id}) 的 target {t}: 节点 {t.node!r} "
+                    f"已属于环境 {node_owner!r}——一个环境可以横跨多台 "
+                    f"HAProxy，但一台 HAProxy 只允许服务一个环境（节点是"
+                    f"环境的独占资源：混挂会让节点级模式切换同时波及两个"
+                    f"环境、节点上的他环境流量也逃出配额边界）"
+                )
+            node_env_owner[t.node] = e.env_id
