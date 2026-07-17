@@ -1,10 +1,10 @@
-# rl_limiter.loop —— 集中式快环（v2.0 主控制循环）。
+# rl_limiter.loop —— 集中式快环（主控制循环，控制单元=节点）。
 #
 # 每个 tick 按固定流水线执行"采集 → 决策 → 分配 → 执行 → 上报"。
-# 其中"分配"一步的由来：决策器产出的是环境级聚合整形值（bwlim_bps），
-# 需要按各挂载点（Target = 节点 × frontend）近期用量加权拆分后才能写回
-# 各台 HAProxy——原慢环的加权分配算法在 v2.0 降级为执行路径的一步
-# （见 model.py 顶部说明）。
+# 其中"分配"一步：决策器产出的是节点级整形值（bwlim_bps），一台节点
+# 可能挂载多个受控 frontend，需要按各挂载点（Target = 节点 × frontend）
+# 近期用量加权拆分后才能写回该节点的 bwlim map（见 allocator 模块头；
+# 拆分只发生在单台节点内部，节点之间没有配额调配）。
 #
 # 并发模型：整个循环运行在单个 asyncio 任务中，组件间不会并发访问，
 # 因此无需任何锁；配置通过 asyncio.Queue 注入，时间通过 tick_interval_s
@@ -155,13 +155,13 @@ class ControlLoop:
         """一次完整的快环流水线：采集 → 决策 → 分配 → 执行 → 上报。"""
         self._ticks += 1
 
-        # 采集：所有节点的 frontend 统计按环境聚合（全局视图）。
+        # 采集：所有节点的 frontend 统计按控制单元（节点）聚合。
         usages = await self._collector.tick(now)
-        # 决策：AIMD 三段状态机产出各环境的聚合整形值。
+        # 决策：AIMD 三段状态机产出各节点的整形值。
         decisions = self._governor.tick(now, usages)
 
-        # 分配：把每个环境的聚合整形值按各挂载点的 60s EWMA 用量加权拆分
-        # 成 per-Target 的整数值（bytes/s），这是写回各 HAProxy map 的最终值。
+        # 分配：把每个节点的整形值按其挂载点的 60s EWMA 用量加权拆分
+        # 成 per-Target 的整数值（bytes/s），这是写回该节点 map 的最终值。
         ewma_by_env = {u.env_id: u.target_ewma for u in usages}
         batch: list[tuple[model.Decision, dict[model.Target, int]]] = []
         for d in decisions:

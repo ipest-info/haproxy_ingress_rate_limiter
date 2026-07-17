@@ -7,9 +7,9 @@
 # 是纯决策组件：既不接触 HAProxy，也不读系统时钟，因此可以被完全确定
 # 性地单测。
 #
-# v2.0 的挂载点模型：决策携带的挂载点是 Target（节点, frontend）列表
-# ——同一环境的 frontend 可能分布在多台 HAProxy 上，AIMD 针对环境全局
-# 聚合值决策，分配与写回交给下游。
+# 控制单元=节点（见 model.py 顶部说明）：AIMD 针对单台节点上受控
+# frontend 的聚合用量决策，决策携带该节点的 Target（节点, frontend）
+# 列表，节点内的拆分与写回交给下游（allocator + executor）。
 #
 # 控制目标（承诺口径）：10 秒滑动均值 ≤ 约定配额，瞬时允许冲高到弹性
 # 上限（默认 quota × 1.10）。由于整形常驻生效，算法退化为对整形值
@@ -55,12 +55,12 @@ CHANGED_EPSILON_FRAC = 0.001
 
 @dataclass(slots=True)
 class _EnvState:
-    """单个环境的完整控制状态。所有速率字段单位均为 bytes/s。"""
+    """单个控制单元（节点）的完整控制状态。所有速率字段单位均为 bytes/s。"""
 
-    targets: list[model.Target]        # 该环境映射到的全部挂载点（跨节点）
-    quota_bytes: float                 # 控制面下发的环境配额，bytes/s
-    params: model.GovParams            # 快环控制参数（可按环境覆盖）
-    bwlim: float                       # 当前整形目标值（环境聚合口径），bytes/s
+    targets: list[model.Target]        # 该单元的全部挂载点（同一节点上的受控 frontend）
+    quota_bytes: float                 # 该节点自己的带宽限制，bytes/s
+    params: model.GovParams            # 快环控制参数（可按节点覆盖）
+    bwlim: float                       # 当前整形目标值（节点聚合口径），bytes/s
     over_secs: int = 0                 # mean10 > quota 的连续拍数（收紧持续性计数）
     under_secs: int = 0                # mean10 < quota×low_watermark 的连续拍数（恢复持续性计数）
     state: model.GovState = model.GovState.NORMAL  # 状态机当前状态

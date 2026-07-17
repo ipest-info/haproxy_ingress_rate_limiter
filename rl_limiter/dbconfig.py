@@ -165,8 +165,8 @@ def rows_to_raw(
     dict 缺 node_id，后续校验会以"node_id 不能为空"报出，比在这里另造
     一条错误信息更一致。
 
-    params_json 是 envs 表里可选的 JSON 文本列（per-env 快环参数覆盖）；
-    非法 JSON 在这里就地报错并带上 env_id，因为 config 层拿到的已是解析
+    params_json 是节点行里可选的 JSON 文本列（按节点的快环参数覆盖）；
+    非法 JSON 在这里就地报错并带上节点名，因为 config 层拿到的已是解析
     后的 dict，无从知道原始文本长什么样。
     """
     raw: dict[str, Any] = {}

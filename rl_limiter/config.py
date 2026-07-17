@@ -1,15 +1,15 @@
 # rl_limiter.config —— 服务配置的解析与校验（服务的"启动契约"层）。
 #
-# v2.0 集中式架构下，服务配置提供四类信息：
-#   1. 服务身份（node_id）：rl-limiter 实例的唯一标识，配置长轮询、指标
-#      上报、心跳都用它向管理后台归属数据；
-#   2. HAProxy 节点接线（haproxy_nodes）：受控节点的内网 TCP stats socket
-#      地址与 bwlim map 路径。这属于基础设施配置，只在本地维护，不随管理
-#      后台配置下发（见 model.ControllerConfig 的注释）；
-#   3. 管理后台接入（backend）：base_url、fail-static 缓存路径、mTLS 材料。
-#      base_url 留空表示 standalone 模式：不连接后台，只用本地 envs 运行；
-#   4. 引导配额（envs）：standalone 模式下的唯一配额来源；接入后台时仅作
-#      首启引导，后台下发配置后以下发为准。
+# 服务配置提供四类信息：
+#   1. 服务身份（node_id）：rl-limiter 实例的唯一标识；
+#   2. HAProxy 节点（haproxy_nodes）：接线字段（内网 TCP stats socket
+#      地址、bwlim map 路径、超时）+ 运行字段（quota_bps 节点带宽限制、
+#      mode 节点模式覆盖、params 节点 AIMD 参数覆盖）。带宽限制按节点
+#      设置：每台节点独立调节，节点间无自动调配；
+#   3. 环境分组（envs）：业务环境 = 节点分组 + 挂载点归属（节点 ×
+#      frontend），不携带配额/参数，仅供控制台聚合查看；
+#   4. 管理后台接入（backend，可选）：base_url、fail-static 缓存路径、
+#      mTLS 材料。base_url 留空即不启用。
 #
 # 配置来源有两种，共用同一套解析/校验管线（from_raw）：
 #   - 本地 YAML 文件（load）：传统部署方式；

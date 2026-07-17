@@ -1,16 +1,16 @@
 # rl_limiter.collector —— 集中式快环的"输入级"：每秒并发采样所有 HAProxy
 # 节点的 frontend 统计，把 bytes_out 累计计数差分成每秒速率，并按
-# Target(node, frontend) → env 映射聚合成各环境的**全局**用量样本，供
-# governor（快环限速决策）与执行路径（加权分配）消费。
+# Target(node, frontend) → 控制单元映射聚合成各单元的用量样本，供
+# governor（快环限速决策）与执行路径（单元内按挂载点加权分配）消费。
 #
-# 多节点设计要点：v2.0 下同一环境的 frontend 可能分布在多台 HAProxy
-# 上，因此：
-#   - 差分基线从 per-frontend 升级为 per-Target（(node, frontend) 二元组）；
-#   - 采样失败的容错从"整体降级"细化为**单节点失败隔离**：一台 HAProxy
-#     失联不影响其他节点的测量，只有失联节点上的 Target 沿用上一秒速率
+# 控制单元=节点（见 model.py 顶部说明）：一个单元的全部 Target 都落在
+# 同一台 HAProxy 上，聚合即"该节点上受控 frontend 的用量之和"。要点：
+#   - 差分基线按 per-Target（(node, frontend) 二元组）维护；
+#   - 采样失败的容错是**单节点失败隔离**：一台 HAProxy 失联不影响其他
+#     节点的测量，只有失联节点上的 Target 沿用上一秒速率
 #     （fail-static，§3.7——速率归零会诱导快环误放松限速，方向上不安全）；
-#   - 除 env 级 EWMA 外，另维护 per-Target 的 60s EWMA，作为执行路径按
-#     挂载点加权分配整形值的输入（原慢环算法的输入，v2.0 下沉到这里）。
+#   - 除单元级 EWMA 外，另维护 per-Target 的 60s EWMA，作为执行路径在
+#     单元内按挂载点加权拆分整形值的输入。
 #
 # 采集口径遵循设计文档 §3.1：以 frontend 的 bytes_out（HAProxy 发回客户端
 # 的应用层字节数）为准，而非网卡计数——口径与计费一致，且天然按 frontend
@@ -101,7 +101,7 @@ class _Agg:
 
 
 class Collector:
-    """把多节点原始 frontend 统计转换成按环境全局聚合的用量样本。
+    """把多节点原始 frontend 统计转换成按控制单元（节点）聚合的用量样本。
 
     并发约定：tick 由单一协程（服务核心循环）以固定 1 秒节奏调用；
     set_mapping / degraded_nodes 也在同一事件循环内调用。asyncio 单线程
@@ -253,7 +253,7 @@ class Collector:
         if self._log.isEnabledFor(logging.DEBUG):
             for u in usages:
                 self._log.debug(
-                    "本秒采样完成，输出该环境的全局聚合用量样本 "
+                    "本秒采样完成，输出该控制单元（节点）的聚合用量样本 "
                     "env=%s rate_bps=%.1f mean10_bps=%.1f ewma60_bps=%.1f "
                     "conn_cur=%d degraded=%s",
                     u.env_id, u.rate_bps, u.mean10_bps, u.ewma60_bps, u.conn_cur, u.degraded)

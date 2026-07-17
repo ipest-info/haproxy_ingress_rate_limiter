@@ -1,9 +1,14 @@
-# rl-limiter systemd unit（v2.0 集中部署）。
+# rl-limiter systemd unit。
 #
 # 部署形态：本服务与 HAProxy 分离，独立部署在限速服务器上，通过内网 TCP
 # 控制多台 HAProxy。崩溃由 systemd 拉起（设计 §3.7）；服务宕机期间各台
 # HAProxy 保持最后写入的 map 限速值不变，且 tc 内核兜底仍在各 HAProxy
 # 机器上生效——限速不会因本服务离线而放开。
+#
+# 配置来源二选一（docs/03 §2）：
+#   - MySQL 配置库（生产推荐）：取消下方 Environment 行的注释并填入接入
+#     参数，-c 参数将被忽略；
+#   - 本地 YAML（standalone）：保持默认，编辑 /etc/rl-limiter/config.yaml。
 #
 # 安装：
 #   cp rl-limiter.service /etc/systemd/system/
@@ -18,14 +23,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Environment=RL_MYSQL_HOST=10.0.0.5 RL_MYSQL_USER=rl RL_MYSQL_PASSWORD=xxx RL_MYSQL_DB=rl_limiter
+# Environment=RL_CONSOLE_PORT=8090   # 内置 Web 控制台（只应经防火墙内访问）
 ExecStart=/usr/local/bin/rl-limiter -c /etc/rl-limiter/config.yaml
 Restart=always
 RestartSec=2
 # 自动创建 /var/lib/rl-limiter（fail-static 配置缓存 cache_path 放在这里）。
 StateDirectory=rl-limiter
-# 注意：不再需要 CAP_NET_ADMIN——tc 内核兜底（deploy/tc/backstop.sh）在
-# v2.0 里部署于各台 HAProxy 机器本机，与本服务无关；本服务只通过内网
-# TCP 调用 HAProxy runtime API，无需任何附加特权。
+# 注意：无需 CAP_NET_ADMIN——tc 内核兜底（deploy/tc/backstop.sh）部署于
+# 各台 HAProxy 机器本机，与本服务无关；本服务只通过内网 TCP 调用
+# HAProxy runtime API，无需任何附加特权。
 NoNewPrivileges=yes
 LimitNOFILE=65536
 

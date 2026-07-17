@@ -1,18 +1,22 @@
-# rl-limiter 本地配置示例（v2.0 集中部署；安装到 /etc/rl-limiter/config.yaml）。
+# rl-limiter 本地 YAML 配置示例（standalone/开发用；安装到
+# /etc/rl-limiter/config.yaml）。生产推荐用 MySQL 配置库（设置
+# RL_MYSQL_HOST 即启用，见 docs/03 §2.1），两种来源走同一套校验管线。
 #
-# v2.0 架构：限速服务与 HAProxy 分离部署，一个 rl-limiter 通过内网 TCP
-# 连接并控制多台 HAProxy——因此这里维护的是"受控节点清单"，而环境
-# （envs）的挂载点是 (节点, frontend) 二元组，同一环境可横跨多台节点。
+# 架构要点：限速服务与 HAProxy 分离部署，一个 rl-limiter 通过内网 TCP
+# 连接并控制多台 HAProxy。**带宽限制按节点设置**：每台节点独立整形与
+# AIMD 调节，节点之间没有自动调配；envs 是业务环境分组（纯分组，仅供
+# 聚合查看），挂载点 (节点, frontend) 声明 frontend 归属。
 #
-# 单位约定：quota_bps 一律为 bit/s（运维口径，200000000 = 200 Mbps），
+# 单位约定：quota_bps 一律为 bit/s（运维口径，40000000 = 40 Mbps），
 # 服务内部统一换算为 bytes/s（唯一换算点在 model.EnvQuota）。
 
-node_id: rl-limiter-01          # 本服务实例的唯一标识（心跳/上报时携带，与后台记录对应）
-mode: dry-run                   # dry-run = 只打日志不写 map；enforce = 真实下发限速
+node_id: rl-limiter-01          # 本服务实例的唯一标识
+mode: dry-run                   # 全局默认模式：dry-run 只记日志；enforce 真实下发
 log_level: info                 # debug | info | warning | error
 tick_interval_s: 1.0            # 快环节拍（秒）；1 秒是设计基准，一般无需改动
 
-# 受控 HAProxy 节点清单（基础设施配置，只在本地维护，不随后台下发）。
+# 受控 HAProxy 节点清单。接线字段（host/port/map/timeout）重启生效；
+# 运行字段（quota_bps/mode/params）在 MySQL 模式下可热更。
 # 每台节点需在 haproxy.cfg 的 global 段开启内网 TCP stats socket：
 #   stats socket ipv4@<内网IP>:9999 level admin
 # 安全须知：该端口具备 admin 权限，必须只绑内网并用安全组/防火墙
@@ -21,40 +25,41 @@ haproxy_nodes:
   - name: hap-1                 # 节点名：envs[].targets[].node 引用它，必须全局唯一
     host: 10.0.0.11             # 该节点的内网地址
     port: 9999                  # TCP stats socket 端口
-    bwlim_map_path: /etc/haproxy/maps/bwlim.map   # 该节点上 bwlim map 的路径（map 标识）
+    quota_bps: 40000000         # 该节点自己的带宽限制（bit/s），40 Mbps；被挂载的节点必填
+    bwlim_map_path: /etc/haproxy/maps/bwlim.map   # 该节点上 bwlim map 的路径
     timeout_ms: 500             # 单次 runtime API 命令超时（连接 + 读写，毫秒）
+    # mode: enforce             # 可选：按节点覆盖模式（逐台灰度用；缺省继承全局 mode）
+    # params:                   # 可选：按节点覆盖 AIMD 参数（设计 §3.3，缺省用默认值）
+    #   elastic_ceiling: 1.10   # 弹性上限系数：整形值常态 = 限制 × 该值
+    #   low_watermark: 0.90     # 恢复水位：均值低于 限制×该值 才开始放松
+    #   tighten_after_s: 3      # 均值超限持续秒数 → 触发收紧
+    #   recover_after_s: 5      # 均值低于水位持续秒数 → 触发放松
+    #   md_factor: 0.9          # 乘性收紧系数
+    #   tighten_floor: 1.00     # 收紧下限：不低于 限制 × 该值（1.00 = 最多压回限制本身）
+    #   ai_step_frac: 0.05      # 加性放松步长（每秒，限制的比例）
   - name: hap-2
     host: 10.0.0.12
     port: 9999
-    bwlim_map_path: /etc/haproxy/maps/bwlim.map
-    timeout_ms: 500
+    quota_bps: 40000000
 
-# 本地静态环境配额：standalone / 首启引导用；后台下发配置后以下发为准。
+# 业务环境分组（纯分组）：环境不携带配额/参数——带宽限制在上方节点上。
+# 约束：节点是环境的独占资源（一个环境可横跨多台节点，一台节点只允许
+# 服务一个环境）；每个环境至少一个挂载点。
 envs:
-  - env_id: env-a               # 环境 ID
-    quota_bps: 200000000        # 约定带宽（bit/s），200 Mbps
-    targets:                    # 该环境的全部挂载点：可横跨多台 HAProxy
+  - env_id: env-a               # 环境 ID（控制台聚合视图按它汇总成员节点）
+    targets:                    # 挂载点：节点 × 该节点上的 frontend 名（stats 的 pxname 列）
       - node: hap-1
-        frontend: fe_env_a      # 该节点上的 frontend 名（stats 输出的 pxname 列）
+        frontend: fe_env_a
       - node: hap-2
         frontend: fe_env_a
-    # params:                   # 可选：按环境覆盖快环参数（设计 §3.3，缺省用默认值）
-    #   elastic_ceiling: 1.10   # 弹性上限系数：bwlim 常态 = 配额 × 该值
-    #   low_watermark: 0.90     # 恢复水位：均值低于 配额×该值 才开始放松
-    #   tighten_after_s: 3      # 均值超配额持续秒数 → 触发收紧
-    #   recover_after_s: 5      # 均值低于水位持续秒数 → 触发放松
-    #   md_factor: 0.9          # 乘性收紧系数
-    #   tighten_floor: 1.00     # 收紧下限：不低于 配额 × 该值
-    #   ai_step_frac: 0.05      # 加性放松步长（每秒，配额的比例）
 
-# 管理后台（可选）：留空/注释掉整段则进入 standalone 模式，只用上方 envs。
+# 可选管理后台通道：留空/注释掉整段则不启用（生产配置权威是 MySQL 配置库）。
 backend:
-  # 后台地址；配置后启用配置长轮询 + 用量上报 + 心跳
-  base_url: http://127.0.0.1:9090
-  # fail-static 配置缓存：断联/重启时按最后一次下发的配置继续限速（设计 §3.7）
+  base_url: ""                  # 后台地址；配置后启用配置长轮询 + 用量上报 + 心跳
+  # fail-static 配置缓存：断联/重启时按最后一次下发的配置继续限速
   # systemd 的 StateDirectory=rl-limiter 会自动创建 /var/lib/rl-limiter
   cache_path: /var/lib/rl-limiter/config-cache.json
-  # tls:                        # mTLS 材料（可选，生产必配）
+  # tls:                        # mTLS 材料（可选）
   #   ca_file: ""               # CA 证书路径
   #   cert_file: ""             # 客户端证书路径
   #   key_file: ""              # 客户端私钥路径

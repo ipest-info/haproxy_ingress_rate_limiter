@@ -2,16 +2,16 @@
 # per-frontend bwlim map（设计文档 §3.2 "限速执行机制"）。
 #
 # 架构位置：executor 是核心循环"采集 → 决策 → 分配 → 执行"四段中的
-# 最后一段——governor 只产出环境聚合目标值，allocator 把聚合值按各
-# Target 近期用量加权拆分，executor 再通过各节点的 HAProxy runtime API
-# 更新 map 条目，haproxy 配置里的 filter bwlim-out 以 map_str_int 查表
-# 的方式实时读取该值完成聚合整形。
+# 最后一段——governor 只产出节点级整形目标值，allocator 把该值按节点
+# 内各 Target 近期用量加权拆分，executor 再通过各节点的 HAProxy runtime
+# API 更新 map 条目，haproxy 配置里的 filter bwlim 以 map_str_int 查表
+# 的方式实时读取该值完成整形。
 #
-# v2.0 的结构要点：
+# 结构要点：
 #   - 集中式服务控制多台 HAProxy，因此按节点名持有 clients 与
 #     map_paths 两张表，每个 Target 用其所在节点的 client 写该节点
 #     自己的 map 路径；
-#   - 聚合值到各 Target 的拆分由 allocator 按用量加权完成，apply
+#   - 节点整形值到各 Target 的拆分由 allocator 按用量加权完成，apply
 #     直接消费分配好的整数值，不在 executor 内自行均分；
 #   - 并发约定：本模块运行在单线程 asyncio 事件循环内，不需要锁——
 #     但 apply 是协程，会在 await 处让出控制权，set_mode 可能在两个
@@ -39,14 +39,13 @@ from . import model
 
 # 分配漂移再平衡阈值（相对变化比例）。
 #
-# 背景：v2.0 把原慢环"每 5~10s 无条件重新切分节点配额"合并进了执行
-# 路径，但 apply 默认只在 changed=True（聚合整形值变化）时写 map。
-# 稳态下（用量低于配额、bwlim 长期停在弹性上限不变）changed 恒为
-# False——此时若节点间流量发生倾斜（DNS 打流变化），各节点 map 里
-# 还是旧的分配值，繁忙节点会被过小的份额冤枉限速，而 governor 看到
-# 的环境总量并未超限、永远不会触发重写。因此 executor 必须自己感知
+# 背景：apply 默认只在 changed=True（节点整形值变化）时写 map。稳态下
+# （用量低于限制、bwlim 长期停在弹性上限不变）changed 恒为 False——
+# 此时若同一节点上多个受控 frontend 的流量发生倾斜，map 里还是旧的
+# 分配值，繁忙 frontend 会被过小的份额冤枉限速，而 governor 看到的
+# 节点总量并未超限、永远不会触发重写。因此 executor 必须自己感知
 # "分配结果相对上次落地值的漂移"：任一 Target 的分配值相对变化超过
-# 该阈值（或 Target 集合变化）即强制重写整个 env 的分配。阈值过小会
+# 该阈值（或 Target 集合变化）即强制重写该节点的整份分配。阈值过小会
 # 造成每秒写 map 的抖动，过大会让倾斜迟迟得不到纠正，5% 与 AIStepFrac
 # 同量级，实测每次显著倾斜后 1~2 秒内完成再平衡。
 REBALANCE_EPSILON = 0.05
@@ -267,7 +266,7 @@ class Executor:
                 drift = self._alloc_drift(d.env_id, enf_alloc)
                 if drift > REBALANCE_EPSILON:
                     self._log.info(
-                        "挂载点分配相对上次落地值漂移超过阈值，触发跨节点再平衡重写 "
+                        "挂载点分配相对上次落地值漂移超过阈值，触发节点内再平衡重写 "
                         "env=%s max_drift=%.3f alloc=%s",
                         d.env_id, drift,
                         {str(t): v for t, v in enf_alloc.items()},

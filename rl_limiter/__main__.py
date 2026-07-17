@@ -1,10 +1,10 @@
-# rl_limiter.__main__ —— rl-limiter 服务入口（v2.0 集中部署）。
+# rl_limiter.__main__ —— rl-limiter 服务入口（集中部署，控制单元=节点）。
 #
 # rl-limiter 是与 HAProxy 分离部署的集中式限速服务：通过内网 TCP 连接
 # 多台 HAProxy 的 stats socket，每秒采样各节点 frontend 的 bytes_out，
-# 把同一环境分布在多台节点上的流量全局聚合后做 AIMD 决策（设计文档
-# §3.3），再按各挂载点近期用量加权把整形值写回各节点的 bwlim map
-# （dry-run 模式下只记录不写入）。与管理后台断联时按最后一次下发的
+# **按节点**做 AIMD 决策（设计文档 §3.3）——每台节点有自己的带宽限制、
+# 独立调节，节点之间没有自动调配——再把整形值写回该节点的 bwlim map
+# （dry-run 模式下只记录不写入）。与配置来源断联时按最后一次加载的
 # 配置继续限速（fail-static，§3.7）。
 
 from __future__ import annotations
@@ -47,8 +47,9 @@ def _summarize_nodes(nodes: list[model.NodeConfig]) -> str:
 
 
 def _summarize_envs(envs: list[model.EnvQuota]) -> str:
-    """把环境清单压缩成单个日志字段，格式：
-    "env_id=e1,quota_bps=200000000,targets=hap-1/fe_a|hap-2/fe_a;..."。
+    """把控制单元（节点）清单压缩成单个日志字段，格式：
+    "env_id=hap-1,quota_bps=40000000,targets=hap-1/fe_a;..."。
+    env_id 字段承载节点名（控制单元=节点，见 model.py 顶部说明）；
     quota_bps 为配置口径的 bits/s；targets 为 节点/前端 二元组。"""
     return ";".join(
         "env_id={},quota_bps={},targets={}".format(
@@ -72,7 +73,7 @@ async def _amain(cfg, log: logging.Logger,
     webconsole 模块）：快环 sampler 每拍向 StatusHub 发布一帧快照，配置
     热更经中继队列同步给控制台的配置视图。
     """
-    # --- 组装与各台 HAProxy 的 runtime API 客户端（v2.0：内网 TCP） ---
+    # --- 组装与各台 HAProxy 的 runtime API 客户端（内网 TCP） ---
     # 客户端字典以节点名为键，与 Target.node / NodeConfig.name 对齐；
     # 同一个客户端同时充当采集来源（show stat）与执行通道（set map）。
     clients = {
@@ -185,8 +186,9 @@ async def _amain(cfg, log: logging.Logger,
         if hub is not None:
             hub.update_config(seed_cfg)
         seeded = True
-        log.info("已用%s环境配额完成引导 version=%s mode=%s envs=%d envs_detail=%s",
-                 "数据库下发的" if db_opts is not None else "本地静态",
+        log.info("已用%s配置完成引导（控制单元=节点） version=%s mode=%s "
+                 "units=%d units_detail=%s",
+                 "数据库" if db_opts is not None else "本地静态",
                  seed_version, cfg.mode, len(cfg.envs), _summarize_envs(cfg.envs))
     if not seeded:
         log.warning(

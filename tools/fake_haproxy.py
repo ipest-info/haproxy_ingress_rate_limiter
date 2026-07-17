@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # tools/fake_haproxy.py —— 本地演示/联调用的"假 HAProxy stats socket"。
 #
-# 用途：在没有真实 HAProxy 的开发机上模拟 v2.0 架构里的一台受控节点——
+# 用途：在没有真实 HAProxy 的开发机上模拟一台受控节点——
 # 一个监听内网 TCP 的 stats socket（真实部署中对应 haproxy.cfg 的
 # `stats socket ipv4@<内网IP>:9999 level admin`）。rl-limiter 连上来后：
 #   - "show stat -1 1 -1"：返回带 "# " 列头的 CSV，其中各 frontend 的
