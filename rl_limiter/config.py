@@ -86,7 +86,17 @@ class ServiceConfig:
     # 刻意不放进 NodeConfig——NodeConfig 只装接线字段，其相等性比较被
     # 用作"节点接线变化需重启"的判据，模式切换不应触发该告警。
     node_modes: dict[str, str] = field(default_factory=dict)
-    # 本地静态/引导配额。
+    # v2.1：配额与 AIMD 参数下沉到节点——每台 HAProxy 自己设置带宽
+    # 限制、独立调节，节点之间没有自动调配（跨节点用量加权分配在对称
+    # 饱和负载下会正反馈失衡，已取消）。两者与 mode 同为可热更字段。
+    node_quotas: dict[str, int] = field(default_factory=dict)
+    node_params: dict[str, model.GovParams] = field(default_factory=dict)
+    # 业务环境分组（env_id → 节点名列表）：环境不再有配额/调节语义，
+    # 只提供"聚合查看成员节点带宽之和"的视图。
+    env_groups: dict[str, list[str]] = field(default_factory=dict)
+    # 快环控制单元清单（解析末尾由节点配额+挂载点**组装**而来）：每台
+    # 有挂载点的节点一个单元，env_id 字段=节点名，quota=节点配额。
+    # 复用 EnvQuota 结构让快环全链路（采集聚合/AIMD/执行）零改动。
     envs: list[model.EnvQuota] = field(default_factory=list)
     backend: BackendOptions = field(default_factory=BackendOptions)
 
@@ -125,9 +135,42 @@ def from_raw(raw: Any, source: str) -> ServiceConfig:
     try:
         cfg = _parse(raw)
         _validate(cfg)
+        _assemble_units(cfg)
     except ValueError as e:
         raise ValueError(f"{source} 无效: {e}") from None
     return cfg
+
+
+def _assemble_units(cfg: ServiceConfig) -> None:
+    """校验通过后，把"环境分组"重组为 per-node 控制单元。
+
+    v2.1 架构：每台节点自己限速、独立 AIMD，节点间无自动调配。这里把
+    cfg.envs 从"环境 → 挂载点"重排为"节点 → 挂载点"（每台有挂载点的
+    节点一个 EnvQuota，env_id=节点名，quota=节点配额，params=节点参数
+    覆盖），同时生成 env_groups（环境 → 成员节点）供聚合展示。节点独占
+    校验保证一个节点的全部挂载点来自同一环境，重排无二义。
+    """
+    groups: dict[str, list[str]] = {}
+    node_targets: dict[str, list[model.Target]] = {}
+    for g in cfg.envs:
+        members: list[str] = []
+        for t in g.targets:
+            node_targets.setdefault(t.node, []).append(t)
+            if t.node not in members:
+                members.append(t.node)
+        groups[g.env_id] = members
+    cfg.env_groups = groups
+    cfg.envs = [
+        model.EnvQuota(
+            env_id=node,
+            quota_bits_per_sec=cfg.node_quotas[node],
+            targets=targets,
+            # 复制一份，避免多个单元/多轮加载共享可变参数对象。
+            params=(model.GovParams(**cfg.node_params[node].to_dict())
+                    if node in cfg.node_params else None),
+        )
+        for node, targets in sorted(node_targets.items())
+    ]
 
 
 def _parse(raw: dict[str, Any]) -> ServiceConfig:
@@ -200,8 +243,36 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
         node_mode = str(n.get("mode", "") or "")
         if node_mode:
             cfg.node_modes[name] = node_mode
+        # 节点自己的带宽限制（bits/s，运维口径）。有挂载点的节点必填，
+        # 数值合法性与必填校验在 _validate。
+        quota_raw = n.get("quota_bps")
+        if quota_raw is not None:
+            try:
+                cfg.node_quotas[name] = int(quota_raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"haproxy_nodes[{i}] ({name}): quota_bps 必须是整数"
+                    f"（比特每秒），当前值 {quota_raw!r}"
+                ) from None
+        # 节点级 AIMD 参数覆盖（可选）。
+        params_raw = n.get("params")
+        if params_raw is not None:
+            if not isinstance(params_raw, dict):
+                raise ValueError(
+                    f"haproxy_nodes[{i}] ({name}): params 必须是键值映射，"
+                    f"当前为 {type(params_raw).__name__}"
+                )
+            try:
+                p = model.GovParams.from_dict(params_raw)
+            except (TypeError, ValueError) as ex:
+                raise ValueError(
+                    f"haproxy_nodes[{i}] ({name}): params 结构错误: {ex!r}"
+                ) from None
+            if p is not None:
+                cfg.node_params[name] = p
 
-    # ---- envs：引导配额（结构与管理后台下发一致，直接复用 from_dict）----
+    # ---- envs：业务环境分组（v2.1 起环境只是节点分组 + 挂载点归属，
+    # 不再携带配额/参数——那些已下沉到节点）。----
     envs_raw = raw.get("envs") or []
     if not isinstance(envs_raw, list):
         raise ValueError(
@@ -212,16 +283,26 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
             raise ValueError(
                 f"envs[{i}]: 每个环境必须是键值映射，当前为 {type(e).__name__}"
             )
+        # 老形态（环境带配额/参数）明确拒绝并给出迁移指引，而不是静默
+        # 忽略——静默忽略会让运维以为配额还生效着。
+        for legacy in ("quota_bps", "params"):
+            if legacy in e:
+                raise ValueError(
+                    f"envs[{i}] ({e.get('env_id', '?')}): 字段 {legacy!r} 已"
+                    f"废弃——v2.1 起带宽限制与 AIMD 参数按节点设置"
+                    f"（haproxy_nodes[].quota_bps / params），环境仅作"
+                    f"节点分组与聚合查看"
+                )
         try:
-            cfg.envs.append(model.EnvQuota.from_dict(e))
+            # 复用 EnvQuota 解析 targets 结构；quota 置 1 只为通过结构
+            # 构造，_parse 末尾组装控制单元时不使用环境级配额。
+            group = model.EnvQuota.from_dict({**e, "quota_bps": 1})
         except (KeyError, TypeError, ValueError) as ex:
-            # from_dict 对缺键/类型错误直接抛异常，这里补上环境下标与
-            # 结构提示，避免运维面对裸 KeyError 无从下手。
             raise ValueError(
                 f"envs[{i}] ({e.get('env_id', '?')}) 结构错误: {ex!r}；"
-                f"每个 target 必须是 {{node, frontend}} 键值映射，"
-                f"params 必须是键值映射"
+                f"每个 target 必须是 {{node, frontend}} 键值映射"
             ) from None
+        cfg.envs.append(group)
 
     # ---- backend：管理后台接入 ----
     backend_raw = raw.get("backend") or {}
@@ -336,12 +417,6 @@ def _validate(cfg: ServiceConfig) -> None:
                 f"envs[{seen_env_ids[e.env_id]}] 重复：环境标识必须唯一"
             )
         seen_env_ids[e.env_id] = i
-        if e.quota_bits_per_sec <= 0:
-            raise ValueError(
-                f"envs[{i}] ({e.env_id}): quota_bps 必须 > 0，"
-                f"当前值 {e.quota_bits_per_sec!r}"
-                f"（单位为比特每秒，例如 200000000 表示 200 Mbps）"
-            )
         if not e.targets:
             raise ValueError(
                 f"envs[{i}] ({e.env_id}): 至少需要一个 target——"
@@ -376,3 +451,15 @@ def _validate(cfg: ServiceConfig) -> None:
                     f"环境、节点上的他环境流量也逃出配额边界）"
                 )
             node_env_owner[t.node] = e.env_id
+
+    # v2.1：被挂载的节点必须设置自己的带宽限制。配额是该节点 AIMD 的
+    # 分母/基准，缺失或非正意味着该节点的控制单元无法构造。
+    for node in node_env_owner:
+        q = cfg.node_quotas.get(node)
+        if q is None or q <= 0:
+            raise ValueError(
+                f"节点 {node!r} 已被挂载但未设置有效的 quota_bps"
+                f"（当前值 {q!r}）：v2.1 起带宽限制按节点设置"
+                f"（haproxy_nodes[].quota_bps，单位比特每秒，"
+                f"例如 40000000 表示 40 Mbps）"
+            )

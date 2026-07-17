@@ -4,8 +4,10 @@
 # 四块内容（建表与种子数据见 deploy/mysql/init.sql）：
 #
 #   service_config   单行表：node_id / mode / log_level / tick_interval_s
-#   haproxy_nodes    受控 HAProxy 节点清单（name/host/port/map 路径/超时）
-#   envs             环境配额（env_id / quota_bps / 可选 params_json）
+#   haproxy_nodes    受控 HAProxy 节点清单：接线（host/port/map 路径/超时）
+#                    + 可热更运行列（mode / quota_bps / params_json）——
+#                    v2.1 起带宽限制与 AIMD 参数按节点设置
+#   envs             业务环境分组（仅 env_id：环境=节点分组+聚合视图）
 #   env_targets      环境挂载点（env_id × node × frontend）
 #
 # 复用而不是重写：数据库行先被组装成与 yaml.safe_load 结果**同构**的原始
@@ -68,10 +70,11 @@ _SQL_SERVICE = (
     "FROM service_config WHERE id = 1"
 )
 _SQL_NODES = (
-    "SELECT name, host, port, bwlim_map_path, timeout_ms, mode "
-    "FROM haproxy_nodes ORDER BY name"
+    "SELECT name, host, port, bwlim_map_path, timeout_ms, mode, "
+    "quota_bps, params_json FROM haproxy_nodes ORDER BY name"
 )
-_SQL_ENVS = "SELECT env_id, quota_bps, params_json FROM envs ORDER BY env_id"
+# v2.1：envs 表只剩分组标识——配额/参数已下沉到 haproxy_nodes。
+_SQL_ENVS = "SELECT env_id FROM envs ORDER BY env_id"
 _SQL_TARGETS = (
     "SELECT env_id, node, frontend FROM env_targets "
     "ORDER BY env_id, node, frontend"
@@ -177,19 +180,37 @@ def rows_to_raw(
         if tick is not None:
             raw["tick_interval_s"] = tick
 
-    raw["haproxy_nodes"] = [
-        {
+    nodes_out: list[dict[str, Any]] = []
+    for (name, host, port, bwlim_map_path, timeout_ms, mode,
+         quota_bps, params_json) in node_rows:
+        node: dict[str, Any] = {
             "name": name,
             "host": host,
             "port": port,
             "bwlim_map_path": bwlim_map_path or "",
             "timeout_ms": timeout_ms or 0,
-            # 节点级模式覆盖：NULL/空 = 继承全局 service_config.mode。
-            # 这是节点行里唯一**可热更**的列（其余为接线字段，重启生效）。
+            # mode/quota_bps/params 是节点行里的**可热更**运行列
+            # （其余为接线字段，重启生效）。mode NULL/空 = 继承全局。
             "mode": mode or "",
         }
-        for name, host, port, bwlim_map_path, timeout_ms, mode in node_rows
-    ]
+        if quota_bps is not None:
+            node["quota_bps"] = quota_bps
+        if params_json:
+            try:
+                params = json.loads(params_json)
+            except ValueError as e:
+                raise ValueError(
+                    f"haproxy_nodes 表中节点 {name!r} 的 params_json "
+                    f"不是合法的 JSON: {e}"
+                ) from None
+            if not isinstance(params, dict):
+                raise ValueError(
+                    f"haproxy_nodes 表中节点 {name!r} 的 params_json "
+                    f"必须是 JSON 对象，当前为 {type(params).__name__}"
+                )
+            node["params"] = params
+        nodes_out.append(node)
+    raw["haproxy_nodes"] = nodes_out
 
     targets_by_env: dict[str, list[dict[str, Any]]] = {}
     for env_id, node, frontend in target_rows:
@@ -197,28 +218,11 @@ def rows_to_raw(
             {"node": node, "frontend": frontend}
         )
 
-    envs: list[dict[str, Any]] = []
-    for env_id, quota_bps, params_json in env_rows:
-        env: dict[str, Any] = {
-            "env_id": env_id,
-            "quota_bps": quota_bps,
-            "targets": targets_by_env.get(str(env_id), []),
-        }
-        if params_json:
-            try:
-                params = json.loads(params_json)
-            except ValueError as e:
-                raise ValueError(
-                    f"envs 表中环境 {env_id!r} 的 params_json 不是合法的 JSON: {e}"
-                ) from None
-            if not isinstance(params, dict):
-                raise ValueError(
-                    f"envs 表中环境 {env_id!r} 的 params_json 必须是 JSON 对象，"
-                    f"当前为 {type(params).__name__}"
-                )
-            env["params"] = params
-        envs.append(env)
-    raw["envs"] = envs
+    # v2.1：环境行只剩分组标识（配额/参数已下沉到节点行）。
+    raw["envs"] = [
+        {"env_id": env_id, "targets": targets_by_env.get(str(env_id), [])}
+        for (env_id,) in env_rows
+    ]
     return raw
 
 
@@ -226,9 +230,14 @@ def canonical_config(
     mode: str,
     envs: list[model.EnvQuota],
     node_modes: dict[str, str] | None = None,
+    env_groups: dict[str, list[str]] | None = None,
 ) -> str:
-    """把可热更新部分（mode + envs + node_modes）序列化为规范化 JSON
-    （键排序、紧凑分隔符），作为配置内容的精确身份。
+    """把可热更新部分（mode + 控制单元 + node_modes + 环境分组）序列化
+    为规范化 JSON（键排序、紧凑分隔符），作为配置内容的精确身份。
+
+    env_groups 必须纳入：把节点从一个环境移到另一个环境时，控制单元
+    （节点配额/挂载点）可能完全不变，只有分组归属变了——不纳入会漏掉
+    这类"纯重分组"变更，控制台聚合视图将停在旧分组。
 
     变更检测必须比较这个字符串本身而不是它的哈希：32 位校验和存在碰撞
     窗口（~2^-32/次，且非密码学哈希对结构化输入可能更差），一旦新旧内容
@@ -239,6 +248,7 @@ def canonical_config(
         "mode": mode,
         "envs": [e.to_dict() for e in envs],
         "node_modes": dict(node_modes or {}),
+        "env_groups": {k: list(v) for k, v in (env_groups or {}).items()},
     }
     return json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -249,6 +259,7 @@ def config_checksum(
     mode: str,
     envs: list[model.EnvQuota],
     node_modes: dict[str, str] | None = None,
+    env_groups: dict[str, list[str]] | None = None,
 ) -> int:
     """内容校验和 = canonical_config 的 CRC32，充当配置版本号。
 
@@ -257,7 +268,8 @@ def config_checksum(
     ControllerConfig.version 的展示/核对（日志、心跳），变更检测一律用
     canonical_config 字符串精确比较（见其 docstring），不依赖此哈希。
     """
-    return zlib.crc32(canonical_config(mode, envs, node_modes).encode("utf-8"))
+    return zlib.crc32(
+        canonical_config(mode, envs, node_modes, env_groups).encode("utf-8"))
 
 
 async def _fetch_raw(opts: MySQLOptions) -> dict[str, Any]:
@@ -478,22 +490,22 @@ async def update_node_mode(
         raise ValueError(f"节点 {name!r} 不存在于 haproxy_nodes 表")
 
 
-async def update_env_quota(opts: MySQLOptions, env_id: str, quota_bps: int) -> None:
-    """更新环境配额（bits/s，运维口径）。环境不存在按错误报出，
-    而不是静默 0 行更新——控制台上的拼写错误必须立刻可见。"""
+async def update_node_quota(opts: MySQLOptions, name: str, quota_bps: int) -> None:
+    """更新节点自己的带宽限制（bits/s，运维口径）。节点不存在按错误
+    报出，而不是静默 0 行更新——控制台上的拼写错误必须立刻可见。"""
     if quota_bps <= 0:
         raise ValueError(f"quota_bps 必须 > 0（比特每秒），当前值 {quota_bps!r}")
     n = await _exec_write(
-        opts, "UPDATE envs SET quota_bps = %s WHERE env_id = %s",
-        (int(quota_bps), env_id))
+        opts, "UPDATE haproxy_nodes SET quota_bps = %s WHERE name = %s",
+        (int(quota_bps), name))
     if n == 0:
-        raise ValueError(f"环境 {env_id!r} 不存在于 envs 表")
+        raise ValueError(f"节点 {name!r} 不存在于 haproxy_nodes 表")
 
 
-async def update_env_params(
-    opts: MySQLOptions, env_id: str, params: dict[str, Any] | None,
+async def update_node_params(
+    opts: MySQLOptions, name: str, params: dict[str, Any] | None,
 ) -> None:
-    """更新环境的快环参数覆盖（None 表示清除覆盖、回到默认参数）。
+    """更新节点的快环参数覆盖（None 表示清除覆盖、回到默认参数）。
 
     键集合与数值先在这里按 GovParams 校验（未知键/非数值直接拒绝），
     避免把"下一轮 fetch 才发现的坏 JSON"写进库触发 fail-static 告警。
@@ -513,10 +525,10 @@ async def update_env_params(
                 raise ValueError(f"params.{k} 必须是数值，当前值 {v!r}")
         params_json = json.dumps(params, ensure_ascii=False)
     n = await _exec_write(
-        opts, "UPDATE envs SET params_json = %s WHERE env_id = %s",
-        (params_json, env_id))
+        opts, "UPDATE haproxy_nodes SET params_json = %s WHERE name = %s",
+        (params_json, name))
     if n == 0:
-        raise ValueError(f"环境 {env_id!r} 不存在于 envs 表")
+        raise ValueError(f"节点 {name!r} 不存在于 haproxy_nodes 表")
 
 
 def _validate_targets(targets: Any) -> list[tuple[str, str]]:
@@ -541,7 +553,7 @@ async def _write_targets_tx(
     opts: MySQLOptions,
     env_id: str,
     pairs: list[tuple[str, str]],
-    create_quota_bps: int | None,
+    create_env_row: bool,
 ) -> None:
     """create_env / update_env_targets 的共同事务体。
 
@@ -582,10 +594,9 @@ async def _write_targets_tx(
                             f"{detail}——一台 HAProxy 只允许服务一个环境"
                             f"（一个环境可横跨多台节点，反向不行）。如需"
                             f"迁移节点，先从原环境移除该节点的全部挂载点")
-                    if create_quota_bps is not None:
+                    if create_env_row:
                         await cur.execute(
-                            "INSERT INTO envs (env_id, quota_bps) VALUES (%s, %s)",
-                            (env_id, int(create_quota_bps)))
+                            "INSERT INTO envs (env_id) VALUES (%s)", (env_id,))
                     else:
                         await cur.execute(
                             "SELECT env_id FROM envs WHERE env_id = %s FOR UPDATE",
@@ -619,22 +630,19 @@ async def update_env_targets(
     挂载点，再加入目标环境——顺序不可反（节点独占检查会拒绝反序）。
     """
     pairs = _validate_targets(targets)
-    await _write_targets_tx(opts, env_id, pairs, create_quota_bps=None)
+    await _write_targets_tx(opts, env_id, pairs, create_env_row=False)
 
 
-async def create_env(
-    opts: MySQLOptions, env_id: str, quota_bps: int, targets: Any,
-) -> None:
-    """新建环境（配额 + 初始挂载点，单事务）。必须携带至少一个挂载点：
-    统一校验管线拒绝零挂载点的环境，缺挂载点的新环境会让整份配置快照
-    无法生效（fail-static 卡住所有后续变更）。"""
+async def create_env(opts: MySQLOptions, env_id: str, targets: Any) -> None:
+    """新建环境分组（v2.1：环境不再有配额，只是节点分组 + 聚合视图；
+    带宽限制设在成员节点上）。必须携带至少一个挂载点：统一校验管线
+    拒绝零挂载点的环境，缺挂载点的新环境会让整份配置快照无法生效
+    （fail-static 卡住所有后续变更）。"""
     env_id = str(env_id).strip()
     if not env_id:
         raise ValueError("env_id 不能为空")
-    if quota_bps <= 0:
-        raise ValueError(f"quota_bps 必须 > 0（比特每秒），当前值 {quota_bps!r}")
     pairs = _validate_targets(targets)
-    await _write_targets_tx(opts, env_id, pairs, create_quota_bps=int(quota_bps))
+    await _write_targets_tx(opts, env_id, pairs, create_env_row=True)
 
 
 async def delete_env(opts: MySQLOptions, env_id: str) -> None:
@@ -670,7 +678,7 @@ async def watch(
       下一轮再试。
     """
     last_canonical = canonical_config(
-        boot_cfg.mode, boot_cfg.envs, boot_cfg.node_modes)
+        boot_cfg.mode, boot_cfg.envs, boot_cfg.node_modes, boot_cfg.env_groups)
     last_nodes = list(boot_cfg.nodes)  # NodeConfig 是 dataclass，逐字段相等
     # 启动时完成接线（构建了 RuntimeClient）的节点集合：热更新的硬边界。
     wired_nodes = frozenset(n.name for n in boot_cfg.nodes)
@@ -692,7 +700,8 @@ async def watch(
                 "热更新不生效，请重启 rl-limiter 使其生效 nodes=%d", len(cfg.nodes))
             last_nodes = list(cfg.nodes)  # 只在变化那一轮告警一次
 
-        canonical = canonical_config(cfg.mode, cfg.envs, cfg.node_modes)
+        canonical = canonical_config(
+            cfg.mode, cfg.envs, cfg.node_modes, cfg.env_groups)
         if canonical == last_canonical:
             continue
 
@@ -715,7 +724,8 @@ async def watch(
         version = zlib.crc32(canonical.encode("utf-8"))
         ctl = model.ControllerConfig(
             version=version, mode=cfg.mode, envs=cfg.envs,
-            node_modes=dict(cfg.node_modes))
+            node_modes=dict(cfg.node_modes),
+            env_groups={k: list(v) for k, v in cfg.env_groups.items()})
         queue.put_nowait(ctl)
         log.info(
             "检测到数据库配置变化，已提交主循环热生效 "

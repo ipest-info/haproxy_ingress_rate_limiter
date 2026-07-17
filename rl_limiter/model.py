@@ -178,9 +178,14 @@ class GovParams:
 
 @dataclass(slots=True)
 class EnvQuota:
-    """一个环境的配额与挂载点清单，配置分发的最小单元（§3.5 数据模型）。
+    """一个**控制单元**的配额与挂载点清单（快环 AIMD 的调节对象）。
 
-    v2.0：targets 显式携带节点维度——同一环境可以横跨多台 HAProxy。
+    架构演进说明（v2.1）：控制单元从"业务环境"改为"单台 HAProxy 节点"
+    ——每台节点自己设置带宽限制、独立跑 AIMD，节点之间没有任何自动
+    调配（早期的跨节点用量加权分配在对称饱和负载下会形成正反馈失衡，
+    已取消）。此后 env_id 字段装的是**节点名**，targets 是该节点上的
+    全部挂载 frontend；业务"环境"退化为节点分组，只用于聚合展示
+    （见 ControllerConfig.env_groups）。结构保持不变以复用快环全链路。
     """
 
     env_id: str
@@ -241,11 +246,16 @@ class ControllerConfig:
     version: int = 0
     # 全局默认运行模式：未被 node_modes 覆盖的节点继承它。
     mode: str = MODE_DRY_RUN
+    # 控制单元清单：v2.1 起每个元素对应**一台节点**（env_id=节点名，
+    # quota=该节点自己的带宽限制），见 EnvQuota 的架构演进说明。
     envs: list[EnvQuota] = field(default_factory=list)
     # 按节点覆盖运行模式（节点名 → dry-run/enforce）。生产灰度的关键
     # 能力：可以逐台 HAProxy 打开 enforce，其余节点留在 dry-run 观察。
     # 字典中不存在的节点继承全局 mode。
     node_modes: dict[str, str] = field(default_factory=dict)
+    # 业务环境分组（env_id → 节点名列表）：纯展示信息——环境不再有
+    # 自己的配额与调节，只提供"聚合查看成员节点带宽之和"的视图。
+    env_groups: dict[str, list[str]] = field(default_factory=dict)
     report_interval_s: int = 5    # 用量样本上报间隔（秒）
     heartbeat_interval_s: int = 10  # 心跳间隔（秒）
 
@@ -286,6 +296,10 @@ class ControllerConfig:
             node_modes={
                 str(k): str(v) for k, v in (d.get("node_modes") or {}).items()
             },
+            env_groups={
+                str(k): [str(n) for n in v]
+                for k, v in (d.get("env_groups") or {}).items()
+            },
             report_interval_s=int(d.get("report_interval_s", 5)),
             heartbeat_interval_s=int(d.get("heartbeat_interval_s", 10)),
         )
@@ -298,6 +312,7 @@ class ControllerConfig:
             "mode": self.mode,
             "envs": [e.to_dict() for e in self.envs],
             "node_modes": dict(self.node_modes),
+            "env_groups": {k: list(v) for k, v in self.env_groups.items()},
             "report_interval_s": self.report_interval_s,
             "heartbeat_interval_s": self.heartbeat_interval_s,
         }

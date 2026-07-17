@@ -6,9 +6,13 @@
 -- 配置后走同一套校验管线。
 --
 -- 热更新说明：rl-limiter 每 RL_MYSQL_POLL_S 秒轮询一次全量配置，
--- mode / envs（配额、挂载点、参数覆盖）改表即热生效，无需重启；
--- haproxy_nodes（节点接线）与 service_config 的 node_id/log_level/
--- tick_interval_s 在进程启动时定型，改表后需重启 rl-limiter。
+-- 节点的 mode/quota_bps/params_json 与挂载点归属改表即热生效，无需
+-- 重启；节点接线列（host/port/map/timeout）与 service_config 的
+-- node_id/log_level/tick_interval_s 在进程启动时定型，改表后需重启。
+--
+-- v2.1 架构：带宽限制按**节点**设置（每台 HAProxy 自己限速、独立
+-- AIMD 调节，节点间无自动调配）；环境退化为节点分组，仅供控制台
+-- 聚合查看成员节点带宽之和。
 
 -- ---------------------------------------------------------------------------
 -- 1. service_config：服务级配置（单行表，id 恒为 1）。
@@ -41,23 +45,26 @@ CREATE TABLE IF NOT EXISTS haproxy_nodes (
     bwlim_map_path  VARCHAR(255) NOT NULL DEFAULT '/etc/haproxy/maps/bwlim.map',
     -- 单次 runtime API 命令超时（连接 + 读写，毫秒）；<=0 按默认 500 处理。
     timeout_ms      INT          NOT NULL DEFAULT 500,
+    -- ---- 以下为**热生效**的运行列（接线列改后需重启）----
     -- 节点级模式覆盖：NULL = 继承全局 service_config.mode；
     -- 'dry-run'/'enforce' = 覆盖。生产灰度用：逐台节点打开 enforce。
-    -- 本列是节点行里唯一**热生效**的列（其余为接线字段，改后需重启）。
     mode            VARCHAR(16)  NULL DEFAULT NULL,
+    -- 节点自己的带宽限制（bits/s，运维口径，40000000 = 40 Mbps）。
+    -- 被挂载（env_targets 引用）的节点必须设置为 > 0。
+    quota_bps       BIGINT UNSIGNED NULL DEFAULT NULL,
+    -- 节点级 AIMD 参数覆盖（JSON 对象，字段见 rl_limiter/model.py 的
+    -- GovParams；NULL/空串 = 全用默认值）。
+    params_json     TEXT         NULL,
     updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
                                  ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------------------------------------------------------------------
--- 3. envs：环境配额。quota_bps 单位为比特每秒（运维口径，
---    80000000 = 80 Mbps）；params_json 为可选的快环参数覆盖（JSON 对象，
---    字段见 rl_limiter/model.py 的 GovParams，NULL/空串表示全用默认值）。
+-- 3. envs：业务环境分组（v2.1：仅分组标识——配额/参数已下沉到
+--    haproxy_nodes；环境只用于控制台聚合查看成员节点带宽之和）。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS envs (
     env_id      VARCHAR(64)     NOT NULL PRIMARY KEY,
-    quota_bps   BIGINT UNSIGNED NOT NULL,
-    params_json TEXT            NULL,
     updated_at  TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP
                                 ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -92,18 +99,18 @@ VALUES (1, 'rl-limiter-01', 'enforce', 'info', 1.0);
 -- mode 为 NULL = 继承全局模式；演示逐节点灰度时改这一列即可。
 -- 归属约定（校验强制）：节点是环境的独占资源——一个环境可横跨多台
 -- HAProxy，但一台 HAProxy 只允许服务一个环境。
-INSERT INTO haproxy_nodes (name, host, port, bwlim_map_path, timeout_ms, mode)
-VALUES ('hap-1', 'haproxy1', 9999, '/etc/haproxy/maps/bwlim.map', 500, NULL),
-       ('hap-2', 'haproxy2', 9999, '/etc/haproxy/maps/bwlim.map', 500, NULL),
-       ('hap-3', 'haproxy3', 9999, '/etc/haproxy/maps/bwlim.map', 500, NULL);
+-- 每台节点自己的带宽限制：hap-1/hap-2 各 40 Mbps（同属 env-a，控制台
+-- 聚合视图显示合计 80 Mbps），hap-3 40 Mbps（env-b）。
+INSERT INTO haproxy_nodes
+    (name, host, port, bwlim_map_path, timeout_ms, mode, quota_bps, params_json)
+VALUES ('hap-1', 'haproxy1', 9999, '/etc/haproxy/maps/bwlim.map', 500, NULL, 40000000, NULL),
+       ('hap-2', 'haproxy2', 9999, '/etc/haproxy/maps/bwlim.map', 500, NULL, 40000000, NULL),
+       ('hap-3', 'haproxy3', 9999, '/etc/haproxy/maps/bwlim.map', 500, NULL, 40000000, NULL);
 
--- 演示环境两套：
---   env-a：80 Mbps，独占 hap-1 + hap-2（跨节点全局聚合限速：两台的
---          流量聚合后统一限速，压一台另一台会自动多分到份额）；
---   env-b：40 Mbps，独占 hap-3（单节点环境）。
-INSERT INTO envs (env_id, quota_bps, params_json)
-VALUES ('env-a', 80000000, NULL),
-       ('env-b', 40000000, NULL);
+-- 演示环境两套（纯分组）：env-a = hap-1 + hap-2，env-b = hap-3。
+INSERT INTO envs (env_id)
+VALUES ('env-a'),
+       ('env-b');
 
 INSERT INTO env_targets (env_id, node, frontend)
 VALUES ('env-a', 'hap-1', 'fe_env_a'),
@@ -115,8 +122,8 @@ VALUES ('env-a', 'hap-1', 'fe_env_a'),
 --
 --   进入 mysql： docker compose exec mysql mysql -url -prl_pass rl_limiter
 --
---   调整配额（80 Mbps → 40 Mbps）：
---     UPDATE envs SET quota_bps = 40000000 WHERE env_id = 'env-a';
+--   调整某台节点的带宽限制（40 Mbps → 20 Mbps）：
+--     UPDATE haproxy_nodes SET quota_bps = 20000000 WHERE name = 'hap-1';
 --
 --   dry-run / enforce 全局默认热切换：
 --     UPDATE service_config SET mode = 'dry-run' WHERE id = 1;
@@ -125,7 +132,7 @@ VALUES ('env-a', 'hap-1', 'fe_env_a'),
 --     UPDATE haproxy_nodes SET mode = 'enforce' WHERE name = 'hap-1';
 --     UPDATE haproxy_nodes SET mode = NULL WHERE name = 'hap-1';  -- 恢复继承
 --
---   按环境覆盖快环参数（示例：收紧更狠、恢复更慢）：
---     UPDATE envs SET params_json =
---       '{"md_factor": 0.8, "recover_after_s": 10}' WHERE env_id = 'env-a';
+--   按节点覆盖快环参数（示例：收紧更狠、恢复更慢）：
+--     UPDATE haproxy_nodes SET params_json =
+--       '{"md_factor": 0.8, "recover_after_s": 10}' WHERE name = 'hap-1';
 -- ===========================================================================

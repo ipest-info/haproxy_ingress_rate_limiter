@@ -170,14 +170,17 @@ async def _amain(cfg, log: logging.Logger,
     # 数据库配置模式：引导配置的版本号取内容校验和，并把它作为轮询任务的
     # 变更检测基准——首轮轮询读到同样内容时不会再触发一次重复应用。
     node_modes = dict(getattr(cfg, "node_modes", {}) or {})
+    env_groups = {
+        k: list(v) for k, v in (getattr(cfg, "env_groups", {}) or {}).items()
+    }
     seed_version = (
-        dbconfig.config_checksum(cfg.mode, cfg.envs, node_modes)
+        dbconfig.config_checksum(cfg.mode, cfg.envs, node_modes, env_groups)
         if db_opts is not None else 0
     )
     if not seeded and cfg.envs:
         seed_cfg = model.ControllerConfig(
             version=seed_version, mode=cfg.mode, envs=cfg.envs,
-            node_modes=node_modes)
+            node_modes=node_modes, env_groups=env_groups)
         ctl.seed(seed_cfg)
         if hub is not None:
             hub.update_config(seed_cfg)

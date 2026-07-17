@@ -35,22 +35,23 @@ haproxy_nodes:
     port: 9999
     bwlim_map_path: /etc/haproxy/maps/custom.map
     timeout_ms: 250
+    quota_bps: 200000000
+    params:
+      md_factor: 0.8
   - name: lb-2
     host: 10.0.0.2
     port: 9999
+    quota_bps: 150000000
   - name: lb-3
     host: 10.0.0.3
     port: 9999
+    quota_bps: 100000000
 envs:
   - env_id: env-a
-    quota_bps: 200000000
     targets:
       - {node: lb-1, frontend: fe_a}
       - {node: lb-2, frontend: fe_a}
-    params:
-      md_factor: 0.8
   - env_id: env-b
-    quota_bps: 100000000
     targets:
       - {node: lb-3, frontend: fe_b}
 backend:
@@ -81,19 +82,21 @@ def test_load_full_config(tmp_path):
     assert n2.bwlim_map_path == config.DEFAULT_BWLIM_MAP_PATH
     assert n2.timeout_s == pytest.approx(config.DEFAULT_TIMEOUT_MS / 1000.0)
 
-    assert [e.env_id for e in cfg.envs] == ["env-a", "env-b"]
-    ea = cfg.envs[0]
-    assert ea.quota_bits_per_sec == 200_000_000
+    # v2.1：cfg.envs 是 per-node 控制单元（env_id=节点名，quota=节点配额），
+    # 业务环境只保留在 env_groups（分组 → 成员节点）里。
+    assert [u.env_id for u in cfg.envs] == ["lb-1", "lb-2", "lb-3"]
+    assert cfg.env_groups == {"env-a": ["lb-1", "lb-2"], "env-b": ["lb-3"]}
+    u1 = cfg.envs[0]
+    assert u1.quota_bits_per_sec == 200_000_000
     # 配额单位是 bits/s，quota_bytes_per_sec 是唯一的换算边界（÷8）。
-    assert ea.quota_bytes_per_sec == pytest.approx(25_000_000.0)
-    assert ea.targets == [
-        model.Target("lb-1", "fe_a"),
-        model.Target("lb-2", "fe_a"),
-    ]
-    assert ea.params is not None and ea.params.md_factor == pytest.approx(0.8)
+    assert u1.quota_bytes_per_sec == pytest.approx(25_000_000.0)
+    assert u1.targets == [model.Target("lb-1", "fe_a")]
+    assert u1.params is not None and u1.params.md_factor == pytest.approx(0.8)
     # params 局部覆盖经 normalize 补齐其余字段（零值回填默认）。
-    assert ea.params.elastic_ceiling == pytest.approx(1.10)
-    assert cfg.envs[1].params is None
+    assert u1.params.elastic_ceiling == pytest.approx(1.10)
+    assert cfg.node_quotas == {
+        "lb-1": 200_000_000, "lb-2": 150_000_000, "lb-3": 100_000_000}
+    assert cfg.envs[1].params is None and cfg.envs[2].params is None
 
     assert cfg.backend.base_url == "https://backend:9090/"
     assert cfg.backend.cache_path == "/tmp/cache.json"
@@ -140,10 +143,9 @@ def test_load_non_mapping_root(tmp_path):
 BASE = """\
 node_id: svc-1
 haproxy_nodes:
-  - {name: lb-1, host: 10.0.0.1, port: 9999}
+  - {name: lb-1, host: 10.0.0.1, port: 9999, quota_bps: 200000000}
 envs:
   - env_id: env-a
-    quota_bps: 200000000
     targets:
       - {node: lb-1, frontend: fe_a}
 """
@@ -224,36 +226,46 @@ envs:
         pytest.param(
             BASE
             + "  - env_id: env-a\n"
-            "    quota_bps: 100000000\n"
             "    targets:\n"
             "      - {node: lb-1, frontend: fe_b}\n",
             r"envs\[1\].*'env-a'.*重复",
             id="env-id-duplicate",
         ),
-        # 配额必须为正（0 与负数都会把环境限死或让计算失去基准）。
+        # v2.1：配额设在节点上，被挂载的节点必须有有效 quota_bps。
+        pytest.param(
+            BASE.replace(", quota_bps: 200000000", ""),
+            r"'lb-1' 已被挂载但未设置有效的 quota_bps",
+            id="node-quota-missing",
+        ),
         pytest.param(
             BASE.replace("quota_bps: 200000000", "quota_bps: 0"),
-            r"env-a.*quota_bps 必须 > 0",
-            id="quota-zero",
+            r"'lb-1' 已被挂载但未设置有效的 quota_bps",
+            id="node-quota-zero",
         ),
         pytest.param(
             BASE.replace("quota_bps: 200000000", "quota_bps: -5"),
-            r"env-a.*quota_bps 必须 > 0.*-5",
-            id="quota-negative",
+            r"'lb-1' 已被挂载但未设置有效的 quota_bps",
+            id="node-quota-negative",
+        ),
+        # 老形态（环境带配额）明确拒绝并给迁移指引，不静默忽略。
+        pytest.param(
+            BASE.replace("targets:", "quota_bps: 200000000\n    targets:"),
+            r"quota_bps.*已废弃.*按节点设置",
+            id="env-quota-legacy-rejected",
         ),
         # targets 非空。
         pytest.param(
             "node_id: svc-1\nhaproxy_nodes:\n"
-            "  - {name: lb-1, host: 10.0.0.1, port: 9999}\n"
-            "envs:\n  - {env_id: env-a, quota_bps: 200000000}\n",
+            "  - {name: lb-1, host: 10.0.0.1, port: 9999, quota_bps: 200000000}\n"
+            "envs:\n  - {env_id: env-a}\n",
             r"env-a.*至少需要一个 target",
             id="targets-missing",
         ),
         pytest.param(
             "node_id: svc-1\nhaproxy_nodes:\n"
-            "  - {name: lb-1, host: 10.0.0.1, port: 9999}\n"
+            "  - {name: lb-1, host: 10.0.0.1, port: 9999, quota_bps: 200000000}\n"
             "envs:\n"
-            "  - {env_id: env-a, quota_bps: 200000000, targets: []}\n",
+            "  - {env_id: env-a, targets: []}\n",
             r"env-a.*至少需要一个 target",
             id="targets-empty",
         ),
@@ -273,7 +285,6 @@ envs:
         pytest.param(
             BASE
             + "  - env_id: env-b\n"
-            "    quota_bps: 100000000\n"
             "    targets:\n"
             "      - {node: lb-1, frontend: fe_a}\n",
             r"lb-1/fe_a 同时映射到环境 'env-a' 与 'env-b'",
@@ -325,14 +336,12 @@ def test_node_exclusive_to_single_env(tmp_path):
     yaml_text = (
         "node_id: svc-1\n"
         "haproxy_nodes:\n"
-        "  - {name: lb-1, host: 10.0.0.1, port: 9999}\n"
+        "  - {name: lb-1, host: 10.0.0.1, port: 9999, quota_bps: 100000000}\n"
         "envs:\n"
         "  - env_id: env-a\n"
-        "    quota_bps: 100000000\n"
         "    targets:\n"
         "      - {node: lb-1, frontend: fe_a}\n"
         "  - env_id: env-b\n"
-        "    quota_bps: 100000000\n"
         "    targets:\n"
         "      - {node: lb-1, frontend: fe_b}\n"
     )

@@ -106,8 +106,11 @@ class StatusHub:
         self._history: collections.deque[dict[str, Any]] = collections.deque(
             maxlen=HISTORY_TICKS)
         self._subs: set[asyncio.Queue] = set()
-        # env_id → 配置视图（quota/targets/params），来自最近一次应用的配置。
-        self._env_config: dict[str, dict[str, Any]] = {}
+        # 节点名 → 控制单元配置视图（quota/frontends/params）。v2.1 起
+        # 控制单元 = 节点（cfg.envs 的 env_id 字段装节点名）。
+        self._unit_config: dict[str, dict[str, Any]] = {}
+        # 业务环境分组（env_id → 成员节点列表），仅聚合展示。
+        self._env_groups: dict[str, list[str]] = {}
         # 节点名 → 模式覆盖（不含 = 继承全局默认），随配置热更。
         self._node_modes: dict[str, str] = {}
         self._started = time.time()
@@ -115,16 +118,16 @@ class StatusHub:
     # ---- 配置与数据注入 ----
 
     def update_config(self, cfg: model.ControllerConfig) -> None:
-        self._env_config = {
-            e.env_id: {
-                "quota_bps": e.quota_bits_per_sec,
-                "quota_bytes_per_s": e.quota_bytes_per_sec,
-                "targets": [{"node": t.node, "frontend": t.frontend}
-                            for t in e.targets],
-                "params": e.params.to_dict() if e.params is not None else None,
+        self._unit_config = {
+            u.env_id: {
+                "quota_bps": u.quota_bits_per_sec,
+                "quota_bytes_per_s": u.quota_bytes_per_sec,
+                "frontends": [t.frontend for t in u.targets],
+                "params": u.params.to_dict() if u.params is not None else None,
             }
-            for e in cfg.envs
+            for u in cfg.envs
         }
+        self._env_groups = {k: list(v) for k, v in cfg.env_groups.items()}
         self._node_modes = dict(cfg.node_modes)
 
     def _nodes_view(self) -> dict[str, Any]:
@@ -143,13 +146,18 @@ class StatusHub:
         }
 
     def record(self, now: float, usages, decisions) -> None:
-        """快环 sampler 回调：把一拍的采集/决策结果合成快照并发布。"""
-        dec_by_env = {d.env_id: d for d in decisions}
-        envs: dict[str, Any] = {}
+        """快环 sampler 回调：把一拍的采集/决策结果合成快照并发布。
+
+        v2.1：控制单元 = 节点，usages/decisions 的 env_id 字段即节点名，
+        快照按节点键发布（units）；环境聚合视图由前端按 env_groups 把
+        成员节点的序列求和得出，服务端不再有环境级数据。
+        """
+        dec_by_unit = {d.env_id: d for d in decisions}
+        units: dict[str, Any] = {}
         for u in usages:
-            d = dec_by_env.get(u.env_id)
-            conf = self._env_config.get(u.env_id, {})
-            envs[u.env_id] = {
+            d = dec_by_unit.get(u.env_id)
+            conf = self._unit_config.get(u.env_id, {})
+            units[u.env_id] = {
                 "rate_bytes_per_s": u.rate_bps,
                 "mean10_bytes_per_s": u.mean10_bps,
                 "ewma60_bytes_per_s": u.ewma60_bps,
@@ -163,7 +171,8 @@ class StatusHub:
             "ts": now,
             "mode": self._mode_fn(),
             "config_version": self._version_fn(),
-            "envs": envs,
+            "units": units,
+            "env_groups": {k: list(v) for k, v in self._env_groups.items()},
             "nodes": self._nodes_view(),
         }
         self._history.append(snap)
@@ -192,7 +201,9 @@ class StatusHub:
             "mode": self._mode_fn(),
             "config_version": self._version_fn(),
             "uptime_s": time.time() - self._started,
-            "env_config": self._env_config,
+            # 节点控制单元配置（quota/frontends/params）与环境分组。
+            "node_config": self._unit_config,
+            "env_groups": {k: list(v) for k, v in self._env_groups.items()},
             "nodes": self._nodes_view(),
             # AIMD 参数的默认值：页面参数表单以此为占位符/说明，
             # 不在前端硬编码，跟随 model.GovParams 演进。
@@ -306,8 +317,8 @@ def build_app(
             await dbconfig.update_mode(db_opts, str(payload.get("mode", "")))
         return await _mutate(request, action)
 
-    async def handle_set_quota(request: web.Request) -> web.Response:
-        env_id = request.match_info["env_id"]
+    async def handle_set_node_quota(request: web.Request) -> web.Response:
+        name = request.match_info["name"]
 
         async def action(payload):
             if not isinstance(payload, dict) or "quota_bps" not in payload:
@@ -318,16 +329,16 @@ def build_app(
                 raise ValueError(
                     f"quota_bps 必须是整数（比特每秒），"
                     f"当前值 {payload['quota_bps']!r}") from None
-            await dbconfig.update_env_quota(db_opts, env_id, quota)
+            await dbconfig.update_node_quota(db_opts, name, quota)
         return await _mutate(request, action)
 
-    async def handle_set_params(request: web.Request) -> web.Response:
-        env_id = request.match_info["env_id"]
+    async def handle_set_node_params(request: web.Request) -> web.Response:
+        name = request.match_info["name"]
 
         async def action(payload):
             if not isinstance(payload, dict) or "params" not in payload:
                 raise ValueError('请求体须为 {"params": {…} 或 null}')
-            await dbconfig.update_env_params(db_opts, env_id, payload["params"])
+            await dbconfig.update_node_params(db_opts, name, payload["params"])
         return await _mutate(request, action)
 
     async def handle_set_node_mode(request: web.Request) -> web.Response:
@@ -356,15 +367,10 @@ def build_app(
         async def action(payload):
             if not isinstance(payload, dict):
                 raise ValueError(
-                    '请求体须为 {"env_id": …, "quota_bps": …, "targets": […]}')
-            try:
-                quota = int(payload.get("quota_bps", 0))
-            except (TypeError, ValueError):
-                raise ValueError(
-                    f"quota_bps 必须是整数（比特每秒），"
-                    f"当前值 {payload.get('quota_bps')!r}") from None
+                    '请求体须为 {"env_id": …, "targets": […]}'
+                    '（v2.1：环境是节点分组，带宽限制设在成员节点上）')
             await dbconfig.create_env(
-                db_opts, str(payload.get("env_id", "")), quota,
+                db_opts, str(payload.get("env_id", "")),
                 payload.get("targets"))
         return await _mutate(request, action)
 
@@ -383,9 +389,10 @@ def build_app(
     app.router.add_get("/api/stream", handle_stream)
     app.router.add_put("/api/mode", handle_set_mode)
     app.router.add_put("/api/nodes/{name}/mode", handle_set_node_mode)
+    # v2.1：带宽限制与 AIMD 参数按节点设置。
+    app.router.add_put("/api/nodes/{name}/quota", handle_set_node_quota)
+    app.router.add_put("/api/nodes/{name}/params", handle_set_node_params)
     app.router.add_post("/api/envs", handle_create_env)
-    app.router.add_put("/api/envs/{env_id}/quota", handle_set_quota)
-    app.router.add_put("/api/envs/{env_id}/params", handle_set_params)
     app.router.add_put("/api/envs/{env_id}/targets", handle_set_targets)
     app.router.add_delete("/api/envs/{env_id}", handle_delete_env)
     return app

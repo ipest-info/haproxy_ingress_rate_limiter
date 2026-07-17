@@ -10,21 +10,22 @@ import pytest
 from rl_limiter import dbconfig, model, webconsole
 
 
-def _quota(env_id="env-a", quota_bps=80_000_000):
+# v2.1：控制单元 = 节点，EnvQuota/EnvUsage/Decision 的 env_id 字段装节点名。
+def _unit(node="hap-1", quota_bps=40_000_000):
     return model.EnvQuota(
-        env_id=env_id, quota_bits_per_sec=quota_bps,
-        targets=[model.Target("hap-1", "fe_env_a")])
+        env_id=node, quota_bits_per_sec=quota_bps,
+        targets=[model.Target(node, "fe_env_a")])
 
 
-def _usage(env_id="env-a", rate=1000.0):
+def _usage(node="hap-1", rate=1000.0):
     return model.EnvUsage(
-        env_id=env_id, rate_bps=rate, mean10_bps=rate, ewma60_bps=rate,
+        env_id=node, rate_bps=rate, mean10_bps=rate, ewma60_bps=rate,
         conn_cur=3)
 
 
-def _decision(env_id="env-a", bwlim=11_000_000.0):
+def _decision(node="hap-1", bwlim=5_500_000.0):
     return model.Decision(
-        env_id=env_id, targets=[model.Target("hap-1", "fe_env_a")],
+        env_id=node, targets=[model.Target(node, "fe_env_a")],
         bwlim_bps=bwlim, state=model.GovState.NORMAL)
 
 
@@ -59,20 +60,22 @@ def test_log_buffer_since_and_capacity():
 def test_hub_snapshot_merges_usage_decision_and_quota():
     hub = make_hub()
     hub.update_config(model.ControllerConfig(
-        version=1, mode="enforce", envs=[_quota()]))
+        version=1, mode="enforce", envs=[_unit()],
+        env_groups={"env-a": ["hap-1"]}))
     hub.record(1000.0, [_usage(rate=5000.0)], [_decision()])
 
     ov = hub.overview()
     assert ov["mode"] == "enforce" and ov["config_version"] == 42
-    env = ov["latest"]["envs"]["env-a"]
-    assert env["rate_bytes_per_s"] == 5000.0
-    assert env["bwlim_bytes_per_s"] == 11_000_000.0
-    assert env["state"] == "normal"
-    # 配额来自 update_config 缓存的配置视图（bits → bytes 已换算）。
-    assert env["quota_bytes_per_s"] == 10_000_000.0
-    # targets 以结构化对象暴露（控制台挂载点编辑需要 node/frontend 字段）。
-    assert ov["env_config"]["env-a"]["targets"] == [
-        {"node": "hap-1", "frontend": "fe_env_a"}]
+    unit = ov["latest"]["units"]["hap-1"]
+    assert unit["rate_bytes_per_s"] == 5000.0
+    assert unit["bwlim_bytes_per_s"] == 5_500_000.0
+    assert unit["state"] == "normal"
+    # 节点配额来自 update_config 缓存的配置视图（bits → bytes 已换算）。
+    assert unit["quota_bytes_per_s"] == 5_000_000.0
+    # 节点配置视图暴露 frontends 与分组（控制台挂载点管理据此推导明细）。
+    assert ov["node_config"]["hap-1"]["frontends"] == ["fe_env_a"]
+    assert ov["env_groups"] == {"env-a": ["hap-1"]}
+    assert ov["latest"]["env_groups"] == {"env-a": ["hap-1"]}
 
 
 def test_hub_history_is_bounded():
@@ -111,10 +114,10 @@ async def test_update_mode_rejects_bad_value():
         await dbconfig.update_mode(opts, "observe")
 
 
-async def test_update_env_quota_rejects_nonpositive():
+async def test_update_node_quota_rejects_nonpositive():
     opts = dbconfig.MySQLOptions(host="unused")
     with pytest.raises(ValueError, match="quota_bps"):
-        await dbconfig.update_env_quota(opts, "env-a", 0)
+        await dbconfig.update_node_quota(opts, "hap-1", 0)
 
 
 @pytest.mark.parametrize("params, match", [
@@ -123,11 +126,11 @@ async def test_update_env_quota_rejects_nonpositive():
     ({"md_factor": True}, "必须是数值"),
     ("not-a-dict", "键值映射"),
 ])
-async def test_update_env_params_validates_locally(params, match):
+async def test_update_node_params_validates_locally(params, match):
     """坏参数必须在写库前拦下，而不是等下一轮 fetch 触发 fail-static。"""
     opts = dbconfig.MySQLOptions(host="unused")
     with pytest.raises(ValueError, match=match):
-        await dbconfig.update_env_params(opts, "env-a", params)
+        await dbconfig.update_node_params(opts, "hap-1", params)
 
 
 def test_hub_nodes_view_effective_mode_and_degraded():
@@ -140,8 +143,9 @@ def test_hub_nodes_view_effective_mode_and_degraded():
         "test", mode_fn=lambda: "dry-run", version_fn=lambda: 1,
         nodes=nodes, degraded_fn=lambda: {"hap-2"})
     hub.update_config(model.ControllerConfig(
-        version=1, mode="dry-run", envs=[_quota()],
-        node_modes={"hap-1": "enforce"}))
+        version=1, mode="dry-run", envs=[_unit()],
+        node_modes={"hap-1": "enforce"},
+        env_groups={"env-a": ["hap-1", "hap-2"]}))
     view = hub.overview()["nodes"]
     assert view["hap-1"] == {
         "host": "haproxy1", "port": 9999,

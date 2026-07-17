@@ -7,11 +7,13 @@ import pytest
 
 from rl_limiter import config, dbconfig, model
 
-# 与 deploy/mysql/init.sql 种子数据同构的行样本（节点行末列为模式覆盖，
-# NULL = 继承全局）。
+# 与 deploy/mysql/init.sql 种子数据同构的行样本。节点行末三列为可热更
+# 运行列：mode（NULL=继承全局）、quota_bps（节点自己的带宽限制）、
+# params_json（节点级 AIMD 参数覆盖）；环境行只剩分组标识。
 SERVICE_ROW = ("rl-limiter-01", "enforce", "info", 1.0)
-NODE_ROWS = [("hap-1", "haproxy1", 9999, "/etc/haproxy/maps/bwlim.map", 500, None)]
-ENV_ROWS = [("env-a", 80_000_000, None)]
+NODE_ROWS = [("hap-1", "haproxy1", 9999, "/etc/haproxy/maps/bwlim.map",
+              500, None, 80_000_000, None)]
+ENV_ROWS = [("env-a",)]
 TARGET_ROWS = [("env-a", "hap-1", "fe_env_a")]
 
 
@@ -34,12 +36,14 @@ def test_rows_roundtrip_to_service_config():
     assert (n.name, n.host, n.port) == ("hap-1", "haproxy1", 9999)
     assert n.bwlim_map_path == "/etc/haproxy/maps/bwlim.map"
     assert n.timeout_s == 0.5  # timeout_ms=500 → 秒口径
+    # v2.1：控制单元 = 节点（env_id 字段装节点名，quota 来自节点行）。
     assert len(cfg.envs) == 1
-    e = cfg.envs[0]
-    assert e.env_id == "env-a"
-    assert e.quota_bits_per_sec == 80_000_000
-    assert e.targets == [model.Target("hap-1", "fe_env_a")]
-    assert e.params is None
+    u = cfg.envs[0]
+    assert u.env_id == "hap-1"
+    assert u.quota_bits_per_sec == 80_000_000
+    assert u.targets == [model.Target("hap-1", "fe_env_a")]
+    assert u.params is None
+    assert cfg.env_groups == {"env-a": ["hap-1"]}
 
 
 def test_service_row_defaults_and_timeout_fallback():
@@ -47,7 +51,7 @@ def test_service_row_defaults_and_timeout_fallback():
     YAML 管线的兜底行为一字不差。"""
     cfg = build(
         service_row=("node-x", None, None, None),
-        node_rows=[("hap-1", "haproxy", 9999, "", 0, None)],
+        node_rows=[("hap-1", "haproxy", 9999, "", 0, None, 80_000_000, None)],
     )
     assert cfg.mode == model.MODE_DRY_RUN
     assert cfg.log_level == "info"
@@ -69,8 +73,10 @@ def test_unknown_target_node_rejected_like_yaml():
 
 
 def test_params_json_parsed_into_gov_params():
-    cfg = build(env_rows=[
-        ("env-a", 80_000_000, '{"md_factor": 0.8, "recover_after_s": 10}')])
+    """节点行的 params_json → 该节点控制单元的 AIMD 参数覆盖。"""
+    cfg = build(node_rows=[
+        ("hap-1", "haproxy1", 9999, "", 500, None, 80_000_000,
+         '{"md_factor": 0.8, "recover_after_s": 10}')])
     p = cfg.envs[0].params
     assert p is not None
     assert p.md_factor == 0.8
@@ -83,13 +89,14 @@ def test_params_json_parsed_into_gov_params():
     ('{"md_factor": 0.8', "不是合法的 JSON"),   # 截断的 JSON
     ('[1, 2, 3]', "必须是 JSON 对象"),          # 合法 JSON 但不是对象
 ])
-def test_bad_params_json_rejected_with_env_id(bad_json, match):
-    """params_json 写坏时错误信息必须带 env_id，运维才知道改哪一行。"""
+def test_bad_params_json_rejected_with_node_name(bad_json, match):
+    """params_json 写坏时错误信息必须带节点名，运维才知道改哪一行。"""
     with pytest.raises(ValueError, match=match) as ei:
         dbconfig.rows_to_raw(
-            SERVICE_ROW, NODE_ROWS,
-            [("env-a", 80_000_000, bad_json)], TARGET_ROWS)
-    assert "env-a" in str(ei.value)
+            SERVICE_ROW,
+            [("hap-1", "haproxy1", 9999, "", 500, None, 80_000_000, bad_json)],
+            ENV_ROWS, TARGET_ROWS)
+    assert "hap-1" in str(ei.value)
 
 
 def test_checksum_stable_and_content_sensitive():
@@ -98,13 +105,16 @@ def test_checksum_stable_and_content_sensitive():
     base = dbconfig.config_checksum(cfg.mode, cfg.envs)
     assert base == dbconfig.config_checksum(cfg.mode, cfg.envs)  # 稳定
 
-    quota_changed = build(env_rows=[("env-a", 40_000_000, None)])
+    quota_changed = build(node_rows=[
+        ("hap-1", "haproxy1", 9999, "", 500, None, 40_000_000, None)])
     assert dbconfig.config_checksum(
         quota_changed.mode, quota_changed.envs) != base
 
     assert dbconfig.config_checksum(model.MODE_DRY_RUN, cfg.envs) != base
 
-    params_changed = build(env_rows=[("env-a", 80_000_000, '{"md_factor": 0.8}')])
+    params_changed = build(node_rows=[
+        ("hap-1", "haproxy1", 9999, "", 500, None, 80_000_000,
+         '{"md_factor": 0.8}')])
     assert dbconfig.config_checksum(
         params_changed.mode, params_changed.envs) != base
 
@@ -156,16 +166,23 @@ def test_canonical_config_is_exact_identity():
     cfg = build()
     base = dbconfig.canonical_config(cfg.mode, cfg.envs)
     assert base == dbconfig.canonical_config(cfg.mode, cfg.envs)
-    changed = build(env_rows=[("env-a", 40_000_000, None)])
+    changed = build(node_rows=[
+        ("hap-1", "haproxy1", 9999, "", 500, None, 40_000_000, None)])
     assert dbconfig.canonical_config(changed.mode, changed.envs) != base
+    # 纯重分组（单元不变、只换环境归属）也必须改变身份。
+    regrouped = build(env_rows=[("env-x",)],
+                      target_rows=[("env-x", "hap-1", "fe_env_a")])
+    assert dbconfig.canonical_config(
+        regrouped.mode, regrouped.envs, None, regrouped.env_groups) != \
+        dbconfig.canonical_config(cfg.mode, cfg.envs, None, cfg.env_groups)
 
 
 def test_node_mode_column_maps_to_node_modes():
     """节点行的 mode 列进入 ServiceConfig.node_modes（不进 NodeConfig，
     保持节点接线相等性比较不受模式切换影响）。"""
     cfg = build(node_rows=[
-        ("hap-1", "haproxy1", 9999, "", 500, "enforce"),
-        ("hap-2", "haproxy2", 9999, "", 500, None),
+        ("hap-1", "haproxy1", 9999, "", 500, "enforce", 80_000_000, None),
+        ("hap-2", "haproxy2", 9999, "", 500, None, 80_000_000, None),
     ], target_rows=[("env-a", "hap-1", "fe_env_a"),
                     ("env-a", "hap-2", "fe_env_a")])
     assert cfg.node_modes == {"hap-1": "enforce"}
@@ -175,7 +192,8 @@ def test_node_mode_column_maps_to_node_modes():
 
 def test_bad_node_mode_rejected():
     with pytest.raises(ValueError, match="mode 值非法"):
-        build(node_rows=[("hap-1", "haproxy1", 9999, "", 500, "observe")])
+        build(node_rows=[
+            ("hap-1", "haproxy1", 9999, "", 500, "observe", 80_000_000, None)])
 
 
 def test_checksum_sensitive_to_node_modes():
@@ -183,6 +201,7 @@ def test_checksum_sensitive_to_node_modes():
     cfg = build()
     base = dbconfig.config_checksum(cfg.mode, cfg.envs, cfg.node_modes)
     overridden = build(node_rows=[
-        ("hap-1", "haproxy1", 9999, "/etc/haproxy/maps/bwlim.map", 500, "dry-run")])
+        ("hap-1", "haproxy1", 9999, "/etc/haproxy/maps/bwlim.map",
+         500, "dry-run", 80_000_000, None)])
     assert dbconfig.config_checksum(
         overridden.mode, overridden.envs, overridden.node_modes) != base
