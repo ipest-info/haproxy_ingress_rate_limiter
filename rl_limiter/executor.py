@@ -181,7 +181,7 @@ class Executor:
 
     def snapshot(self) -> dict[str, float]:
         """返回每个 env 最近一次落地/记录的聚合 bwlim（bytes/s）的
-        副本，供状态上报使用。"""
+        副本，供状态展示使用。"""
         return dict(self._last_applied)
 
     async def apply(

@@ -10,7 +10,6 @@
 # 单位约定：quota_bps 一律为 bit/s（运维口径，40000000 = 40 Mbps），
 # 服务内部统一换算为 bytes/s（唯一换算点在 model.EnvQuota）。
 
-node_id: rl-limiter-01          # 本服务实例的唯一标识
 mode: dry-run                   # 全局默认模式：dry-run 只记日志；enforce 真实下发
 log_level: info                 # debug | info | warning | error
 tick_interval_s: 1.0            # 快环节拍（秒）；1 秒是设计基准，一般无需改动
@@ -52,14 +51,3 @@ envs:
         frontend: fe_env_a
       - node: hap-2
         frontend: fe_env_a
-
-# 可选管理后台通道：留空/注释掉整段则不启用（生产配置权威是 MySQL 配置库）。
-backend:
-  base_url: ""                  # 后台地址；配置后启用配置长轮询 + 用量上报 + 心跳
-  # fail-static 配置缓存：断联/重启时按最后一次下发的配置继续限速
-  # systemd 的 StateDirectory=rl-limiter 会自动创建 /var/lib/rl-limiter
-  cache_path: /var/lib/rl-limiter/config-cache.json
-  # tls:                        # mTLS 材料（可选）
-  #   ca_file: ""               # CA 证书路径
-  #   cert_file: ""             # 客户端证书路径
-  #   key_file: ""              # 客户端私钥路径

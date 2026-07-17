@@ -30,9 +30,8 @@ rl_limiter/       # Python 3.11 + asyncio 集中限速服务
   dbconfig.py     #   MySQL 配置源（启动加载 + 轮询热更新 + 控制台写回，RL_MYSQL_* 接线）
   config.py       #   配置解析与校验（YAML 与数据库共用同一管线）
   webconsole.py   #   内置 Web 控制台（节点带宽视图/环境聚合视图/在线调参/日志）
-  reporter.py     #   可选管理后台通道（长轮询/上报/心跳、fail-static 缓存）
   loop.py         #   1s 主循环
-tools/            # fake_haproxy.py（联调假节点）、mock_backend.py（后台桩）
+tools/            # fake_haproxy.py（联调假节点）
                   # random_web.py（随机大小响应的模拟后端）、loadgen.py（可调并发压测）
 deploy/           # systemd、haproxy L4 配置示例、tc 兜底脚本、YAML 示例配置
                   # mysql/init.sql（配置库建表+种子）、docker/（compose 用 HAProxy 配置）

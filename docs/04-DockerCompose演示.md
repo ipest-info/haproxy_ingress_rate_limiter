@@ -155,7 +155,7 @@ rl-limiter 侧日志会出现：
 | `envs` / `env_targets` | 环境分组、挂载点归属 | **热生效** |
 | `service_config.mode` | 全局默认 dry-run / enforce | **热生效** |
 | `haproxy_nodes.mode` | 按节点模式覆盖（NULL=继承全局） | **热生效**（逐节点灰度就改它） |
-| `service_config` 其余列 | node_id / log_level / tick_interval_s | 重启生效 |
+| `service_config` 其余列 | log_level / tick_interval_s | 重启生效 |
 | `haproxy_nodes` 其余列 | 节点接线（地址/端口/map 路径/超时） | 重启生效（检测到变化会记 warning；引用新增节点的环境会被拒绝热应用） |
 
 校验规则与 YAML 完全一致（同一套管线）：配置写错时 rl-limiter 保留当前

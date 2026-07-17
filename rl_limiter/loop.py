@@ -1,6 +1,6 @@
 # rl_limiter.loop —— 集中式快环（主控制循环，控制单元=节点）。
 #
-# 每个 tick 按固定流水线执行"采集 → 决策 → 分配 → 执行 → 上报"。
+# 每个 tick 按固定流水线执行"采集 → 决策 → 分配 → 执行 → 发布"。
 # 其中"分配"一步：决策器产出的是节点级整形值（bwlim_bps），一台节点
 # 可能挂载多个受控 frontend，需要按各挂载点（Target = 节点 × frontend）
 # 近期用量加权拆分后才能写回该节点的 bwlim map（见 allocator 模块头；
@@ -61,7 +61,8 @@ class ControlLoop:
       - async executor.apply(list[tuple[Decision, dict[Target, int]]])
         -> list[Exception]；executor.set_mode(mode, node_modes)
         （mode 为全局默认；node_modes 为按节点覆盖，未覆盖的节点继承默认）
-      - sampler 可选回调：sampler(now, usages, decisions)，供上报器缓冲样本。
+      - sampler 可选回调：sampler(now, usages, decisions)，供控制台
+        StatusHub 记录每拍快照。
     """
 
     def __init__(self, collector, governor, executor, sampler=None, log=None):
@@ -78,18 +79,14 @@ class ControlLoop:
     @property
     def version(self) -> int:
         """最近一次应用的配置版本号（尚未应用任何配置时为 0）。
-        上报器在样本/心跳中携带它，供后台核对配置是否推送到位。"""
+        数据库模式下是配置内容的校验和；控制台展示它，便于核对配置
+        是否已热更到位。"""
         return self._version
 
     def seed(self, cfg: model.ControllerConfig) -> None:
         """在 run 启动之前同步应用一份初始配置，即"引导"语义：让循环从
-        第一个 tick 起就带着配额工作，而不是空转等管理后台。
-
-        三个使用场景（见 __main__ 的引导优先级）：
-          - 独立运行模式的本地静态配额；
-          - 接入后台时的本地 envs 兜底；
-          - fail-static 缓存（设计文档 §3.7：断联期间按最后一次下发的
-            配置继续限速，绝不放开为不限速）。
+        第一个 tick 起就带着带宽限制工作，而不是空转等首次热更（引导
+        配置来自启动时加载的数据库快照或本地 YAML）。
 
         seed 与 run 内的配置应用走同一条 _apply_config 路径，语义完全一致。
         """
@@ -117,12 +114,13 @@ class ControlLoop:
                   tick_interval_s: float = 1.0) -> None:
         """驱动循环直至所在任务被取消。
 
-        - config_queue 传递管理后台推送的新配置（Reporter.config_queue）；
-          独立运行模式下传 None，循环退化为纯 tick 驱动。
+        - config_queue 传递配置源投递的新配置（数据库轮询任务，见
+          dbconfig.watch）；standalone 模式下传 None，循环退化为纯 tick
+          驱动。
         - 顺序保证：某个 tick 之前已经送达的配置，一定在处理该 tick 之前
           被应用——每拍开头先非阻塞地把队列里排队的配置全部排空再跑流水
           线。理由：若先按旧配置执行本 tick，这一秒就会按旧配额/旧模式做
-          决策，对"后台刚下调配额"或"dry-run 切 enforce"这类变更意味着
+          决策，对"刚下调带宽限制"或"dry-run 切 enforce"这类变更意味着
           多放行一秒流量。
         - 节拍对齐：用"计算下一拍的绝对时刻再 sleep 差值"的方式推进，
           单拍处理耗时不会累积成节拍漂移。
@@ -152,7 +150,7 @@ class ControlLoop:
             await asyncio.sleep(max(0.0, next_at - ev.time()))
 
     async def _tick(self, now: float) -> None:
-        """一次完整的快环流水线：采集 → 决策 → 分配 → 执行 → 上报。"""
+        """一次完整的快环流水线：采集 → 决策 → 分配 → 执行 → 发布。"""
         self._ticks += 1
 
         # 采集：所有节点的 frontend 统计按控制单元（节点）聚合。
@@ -179,7 +177,7 @@ class ControlLoop:
                 "本拍下发整形值时发生错误（循环继续，不中断限速，下拍自然重试） "
                 "tick=%d err=%s", self._ticks, err)
 
-        # 上报：把本 tick 的完整结果交给可选的 sampler 回调（上报器缓冲）。
+        # 采样发布：把本 tick 的完整结果交给可选的 sampler 回调（控制台）。
         if self._sampler is not None:
             self._sampler(now, usages, decisions)
 

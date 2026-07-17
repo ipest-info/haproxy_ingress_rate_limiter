@@ -1,21 +1,19 @@
 # rl_limiter.config —— 服务配置的解析与校验（服务的"启动契约"层）。
 #
-# 服务配置提供四类信息：
-#   1. 服务身份（node_id）：rl-limiter 实例的唯一标识；
-#   2. HAProxy 节点（haproxy_nodes）：接线字段（内网 TCP stats socket
+# 服务配置提供三类信息：
+#   1. HAProxy 节点（haproxy_nodes）：接线字段（内网 TCP stats socket
 #      地址、bwlim map 路径、超时）+ 运行字段（quota_bps 节点带宽限制、
 #      mode 节点模式覆盖、params 节点 AIMD 参数覆盖）。带宽限制按节点
 #      设置：每台节点独立调节，节点间无自动调配；
-#   3. 环境分组（envs）：业务环境 = 节点分组 + 挂载点归属（节点 ×
+#   2. 环境分组（envs）：业务环境 = 节点分组 + 挂载点归属（节点 ×
 #      frontend），不携带配额/参数，仅供控制台聚合查看；
-#   4. 管理后台接入（backend，可选）：base_url、fail-static 缓存路径、
-#      mTLS 材料。base_url 留空即不启用。
+#   3. 服务级运行参数：mode（全局默认模式）、log_level、tick_interval_s。
 #
 # 配置来源有两种，共用同一套解析/校验管线（from_raw）：
-#   - 本地 YAML 文件（load）：传统部署方式；
-#   - MySQL 数据库（dbconfig 模块）：数据库各表的行被组装成与 YAML 解析
-#     结果同构的原始 dict 后走 from_raw——校验规则只写一遍，两种来源的
-#     错误信息与拒绝行为完全一致。
+#   - MySQL 数据库（dbconfig 模块，生产权威）：数据库各表的行被组装成
+#     与 YAML 解析结果同构的原始 dict 后走 from_raw——校验规则只写一遍，
+#     两种来源的错误信息与拒绝行为完全一致；
+#   - 本地 YAML 文件（load）：standalone / 开发联调。
 #
 # 单位约定：配额一律按运维口径的「比特每秒」（quota_bps，200000000 =
 # 200 Mbps）书写，内部统一换算为 bytes/s（见 model.EnvQuota）。
@@ -43,36 +41,15 @@ DEFAULT_TIMEOUT_MS = 500
 # bwlim map 默认路径，必须与各节点 haproxy 配置中 map_str_int(...) 引用的
 # 路径一致，否则限速值写了也不会生效。
 DEFAULT_BWLIM_MAP_PATH = "/etc/haproxy/maps/bwlim.map"
-# fail-static 配置缓存默认落盘路径（设计文档 §3.7）：与后台断联时按缓存中
-# 最后一次下发的配置继续限速。
-DEFAULT_CACHE_PATH = "/var/lib/rl-limiter/config-cache.json"
 
 # 合法日志级别枚举。拼错的级别若静默回落会让运维误以为已调级，必须显式拒绝。
 _LOG_LEVELS = ("debug", "info", "warn", "error")
 
 
 @dataclass(slots=True)
-class BackendOptions:
-    """管理后台（Controller）接入方式。
-
-    base_url 留空即 standalone 模式：Reporter.run 只挂起不发请求（防御
-    分支），配额完全来自本地 envs。ca/cert/key 是可选的 mTLS 材料
-    （§3.6：双向认证防伪造上报/伪造下发），客户端证书与私钥必须成对。
-    """
-
-    base_url: str = ""
-    cache_path: str = DEFAULT_CACHE_PATH
-    ca_file: str = ""
-    cert_file: str = ""
-    key_file: str = ""
-
-
-@dataclass(slots=True)
 class ServiceConfig:
-    """磁盘上完整的 rl-limiter 服务配置（load 的返回类型）。"""
+    """完整的 rl-limiter 服务配置（from_raw / load 的返回类型）。"""
 
-    # 本服务实例的唯一标识，随配置轮询/指标/心跳上报，须与管理后台记录一致。
-    node_id: str
     # 全局默认运行模式：dry-run（只算不写，观测模式）或 enforce（真实
     # 下发限速）。默认 dry-run，确保误部署时不产生任何数据面影响。
     mode: str = model.MODE_DRY_RUN
@@ -98,7 +75,6 @@ class ServiceConfig:
     # 有挂载点的节点一个单元，env_id 字段=节点名，quota=节点配额。
     # 复用 EnvQuota 结构让快环全链路（采集聚合/AIMD/执行）零改动。
     envs: list[model.EnvQuota] = field(default_factory=list)
-    backend: BackendOptions = field(default_factory=BackendOptions)
 
 
 def load(path: str) -> ServiceConfig:
@@ -180,7 +156,6 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
     给出带上下文的错误信息）。
     """
     cfg = ServiceConfig(
-        node_id=str(raw.get("node_id", "") or ""),
         mode=str(raw.get("mode", "") or "") or model.MODE_DRY_RUN,
         log_level=str(raw.get("log_level", "") or "") or DEFAULT_LOG_LEVEL,
     )
@@ -303,34 +278,12 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
                 f"每个 target 必须是 {{node, frontend}} 键值映射"
             ) from None
         cfg.envs.append(group)
-
-    # ---- backend：管理后台接入 ----
-    backend_raw = raw.get("backend") or {}
-    if not isinstance(backend_raw, dict):
-        raise ValueError(
-            f"backend 必须是键值映射，当前为 {type(backend_raw).__name__}"
-        )
-    tls_raw = backend_raw.get("tls") or {}
-    if not isinstance(tls_raw, dict):
-        raise ValueError(
-            f"backend.tls 必须是键值映射，当前为 {type(tls_raw).__name__}"
-        )
-    cfg.backend = BackendOptions(
-        base_url=str(backend_raw.get("base_url", "") or ""),
-        cache_path=str(backend_raw.get("cache_path", "") or "")
-        or DEFAULT_CACHE_PATH,
-        ca_file=str(tls_raw.get("ca_file", "") or ""),
-        cert_file=str(tls_raw.get("cert_file", "") or ""),
-        key_file=str(tls_raw.get("key_file", "") or ""),
-    )
     return cfg
 
 
 def _validate(cfg: ServiceConfig) -> None:
     """校验服务其余部分赖以运行的结构性不变量，逐条业务原因：
 
-    - node_id 必填：它是管理后台识别本实例的唯一键，缺失则轮询/上报/
-      心跳全部无法归属；
     - mode 只能是 dry-run 或 enforce：写错模式的后果不对称（该限不限 /
       不该限乱限），必须在启动前拦下而不是静默取默认；
     - log_level 枚举校验：拼错的级别若静默回落会让运维误以为已调级；
@@ -349,11 +302,6 @@ def _validate(cfg: ServiceConfig) -> None:
       环境的配额边界失去意义——对节点切 enforce/dry-run 会同时影响
       两个环境，节点上的非本环境 frontend 也逃出了配额视野。
     """
-    if not cfg.node_id:
-        raise ValueError(
-            "node_id 不能为空：它是本服务实例的唯一标识，"
-            "配置轮询/指标上报/心跳都用它向管理后台归属数据"
-        )
     if cfg.mode not in (model.MODE_DRY_RUN, model.MODE_ENFORCE):
         raise ValueError(
             f"mode 值非法：{cfg.mode!r}，必须是 {model.MODE_DRY_RUN!r} 或 "

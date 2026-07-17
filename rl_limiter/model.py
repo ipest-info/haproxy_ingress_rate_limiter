@@ -11,7 +11,7 @@
 # 单位约定（非常重要，混淆会带来 8 倍误差）：
 #   - 内部所有速率一律为「字节每秒」（bytes/s，float）。HAProxy stats 的
 #     bytes_out 本身就是字节计数，内部保持字节口径避免反复换算。
-#   - 配置中的配额（本地 YAML 与管理后台 JSON 的 quota_bps 字段）一律为
+#   - 配置中的配额（数据库与本地 YAML 的 quota_bps 字段）一律为
 #     「比特每秒」（bits/s），遵循运维习惯：200_000_000 表示 200 Mbps。
 #   - 两种口径只在 EnvQuota.quota_bytes_per_sec 这一处转换（除以 8），
 #     其余代码不得再做单位换算。
@@ -34,9 +34,8 @@ MODE_ENFORCE = "enforce"
 class Target(NamedTuple):
     """限速目标：某台 HAProxy 节点上的某个 frontend。
 
-    v2.0 的关键变化——同一个环境的 frontend 可能分布在多台 HAProxy 上，
-    因此 (node, frontend) 二元组才是采集与执行的最小单位；纯 frontend
-    名字不再全局唯一。
+    集中式服务同时控制多台 HAProxy，不同节点上的 frontend 可能重名，
+    因此 (node, frontend) 二元组才是采集与执行的最小单位。
     """
 
     node: str      # HAProxy 节点名（与配置 haproxy_nodes[].name 对应）
@@ -72,10 +71,10 @@ class GovState(enum.Enum):
 
 @dataclass(slots=True)
 class EnvUsage:
-    """采集器每个 tick（1s）按环境聚合出的用量视图。
+    """采集器每个 tick（1s）按控制单元（节点）聚合出的用量视图。
 
-    v2.0：聚合范围是该环境在**所有节点**上的全部 Target——环境总带宽
-    直接全局可见，无需再经过慢环上报汇总。
+    env_id 字段承载节点名（见 EnvQuota），聚合范围是该节点上的全部
+    受控 Target——即"该节点当前的下行带宽用量"。
     """
 
     env_id: str
@@ -92,18 +91,18 @@ class EnvUsage:
     # 采样已持续失败（节点失联等），速率值沿用最后一次成功采样的结果
     # （设计文档 §3.7 fail-static）。degraded 时 governor 冻结该环境。
     degraded: bool = False
-    # 每个 Target 的 60s EWMA 用量（bytes/s），是执行路径按挂载点加权
-    # 分配整形值的输入（原慢环算法的输入，v2.0 下沉到这里）。
+    # 每个 Target 的 60s EWMA 用量（bytes/s），是执行路径在节点内按
+    # 挂载点加权拆分整形值的输入（见 allocator 模块）。
     target_ewma: dict[Target, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class Decision:
-    """决策器每 tick 针对单个环境产出的执行指令。"""
+    """决策器每 tick 针对单个控制单元（节点）产出的执行指令。"""
 
     env_id: str
-    targets: list[Target]  # 该环境的全部挂载点（分配器据此拆分聚合值）
-    bwlim_bps: float       # 目标聚合整形值（bytes/s，环境全局口径）
+    targets: list[Target]  # 该节点的全部挂载点（分配器据此拆分整形值）
+    bwlim_bps: float       # 目标整形值（bytes/s，节点聚合口径）
     state: GovState
     # bwlim_bps 相比上次产出是否变化（迟滞 epsilon = 0.1% × quota）。
     # 执行器据此跳过无变化的写入，减少 runtime API 压力。
@@ -112,7 +111,7 @@ class Decision:
 
 @dataclass(slots=True)
 class GovParams:
-    """本地快环控制参数（设计文档 §3.3），可由管理后台下发并按环境覆盖。
+    """快环 AIMD 控制参数（设计文档 §3.3），可按节点覆盖并热更。
 
     默认值即 §3.3 拍板组合：1.10 / 0.90 / 3s / 5s / ×0.9 / 1.00 / +5%。
     """
@@ -236,13 +235,13 @@ class EnvQuota:
 
 @dataclass(slots=True)
 class ControllerConfig:
-    """管理后台通过长轮询接口（§3.6）下发的带版本配置文档。
+    """投递给快环的运行期配置文档（业务配置的内存形态）。
 
-    同时也是 fail-static 本地缓存的持久化格式（§3.7：与后台断联时按
-    最后一次下发的配置继续限速，恢复后先拉全量）。version 单调比较：
-    服务以本地版本号发起长轮询，后台仅在版本不一致时立即返回新配置。
+    由配置来源组装：MySQL 数据库轮询（dbconfig.watch，生产）或本地
+    YAML 引导（standalone）。version 是内容校验和——轮询任务据此判断
+    配置是否变化，变了才投递给核心循环热应用。
     注意：HAProxy 节点的连接信息（地址/超时/map 路径）属于基础设施
-    配置，只在本地 YAML 维护，不随后台配置下发。
+    配置（NodeConfig），进程启动时定型，不在本文档内热更。
     """
 
     version: int = 0
@@ -258,13 +257,11 @@ class ControllerConfig:
     # 业务环境分组（env_id → 节点名列表）：纯展示信息——环境不再有
     # 自己的配额与调节，只提供"聚合查看成员节点带宽之和"的视图。
     env_groups: dict[str, list[str]] = field(default_factory=dict)
-    report_interval_s: int = 5    # 用量样本上报间隔（秒）
-    heartbeat_interval_s: int = 10  # 心跳间隔（秒）
 
     def normalize(self) -> None:
-        """模式非法归一为 dry-run（安全方向），间隔非正取默认，并逐个
-        归一各环境的参数覆盖。所有配置入口（后台下发、本地 YAML、缓存
-        加载）都必须先经过这里。"""
+        """模式非法归一为 dry-run（安全方向），并逐个归一各单元的参数
+        覆盖。所有配置入口（数据库轮询、本地 YAML 引导）都必须先经过
+        这里。"""
         if self.mode != MODE_ENFORCE:
             self.mode = MODE_DRY_RUN
         # 节点覆盖同样按安全方向归一：写错的覆盖值降级为 dry-run 而不是
@@ -272,10 +269,6 @@ class ControllerConfig:
         for n, m in list(self.node_modes.items()):
             if m not in (MODE_DRY_RUN, MODE_ENFORCE):
                 self.node_modes[n] = MODE_DRY_RUN
-        if self.report_interval_s <= 0:
-            self.report_interval_s = 5
-        if self.heartbeat_interval_s <= 0:
-            self.heartbeat_interval_s = 10
         for e in self.envs:
             if e.params is not None:
                 e.params.normalize()
@@ -302,8 +295,6 @@ class ControllerConfig:
                 str(k): [str(n) for n in v]
                 for k, v in (d.get("env_groups") or {}).items()
             },
-            report_interval_s=int(d.get("report_interval_s", 5)),
-            heartbeat_interval_s=int(d.get("heartbeat_interval_s", 10)),
         )
         cfg.normalize()
         return cfg
@@ -315,19 +306,16 @@ class ControllerConfig:
             "envs": [e.to_dict() for e in self.envs],
             "node_modes": dict(self.node_modes),
             "env_groups": {k: list(v) for k, v in self.env_groups.items()},
-            "report_interval_s": self.report_interval_s,
-            "heartbeat_interval_s": self.heartbeat_interval_s,
         }
 
 
 @dataclass(slots=True)
 class NodeConfig:
-    """一台受控 HAProxy 节点的连接配置（基础设施配置，仅本地 YAML）。
+    """一台受控 HAProxy 节点的连接配置（基础设施配置，启动时定型）。
 
-    v2.0：runtime API 不再是本机 unix socket，而是 HAProxy 在内网监听
-    的 TCP stats socket（haproxy.cfg：`stats socket ipv4@<内网IP>:9999
-    level admin`）。该端口具备 admin 权限，必须只绑内网并用安全组/防火
-    墙限制仅限速服务可达。
+    runtime API 走 HAProxy 在内网监听的 TCP stats socket（haproxy.cfg：
+    `stats socket ipv4@<内网IP>:9999 level admin`）。该端口具备 admin
+    权限，必须只绑内网并用安全组/防火墙限制仅限速服务可达。
     """
 
     name: str                # 节点名（Target.node 引用它）

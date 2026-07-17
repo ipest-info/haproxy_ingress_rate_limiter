@@ -19,7 +19,6 @@ import sys
 from . import config as configmod
 from . import dbconfig
 from . import haproxy, model
-from . import reporter as reportermod
 from . import webconsole
 from .collector import Collector
 from .executor import Executor
@@ -27,7 +26,7 @@ from .governor import Governor
 from .loop import ControlLoop, executor_mode
 
 # 服务版本：优先取安装元数据（pip install 后即 pyproject 里的版本号），
-# 源码目录直跑等取不到元数据的场景回退为 "dev"。随心跳上报给管理后台，
+# 源码目录直跑等取不到元数据的场景回退为 "dev"。控制台页面展示它，
 # 便于灰度期间核对各实例版本。
 try:
     from importlib import metadata as _metadata
@@ -62,12 +61,11 @@ async def _amain(cfg, log: logging.Logger,
                  db_opts: dbconfig.MySQLOptions | None = None,
                  console_port: int = 0,
                  logbuf: "webconsole.LogBuffer | None" = None) -> None:
-    """事件循环内的主体：组装组件、引导配置、并发运行快环与配置源/上报器。
+    """事件循环内的主体：组装组件、引导配置、并发运行快环与配置源。
 
-    db_opts 非 None 表示配置来自 MySQL（数据库配置模式）：额外运行一个
-    数据库轮询任务，把 mode/envs 的变化经配置队列热应用到快环——角色上
-    等价于管理后台的配置长轮询，两者不会同时启用（数据库配置里没有
-    backend 段，reporter 天然关闭）。
+    db_opts 非 None 表示配置来自 MySQL（数据库配置模式，生产权威）：
+    额外运行一个数据库轮询任务，把配置变化经配置队列热应用到快环；
+    db_opts 为 None 时按引导时的本地 YAML 静态运行（standalone）。
 
     console_port 非 0 时启动内置 Web 控制台（实时观测 + 在线调参，见
     webconsole 模块）：快环 sampler 每拍向 StatusHub 发布一帧快照，配置
@@ -87,26 +85,9 @@ async def _amain(cfg, log: logging.Logger,
     gov = Governor(log)
     exe = Executor(clients, map_paths, cfg.mode, log)
 
-    # --- 管理后台（可选）：配置了 backend.base_url 才启用上报器与配置
-    # 长轮询；否则快环进入纯本地的独立运行模式（config_queue 传 None）。
-    backend = getattr(cfg, "backend", None)
-    backend_configured = bool(backend is not None and getattr(backend, "base_url", ""))
-    rep = None
-    if backend_configured:
-        # mode_fn/version_fn 让心跳始终上报"实际已应用"的模式与配置版本
-        # （而不是启动时的静态值）；ctl 在下方才赋值，闭包延迟求值是安全的
-        # ——上报协程首次心跳前 ctl 已完成构造。
-        rep = reportermod.Reporter(
-            backend,
-            cfg.node_id,
-            SERVICE_VERSION,
-            mode_fn=lambda: executor_mode(exe),
-            version_fn=lambda: ctl.version,
-            log=log,
-        )
-
     # --- Web 控制台（可选）：StatusHub 是快环数据的发布枢纽。
-    # mode_fn/version_fn 与 reporter 同款延迟求值闭包（ctl 在下方赋值）。
+    # mode_fn/version_fn 是延迟求值闭包（ctl 在下方才赋值，闭包只会在
+    # 运行期被调用，届时 ctl 已完成构造）。
     ctl: ControlLoop
     hub: webconsole.StatusHub | None = None
     if console_port:
@@ -119,57 +100,14 @@ async def _amain(cfg, log: logging.Logger,
 
     # Sampler 闭包引用 ctl.version；ctl 在下方完成赋值，而 sampler 只会在
     # ctl.run 的 tick 中被调用——首次调用必然晚于赋值，延迟捕获是安全的。
-    # 上报器与控制台各自消费同一拍数据，组合成单个回调交给快环。
-    sample_sinks = []
-    if rep is not None:
-        # 接入后台：每个 tick 的结果交给上报器缓冲，按下发的间隔批量上报。
-        sample_sinks.append(lambda now, usages, decisions: rep.add_sample(
-            now, usages, decisions, executor_mode(exe), ctl.version))
-    if hub is not None:
-        sample_sinks.append(hub.record)
-    if sample_sinks:
-        def sampler(now, usages, decisions):
-            for sink in sample_sinks:
-                sink(now, usages, decisions)
-    else:
-        sampler = None
+    sampler = hub.record if hub is not None else None
     ctl = ControlLoop(col, gov, exe, sampler=sampler, log=log)
 
-    # --- 启动引导（seed）优先级：后台缓存 > 本地静态 envs > 无限速等待。
-    # 原因逐条说明：
-    #  1. 配置了后台时优先用本地缓存的最后一次下发配置引导——这正是
-    #     fail-static（§3.7）在"重启后后台恰好不可达"场景下的延伸：缓存里
-    #     的配额比本地静态配置新，用它引导可保证重启前后限速行为连续，
-    #     绝不放开为不限速。
-    #  2. 无缓存（首次部署/缓存被清）时退回本地静态 envs：粗粒度但安全的
-    #     兜底配额，同时也是纯独立运行模式的唯一配置来源。
-    #  3. 两者皆无时不限速启动，等待后台首次下发——此时尚无任何配额信息，
-    #     凭空限速比不限速更危险（可能误伤全部流量），故记 warn 提醒运维
-    #     这是一个需要关注的空窗期。
+    # --- 启动引导（seed）：用加载到的配置（数据库或本地 YAML）构造首份
+    # 运行期配置直接喂给快环。数据库配置模式下引导配置的版本号取内容
+    # 校验和，并把它作为轮询任务的变更检测基准——首轮轮询读到同样内容
+    # 时不会再触发一次重复应用。
     seeded = False
-    if backend_configured:
-        cache_path = getattr(backend, "cache_path", "")
-        cached = None
-        cache_err: Exception | None = None
-        try:
-            cached = reportermod.load_cache(cache_path)
-        except Exception as e:  # 缓存缺失/损坏都不是致命错误，往下走兜底链
-            cache_err = e
-        if cached is not None:
-            ctl.seed(cached)
-            if hub is not None:
-                hub.update_config(cached)
-            seeded = True
-            log.info(
-                "已用本地缓存的后台配置完成引导（fail-static，重启前后限速"
-                "行为连续） path=%s version=%s mode=%s envs=%d",
-                cache_path, cached.version, cached.mode, len(cached.envs))
-        else:
-            log.warning("后台配置缓存不可用（首次部署或缓存损坏），转本地"
-                        "静态配额兜底 path=%s err=%s",
-                        cache_path, cache_err if cache_err is not None else "empty")
-    # 数据库配置模式：引导配置的版本号取内容校验和，并把它作为轮询任务的
-    # 变更检测基准——首轮轮询读到同样内容时不会再触发一次重复应用。
     node_modes = dict(getattr(cfg, "node_modes", {}) or {})
     env_groups = {
         k: list(v) for k, v in (getattr(cfg, "env_groups", {}) or {}).items()
@@ -191,10 +129,11 @@ async def _amain(cfg, log: logging.Logger,
                  "数据库" if db_opts is not None else "本地静态",
                  seed_version, cfg.mode, len(cfg.envs), _summarize_envs(cfg.envs))
     if not seeded:
-        log.warning(
-            "无任何引导配置，暂不限速，等待后台首次下发（注意此空窗期） "
-            "backend_base_url=%s",
-            getattr(backend, "base_url", "") if backend is not None else "")
+        # 配置里没有任何挂载点（数据库尚未录入 env_targets 等）：不限速
+        # 启动并等待配置轮询送来首份有效配置。凭空限速比不限速更危险
+        # （可能误伤全部流量），故记 warn 提醒运维这是需要关注的空窗期。
+        log.warning("引导配置中没有任何挂载点，暂不限速，等待配置热更"
+                    "（注意此空窗期）")
 
     # --- 信号处理：SIGINT/SIGTERM 触发优雅退出（记录信号名后取消任务）。
     stop = asyncio.Event()
@@ -210,17 +149,16 @@ async def _amain(cfg, log: logging.Logger,
         except NotImplementedError:  # pragma: no cover - 非 Unix 平台兜底
             signal.signal(sig, lambda *_a, _n=sig.name: _on_signal(_n))
 
-    # --- 并发运行：快环 + 配置源（数据库轮询或后台上报器，二选一）+
-    # 可选的 Web 控制台。config_queue 是快环的配置入口（配置优先于 tick）：
-    # 数据库模式下由轮询任务投递内容变化；后台模式下由上报器的长轮询投递。
+    # --- 并发运行：快环 + 配置源（数据库轮询）+ 可选的 Web 控制台。
+    # config_queue 是快环的配置入口（配置优先于 tick）：数据库模式下由
+    # 轮询任务投递内容变化；standalone（本地 YAML）没有运行期配置源，
+    # 传 None，快环按引导配置静态运行。
     tick_interval_s = getattr(cfg, "tick_interval_s", 1.0) or 1.0
     tasks: list[asyncio.Task] = []
 
     source_queue: asyncio.Queue | None = None
     if db_opts is not None:
         source_queue = asyncio.Queue()
-    elif rep is not None:
-        source_queue = rep.configs
 
     # 控制台需要跟随配置热更（配额参考线、参数展示）：在源队列与快环
     # 之间加一级中继，把每份新配置先喂给 hub 再原样转投快环——配置视图
@@ -246,18 +184,14 @@ async def _amain(cfg, log: logging.Logger,
         tasks.append(asyncio.create_task(
             dbconfig.watch(db_opts, source_queue, cfg, log),
             name="db-config-watch"))
-    if rep is not None:
-        tasks.append(asyncio.create_task(rep.run(), name="reporter"))
     if hub is not None:
         tasks.append(asyncio.create_task(
             webconsole.run_console(console_port, hub, logbuf, db_opts, log),
             name="web-console"))
 
-    log.info("rl-limiter 服务已启动，快环与上报器开始运行 "
-             "node_id=%s mode=%s nodes=%d backend=%s version=%s",
-             cfg.node_id, executor_mode(exe), len(cfg.nodes),
-             getattr(backend, "base_url", "") if backend is not None else "",
-             SERVICE_VERSION)
+    log.info("rl-limiter 服务已启动，快环开始运行 "
+             "mode=%s nodes=%d version=%s",
+             executor_mode(exe), len(cfg.nodes), SERVICE_VERSION)
 
     # 等待退出信号；任一常驻任务意外结束（本应永续运行）也触发整体退出，
     # 交由 systemd Restart=always 拉起，比带着半残状态继续跑更安全。
@@ -356,20 +290,15 @@ def main() -> None:
     config_source = db_opts.describe() if db_opts is not None else f"文件 {args.config}"
 
     # 启动即输出完整配置摘要：现场排障时第一条要看的日志，可直接核对
-    # 服务身份、模式、受控节点清单与配额来源。
-    backend = getattr(cfg, "backend", None)
+    # 运行模式、受控节点清单与配置来源。
     log.info(
         "服务配置加载完成，以下为完整配置摘要（排障第一条要看的日志） "
-        "config_source=%s node_id=%s mode=%s log_level=%s tick_interval_s=%s "
-        "nodes=%d nodes_detail=%s envs=%d envs_detail=%s "
-        "backend_configured=%s backend_base_url=%s cache_path=%s",
-        config_source, cfg.node_id, cfg.mode, cfg.log_level,
+        "config_source=%s mode=%s log_level=%s tick_interval_s=%s "
+        "nodes=%d nodes_detail=%s units=%d units_detail=%s",
+        config_source, cfg.mode, cfg.log_level,
         getattr(cfg, "tick_interval_s", 1.0),
         len(cfg.nodes), _summarize_nodes(cfg.nodes),
         len(cfg.envs), _summarize_envs(cfg.envs),
-        bool(backend is not None and getattr(backend, "base_url", "")),
-        getattr(backend, "base_url", "") if backend is not None else "",
-        getattr(backend, "cache_path", "") if backend is not None else "",
     )
 
     try:

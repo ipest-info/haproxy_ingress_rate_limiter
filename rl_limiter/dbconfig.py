@@ -3,7 +3,7 @@
 # 定位：替代本地 YAML 文件成为服务配置的权威来源。四张表对应 YAML 的
 # 四块内容（建表与种子数据见 deploy/mysql/init.sql）：
 #
-#   service_config   单行表：node_id / mode / log_level / tick_interval_s
+#   service_config   单行表：mode / log_level / tick_interval_s
 #   haproxy_nodes    受控 HAProxy 节点清单：接线（host/port/map 路径/超时）
 #                    + 可热更运行列（mode / quota_bps / params_json）——
 #                    v2.1 起带宽限制与 AIMD 参数按节点设置
@@ -20,8 +20,8 @@
 #   - 以配置内容的 CRC32 校验和为"版本号"：内容变了校验和必变，直接把
 #     组装好的 ControllerConfig 投入主循环的配置队列热生效（mode 与 envs
 #     可热更；haproxy_nodes 变更涉及重建 TCP 客户端，记 warning 提示重启）；
-#   - 数据库故障或新配置校验不通过时：保留当前配置继续限速、只记日志，
-#     与管理后台断联的 fail-static 行为（设计 §3.7）保持同一精神。
+#   - 数据库故障或新配置校验不通过时：保留当前配置继续限速、只记日志
+#     （fail-static，设计 §3.7：断联/出错绝不放开限速）。
 #
 # 连接凭据通过 RL_MYSQL_* 环境变量注入（见 from_env），不落任何文件。
 
@@ -66,7 +66,7 @@ STARTUP_RETRY_INTERVAL_S = 2.0
 
 # 四条快照查询。ORDER BY 让行序稳定，保证同一份数据算出的校验和一致。
 _SQL_SERVICE = (
-    "SELECT node_id, mode, log_level, tick_interval_s "
+    "SELECT mode, log_level, tick_interval_s "
     "FROM service_config WHERE id = 1"
 )
 _SQL_NODES = (
@@ -162,8 +162,7 @@ def rows_to_raw(
     config._validate，保证两种配置来源的拒绝行为一字不差。
 
     service_row 为 None 表示 service_config 表没有 id=1 的行——组装出的
-    dict 缺 node_id，后续校验会以"node_id 不能为空"报出，比在这里另造
-    一条错误信息更一致。
+    dict 服务级键全部缺省（mode 等按默认值处理，安全方向是 dry-run）。
 
     params_json 是节点行里可选的 JSON 文本列（按节点的快环参数覆盖）；
     非法 JSON 在这里就地报错并带上节点名，因为 config 层拿到的已是解析
@@ -171,8 +170,7 @@ def rows_to_raw(
     """
     raw: dict[str, Any] = {}
     if service_row is not None:
-        node_id, mode, log_level, tick = service_row
-        raw["node_id"] = "" if node_id is None else str(node_id)
+        mode, log_level, tick = service_row
         if mode:
             raw["mode"] = str(mode)
         if log_level:
@@ -265,7 +263,7 @@ def config_checksum(
 
     数据库没有现成的单调版本号可用（要求运维每次改配置手动 bump 版本，
     既繁琐又容易忘），因此用内容指纹代替。注意角色边界：它只用于
-    ControllerConfig.version 的展示/核对（日志、心跳），变更检测一律用
+    ControllerConfig.version 的展示/核对（日志、控制台），变更检测一律用
     canonical_config 字符串精确比较（见其 docstring），不依赖此哈希。
     """
     return zlib.crc32(
@@ -667,7 +665,7 @@ async def watch(
 
     - 变更判定：canonical_config 字符串精确比较（不是哈希，见其
       docstring）；首轮轮询读到与引导相同的内容时不会重复触发空应用；
-    - 能力边界：只热更 mode 与 envs（与管理后台下发一致）。haproxy_nodes
+    - 能力边界：只热更运行字段（mode/配额/参数/分组/挂载点）。haproxy_nodes
       属于基础设施接线，进程内的 TCP 客户端在启动时构建：
         * 节点行内容变化 → 记 warning 提示需要重启生效；
         * envs 引用了启动时不存在的节点 → **拒绝应用整份快照**（保留

@@ -17,7 +17,7 @@
 [Unit]
 Description=rl-limiter - centralized HAProxy ingress bandwidth rate limiter
 Documentation=https://github.com/ipest-info/haproxy_ingress_rate_limiter
-# 需要通往各 HAProxy 节点与管理后台的网络路径。
+# 需要通往各 HAProxy 节点与 MySQL 配置库的网络路径。
 After=network-online.target
 Wants=network-online.target
 
@@ -28,8 +28,6 @@ Type=simple
 ExecStart=/usr/local/bin/rl-limiter -c /etc/rl-limiter/config.yaml
 Restart=always
 RestartSec=2
-# 自动创建 /var/lib/rl-limiter（fail-static 配置缓存 cache_path 放在这里）。
-StateDirectory=rl-limiter
 # 注意：无需 CAP_NET_ADMIN——tc 内核兜底（deploy/tc/backstop.sh）部署于
 # 各台 HAProxy 机器本机，与本服务无关；本服务只通过内网 TCP 调用
 # HAProxy runtime API，无需任何附加特权。

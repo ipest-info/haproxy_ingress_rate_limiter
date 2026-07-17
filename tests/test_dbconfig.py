@@ -10,7 +10,7 @@ from rl_limiter import config, dbconfig, model
 # 与 deploy/mysql/init.sql 种子数据同构的行样本。节点行末三列为可热更
 # 运行列：mode（NULL=继承全局）、quota_bps（节点自己的带宽限制）、
 # params_json（节点级 AIMD 参数覆盖）；环境行只剩分组标识。
-SERVICE_ROW = ("rl-limiter-01", "enforce", "info", 1.0)
+SERVICE_ROW = ("enforce", "info", 1.0)
 NODE_ROWS = [("hap-1", "haproxy1", 9999, "/etc/haproxy/maps/bwlim.map",
               500, None, 80_000_000, None)]
 ENV_ROWS = [("env-a",)]
@@ -26,7 +26,6 @@ def build(service_row=SERVICE_ROW, node_rows=NODE_ROWS,
 def test_rows_roundtrip_to_service_config():
     """种子数据经 行组装 → 统一校验管线 得到与 YAML 加载同构的 ServiceConfig。"""
     cfg = build()
-    assert cfg.node_id == "rl-limiter-01"
     assert cfg.mode == model.MODE_ENFORCE
     assert cfg.log_level == "info"
     assert cfg.tick_interval_s == 1.0
@@ -50,7 +49,7 @@ def test_service_row_defaults_and_timeout_fallback():
     """mode/log_level 空值取默认；timeout_ms 非正回落默认 500ms——与
     YAML 管线的兜底行为一字不差。"""
     cfg = build(
-        service_row=("node-x", None, None, None),
+        service_row=(None, None, None),
         node_rows=[("hap-1", "haproxy", 9999, "", 0, None, 80_000_000, None)],
     )
     assert cfg.mode == model.MODE_DRY_RUN
@@ -60,10 +59,13 @@ def test_service_row_defaults_and_timeout_fallback():
     assert cfg.nodes[0].bwlim_map_path == config.DEFAULT_BWLIM_MAP_PATH
 
 
-def test_missing_service_row_rejected_as_missing_node_id():
-    """service_config 表缺 id=1 的行 → 走统一校验的 node_id 非空规则拒绝。"""
-    with pytest.raises(ValueError, match="node_id"):
-        build(service_row=None)
+def test_missing_service_row_falls_back_to_safe_defaults():
+    """service_config 表缺 id=1 的行 → 服务级键全部取安全默认
+    （mode=dry-run，误配置不产生数据面影响）。"""
+    cfg = build(service_row=None)
+    assert cfg.mode == model.MODE_DRY_RUN
+    assert cfg.log_level == "info"
+    assert cfg.tick_interval_s == 1.0
 
 
 def test_unknown_target_node_rejected_like_yaml():

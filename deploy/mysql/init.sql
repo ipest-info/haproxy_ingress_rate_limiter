@@ -8,7 +8,7 @@
 -- 热更新说明：rl-limiter 每 RL_MYSQL_POLL_S 秒轮询一次全量配置，
 -- 节点的 mode/quota_bps/params_json 与挂载点归属改表即热生效，无需
 -- 重启；节点接线列（host/port/map/timeout）与 service_config 的
--- node_id/log_level/tick_interval_s 在进程启动时定型，改表后需重启。
+-- log_level/tick_interval_s 在进程启动时定型，改表后需重启。
 --
 -- v2.1 架构：带宽限制按**节点**设置（每台 HAProxy 自己限速、独立
 -- AIMD 调节，节点间无自动调配）；环境退化为节点分组，仅供控制台
@@ -19,8 +19,6 @@
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS service_config (
     id              TINYINT UNSIGNED NOT NULL PRIMARY KEY,
-    -- 本服务实例的唯一标识（心跳/上报归属）。
-    node_id         VARCHAR(64)  NOT NULL,
     -- dry-run = 只算不写（观测模式）；enforce = 真实下发限速。
     mode            VARCHAR(16)  NOT NULL DEFAULT 'dry-run',
     -- debug | info | warn | error
@@ -92,8 +90,8 @@ CREATE TABLE IF NOT EXISTS env_targets (
 
 -- 演示直接用 enforce：compose 环境是隔离沙盒，观察限速真实生效才是目的。
 -- 生产部署建议先 dry-run 观察，再 UPDATE mode='enforce' 热切换。
-INSERT INTO service_config (id, node_id, mode, log_level, tick_interval_s)
-VALUES (1, 'rl-limiter-01', 'enforce', 'info', 1.0);
+INSERT INTO service_config (id, mode, log_level, tick_interval_s)
+VALUES (1, 'enforce', 'info', 1.0);
 
 -- compose 里的三台 HAProxy：容器内 9999 端口为 admin 级 TCP stats socket。
 -- mode 为 NULL = 继承全局模式；演示逐节点灰度时改这一列即可。
