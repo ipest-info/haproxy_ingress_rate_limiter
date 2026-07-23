@@ -1,19 +1,18 @@
 # rl_limiter.haproxy —— HAProxy runtime API（TCP stats socket）异步客户端。
 #
-# 这是 rl-limiter 服务与数据面（各台 HAProxy 进程）之间唯一的交互通道：
+# 这是 rl-limiter 服务与数据面（各台 HAProxy 进程）之间唯一的交互通道，
+# 且是**只读**的：collector 每秒通过 show_stat 拉取各 frontend 的
+# bytes_out 累计值与当前并发连接数，作为计费口径的原始输入（设计文档
+# §3.1：选用 frontend bytes_out 而非网卡计数，保证口径与"HAProxy 发回
+# 客户端的字节数"精确一致，且天然按 frontend 拆分）。限速本身由 HAProxy
+# 的 shared bwlim 配置执行，rl-limiter 不写入任何运行期状态，因此
+# stats socket 用 level user（只读）即够。
 #
-#   - 采集侧：collector 每秒通过 show_stat 拉取各 frontend 的 bytes_out 累计值
-#     与当前并发连接数，作为计费口径的原始输入（设计文档 §3.1：选用 frontend
-#     bytes_out 而非网卡计数，保证口径与"HAProxy 发回客户端的字节数"精确一致，
-#     且天然按 frontend 拆分以支持一台 HAProxy 服务多个环境）；
-#   - 执行侧：executor 通过 set_map_entry 把快环算出的整形值写入 runtime map，
-#     驱动 bwlim-out 过滤器动态调整聚合限速（设计文档 §3.2/§3.3）。
-#
-# v2.0 变化：runtime API 不再是本机 unix socket，而是 HAProxy 在内网监听的
-# TCP stats socket（haproxy.cfg：`stats socket ipv4@<内网IP>:9999 level admin`）。
-# 协议本身不变——HAProxy runtime socket 在非交互模式下"一次连接只服务一条
-# 命令"，命令执行完即由服务端关闭连接。因此 exec_cmd 每次调用都重新建连，
-# 而不是复用长连接——这不是性能疏忽，而是协议要求。
+# 接线走 HAProxy 在内网监听的 TCP stats socket（haproxy.cfg：
+# `stats socket ipv4@<内网IP>:9999 level user`）。HAProxy runtime socket
+# 在非交互模式下"一次连接只服务一条命令"，命令执行完即由服务端关闭
+# 连接。因此 exec_cmd 每次调用都重新建连，而不是复用长连接——这不是
+# 性能疏忽，而是协议要求。
 
 from __future__ import annotations
 
@@ -33,7 +32,7 @@ SHOW_STAT_CMD = "show stat -1 1 -1"
 # 没有统一格式，只能靠已知前缀识别：命令不存在（"Unknown command"）、socket
 # 权限级别不足（"Permission denied"）、以及 "[ALERT]"/"[CFGERR]" 这类方括号
 # 包裹的诊断信息。不在此列的回包一律原样返回，由调用方按各自命令的语义
-# 解释——例如 "show stat" 的正常回包是 CSV，"set map" 成功时回包为空。
+# 解释——例如 "show stat" 的正常回包是 CSV。
 _ERROR_REPLY_PREFIXES = ("Unknown command", "Permission denied", "[")
 
 
@@ -44,8 +43,8 @@ class RuntimeAPIError(RuntimeError):
 class CommandError(RuntimeAPIError):
     """命令被 HAProxy 明确拒绝（回包命中已知错误前缀）。
 
-    保留 cmd 与完整回包原文（reply），便于上层记录与 set_map_entry 的
-    回退判断——回退逻辑需要检查回包的具体措辞，仅有异常消息不够用。
+    保留 cmd 与完整回包原文（reply），便于上层记录与按回包措辞做
+    针对性处理。
     """
 
     def __init__(self, cmd: str, reply: str, detail: str | None = None):
@@ -123,48 +122,6 @@ class RuntimeClient:
         out = await self.exec_cmd(SHOW_STAT_CMD)
         return parse_show_stat(out)
 
-    async def set_map_entry(self, map_path: str, key: str, value: str) -> None:
-        """更新 runtime map 中 key 对应的条目。
-
-        HAProxy 对 "set map" 成功时回包为空；若 key 尚不存在（例如 map 文件
-        初始为空、或 HAProxy reload 后 map 被重建），"set map" 会返回 "not
-        found" 类回包。此时自动回退一次 "add map"，让首次出现的 key 被透明
-        创建——调用方（executor）因此无需关心"该 key 是否已存在"，两条路径
-        对外语义一致。回退只做一次：若 "add map" 仍失败，说明是 map 路径
-        错误等真实故障，直接上抛。
-        """
-        cmd = f"set map {map_path} {key} {value}"
-        err: CommandError | None = None
-        try:
-            out = await self.exec_cmd(cmd)
-        except CommandError as e:
-            # 即使回包命中错误前缀，也先检查是否属于"条目不存在"的
-            # 措辞变体，再决定是回退还是上抛。
-            out, err = e.reply, e
-
-        if _is_missing_entry_reply(out):
-            # key 不存在不算错误，是"首次写入"的正常路径；记 info 便于确认
-            # map 冷启动/重建后的首次填充时点。
-            self._log.info(
-                "map 条目不存在（多为 map 冷启动或 HAProxy reload 后重建），回退为新增条目（add map）"
-                "，对调用方语义等同写入成功 map_path=%s key=%s value=%s",
-                map_path, key, value)
-            add_cmd = f"add map {map_path} {key} {value}"
-            out = await self.exec_cmd(add_cmd)  # CommandError 直接上抛（回退只做一次）
-            if out:
-                # "add map" 成功时同样应回空包；任何非空回包都是未知情况，
-                # 宁可报错也不能假装写入成功（限速值未生效属于危险方向）。
-                raise RuntimeAPIError(
-                    f"haproxy: add map {map_path} {key}: unexpected reply: {_first_line(out)}")
-            return
-
-        if err is not None:
-            raise err
-        if out:
-            raise RuntimeAPIError(
-                f"haproxy: set map {map_path} {key}: unexpected reply: {_first_line(out)}")
-
-
 def parse_show_stat(out: str) -> list[model.FrontendStat]:
     """解析 "show stat" 的 CSV 回包。
 
@@ -239,14 +196,6 @@ def _is_error_reply(out: str) -> bool:
     （若有）是补充说明，不影响成败判定。"""
     line = _first_line(out)
     return line.startswith(_ERROR_REPLY_PREFIXES)
-
-
-def _is_missing_entry_reply(out: str) -> bool:
-    """识别 "set map" 的"条目不存在"回包。不同 HAProxy 版本的措辞不完全
-    一致（"entry not found" / "unable to find ..."），因此用小写子串匹配
-    兜住两种已知变体，而不是精确比对。"""
-    lowered = out.lower()
-    return "not found" in lowered or "unable to find" in lowered
 
 
 def _first_line(s: str) -> str:

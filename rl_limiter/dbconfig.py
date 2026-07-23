@@ -3,10 +3,10 @@
 # 定位：替代本地 YAML 文件成为服务配置的权威来源。四张表对应 YAML 的
 # 四块内容（建表与种子数据见 deploy/mysql/init.sql）：
 #
-#   service_config   单行表：mode / log_level / tick_interval_s
-#   haproxy_nodes    受控 HAProxy 节点清单：接线（host/port/map 路径/超时）
-#                    + 可热更运行列（mode / quota_bps / params_json）——
-#                    v2.1 起带宽限制与 AIMD 参数按节点设置
+#   service_config   单行表：log_level / tick_interval_s
+#   haproxy_nodes    受控 HAProxy 节点清单：接线（host/port/超时）+
+#                    quota_bps（登记限额=超限告警基准，可热更；应与该
+#                    节点 haproxy.cfg 里 shared bwlim 的 limit 一致）
 #   envs             业务环境分组（仅 env_id：环境=节点分组+聚合视图）
 #   env_targets      环境挂载点（env_id × node × frontend）
 #
@@ -18,10 +18,11 @@
 #   - 每 poll_interval_s 拉取一次全量配置（四条 SELECT 包在同一个事务里，
 #     InnoDB REPEATABLE READ 保证读到的是同一时刻的一致快照）；
 #   - 以配置内容的 CRC32 校验和为"版本号"：内容变了校验和必变，直接把
-#     组装好的 ControllerConfig 投入主循环的配置队列热生效（mode 与 envs
-#     可热更；haproxy_nodes 变更涉及重建 TCP 客户端，记 warning 提示重启）；
-#   - 数据库故障或新配置校验不通过时：保留当前配置继续限速、只记日志
-#     （fail-static，设计 §3.7：断联/出错绝不放开限速）。
+#     组装好的 ControllerConfig 投入主循环的配置队列热生效（限额基准与
+#     分组可热更；haproxy_nodes 接线变更涉及重建 TCP 客户端，记 warning
+#     提示重启）；
+#   - 数据库故障或新配置校验不通过时：保留当前配置继续监控、只记日志
+#     （fail-static 的监控侧对应：出错不丢弃已知配置）。
 #
 # 连接凭据通过 RL_MYSQL_* 环境变量注入（见 from_env），不落任何文件。
 
@@ -66,12 +67,12 @@ STARTUP_RETRY_INTERVAL_S = 2.0
 
 # 四条快照查询。ORDER BY 让行序稳定，保证同一份数据算出的校验和一致。
 _SQL_SERVICE = (
-    "SELECT mode, log_level, tick_interval_s "
+    "SELECT log_level, tick_interval_s "
     "FROM service_config WHERE id = 1"
 )
 _SQL_NODES = (
-    "SELECT name, host, port, bwlim_map_path, timeout_ms, mode, "
-    "quota_bps, params_json FROM haproxy_nodes ORDER BY name"
+    "SELECT name, host, port, timeout_ms, quota_bps "
+    "FROM haproxy_nodes ORDER BY name"
 )
 # v2.1：envs 表只剩分组标识——配额/参数已下沉到 haproxy_nodes。
 _SQL_ENVS = "SELECT env_id FROM envs ORDER BY env_id"
@@ -162,51 +163,28 @@ def rows_to_raw(
     config._validate，保证两种配置来源的拒绝行为一字不差。
 
     service_row 为 None 表示 service_config 表没有 id=1 的行——组装出的
-    dict 服务级键全部缺省（mode 等按默认值处理，安全方向是 dry-run）。
-
-    params_json 是节点行里可选的 JSON 文本列（按节点的快环参数覆盖）；
-    非法 JSON 在这里就地报错并带上节点名，因为 config 层拿到的已是解析
-    后的 dict，无从知道原始文本长什么样。
+    dict 服务级键全部缺省（按默认值处理）。
     """
     raw: dict[str, Any] = {}
     if service_row is not None:
-        mode, log_level, tick = service_row
-        if mode:
-            raw["mode"] = str(mode)
+        log_level, tick = service_row
         if log_level:
             raw["log_level"] = str(log_level)
         if tick is not None:
             raw["tick_interval_s"] = tick
 
     nodes_out: list[dict[str, Any]] = []
-    for (name, host, port, bwlim_map_path, timeout_ms, mode,
-         quota_bps, params_json) in node_rows:
+    for (name, host, port, timeout_ms, quota_bps) in node_rows:
         node: dict[str, Any] = {
             "name": name,
             "host": host,
             "port": port,
-            "bwlim_map_path": bwlim_map_path or "",
             "timeout_ms": timeout_ms or 0,
-            # mode/quota_bps/params 是节点行里的**可热更**运行列
-            # （其余为接线字段，重启生效）。mode NULL/空 = 继承全局。
-            "mode": mode or "",
         }
+        # quota_bps 是节点行里唯一的**可热更**运行列（其余为接线字段，
+        # 重启生效）。
         if quota_bps is not None:
             node["quota_bps"] = quota_bps
-        if params_json:
-            try:
-                params = json.loads(params_json)
-            except ValueError as e:
-                raise ValueError(
-                    f"haproxy_nodes 表中节点 {name!r} 的 params_json "
-                    f"不是合法的 JSON: {e}"
-                ) from None
-            if not isinstance(params, dict):
-                raise ValueError(
-                    f"haproxy_nodes 表中节点 {name!r} 的 params_json "
-                    f"必须是 JSON 对象，当前为 {type(params).__name__}"
-                )
-            node["params"] = params
         nodes_out.append(node)
     raw["haproxy_nodes"] = nodes_out
 
@@ -225,16 +203,14 @@ def rows_to_raw(
 
 
 def canonical_config(
-    mode: str,
     envs: list[model.EnvQuota],
-    node_modes: dict[str, str] | None = None,
     env_groups: dict[str, list[str]] | None = None,
 ) -> str:
-    """把可热更新部分（mode + 控制单元 + node_modes + 环境分组）序列化
-    为规范化 JSON（键排序、紧凑分隔符），作为配置内容的精确身份。
+    """把可热更新部分（监控单元 + 环境分组）序列化为规范化 JSON
+    （键排序、紧凑分隔符），作为配置内容的精确身份。
 
-    env_groups 必须纳入：把节点从一个环境移到另一个环境时，控制单元
-    （节点配额/挂载点）可能完全不变，只有分组归属变了——不纳入会漏掉
+    env_groups 必须纳入：把节点从一个环境移到另一个环境时，监控单元
+    （节点限额/挂载点）可能完全不变，只有分组归属变了——不纳入会漏掉
     这类"纯重分组"变更，控制台聚合视图将停在旧分组。
 
     变更检测必须比较这个字符串本身而不是它的哈希：32 位校验和存在碰撞
@@ -243,9 +219,7 @@ def canonical_config(
     没有理由用有损比较。envs 查询带 ORDER BY，行序稳定，字符串可复现。
     """
     payload = {
-        "mode": mode,
         "envs": [e.to_dict() for e in envs],
-        "node_modes": dict(node_modes or {}),
         "env_groups": {k: list(v) for k, v in (env_groups or {}).items()},
     }
     return json.dumps(
@@ -254,9 +228,7 @@ def canonical_config(
 
 
 def config_checksum(
-    mode: str,
     envs: list[model.EnvQuota],
-    node_modes: dict[str, str] | None = None,
     env_groups: dict[str, list[str]] | None = None,
 ) -> int:
     """内容校验和 = canonical_config 的 CRC32，充当配置版本号。
@@ -267,7 +239,7 @@ def config_checksum(
     canonical_config 字符串精确比较（见其 docstring），不依赖此哈希。
     """
     return zlib.crc32(
-        canonical_config(mode, envs, node_modes, env_groups).encode("utf-8"))
+        canonical_config(envs, env_groups).encode("utf-8"))
 
 
 async def _fetch_raw(opts: MySQLOptions) -> dict[str, Any]:
@@ -317,7 +289,7 @@ async def _fetch_raw(opts: MySQLOptions) -> dict[str, Any]:
 async def fetch_service_config(opts: MySQLOptions) -> configmod.ServiceConfig:
     """拉取一次全量配置并走统一校验管线，返回 ServiceConfig。
 
-    rows_to_raw 阶段的 ValueError（如 params_json 写坏）发生在 from_raw
+    rows_to_raw 阶段若抛 ValueError，它发生在 from_raw
     的来源包装之前，这里补上同样的来源前缀——保证"所有配置内容错误都
     带来源描述"的承诺对数据库路径同样成立（多实例对接不同配置库时靠它
     定位是哪个库写坏了）。
@@ -458,39 +430,14 @@ async def _exec_write(opts: MySQLOptions, sql: str, args: tuple) -> int:
     return (await _exec_tx(opts, [(sql, args)]))[0]
 
 
-async def update_mode(opts: MySQLOptions, mode: str) -> None:
-    """热切换全局默认运行模式（dry-run/enforce）。非法值在这里就拦下，
-    不落库。未被 haproxy_nodes.mode 覆盖的节点继承该值。"""
-    if mode not in (model.MODE_DRY_RUN, model.MODE_ENFORCE):
-        raise ValueError(
-            f"mode 值非法：{mode!r}，必须是 {model.MODE_DRY_RUN!r} 或 "
-            f"{model.MODE_ENFORCE!r}")
-    await _exec_write(
-        opts, "UPDATE service_config SET mode = %s WHERE id = 1", (mode,))
-
-
-async def update_node_mode(
-    opts: MySQLOptions, name: str, mode: str | None,
-) -> None:
-    """设置单个 HAProxy 节点的模式覆盖；None/空 = 清除覆盖、继承全局。
-
-    生产灰度的入口：逐台把节点切到 enforce，其余留在 dry-run 观察。
-    """
-    if mode is not None and mode != "" and \
-            mode not in (model.MODE_DRY_RUN, model.MODE_ENFORCE):
-        raise ValueError(
-            f"节点 mode 值非法：{mode!r}，必须是 {model.MODE_DRY_RUN!r}、"
-            f"{model.MODE_ENFORCE!r} 或 null（继承全局）")
-    n = await _exec_write(
-        opts, "UPDATE haproxy_nodes SET mode = %s WHERE name = %s",
-        (mode or None, name))
-    if n == 0:
-        raise ValueError(f"节点 {name!r} 不存在于 haproxy_nodes 表")
-
-
 async def update_node_quota(opts: MySQLOptions, name: str, quota_bps: int) -> None:
-    """更新节点自己的带宽限制（bits/s，运维口径）。节点不存在按错误
-    报出，而不是静默 0 行更新——控制台上的拼写错误必须立刻可见。"""
+    """更新节点的登记限额（bits/s，运维口径）——超限告警基准。
+
+    注意：这只改**监控基准**；真实限速在该节点 haproxy.cfg 的 shared
+    bwlim limit 里，需要同步修改并 reload（不同步会触发持续超限告警）。
+    节点不存在按错误报出，而不是静默 0 行更新——控制台上的拼写错误
+    必须立刻可见。
+    """
     if quota_bps <= 0:
         raise ValueError(f"quota_bps 必须 > 0（比特每秒），当前值 {quota_bps!r}")
     n = await _exec_write(
@@ -500,41 +447,12 @@ async def update_node_quota(opts: MySQLOptions, name: str, quota_bps: int) -> No
         raise ValueError(f"节点 {name!r} 不存在于 haproxy_nodes 表")
 
 
-async def update_node_params(
-    opts: MySQLOptions, name: str, params: dict[str, Any] | None,
-) -> None:
-    """更新节点的快环参数覆盖（None 表示清除覆盖、回到默认参数）。
-
-    键集合与数值先在这里按 GovParams 校验（未知键/非数值直接拒绝），
-    避免把"下一轮 fetch 才发现的坏 JSON"写进库触发 fail-static 告警。
-    """
-    params_json: str | None = None
-    if params is not None:
-        if not isinstance(params, dict):
-            raise ValueError(
-                f"params 必须是键值映射或 null，当前为 {type(params).__name__}")
-        allowed = set(model.GovParams.__dataclass_fields__)
-        unknown = sorted(set(params) - allowed)
-        if unknown:
-            raise ValueError(
-                f"params 含未知键 {unknown}，可用键：{sorted(allowed)}")
-        for k, v in params.items():
-            if not isinstance(v, (int, float)) or isinstance(v, bool):
-                raise ValueError(f"params.{k} 必须是数值，当前值 {v!r}")
-        params_json = json.dumps(params, ensure_ascii=False)
-    n = await _exec_write(
-        opts, "UPDATE haproxy_nodes SET params_json = %s WHERE name = %s",
-        (params_json, name))
-    if n == 0:
-        raise ValueError(f"节点 {name!r} 不存在于 haproxy_nodes 表")
-
-
 def _validate_targets(targets: Any) -> list[tuple[str, str]]:
     """把 API 传入的 targets 载荷校验/规整为 (node, frontend) 元组表。"""
     if not isinstance(targets, list) or not targets:
         raise ValueError(
             "targets 必须是非空列表（每个环境至少一个挂载点：没有挂载点的"
-            "环境既采不到用量也无处下发限速，统一校验管线会拒绝整份配置）")
+            "环境采不到任何用量，统一校验管线会拒绝整份配置）")
     out: list[tuple[str, str]] = []
     for i, t in enumerate(targets):
         if not isinstance(t, dict) or not t.get("node") or not t.get("frontend"):
@@ -632,10 +550,10 @@ async def update_env_targets(
 
 
 async def create_env(opts: MySQLOptions, env_id: str, targets: Any) -> None:
-    """新建环境分组（v2.1：环境不再有配额，只是节点分组 + 聚合视图；
-    带宽限制设在成员节点上）。必须携带至少一个挂载点：统一校验管线
-    拒绝零挂载点的环境，缺挂载点的新环境会让整份配置快照无法生效
-    （fail-static 卡住所有后续变更）。"""
+    """新建环境分组（环境没有限额，只是节点分组 + 聚合视图；限额登记
+    在成员节点上）。必须携带至少一个挂载点：统一校验管线拒绝零挂载点
+    的环境，缺挂载点的新环境会让整份配置快照无法生效（fail-static 卡住
+    所有后续变更）。"""
     env_id = str(env_id).strip()
     if not env_id:
         raise ValueError("env_id 不能为空")
@@ -644,7 +562,8 @@ async def create_env(opts: MySQLOptions, env_id: str, targets: Any) -> None:
 
 
 async def delete_env(opts: MySQLOptions, env_id: str) -> None:
-    """删除环境（挂载点由外键级联删除）。删除即解除该环境的限速。"""
+    """删除环境（挂载点由外键级联删除）。删除只影响监控分组视图，
+    不影响各节点 HAProxy 上的限速。"""
     n = await _exec_write(
         opts, "DELETE FROM envs WHERE env_id = %s", (env_id,))
     if n == 0:
@@ -665,18 +584,16 @@ async def watch(
 
     - 变更判定：canonical_config 字符串精确比较（不是哈希，见其
       docstring）；首轮轮询读到与引导相同的内容时不会重复触发空应用；
-    - 能力边界：只热更运行字段（mode/配额/参数/分组/挂载点）。haproxy_nodes
+    - 能力边界：只热更运行字段（限额基准/分组/挂载点）。haproxy_nodes
       属于基础设施接线，进程内的 TCP 客户端在启动时构建：
         * 节点行内容变化 → 记 warning 提示需要重启生效；
         * envs 引用了启动时不存在的节点 → **拒绝应用整份快照**（保留
           当前配置，fail-static）。此时校验虽通过（新节点行在同一快照
-          里），但进程内没有它的 client：应用了只会让该环境既采不到量
-          也写不进限速值，即实际不受限——比"暂不生效"危险得多；
-    - 任何失败（连接断、校验不过）都保留当前配置继续限速（fail-static），
+          里），但进程内没有它的 client：应用了该单元也采不到任何量；
+    - 任何失败（连接断、校验不过）都保留当前配置继续监控（fail-static），
       下一轮再试。
     """
-    last_canonical = canonical_config(
-        boot_cfg.mode, boot_cfg.envs, boot_cfg.node_modes, boot_cfg.env_groups)
+    last_canonical = canonical_config(boot_cfg.envs, boot_cfg.env_groups)
     last_nodes = list(boot_cfg.nodes)  # NodeConfig 是 dataclass，逐字段相等
     # 启动时完成接线（构建了 RuntimeClient）的节点集合：热更新的硬边界。
     wired_nodes = frozenset(n.name for n in boot_cfg.nodes)
@@ -688,7 +605,7 @@ async def watch(
             cfg = await fetch_service_config(opts)
         except Exception as e:
             log.warning(
-                "轮询数据库配置失败，保留当前配置继续限速（fail-static），下一轮再试 "
+                "轮询数据库配置失败，保留当前配置继续监控（fail-static），下一轮再试 "
                 "poll_interval_s=%s err=%s", opts.poll_interval_s, e)
             continue
 
@@ -698,8 +615,7 @@ async def watch(
                 "热更新不生效，请重启 rl-limiter 使其生效 nodes=%d", len(cfg.nodes))
             last_nodes = list(cfg.nodes)  # 只在变化那一轮告警一次
 
-        canonical = canonical_config(
-            cfg.mode, cfg.envs, cfg.node_modes, cfg.env_groups)
+        canonical = canonical_config(cfg.envs, cfg.env_groups)
         if canonical == last_canonical:
             continue
 
@@ -711,9 +627,9 @@ async def watch(
                 last_rejected = canonical
                 log.error(
                     "数据库新配置引用了启动时未接线的节点，拒绝热应用并保留当前配置"
-                    "（fail-static）：这些节点没有运行期客户端，应用后对应环境将"
-                    "既采不到用量也写不进限速值（实际不受限）。请重启 rl-limiter "
-                    "完成新节点接线 unwired_nodes=%s envs=%d",
+                    "（fail-static）：这些节点没有运行期客户端，应用后对应单元"
+                    "采不到任何用量。请重启 rl-limiter 完成新节点接线 "
+                    "unwired_nodes=%s envs=%d",
                     ",".join(unwired), len(cfg.envs))
             continue
 
@@ -721,13 +637,9 @@ async def watch(
         last_rejected = None
         version = zlib.crc32(canonical.encode("utf-8"))
         ctl = model.ControllerConfig(
-            version=version, mode=cfg.mode, envs=cfg.envs,
-            node_modes=dict(cfg.node_modes),
+            version=version, envs=cfg.envs,
             env_groups={k: list(v) for k, v in cfg.env_groups.items()})
         queue.put_nowait(ctl)
         log.info(
-            "检测到数据库配置变化，已提交主循环热生效 "
-            "version=%s mode=%s node_modes=%s envs=%d",
-            version, cfg.mode,
-            ";".join(f"{n}={m}" for n, m in sorted(cfg.node_modes.items())) or "-",
-            len(cfg.envs))
+            "检测到数据库配置变化，已提交主循环热生效 version=%s units=%d",
+            version, len(cfg.envs))

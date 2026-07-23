@@ -13,7 +13,7 @@
 #                    haproxy3:8080 (fe_env_b → env-b 独占)
 #                          └──> web:9000（随机大小响应）
 #   rl-limiter ──轮询──> mysql（配置：节点/环境/挂载点/模式）
-#   rl-limiter ──show stat / set map──> haproxy{1,2,3}:9999
+#   rl-limiter ──show stat（只读采样）──> haproxy{1,2,3}:9999
 # env-a（80Mbps）独占 hap-1+hap-2（跨节点聚合限速）；env-b（40Mbps）
 # 独占 hap-3；模式可全局或按节点（haproxy_nodes.mode）控制。
 
@@ -59,7 +59,6 @@ services:
     image: haproxy:2.8
     volumes:
       - ./deploy/docker/haproxy-env-a.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - ./deploy/docker/maps:/etc/haproxy/maps:ro
     ports:
       - "8080:8080"   # hap-1 / fe_env_a（宿主机可 curl 体验限速）
     depends_on:
@@ -70,7 +69,6 @@ services:
     image: haproxy:2.8
     volumes:
       - ./deploy/docker/haproxy-env-a.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - ./deploy/docker/maps:/etc/haproxy/maps:ro
     ports:
       - "8082:8080"   # hap-2 / fe_env_a
     depends_on:
@@ -81,7 +79,6 @@ services:
     image: haproxy:2.8
     volumes:
       - ./deploy/docker/haproxy-env-b.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - ./deploy/docker/maps:/etc/haproxy/maps:ro
     ports:
       - "8083:8080"   # hap-3 / fe_env_b
     depends_on:
@@ -98,7 +95,7 @@ services:
       RL_MYSQL_PASSWORD: rl_pass
       RL_MYSQL_DB: rl_limiter
       RL_MYSQL_POLL_S: "3"
-      # 内置 Web 控制台：实时带宽/连接数/AIMD 状态曲线 + 在线调参 + 日志。
+      # 内置 Web 控制台：实时带宽/连接数曲线 + 限额登记 + 超限告警 + 日志。
       RL_CONSOLE_PORT: "8090"
     ports:
       - "8090:8090"   # 控制台（浏览器打开 http://localhost:8090）

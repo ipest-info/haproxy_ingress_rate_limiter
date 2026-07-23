@@ -11,7 +11,6 @@ from rl_limiter import model
 from rl_limiter.haproxy import (
     SHOW_STAT_CMD,
     CommandError,
-    RuntimeAPIError,
     RuntimeClient,
     StatParseError,
     parse_show_stat,
@@ -180,70 +179,3 @@ def test_parse_show_stat_empty_output_raises():
 def test_parse_show_stat_bad_number_raises():
     with pytest.raises(StatParseError):
         parse_show_stat("# pxname,svname,scur,bout\nfe,FRONTEND,1,notanumber\n")
-
-
-# ---------------------------------------------------------------------------
-# set_map_entry
-# ---------------------------------------------------------------------------
-
-async def test_set_map_success_empty_reply():
-    async with fake_haproxy(lambda cmd: "\n") as srv:
-        c = RuntimeClient("127.0.0.1", srv.port)
-        await c.set_map_entry("/etc/haproxy/maps/bwlim.map", "env1", "125000000")
-        assert srv.commands == ["set map /etc/haproxy/maps/bwlim.map env1 125000000"]
-
-
-async def test_set_map_falls_back_to_add_map():
-    # "set map" 回 "not found" → 透明回退 "add map"（首次写入的正常路径）。
-    def reply(cmd):
-        if cmd.startswith("set map"):
-            return "entry not found.\n"
-        return "\n"
-
-    async with fake_haproxy(reply) as srv:
-        c = RuntimeClient("127.0.0.1", srv.port)
-        await c.set_map_entry("/m.map", "env1", "42")
-        assert srv.commands == ["set map /m.map env1 42", "add map /m.map env1 42"]
-
-
-async def test_set_map_fallback_on_unable_to_find_variant():
-    # 另一种版本措辞 "unable to find ..." 同样触发回退。
-    def reply(cmd):
-        if cmd.startswith("set map"):
-            return "unable to find entry for key.\n"
-        return "\n"
-
-    async with fake_haproxy(reply) as srv:
-        c = RuntimeClient("127.0.0.1", srv.port)
-        await c.set_map_entry("/m.map", "k", "v")
-        assert [cmd.split()[0:2] for cmd in srv.commands] == [["set", "map"], ["add", "map"]]
-
-
-async def test_set_map_fallback_add_map_unexpected_reply_raises():
-    # 回退只做一次："add map" 也回非空包时必须上抛，绝不假装写入成功。
-    def reply(cmd):
-        if cmd.startswith("set map"):
-            return "entry not found.\n"
-        return "something odd happened\n"
-
-    async with fake_haproxy(reply) as srv:
-        c = RuntimeClient("127.0.0.1", srv.port)
-        with pytest.raises(RuntimeAPIError):
-            await c.set_map_entry("/m.map", "k", "v")
-
-
-async def test_set_map_unexpected_reply_raises():
-    # 非空、又不是"条目不存在"的回包：未知情况，报错。
-    async with fake_haproxy(lambda cmd: "weird reply\n") as srv:
-        c = RuntimeClient("127.0.0.1", srv.port)
-        with pytest.raises(RuntimeAPIError):
-            await c.set_map_entry("/m.map", "k", "v")
-
-
-async def test_set_map_error_reply_propagates():
-    # 命中错误前缀且不含"not found"措辞：直接上抛，不触发回退。
-    async with fake_haproxy(lambda cmd: "Permission denied\n") as srv:
-        c = RuntimeClient("127.0.0.1", srv.port)
-        with pytest.raises(CommandError):
-            await c.set_map_entry("/m.map", "k", "v")
-        assert srv.commands == ["set map /m.map k v"]  # 未发出 add map

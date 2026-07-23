@@ -7,12 +7,10 @@ import pytest
 
 from rl_limiter import config, dbconfig, model
 
-# 与 deploy/mysql/init.sql 种子数据同构的行样本。节点行末三列为可热更
-# 运行列：mode（NULL=继承全局）、quota_bps（节点自己的带宽限制）、
-# params_json（节点级 AIMD 参数覆盖）；环境行只剩分组标识。
-SERVICE_ROW = ("enforce", "info", 1.0)
-NODE_ROWS = [("hap-1", "haproxy1", 9999, "/etc/haproxy/maps/bwlim.map",
-              500, None, 80_000_000, None)]
+# 与 deploy/mysql/init.sql 种子数据同构的行样本。节点行末列 quota_bps 为
+# 唯一可热更运行列（登记限额=超限告警基准）；环境行只剩分组标识。
+SERVICE_ROW = ("info", 1.0)
+NODE_ROWS = [("hap-1", "haproxy1", 9999, 500, 80_000_000)]
 ENV_ROWS = [("env-a",)]
 TARGET_ROWS = [("env-a", "hap-1", "fe_env_a")]
 
@@ -26,44 +24,36 @@ def build(service_row=SERVICE_ROW, node_rows=NODE_ROWS,
 def test_rows_roundtrip_to_service_config():
     """种子数据经 行组装 → 统一校验管线 得到与 YAML 加载同构的 ServiceConfig。"""
     cfg = build()
-    assert cfg.mode == model.MODE_ENFORCE
     assert cfg.log_level == "info"
     assert cfg.tick_interval_s == 1.0
     assert len(cfg.nodes) == 1
-    assert cfg.node_modes == {}  # mode 列为 NULL → 无覆盖，继承全局
     n = cfg.nodes[0]
     assert (n.name, n.host, n.port) == ("hap-1", "haproxy1", 9999)
-    assert n.bwlim_map_path == "/etc/haproxy/maps/bwlim.map"
     assert n.timeout_s == 0.5  # timeout_ms=500 → 秒口径
-    # v2.1：控制单元 = 节点（env_id 字段装节点名，quota 来自节点行）。
+    # 监控单元 = 节点（env_id 字段装节点名，quota 来自节点行）。
     assert len(cfg.envs) == 1
     u = cfg.envs[0]
     assert u.env_id == "hap-1"
     assert u.quota_bits_per_sec == 80_000_000
     assert u.targets == [model.Target("hap-1", "fe_env_a")]
-    assert u.params is None
     assert cfg.env_groups == {"env-a": ["hap-1"]}
 
 
 def test_service_row_defaults_and_timeout_fallback():
-    """mode/log_level 空值取默认；timeout_ms 非正回落默认 500ms——与
-    YAML 管线的兜底行为一字不差。"""
+    """log_level 空值取默认；timeout_ms 非正回落默认 500ms——与 YAML
+    管线的兜底行为一字不差。"""
     cfg = build(
-        service_row=(None, None, None),
-        node_rows=[("hap-1", "haproxy", 9999, "", 0, None, 80_000_000, None)],
+        service_row=(None, None),
+        node_rows=[("hap-1", "haproxy", 9999, 0, 80_000_000)],
     )
-    assert cfg.mode == model.MODE_DRY_RUN
     assert cfg.log_level == "info"
     assert cfg.tick_interval_s == 1.0
     assert cfg.nodes[0].timeout_s == 0.5
-    assert cfg.nodes[0].bwlim_map_path == config.DEFAULT_BWLIM_MAP_PATH
 
 
 def test_missing_service_row_falls_back_to_safe_defaults():
-    """service_config 表缺 id=1 的行 → 服务级键全部取安全默认
-    （mode=dry-run，误配置不产生数据面影响）。"""
+    """service_config 表缺 id=1 的行 → 服务级键全部取安全默认。"""
     cfg = build(service_row=None)
-    assert cfg.mode == model.MODE_DRY_RUN
     assert cfg.log_level == "info"
     assert cfg.tick_interval_s == 1.0
 
@@ -74,51 +64,21 @@ def test_unknown_target_node_rejected_like_yaml():
         build(target_rows=[("env-a", "hap-ghost", "fe_env_a")])
 
 
-def test_params_json_parsed_into_gov_params():
-    """节点行的 params_json → 该节点控制单元的 AIMD 参数覆盖。"""
-    cfg = build(node_rows=[
-        ("hap-1", "haproxy1", 9999, "", 500, None, 80_000_000,
-         '{"md_factor": 0.8, "recover_after_s": 10}')])
-    p = cfg.envs[0].params
-    assert p is not None
-    assert p.md_factor == 0.8
-    assert p.recover_after_s == 10
-    # 未覆盖的字段维持默认。
-    assert p.elastic_ceiling == model.GovParams().elastic_ceiling
-
-
-@pytest.mark.parametrize("bad_json, match", [
-    ('{"md_factor": 0.8', "不是合法的 JSON"),   # 截断的 JSON
-    ('[1, 2, 3]', "必须是 JSON 对象"),          # 合法 JSON 但不是对象
-])
-def test_bad_params_json_rejected_with_node_name(bad_json, match):
-    """params_json 写坏时错误信息必须带节点名，运维才知道改哪一行。"""
-    with pytest.raises(ValueError, match=match) as ei:
-        dbconfig.rows_to_raw(
-            SERVICE_ROW,
-            [("hap-1", "haproxy1", 9999, "", 500, None, 80_000_000, bad_json)],
-            ENV_ROWS, TARGET_ROWS)
-    assert "hap-1" in str(ei.value)
+def test_mounted_node_without_quota_rejected():
+    """被挂载的节点必须登记限额（它是超限告警的基准）。"""
+    with pytest.raises(ValueError, match="未设置有效的 quota_bps"):
+        build(node_rows=[("hap-1", "haproxy1", 9999, 500, None)])
 
 
 def test_checksum_stable_and_content_sensitive():
-    """校验和 = 配置版本号：同内容恒定，配额/模式/参数任一变化必变。"""
+    """校验和 = 配置版本号：同内容恒定，限额变化必变。"""
     cfg = build()
-    base = dbconfig.config_checksum(cfg.mode, cfg.envs)
-    assert base == dbconfig.config_checksum(cfg.mode, cfg.envs)  # 稳定
+    base = dbconfig.config_checksum(cfg.envs)
+    assert base == dbconfig.config_checksum(cfg.envs)  # 稳定
 
     quota_changed = build(node_rows=[
-        ("hap-1", "haproxy1", 9999, "", 500, None, 40_000_000, None)])
-    assert dbconfig.config_checksum(
-        quota_changed.mode, quota_changed.envs) != base
-
-    assert dbconfig.config_checksum(model.MODE_DRY_RUN, cfg.envs) != base
-
-    params_changed = build(node_rows=[
-        ("hap-1", "haproxy1", 9999, "", 500, None, 80_000_000,
-         '{"md_factor": 0.8}')])
-    assert dbconfig.config_checksum(
-        params_changed.mode, params_changed.envs) != base
+        ("hap-1", "haproxy1", 9999, 500, 40_000_000)])
+    assert dbconfig.config_checksum(quota_changed.envs) != base
 
 
 def test_from_env_disabled_without_host():
@@ -166,44 +126,13 @@ def test_canonical_config_is_exact_identity():
     """变更检测的身份是规范化 JSON 字符串本身（精确比较，不经哈希），
     同内容恒等、任一字段变化必不等。"""
     cfg = build()
-    base = dbconfig.canonical_config(cfg.mode, cfg.envs)
-    assert base == dbconfig.canonical_config(cfg.mode, cfg.envs)
+    base = dbconfig.canonical_config(cfg.envs)
+    assert base == dbconfig.canonical_config(cfg.envs)
     changed = build(node_rows=[
-        ("hap-1", "haproxy1", 9999, "", 500, None, 40_000_000, None)])
-    assert dbconfig.canonical_config(changed.mode, changed.envs) != base
+        ("hap-1", "haproxy1", 9999, 500, 40_000_000)])
+    assert dbconfig.canonical_config(changed.envs) != base
     # 纯重分组（单元不变、只换环境归属）也必须改变身份。
     regrouped = build(env_rows=[("env-x",)],
                       target_rows=[("env-x", "hap-1", "fe_env_a")])
-    assert dbconfig.canonical_config(
-        regrouped.mode, regrouped.envs, None, regrouped.env_groups) != \
-        dbconfig.canonical_config(cfg.mode, cfg.envs, None, cfg.env_groups)
-
-
-def test_node_mode_column_maps_to_node_modes():
-    """节点行的 mode 列进入 ServiceConfig.node_modes（不进 NodeConfig，
-    保持节点接线相等性比较不受模式切换影响）。"""
-    cfg = build(node_rows=[
-        ("hap-1", "haproxy1", 9999, "", 500, "enforce", 80_000_000, None),
-        ("hap-2", "haproxy2", 9999, "", 500, None, 80_000_000, None),
-    ], target_rows=[("env-a", "hap-1", "fe_env_a"),
-                    ("env-a", "hap-2", "fe_env_a")])
-    assert cfg.node_modes == {"hap-1": "enforce"}
-    # NodeConfig 本体不含模式字段：两行除接线字段外完全同构。
-    assert not hasattr(cfg.nodes[0], "mode")
-
-
-def test_bad_node_mode_rejected():
-    with pytest.raises(ValueError, match="mode 值非法"):
-        build(node_rows=[
-            ("hap-1", "haproxy1", 9999, "", 500, "observe", 80_000_000, None)])
-
-
-def test_checksum_sensitive_to_node_modes():
-    """节点模式覆盖属于可热更内容：变化必须反映进 canonical/校验和。"""
-    cfg = build()
-    base = dbconfig.config_checksum(cfg.mode, cfg.envs, cfg.node_modes)
-    overridden = build(node_rows=[
-        ("hap-1", "haproxy1", 9999, "/etc/haproxy/maps/bwlim.map",
-         500, "dry-run", 80_000_000, None)])
-    assert dbconfig.config_checksum(
-        overridden.mode, overridden.envs, overridden.node_modes) != base
+    assert dbconfig.canonical_config(regrouped.envs, regrouped.env_groups) != \
+        dbconfig.canonical_config(cfg.envs, cfg.env_groups)

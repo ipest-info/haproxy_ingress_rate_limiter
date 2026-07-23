@@ -16,8 +16,7 @@
   --text-muted:     #8a8983;
   --series-rate:   #2a78d6;  /* 实时速率（slot1 blue） */
   --series-mean:   #008300;  /* 10s 均值（slot2 green） */
-  --series-bwlim:  #e87ba4;  /* 整形值（slot3 magenta，亮面低对比 → 图例+悬浮直标兜底） */
-  --ref-quota:     #52514e;  /* 配额参考线（中性，非序列色） */
+  --ref-quota:     #52514e;  /* 限额参考线（中性，非序列色） */
   --status-good:     #0ca30c;
   --status-warning:  #fab219;
   --status-serious:  #ec835a;
@@ -34,7 +33,6 @@
     --text-muted:     #85847c;
     --series-rate:  #3987e5;
     --series-mean:  #008300;
-    --series-bwlim: #d55181;
     --ref-quota:    #c3c2b7;
     --grid: rgba(255,255,255,.08);
   }
@@ -97,13 +95,6 @@ button {
 button:hover { border-color: var(--text-muted); }
 button.primary { background: var(--series-rate); border-color: var(--series-rate); color: #fff; }
 button:disabled { opacity: .5; cursor: not-allowed; }
-details.params { margin-top: 10px; font-size: 13px; }
-details.params summary { cursor: pointer; color: var(--text-secondary); }
-.params-table { border-collapse: collapse; margin: 6px 0 10px; }
-.params-table td { padding: 4px 14px 4px 0; vertical-align: middle; }
-.params-table td.pname { font-weight: 600; white-space: nowrap; }
-.params-table td.pdesc { color: var(--text-secondary); font-size: 12.5px; max-width: 460px; }
-.params-table input { width: 90px; }
 input.dirty { border-color: var(--status-warning); }
 /* 节点面板 */
 .nodes-table { border-collapse: collapse; margin-top: 8px; min-width: 560px; }
@@ -145,7 +136,6 @@ h3.section { font-size: 14px; color: var(--text-secondary); margin: 22px 4px 10p
 <header>
   <h1>rl-limiter 控制台</h1>
   <span class="badge" id="sse-badge"><span class="dot" id="sse-dot" style="background:var(--status-critical)"></span><span id="sse-text">连接中…</span></span>
-  <span class="badge" title="未被节点覆盖的 HAProxy 继承此模式">全局默认 <b id="mode-text">–</b> <button id="mode-btn" style="padding:1px 8px;font-size:12px">切换</button></span>
   <span class="meta">配置版本 <b id="cfg-version">–</b></span>
   <span class="meta">运行时长 <b id="uptime">–</b></span>
   <span class="meta">服务版本 <b id="svc-version">–</b></span>
@@ -161,12 +151,12 @@ h3.section { font-size: 14px; color: var(--text-secondary); margin: 22px 4px 10p
   <div class="card">
     <div class="row">
       <h2>HAProxy 节点</h2>
-      <span class="hint">v2.1：每台节点自己设置带宽限制、独立调节（无跨节点自动调配）；模式可按节点单独控制，「继承全局」跟随头部的全局默认</span>
+      <span class="hint">限速由各节点 HAProxy 的 shared bwlim 配置执行（改 cfg + reload）；这里登记的限额是监控基准，实测持续超过即告警</span>
     </div>
     <table class="nodes-table" id="nodes-table"></table>
   </div>
 
-  <h3 class="section">节点带宽视图（每台 HAProxy 独立限速与调节）</h3>
+  <h3 class="section">节点带宽视图（每台 HAProxy 一个监控单元）</h3>
   <div id="units"></div>
 
   <h3 class="section">环境聚合视图（成员节点带宽之和，仅查看）</h3>
@@ -175,7 +165,7 @@ h3.section { font-size: 14px; color: var(--text-secondary); margin: 22px 4px 10p
   <div class="card">
     <div class="row">
       <h2>新建环境</h2>
-      <span class="hint">环境 = 节点分组（带宽限制设在成员节点上）；须携带至少一个挂载点；节点独占，下拉只列未分配节点</span>
+      <span class="hint">环境 = 节点分组（限额登记在成员节点上）；须携带至少一个挂载点；节点独占，下拉只列未分配节点</span>
     </div>
     <div class="controls" style="margin-top:12px">
       <label>环境 ID <input type="text" id="new-env-id" placeholder="env-c" style="width:110px"></label>
@@ -209,9 +199,6 @@ const fmtMbps = v => v == null ? "–" : (v >= 100 ? v.toFixed(0) : v.toFixed(1)
 const fmtTime = ts => new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour12: false });
 const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
-const STATE_LABEL = { normal: "常态", tightening: "收紧中", recovering: "恢复中" };
-const STATE_COLOR = { normal: "--status-good", tightening: "--status-serious", recovering: "--status-warning" };
-
 function toast(msg, isErr) {
   const t = $("#toast");
   t.textContent = msg;
@@ -233,25 +220,6 @@ async function apiSend(method, path, body) {
 }
 const apiPut = (path, body) => apiSend("PUT", path, body);
 
-/* AIMD 参数表单定义：key 与后端 GovParams 字段一一对应，默认值占位符
-   取自 /api/overview 的 default_params（不在前端硬编码）。 */
-const PARAM_DEFS = [
-  { key: "elastic_ceiling", name: "弹性上限系数", step: "0.01",
-    desc: "常态整形值 = 配额 × 该值；1.10 即允许瞬时冲高到配额的 110%" },
-  { key: "low_watermark", name: "恢复水位系数", step: "0.01",
-    desc: "10s 均值低于 配额 × 该值 并持续足够秒数后才开始放松" },
-  { key: "tighten_after_s", name: "收紧触发秒数", step: "1",
-    desc: "均值持续超配额达到该秒数后触发乘性收紧（整数秒）" },
-  { key: "recover_after_s", name: "恢复触发秒数", step: "1",
-    desc: "均值持续低于水位达到该秒数后触发加性放松（整数秒，急收慢放）" },
-  { key: "md_factor", name: "乘性收紧系数", step: "0.01",
-    desc: "每次收紧：整形值 × 该值（0~1 之间，越小收得越狠）" },
-  { key: "tighten_floor", name: "收紧下限系数", step: "0.01",
-    desc: "整形值不低于 配额 × 该值；1.00 = 最多压回配额本身" },
-  { key: "ai_step_frac", name: "恢复步长系数", step: "0.01",
-    desc: "恢复期每秒放松 配额 × 该值，直至回到弹性上限" },
-];
-
 /* 输入框"脏"标记：用户改过且尚未提交的输入不被实时刷新覆盖。 */
 function markDirtyOnInput(el) {
   el.addEventListener("input", () => { el._dirty = true; el.classList.add("dirty"); });
@@ -265,16 +233,14 @@ const state = {
   windowS: 300,
   units: new Map(),       // 节点名 → 节点带宽卡 { card, buf, ... }
   groups: new Map(),      // env_id → 环境聚合卡 { card, buf, ... }
-  nodeConfig: {},         // 节点名 → {quota_bps, quota_bytes_per_s, frontends, params}
+  nodeConfig: {},         // 节点名 → {quota_bps, quota_bytes_per_s, frontends}
   envGroups: {},          // env_id → [节点名]
-  defaultParams: {},      // GovParams 默认值（来自 /api/overview）
-  nodes: {},              // 节点视图：name → {host,port,mode,override,degraded}
-  mode: null,
+  nodes: {},              // 节点视图：name → {host,port,degraded}
   logsAfter: 0,
   lvlOn: { DEBUG: true, INFO: true, WARNING: true, ERROR: true, CRITICAL: true },
 };
 
-/* ================= 调参后的配置回读 ================= */
+/* ================= 写库后的配置回读 ================= */
 function refreshSoon() {
   loadOverview();
   setTimeout(loadOverview, 4500);
@@ -296,39 +262,19 @@ function renderNodes() {
   const names = Object.keys(state.nodes);
   if (!names.length) { table.innerHTML = ""; return; }
   const owners = nodeOwners();
-  table.innerHTML = `<tr><th>节点</th><th>地址（runtime API）</th><th>所属环境</th><th>带宽限制</th><th>模式</th><th>生效</th><th>采样状态</th></tr>`;
+  table.innerHTML = `<tr><th>节点</th><th>地址（stats socket）</th><th>所属环境</th><th>登记限额</th><th>采样状态</th></tr>`;
   for (const name of names) {
     const n = state.nodes[name];
     const conf = state.nodeConfig[name];
     const tr = document.createElement("tr");
-    const ovVal = n.override || "";
     tr.innerHTML = `
       <td class="nname">${name}</td>
       <td class="naddr">${n.host}:${n.port}</td>
       <td>${owners[name] ? `<b>${owners[name]}</b>` : '<span class="hint">未分配</span>'}</td>
       <td class="naddr">${conf ? (conf.quota_bps / 1e6) + " Mbps" : "–"}</td>
-      <td><select class="node-mode" data-node="${name}">
-        <option value="">继承全局</option>
-        <option value="dry-run">dry-run</option>
-        <option value="enforce">enforce</option>
-      </select></td>
-      <td><span class="state" style="color:var(${n.mode === "enforce" ? "--status-serious" : "--status-good"})">${n.mode}</span></td>
       <td>${n.degraded
         ? '<span class="dot" style="background:var(--status-critical)"></span>失联（fail-static）'
         : '<span class="dot" style="background:var(--status-good)"></span>正常'}</td>`;
-    const sel = tr.querySelector(".node-mode");
-    sel.value = ovVal;
-    sel.onchange = async () => {
-      const v = sel.value;
-      try {
-        const r = await apiPut(`/api/nodes/${encodeURIComponent(name)}/mode`, { mode: v || null });
-        toast(`节点 ${name} 模式已提交为 ${v || "继承全局"}；${r.note}`);
-        refreshSoon();
-      } catch (err) {
-        toast(`节点 ${name} 模式切换失败：` + err.message, true);
-        sel.value = ovVal;
-      }
-    };
     table.appendChild(tr);
   }
 }
@@ -359,7 +305,7 @@ function unitCard(node) {
   card.innerHTML = `
     <div class="row">
       <h2>节点 <span class="u-name"></span></h2>
-      <span class="badge"><span class="dot state-dot"></span><span class="state">–</span></span>
+      <span class="badge overbadge" style="display:none"><span class="dot" style="background:var(--status-serious)"></span>超限（实测高于登记限额）</span>
       <span class="badge degraded" style="display:none"><span class="dot" style="background:var(--status-critical)"></span>失联（fail-static）</span>
       <span class="meta">所属环境 <b class="u-env">–</b></span>
       <span class="meta">frontend <b class="u-fes">–</b></span>
@@ -367,18 +313,15 @@ function unitCard(node) {
     <div class="stats">
       <span class="stat"><div class="k">实时速率</div><div class="v rate">–<span class="u"> Mbps</span></div></span>
       <span class="stat"><div class="k">10s 均值（计费口径）</div><div class="v mean">–<span class="u"> Mbps</span></div></span>
-      <span class="stat"><div class="k">带宽限制</div><div class="v quota">–<span class="u"> Mbps</span></div></span>
-      <span class="stat"><div class="k">当前整形值</div><div class="v bwlim">–<span class="u"> Mbps</span></div></span>
-      <span class="stat"><div class="k">利用率（均值/限制）</div><div class="v util">–<span class="u"> %</span></div></span>
+      <span class="stat"><div class="k">登记限额</div><div class="v quota">–<span class="u"> Mbps</span></div></span>
+      <span class="stat"><div class="k">利用率（均值/限额）</div><div class="v util">–<span class="u"> %</span></div></span>
       <span class="stat"><div class="k">并发连接</div><div class="v conn">–</div></span>
-      <span class="stat"><div class="k">收紧次数<span class="u">（本页）</span></div><div class="v tightens">0</div></span>
       <span class="stat"><div class="k">超限秒数<span class="u">（本页）</span></div><div class="v oversecs">0</div></span>
     </div>
     <div class="legend">
       <span><span class="chip" style="background:var(--series-rate)"></span>实时速率<span class="val l-rate">–</span></span>
       <span><span class="chip" style="background:var(--series-mean)"></span>10s 均值<span class="val l-mean">–</span></span>
-      <span><span class="chip" style="background:var(--series-bwlim)"></span>整形值<span class="val l-bwlim">–</span></span>
-      <span><span class="chip" style="background:var(--ref-quota);height:0;border-top:2px dashed var(--ref-quota)"></span>带宽限制<span class="val l-quota">–</span></span>
+      <span><span class="chip" style="background:var(--ref-quota);height:0;border-top:2px dashed var(--ref-quota)"></span>登记限额<span class="val l-quota">–</span></span>
       <span class="hint">单位 Mbps</span>
     </div>
     <div class="chart-wrap">
@@ -386,83 +329,38 @@ function unitCard(node) {
       <div class="tooltip"></div>
     </div>
     <div class="controls">
-      <label>带宽限制 <input type="number" class="quota-in" min="1" step="1"> Mbps</label>
+      <label>登记限额 <input type="number" class="quota-in" min="1" step="1"> Mbps</label>
       <button class="primary quota-apply">应用</button>
-      <button class="quota-reset" title="放弃输入，恢复为当前生效值">还原</button>
+      <button class="quota-reset" title="放弃输入，恢复为当前登记值">还原</button>
       <span class="hint quota-live"></span>
     </div>
-    <details class="params">
-      <summary>AIMD 参数覆盖（本节点；按项填写，留空的项使用默认值）</summary>
-      <p class="hint" style="margin:8px 0 4px">
-        只需填写想覆盖的参数，其余留空即用默认值（灰色占位符即默认值）；
-        全部留空并保存 = 清除该节点的全部覆盖。
-      </p>
-      <table class="params-table"></table>
-      <div class="controls">
-        <button class="primary params-apply">保存参数</button>
-        <button class="params-clear">清除全部覆盖</button>
-        <span class="hint">写入 MySQL，一个轮询周期内热生效</span>
-      </div>
-    </details>`;
+    <p class="hint" style="margin:8px 0 0">
+      登记限额只是监控基准——真实限速在该节点 haproxy.cfg 的 shared bwlim
+      limit 里，需同步修改并 reload；不同步会触发持续超限告警。
+    </p>`;
   $(".u-name", card).textContent = node;
   $("#units").appendChild(card);
 
-  const ptable = $(".params-table", card);
-  for (const def of PARAM_DEFS) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `<td class="pname">${def.name}</td>
-      <td><input type="number" class="p-in" data-key="${def.key}" step="${def.step}"></td>
-      <td class="pdesc">${def.desc}</td>`;
-    ptable.appendChild(tr);
-  }
-
-  e = { id: node, card, buf: [], tightens: 0, overSecs: 0, lastState: null, tooltipX: null };
+  e = { id: node, card, buf: [], overSecs: 0, tooltipX: null };
   state.units.set(node, e);
 
   const qin = $(".quota-in", card);
   markDirtyOnInput(qin);
-  for (const pin of card.querySelectorAll(".p-in")) markDirtyOnInput(pin);
 
   $(".quota-apply", card).onclick = async () => {
     const v = parseFloat(qin.value);
-    if (!(v > 0)) return toast("带宽限制必须是 > 0 的数值（Mbps）", true);
+    if (!(v > 0)) return toast("登记限额必须是 > 0 的数值（Mbps）", true);
     try {
       const r = await apiPut(`/api/nodes/${encodeURIComponent(node)}/quota`, { quota_bps: Math.round(v * 1e6) });
       clearDirty(qin);
-      toast(`节点 ${node} 带宽限制已提交为 ${v} Mbps；${r.note}`);
+      toast(`节点 ${node} 登记限额已提交为 ${v} Mbps；${r.note}`);
       refreshSoon();
-    } catch (err) { toast("带宽限制修改失败：" + err.message, true); }
+    } catch (err) { toast("登记限额修改失败：" + err.message, true); }
   };
   $(".quota-reset", card).onclick = () => {
     clearDirty(qin);
     const conf = state.nodeConfig[node];
     if (conf) qin.value = (conf.quota_bps / 1e6).toString();
-  };
-
-  const submitParams = async params => {
-    try {
-      const r = await apiPut(`/api/nodes/${encodeURIComponent(node)}/params`, { params });
-      for (const pin of card.querySelectorAll(".p-in")) clearDirty(pin);
-      toast(`节点 ${node} 参数覆盖已提交；${r.note}`);
-      refreshSoon();
-    } catch (err) { toast("参数修改失败：" + err.message, true); }
-  };
-  $(".params-apply", card).onclick = () => {
-    const params = {};
-    for (const pin of card.querySelectorAll(".p-in")) {
-      const raw = pin.value.trim();
-      if (!raw) continue;
-      const num = Number(raw);
-      const def = PARAM_DEFS.find(d => d.key === pin.dataset.key);
-      if (!Number.isFinite(num)) return toast(`「${def.name}」必须是数值，当前输入 ${raw}`, true);
-      params[pin.dataset.key] = num;
-    }
-    submitParams(Object.keys(params).length ? params : null);
-  };
-  $(".params-clear", card).onclick = () => {
-    if (!confirm(`清除节点 ${node} 的全部参数覆盖，恢复默认值？`)) return;
-    for (const pin of card.querySelectorAll(".p-in")) { pin.value = ""; clearDirty(pin); }
-    submitParams(null);
   };
 
   const canvas = $("canvas.chart", card);
@@ -481,19 +379,14 @@ function updateUnitCard(e, d) {
   $(".rate", c).firstChild.nodeValue = fmtMbps(mbps(d.rate_bytes_per_s));
   $(".mean", c).firstChild.nodeValue = fmtMbps(mbps(d.mean10_bytes_per_s));
   $(".quota", c).firstChild.nodeValue = fmtMbps(mbps(d.quota_bytes_per_s));
-  $(".bwlim", c).firstChild.nodeValue = fmtMbps(mbps(d.bwlim_bytes_per_s));
   const util = d.quota_bytes_per_s ? d.mean10_bytes_per_s / d.quota_bytes_per_s * 100 : null;
   $(".util", c).firstChild.nodeValue = util == null ? "–" : util.toFixed(0);
   $(".conn", c).firstChild.nodeValue = d.conn ?? "–";
-  $(".tightens", c).textContent = e.tightens;
   $(".oversecs", c).textContent = e.overSecs;
   $(".l-rate", c).textContent = fmtMbps(mbps(d.rate_bytes_per_s));
   $(".l-mean", c).textContent = fmtMbps(mbps(d.mean10_bytes_per_s));
-  $(".l-bwlim", c).textContent = fmtMbps(mbps(d.bwlim_bytes_per_s));
   $(".l-quota", c).textContent = fmtMbps(mbps(d.quota_bytes_per_s));
-  const st = $(".state", c), dot = $(".state-dot", c);
-  st.textContent = STATE_LABEL[d.state] || d.state || "–";
-  dot.style.background = `var(${STATE_COLOR[d.state] || "--text-muted"})`;
+  $(".overbadge", c).style.display = d.over ? "" : "none";
   $(".degraded", c).style.display = d.degraded ? "" : "none";
 
   $(".u-env", c).textContent = nodeOwners()[e.id] || "未分配";
@@ -501,18 +394,9 @@ function updateUnitCard(e, d) {
   if (conf) {
     $(".u-fes", c).textContent = (conf.frontends || []).join(" | ") || "–";
     $(".quota-live", c).textContent =
-      `当前生效 ${(conf.quota_bps / 1e6).toString()} Mbps（写入 MySQL，一个轮询周期内热生效）`;
+      `当前登记 ${(conf.quota_bps / 1e6).toString()} Mbps`;
     const qin = $(".quota-in", c);
     if (canSync(qin)) qin.value = (conf.quota_bps / 1e6).toString();
-    for (const pin of c.querySelectorAll(".p-in")) {
-      const key = pin.dataset.key;
-      const dflt = state.defaultParams[key];
-      if (dflt !== undefined) pin.placeholder = `默认 ${dflt}`;
-      if (canSync(pin)) {
-        const ov = conf.params && conf.params[key];
-        pin.value = ov === undefined || ov === null ? "" : String(ov);
-      }
-    }
   }
 }
 
@@ -527,21 +411,19 @@ function groupCard(envId) {
       <h2>环境 <span class="g-name"></span> <span class="hint">（聚合视图 = 成员节点之和）</span></h2>
       <span class="meta">成员节点 <b class="g-members">–</b></span>
       <span style="flex:1"></span>
-      <button class="danger env-delete" title="删除环境分组（成员节点变为未分配并停止限速调节）">删除环境</button>
+      <button class="danger env-delete" title="删除环境分组（仅影响监控分组视图，不影响各节点 HAProxy 上的限速）">删除环境</button>
     </div>
     <div class="stats">
       <span class="stat"><div class="k">合计实时速率</div><div class="v rate">–<span class="u"> Mbps</span></div></span>
       <span class="stat"><div class="k">合计 10s 均值</div><div class="v mean">–<span class="u"> Mbps</span></div></span>
-      <span class="stat"><div class="k">合计带宽限制</div><div class="v quota">–<span class="u"> Mbps</span></div></span>
-      <span class="stat"><div class="k">合计整形值</div><div class="v bwlim">–<span class="u"> Mbps</span></div></span>
+      <span class="stat"><div class="k">合计登记限额</div><div class="v quota">–<span class="u"> Mbps</span></div></span>
       <span class="stat"><div class="k">合计并发连接</div><div class="v conn">–</div></span>
-      <span class="stat"><div class="k">收紧中节点</div><div class="v tightening">–</div></span>
+      <span class="stat"><div class="k">超限节点</div><div class="v overnodes">–</div></span>
     </div>
     <div class="legend">
       <span><span class="chip" style="background:var(--series-rate)"></span>合计实时速率<span class="val l-rate">–</span></span>
       <span><span class="chip" style="background:var(--series-mean)"></span>合计 10s 均值<span class="val l-mean">–</span></span>
-      <span><span class="chip" style="background:var(--series-bwlim)"></span>合计整形值<span class="val l-bwlim">–</span></span>
-      <span><span class="chip" style="background:var(--ref-quota);height:0;border-top:2px dashed var(--ref-quota)"></span>合计限制<span class="val l-quota">–</span></span>
+      <span><span class="chip" style="background:var(--ref-quota);height:0;border-top:2px dashed var(--ref-quota)"></span>合计限额<span class="val l-quota">–</span></span>
       <span class="hint">单位 Mbps</span>
     </div>
     <div class="chart-wrap">
@@ -563,7 +445,7 @@ function groupCard(envId) {
   state.groups.set(envId, g);
 
   $(".env-delete", card).onclick = async () => {
-    if (!confirm(`删除环境分组 ${envId}？成员节点的挂载点将被移除（节点停止被调节）。`)) return;
+    if (!confirm(`删除环境分组 ${envId}？成员节点的挂载点将被移除（仅影响监控视图，不影响 HAProxy 上的限速）。`)) return;
     try {
       const data = await apiSend("DELETE", `/api/envs/${encodeURIComponent(envId)}`);
       toast(`环境 ${envId} 已删除；${data.note || ""}`);
@@ -628,12 +510,10 @@ function updateGroupCard(g, agg) {
   $(".rate", c).firstChild.nodeValue = fmtMbps(mbps(agg.rate_bytes_per_s));
   $(".mean", c).firstChild.nodeValue = fmtMbps(mbps(agg.mean10_bytes_per_s));
   $(".quota", c).firstChild.nodeValue = fmtMbps(mbps(agg.quota_bytes_per_s));
-  $(".bwlim", c).firstChild.nodeValue = fmtMbps(mbps(agg.bwlim_bytes_per_s));
   $(".conn", c).firstChild.nodeValue = agg.conn ?? "–";
-  $(".tightening", c).textContent = `${agg.tightening_nodes}/${agg.member_count}`;
+  $(".overnodes", c).textContent = `${agg.over_nodes}/${agg.member_count}`;
   $(".l-rate", c).textContent = fmtMbps(mbps(agg.rate_bytes_per_s));
   $(".l-mean", c).textContent = fmtMbps(mbps(agg.mean10_bytes_per_s));
-  $(".l-bwlim", c).textContent = fmtMbps(mbps(agg.bwlim_bytes_per_s));
   $(".l-quota", c).textContent = fmtMbps(mbps(agg.quota_bytes_per_s));
 
   // 挂载点 chips（内容变化才重建）。
@@ -656,9 +536,7 @@ function updateGroupCard(g, agg) {
 
 /* ================= 快照消费 ================= */
 function applySnapshot(snap, isLive) {
-  $("#mode-text").textContent = snap.mode || "–";
   $("#cfg-version").textContent = snap.config_version ?? "–";
-  state.mode = snap.mode;
   if (snap.nodes) { state.nodes = snap.nodes; if (isLive) renderNodes(); }
   if (snap.env_groups) state.envGroups = snap.env_groups;
 
@@ -677,20 +555,18 @@ function applySnapshot(snap, isLive) {
     e.buf.push({ ts: snap.ts, ...d });
     while (e.buf.length && e.buf[0].ts < cutoff) e.buf.shift();
     if (isLive) {
-      if (d.state === "tightening" && e.lastState !== "tightening") e.tightens++;
-      if (d.quota_bytes_per_s && d.mean10_bytes_per_s > d.quota_bytes_per_s) e.overSecs++;
-      e.lastState = d.state;
+      if (d.over) e.overSecs++;
       updateUnitCard(e, d);
       drawChart(e);
     }
   }
 
   // 环境聚合：成员节点各序列求和（缺采样的成员按 0 计入合计速率，
-  // 限制/整形值仍求和——聚合视图只是查看，不做任何决策）。
+  // 限额仍求和——聚合视图只是查看）。
   for (const [envId, members] of Object.entries(state.envGroups || {})) {
     const agg = {
-      rate_bytes_per_s: 0, mean10_bytes_per_s: 0, bwlim_bytes_per_s: 0,
-      quota_bytes_per_s: 0, conn: 0, tightening_nodes: 0,
+      rate_bytes_per_s: 0, mean10_bytes_per_s: 0,
+      quota_bytes_per_s: 0, conn: 0, over_nodes: 0,
       member_count: members.length,
     };
     let seen = 0;
@@ -702,9 +578,8 @@ function applySnapshot(snap, isLive) {
       seen++;
       agg.rate_bytes_per_s += d.rate_bytes_per_s || 0;
       agg.mean10_bytes_per_s += d.mean10_bytes_per_s || 0;
-      agg.bwlim_bytes_per_s += d.bwlim_bytes_per_s || 0;
       agg.conn += d.conn || 0;
-      if (d.state === "tightening") agg.tightening_nodes++;
+      if (d.over) agg.over_nodes++;
     }
     if (!seen && !members.length) continue;
     const g = groupCard(envId);
@@ -718,7 +593,6 @@ function applySnapshot(snap, isLive) {
 const SERIES = [
   { key: "rate_bytes_per_s",   name: "实时速率", varName: "--series-rate" },
   { key: "mean10_bytes_per_s", name: "10s 均值",  varName: "--series-mean" },
-  { key: "bwlim_bytes_per_s",  name: "整形值",    varName: "--series-bwlim" },
 ];
 const PAD = { l: 46, r: 10, t: 8, b: 20 };
 
@@ -801,11 +675,11 @@ function drawChart(e) {
       }
       const rows = SERIES.map(s =>
         `<div class="r"><span class="n"><span style="background:${cssVar(s.varName)};display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:5px;vertical-align:2px"></span>${s.name}</span><span class="v">${fmtMbps(mbps(best[s.key]))} Mbps</span></div>`).join("");
-      const extra = best.state !== undefined
-        ? `连接 ${best.conn ?? "–"} · ${STATE_LABEL[best.state] || best.state || "–"}`
-        : `连接 ${best.conn ?? "–"} · 收紧 ${best.tightening_nodes}/${best.member_count}`;
+      const extra = best.over !== undefined
+        ? `连接 ${best.conn ?? "–"}${best.over ? " · 超限" : ""}`
+        : `连接 ${best.conn ?? "–"} · 超限节点 ${best.over_nodes}/${best.member_count}`;
       tipEl.innerHTML = `<div class="t">${fmtTime(best.ts)} · ${extra}</div>${rows}
-        <div class="r"><span class="n">带宽限制</span><span class="v">${fmtMbps(mbps(best.quota_bytes_per_s))} Mbps</span></div>`;
+        <div class="r"><span class="n">登记限额</span><span class="v">${fmtMbps(mbps(best.quota_bytes_per_s))} Mbps</span></div>`;
       tipEl.style.display = "block";
       tipEl.style.left = Math.min(x + 12, canvas.clientWidth - tipEl.offsetWidth - 4) + "px";
       tipEl.style.top = "12px";
@@ -823,12 +697,9 @@ async function loadOverview() {
   const r = await fetch("/api/overview"); const o = await r.json();
   state.nodeConfig = o.node_config || {};
   state.envGroups = o.env_groups || {};
-  state.defaultParams = o.default_params || {};
   if (o.nodes) { state.nodes = o.nodes; renderNodes(); nodeOptions($("#new-env-node"), null); }
   $("#svc-version").textContent = o.service_version || "–";
-  $("#mode-text").textContent = o.mode || "–";
   $("#cfg-version").textContent = o.config_version ?? "–";
-  state.mode = o.mode;
   const up = Math.floor(o.uptime_s || 0);
   $("#uptime").textContent = up >= 3600 ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
 }
@@ -839,7 +710,7 @@ async function bootstrap() {
   for (const snap of h.snapshots || []) applySnapshot(snap, false);
   for (const e of state.units.values()) {
     const last = e.buf[e.buf.length - 1];
-    if (last) { e.lastState = last.state; updateUnitCard(e, last); drawChart(e); }
+    if (last) { updateUnitCard(e, last); drawChart(e); }
   }
   for (const g of state.groups.values()) {
     const last = g.buf[g.buf.length - 1];
@@ -850,20 +721,6 @@ async function bootstrap() {
   es.onerror = () => setSse(false, "已断开，自动重连…");
   es.onmessage = ev => applySnapshot(JSON.parse(ev.data), true);
 }
-
-/* ================= 全局默认模式切换 ================= */
-$("#mode-btn").onclick = async () => {
-  const target = state.mode === "enforce" ? "dry-run" : "enforce";
-  const warn = target === "enforce"
-    ? "切换全局默认为 enforce：所有「继承全局」的节点将真实下发限速值，确认？"
-    : "切换全局默认为 dry-run：所有「继承全局」的节点停止更新限速值（已下发的整形值继续生效，fail-static），确认？";
-  if (!confirm(warn)) return;
-  try {
-    const r = await apiPut("/api/mode", { mode: target });
-    toast(`全局默认模式已提交为 ${target}；${r.note}`);
-    refreshSoon();
-  } catch (err) { toast("模式切换失败：" + err.message, true); }
-};
 
 /* ================= 新建环境（纯分组，无配额） ================= */
 $("#new-env-create").onclick = async () => {
@@ -876,7 +733,7 @@ $("#new-env-create").onclick = async () => {
     const data = await apiSend("POST", "/api/envs", {
       env_id: envId, targets: [{ node, frontend }],
     });
-    toast(`环境 ${envId} 已创建；${data.note || ""}（成员节点的带宽限制在节点卡上设置）`);
+    toast(`环境 ${envId} 已创建；${data.note || ""}（成员节点的登记限额在节点卡上设置）`);
     $("#new-env-id").value = ""; $("#new-env-frontend").value = "";
     refreshSoon();
   } catch (err) { toast("创建环境失败：" + err.message, true); }

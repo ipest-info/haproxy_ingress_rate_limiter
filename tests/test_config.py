@@ -25,18 +25,14 @@ def load_from(tmp_path, text: str) -> config.ServiceConfig:
 # 后续错误用例在这份合法配置的基础上做最小改动，保证报错确实来自
 # 被改动的字段而不是别处。
 VALID_YAML = """\
-mode: enforce
 log_level: debug
 tick_interval_s: 0.5
 haproxy_nodes:
   - name: lb-1
     host: 10.0.0.1
     port: 9999
-    bwlim_map_path: /etc/haproxy/maps/custom.map
     timeout_ms: 250
     quota_bps: 200000000
-    params:
-      md_factor: 0.8
   - name: lb-2
     host: 10.0.0.2
     port: 9999
@@ -58,7 +54,6 @@ envs:
 
 def test_load_full_config(tmp_path):
     cfg = load_from(tmp_path, VALID_YAML)
-    assert cfg.mode == model.MODE_ENFORCE
     assert cfg.log_level == "debug"
     assert cfg.tick_interval_s == 0.5
 
@@ -66,35 +61,27 @@ def test_load_full_config(tmp_path):
     n1, n2, _n3 = cfg.nodes
     assert n1.host == "10.0.0.1"
     assert n1.port == 9999
-    assert n1.bwlim_map_path == "/etc/haproxy/maps/custom.map"
     # timeout_ms（毫秒，运维口径）在加载时一次性换算为内部口径的秒。
     assert n1.timeout_s == pytest.approx(0.25)
-    # lb-2 未写 bwlim_map_path/timeout_ms → 各自取默认。
-    assert n2.bwlim_map_path == config.DEFAULT_BWLIM_MAP_PATH
+    # lb-2 未写 timeout_ms → 取默认。
     assert n2.timeout_s == pytest.approx(config.DEFAULT_TIMEOUT_MS / 1000.0)
 
-    # v2.1：cfg.envs 是 per-node 控制单元（env_id=节点名，quota=节点配额），
+    # cfg.envs 是 per-node 监控单元（env_id=节点名，quota=节点限额），
     # 业务环境只保留在 env_groups（分组 → 成员节点）里。
     assert [u.env_id for u in cfg.envs] == ["lb-1", "lb-2", "lb-3"]
     assert cfg.env_groups == {"env-a": ["lb-1", "lb-2"], "env-b": ["lb-3"]}
     u1 = cfg.envs[0]
     assert u1.quota_bits_per_sec == 200_000_000
-    # 配额单位是 bits/s，quota_bytes_per_sec 是唯一的换算边界（÷8）。
+    # 限额单位是 bits/s，quota_bytes_per_sec 是唯一的换算边界（÷8）。
     assert u1.quota_bytes_per_sec == pytest.approx(25_000_000.0)
     assert u1.targets == [model.Target("lb-1", "fe_a")]
-    assert u1.params is not None and u1.params.md_factor == pytest.approx(0.8)
-    # params 局部覆盖经 normalize 补齐其余字段（零值回填默认）。
-    assert u1.params.elastic_ceiling == pytest.approx(1.10)
     assert cfg.node_quotas == {
         "lb-1": 200_000_000, "lb-2": 150_000_000, "lb-3": 100_000_000}
-    assert cfg.envs[1].params is None and cfg.envs[2].params is None
 
 
 def test_load_minimal_config_defaults(tmp_path):
-    """空配置时全部字段取安全默认：dry-run（误部署不产生数据面影响）、
-    info 级日志、1s tick、空节点/环境。"""
+    """空配置时全部字段取安全默认：info 级日志、1s tick、空节点/环境。"""
     cfg = load_from(tmp_path, "{}\n")
-    assert cfg.mode == model.MODE_DRY_RUN
     assert cfg.log_level == "info"
     assert cfg.tick_interval_s == 1.0
     assert cfg.nodes == []
@@ -132,11 +119,16 @@ envs:
 @pytest.mark.parametrize(
     ("yaml_text", "match"),
     [
-        # mode 只能是 dry-run / enforce，不做静默回落。
+        # 旧形态字段（服务级 mode）明确拒绝并给迁移指引，不静默忽略。
         pytest.param(
-            "mode: observe\n",
-            "mode 值非法.*observe",
-            id="mode-invalid",
+            "mode: dry-run\n",
+            "'mode' 已废弃.*shared bwlim",
+            id="mode-legacy-rejected",
+        ),
+        pytest.param(
+            BASE.replace("port: 9999,", "port: 9999, mode: enforce,"),
+            r"haproxy_nodes\[0\].*'mode' 已废弃",
+            id="node-mode-legacy-rejected",
         ),
         # log_level 枚举。
         pytest.param(
@@ -225,7 +217,7 @@ envs:
         # 老形态（环境带配额）明确拒绝并给迁移指引，不静默忽略。
         pytest.param(
             BASE.replace("targets:", "quota_bps: 200000000\n    targets:"),
-            r"quota_bps.*已废弃.*按节点设置",
+            r"quota_bps.*已废弃.*节点",
             id="env-quota-legacy-rejected",
         ),
         # targets 非空。

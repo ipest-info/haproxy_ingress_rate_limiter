@@ -1,41 +1,33 @@
 # rl_limiter.model —— 全服务共享的领域类型（"词汇表"层）。
 #
-# 架构背景：限速服务与 HAProxy 分离部署，一个 rl-limiter 服务通过内网
-# TCP 连接并控制多台 HAProxy。**控制单元 = 单台节点**：每台 HAProxy 有
-# 自己的带宽限制，服务每秒采样后按节点独立做 AIMD 决策并写回该节点；
-# 节点之间没有自动调配。业务"环境"是节点分组（一个环境可含多台节点、
-# 一台节点只服务一个环境），仅用于聚合展示。历史上代码以"环境"为控制
-# 单元，故 EnvQuota/EnvUsage/Decision 的 env_id 字段如今装的是节点名——
-# 结构保持不变以复用快环全链路（详见 EnvQuota 注释）。
+# 架构背景：限速由各台 HAProxy 自身的 shared bwlim（聚合限速，配置常量
+# + reload 调整）执行；rl-limiter 是与 HAProxy 分离部署的**集中监控**
+# 服务——通过内网 TCP 连接多台 HAProxy 的 stats socket，每秒采样各节点
+# 受控 frontend 的 bytes_out，按节点聚合出带宽视图，对照配置库中的节点
+# 限额（quota）做持续超限告警。**监控单元 = 单台节点**；业务"环境"是
+# 节点分组（一个环境可含多台节点、一台节点只服务一个环境），仅用于
+# 聚合展示。历史上代码以"环境"为单元，故 EnvQuota/EnvUsage 的 env_id
+# 字段如今装的是节点名——结构保持不变以复用采集聚合链路。
 #
 # 单位约定（非常重要，混淆会带来 8 倍误差）：
 #   - 内部所有速率一律为「字节每秒」（bytes/s，float）。HAProxy stats 的
 #     bytes_out 本身就是字节计数，内部保持字节口径避免反复换算。
-#   - 配置中的配额（数据库与本地 YAML 的 quota_bps 字段）一律为
+#   - 配置中的限额（数据库与本地 YAML 的 quota_bps 字段）一律为
 #     「比特每秒」（bits/s），遵循运维习惯：200_000_000 表示 200 Mbps。
 #   - 两种口径只在 EnvQuota.quota_bytes_per_sec 这一处转换（除以 8），
 #     其余代码不得再做单位换算。
 
 from __future__ import annotations
 
-import enum
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
-# 执行器（executor）的两种运行模式：
-#   - dry-run：只计算并记录本应写入的整形值，不真正改动 HAProxy，
-#     用于灰度观察与新环境验证（安全默认值）；
-#   - enforce：把整形值真实写入各 HAProxy 的 bwlim map，实际生效限速。
-# 非法模式一律归一为 dry-run（安全方向）。
-MODE_DRY_RUN = "dry-run"
-MODE_ENFORCE = "enforce"
-
 
 class Target(NamedTuple):
-    """限速目标：某台 HAProxy 节点上的某个 frontend。
+    """监控目标：某台 HAProxy 节点上的某个 frontend。
 
-    集中式服务同时控制多台 HAProxy，不同节点上的 frontend 可能重名，
-    因此 (node, frontend) 二元组才是采集与执行的最小单位。
+    集中式服务同时监控多台 HAProxy，不同节点上的 frontend 可能重名，
+    因此 (node, frontend) 二元组才是采集的最小单位。
     """
 
     node: str      # HAProxy 节点名（与配置 haproxy_nodes[].name 对应）
@@ -51,6 +43,7 @@ class FrontendStat:
 
     统计口径遵循设计文档 §3.1：用 frontend 的 bytes_out（发回客户端的
     应用层字节数）而非网卡计数，与计费口径一致且天然按 frontend 拆分。
+    前提是 HAProxy 开启 option contstats（否则长连接的计数成块跳变）。
     """
 
     name: str       # frontend 名称（pxname 列）
@@ -58,20 +51,9 @@ class FrontendStat:
     conn_cur: int   # 当前并发连接数（scur 列），用于资源保护水位观测
 
 
-class GovState(enum.Enum):
-    """决策器对某环境所处的 AIMD 状态（设计文档 §3.3 三段）。"""
-
-    NORMAL = "normal"          # 常态：整形值停在弹性上限（quota × elastic_ceiling）
-    TIGHTENING = "tightening"  # 收紧中：mean10 持续超配额，按 md_factor 乘性下压
-    RECOVERING = "recovering"  # 恢复中：mean10 持续低于低水位，按 ai_step_frac 加性放松
-
-    def __str__(self) -> str:
-        return self.value
-
-
 @dataclass(slots=True)
 class EnvUsage:
-    """采集器每个 tick（1s）按控制单元（节点）聚合出的用量视图。
+    """采集器每个 tick（1s）按监控单元（节点）聚合出的用量视图。
 
     env_id 字段承载节点名（见 EnvQuota），聚合范围是该节点上的全部
     受控 Target——即"该节点当前的下行带宽用量"。
@@ -79,136 +61,42 @@ class EnvUsage:
 
     env_id: str
     # 瞬时速率（bytes/s）：本秒与上一秒计数器的差分之和。噪声最大，
-    # 仅作观测参考，不直接驱动限速决策。
+    # 仅作观测参考，不直接驱动告警判定。
     rate_bps: float = 0.0
     # 10 秒滑动窗口均值（bytes/s）。承诺/计费口径（已拍板：10s 均值 ≤
-    # 约定带宽，瞬时容忍 110%），是快环收紧/恢复判据的直接输入。
+    # 约定带宽），是持续超限告警判据的直接输入。
     mean10_bps: float = 0.0
-    # 约 60 秒 EWMA（bytes/s），平滑趋势观测与加权分配的兜底输入。
+    # 约 60 秒 EWMA（bytes/s），平滑趋势观测。
     ewma60_bps: float = 0.0
-    # 该环境全部 Target 当前并发连接数之和。
+    # 该单元全部 Target 当前并发连接数之和。
     conn_cur: int = 0
     # 采样已持续失败（节点失联等），速率值沿用最后一次成功采样的结果
-    # （设计文档 §3.7 fail-static）。degraded 时 governor 冻结该环境。
+    # （设计文档 §3.7 fail-static 的监控侧对应）。degraded 时超限判定
+    # 暂停（陈旧数据不触发告警翻转）。
     degraded: bool = False
-    # 每个 Target 的 60s EWMA 用量（bytes/s），是执行路径在节点内按
-    # 挂载点加权拆分整形值的输入（见 allocator 模块）。
-    target_ewma: dict[Target, float] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class Decision:
-    """决策器每 tick 针对单个控制单元（节点）产出的执行指令。"""
-
-    env_id: str
-    targets: list[Target]  # 该节点的全部挂载点（分配器据此拆分整形值）
-    bwlim_bps: float       # 目标整形值（bytes/s，节点聚合口径）
-    state: GovState
-    # bwlim_bps 相比上次产出是否变化（迟滞 epsilon = 0.1% × quota）。
-    # 执行器据此跳过无变化的写入，减少 runtime API 压力。
-    changed: bool = False
-
-
-@dataclass(slots=True)
-class GovParams:
-    """快环 AIMD 控制参数（设计文档 §3.3），可按节点覆盖并热更。
-
-    默认值即 §3.3 拍板组合：1.10 / 0.90 / 3s / 5s / ×0.9 / 1.00 / +5%。
-    """
-
-    # 弹性上限系数：ceil = quota × elastic_ceiling。常态下允许冲高到
-    # 配额的 110%（瞬时容忍口径）。
-    elastic_ceiling: float = 1.10
-    # 恢复判据低水位：mean10 < quota × low_watermark 持续 recover_after_s
-    # 秒后开始放松。
-    low_watermark: float = 0.90
-    # mean10 > quota 需持续的秒数，达到后触发乘性收紧。
-    tighten_after_s: int = 3
-    # mean10 低于低水位需持续的秒数，达到后触发加性恢复。急收慢放：
-    # 恢复等待窗口比收紧窗口长。
-    recover_after_s: int = 5
-    # 乘性收紧系数：bwlim = max(quota × tighten_floor, bwlim × md_factor)。
-    md_factor: float = 0.9
-    # 收紧下限系数：整形值永不低于 quota × tighten_floor，防止过度惩罚。
-    # 默认 1.00：收紧最多压回配额本身，稳态吞吐即约定带宽（曾为 0.95，
-    # 会让稳态吞吐停在配额的 95%，对用户不友好）。
-    tighten_floor: float = 1.00
-    # 加性恢复步长：每秒放松 quota × ai_step_frac，直至回到弹性上限。
-    ai_step_frac: float = 0.05
-
-    def normalize(self) -> None:
-        """把零值/非法字段回填为默认值，使局部覆盖也能得到自洽参数。
-
-        特别地 md_factor 必须落在 (0,1) 开区间才有"乘性收紧"的意义。
-        """
-        d = GovParams()
-        if self.elastic_ceiling <= 0:
-            self.elastic_ceiling = d.elastic_ceiling
-        if self.low_watermark <= 0:
-            self.low_watermark = d.low_watermark
-        if self.tighten_after_s <= 0:
-            self.tighten_after_s = d.tighten_after_s
-        if self.recover_after_s <= 0:
-            self.recover_after_s = d.recover_after_s
-        if self.md_factor <= 0 or self.md_factor >= 1:
-            self.md_factor = d.md_factor
-        if self.tighten_floor <= 0:
-            self.tighten_floor = d.tighten_floor
-        if self.ai_step_frac <= 0:
-            self.ai_step_frac = d.ai_step_frac
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any] | None) -> "GovParams | None":
-        if d is None:
-            return None
-        p = cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
-        p.normalize()
-        return p
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "elastic_ceiling": self.elastic_ceiling,
-            "low_watermark": self.low_watermark,
-            "tighten_after_s": self.tighten_after_s,
-            "recover_after_s": self.recover_after_s,
-            "md_factor": self.md_factor,
-            "tighten_floor": self.tighten_floor,
-            "ai_step_frac": self.ai_step_frac,
-        }
 
 
 @dataclass(slots=True)
 class EnvQuota:
-    """一个**控制单元**的配额与挂载点清单（快环 AIMD 的调节对象）。
+    """一个**监控单元**的限额与挂载点清单。
 
-    架构演进说明（v2.1）：控制单元从"业务环境"改为"单台 HAProxy 节点"
-    ——每台节点自己设置带宽限制、独立跑 AIMD，节点之间没有任何自动
-    调配（早期的跨节点用量加权分配在对称饱和负载下会形成正反馈失衡，
-    已取消）。此后 env_id 字段装的是**节点名**，targets 是该节点上的
-    全部挂载 frontend；业务"环境"退化为节点分组，只用于聚合展示
-    （见 ControllerConfig.env_groups）。结构保持不变以复用快环全链路。
+    监控单元 = 单台 HAProxy 节点：quota 是该节点在配置库中登记的约定
+    带宽（应与该节点 haproxy.cfg 里 shared bwlim 的 limit 一致，一致性
+    由发布流程保证、由持续超限告警兜底检验）。env_id 字段装的是节点名，
+    targets 是该节点上的全部受控 frontend；业务"环境"退化为节点分组，
+    只用于聚合展示（见 ControllerConfig.env_groups）。
     """
 
     env_id: str
-    # 环境配额，单位「比特每秒」（bits/s，运维口径）。全代码库唯一以
+    # 节点限额，单位「比特每秒」（bits/s，运维口径）。全代码库唯一以
     # bits/s 存储的速率字段，进入内部计算前必须经 quota_bytes_per_sec。
     quota_bits_per_sec: int
     targets: list[Target] = field(default_factory=list)
-    # 快环参数覆盖；None 表示整体使用默认参数。
-    params: GovParams | None = None
 
     @property
     def quota_bytes_per_sec(self) -> float:
         """bits/s → bytes/s 的唯一换算边界（除以 8）。"""
         return self.quota_bits_per_sec / 8.0
-
-    def effective_params(self) -> GovParams:
-        """返回实际生效参数：无覆盖用默认；有覆盖经 normalize 补齐。"""
-        if self.params is None:
-            return GovParams()
-        p = GovParams(**self.params.to_dict())
-        p.normalize()
-        return p
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "EnvQuota":
@@ -219,63 +107,38 @@ class EnvQuota:
             env_id=d.get("env_id", ""),
             quota_bits_per_sec=int(d.get("quota_bps", 0)),
             targets=targets,
-            params=GovParams.from_dict(d.get("params")),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
+        return {
             "env_id": self.env_id,
             "quota_bps": self.quota_bits_per_sec,
             "targets": [{"node": t.node, "frontend": t.frontend} for t in self.targets],
         }
-        if self.params is not None:
-            out["params"] = self.params.to_dict()
-        return out
 
 
 @dataclass(slots=True)
 class ControllerConfig:
-    """投递给快环的运行期配置文档（业务配置的内存形态）。
+    """投递给监控主循环的运行期配置文档（业务配置的内存形态）。
 
     由配置来源组装：MySQL 数据库轮询（dbconfig.watch，生产）或本地
     YAML 引导（standalone）。version 是内容校验和——轮询任务据此判断
-    配置是否变化，变了才投递给核心循环热应用。
-    注意：HAProxy 节点的连接信息（地址/超时/map 路径）属于基础设施
-    配置（NodeConfig），进程启动时定型，不在本文档内热更。
+    配置是否变化，变了才投递给主循环热应用。
+    注意：HAProxy 节点的连接信息（地址/超时）属于基础设施配置
+    （NodeConfig），进程启动时定型，不在本文档内热更。
     """
 
     version: int = 0
-    # 全局默认运行模式：未被 node_modes 覆盖的节点继承它。
-    mode: str = MODE_DRY_RUN
-    # 控制单元清单：v2.1 起每个元素对应**一台节点**（env_id=节点名，
-    # quota=该节点自己的带宽限制），见 EnvQuota 的架构演进说明。
+    # 监控单元清单：每个元素对应**一台节点**（env_id=节点名，quota=该
+    # 节点登记的约定带宽），见 EnvQuota 说明。
     envs: list[EnvQuota] = field(default_factory=list)
-    # 按节点覆盖运行模式（节点名 → dry-run/enforce）。生产灰度的关键
-    # 能力：可以逐台 HAProxy 打开 enforce，其余节点留在 dry-run 观察。
-    # 字典中不存在的节点继承全局 mode。
-    node_modes: dict[str, str] = field(default_factory=dict)
-    # 业务环境分组（env_id → 节点名列表）：纯展示信息——环境不再有
-    # 自己的配额与调节，只提供"聚合查看成员节点带宽之和"的视图。
+    # 业务环境分组（env_id → 节点名列表）：纯展示信息——环境只提供
+    # "聚合查看成员节点带宽之和"的视图。
     env_groups: dict[str, list[str]] = field(default_factory=dict)
 
-    def normalize(self) -> None:
-        """模式非法归一为 dry-run（安全方向），并逐个归一各单元的参数
-        覆盖。所有配置入口（数据库轮询、本地 YAML 引导）都必须先经过
-        这里。"""
-        if self.mode != MODE_ENFORCE:
-            self.mode = MODE_DRY_RUN
-        # 节点覆盖同样按安全方向归一：写错的覆盖值降级为 dry-run 而不是
-        # 静默移除——移除意味着继承全局（可能是 enforce），比降级危险。
-        for n, m in list(self.node_modes.items()):
-            if m not in (MODE_DRY_RUN, MODE_ENFORCE):
-                self.node_modes[n] = MODE_DRY_RUN
-        for e in self.envs:
-            if e.params is not None:
-                e.params.normalize()
-
     def target_to_env(self) -> dict[Target, str]:
-        """把环境列表展平为 Target → env_id 查找表，供采集器聚合。
-        同一 Target 被多个环境声明时后者覆盖前者（配置校验应阻止）。"""
+        """把单元列表展平为 Target → 单元名 查找表，供采集器聚合。
+        同一 Target 被多个单元声明时后者覆盖前者（配置校验应阻止）。"""
         m: dict[Target, str] = {}
         for e in self.envs:
             for t in e.targets:
@@ -284,27 +147,19 @@ class ControllerConfig:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ControllerConfig":
-        cfg = cls(
+        return cls(
             version=int(d.get("version", 0)),
-            mode=d.get("mode", MODE_DRY_RUN),
             envs=[EnvQuota.from_dict(e) for e in d.get("envs", [])],
-            node_modes={
-                str(k): str(v) for k, v in (d.get("node_modes") or {}).items()
-            },
             env_groups={
                 str(k): [str(n) for n in v]
                 for k, v in (d.get("env_groups") or {}).items()
             },
         )
-        cfg.normalize()
-        return cfg
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
-            "mode": self.mode,
             "envs": [e.to_dict() for e in self.envs],
-            "node_modes": dict(self.node_modes),
             "env_groups": {k: list(v) for k, v in self.env_groups.items()},
         }
 
@@ -313,13 +168,13 @@ class ControllerConfig:
 class NodeConfig:
     """一台受控 HAProxy 节点的连接配置（基础设施配置，启动时定型）。
 
-    runtime API 走 HAProxy 在内网监听的 TCP stats socket（haproxy.cfg：
-    `stats socket ipv4@<内网IP>:9999 level admin`）。该端口具备 admin
-    权限，必须只绑内网并用安全组/防火墙限制仅限速服务可达。
+    采样走 HAProxy 在内网监听的 TCP stats socket（haproxy.cfg：
+    `stats socket ipv4@<内网IP>:9999 level user`——rl-limiter 只做只读
+    采样，user 级即够）。端口必须只绑内网并用安全组/防火墙限制仅限速
+    服务可达。
     """
 
     name: str                # 节点名（Target.node 引用它）
     host: str                # 内网地址
     port: int                # TCP stats socket 端口
-    bwlim_map_path: str = "/etc/haproxy/maps/bwlim.map"  # 该节点上 bwlim map 的路径（map 标识）
     timeout_s: float = 0.5   # 单次 runtime API 命令超时（连接 + 读写）

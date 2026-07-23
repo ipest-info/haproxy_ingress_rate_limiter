@@ -1,22 +1,20 @@
-# rl_limiter.collector —— 集中式快环的"输入级"：每秒并发采样所有 HAProxy
+# rl_limiter.collector —— 监控循环的"输入级"：每秒并发采样所有 HAProxy
 # 节点的 frontend 统计，把 bytes_out 累计计数差分成每秒速率，并按
-# Target(node, frontend) → 控制单元映射聚合成各单元的用量样本，供
-# governor（快环限速决策）与执行路径（单元内按挂载点加权分配）消费。
+# Target(node, frontend) → 监控单元映射聚合成各单元的用量样本，供
+# 超限告警判定与控制台展示消费。
 #
-# 控制单元=节点（见 model.py 顶部说明）：一个单元的全部 Target 都落在
+# 监控单元=节点（见 model.py 顶部说明）：一个单元的全部 Target 都落在
 # 同一台 HAProxy 上，聚合即"该节点上受控 frontend 的用量之和"。要点：
 #   - 差分基线按 per-Target（(node, frontend) 二元组）维护；
 #   - 采样失败的容错是**单节点失败隔离**：一台 HAProxy 失联不影响其他
 #     节点的测量，只有失联节点上的 Target 沿用上一秒速率
-#     （fail-static，§3.7——速率归零会诱导快环误放松限速，方向上不安全）；
-#   - 除单元级 EWMA 外，另维护 per-Target 的 60s EWMA，作为执行路径在
-#     单元内按挂载点加权拆分整形值的输入。
+#     （fail-static——速率骤降为零会让均值/告警判定失真）。
 #
 # 采集口径遵循设计文档 §3.1：以 frontend 的 bytes_out（HAProxy 发回客户端
 # 的应用层字节数）为准，而非网卡计数——口径与计费一致，且天然按 frontend
 # 拆分。在每秒瞬时速率之上维护两条平滑曲线：10 秒滑动窗口均值（承诺口径，
-# 快环决策输入）与 60 秒 EWMA（加权分配输入），瞬时毛刺不会直接触发任何
-# 限速动作。
+# 超限告警判据输入）与 60 秒 EWMA（趋势观测），瞬时毛刺不会直接触发任何
+# 告警。
 
 from __future__ import annotations
 
@@ -32,12 +30,11 @@ from .window import Ewma, SlidingWindow
 # 绑定，不是随意可调的平滑参数。
 WINDOW10_SIZE = 10
 # 按经典 span 公式 α = 2/(N+1) 取 N=60，在 1 秒 tick 节奏下近似 60 秒 EWMA。
-# EWMA 相比再开一个 60 格窗口只需 O(1) 状态，且对加权分配来说"平滑趋势"
-# 比"精确窗口语义"更重要。
+# EWMA 相比再开一个 60 格窗口只需 O(1) 状态，趋势观测不需要精确窗口语义。
 EWMA60_ALPHA = 2.0 / (60 + 1)
-# 触发单节点降级的连续采样失败次数（§3.7："连续 10s 失败则告警并保持当前
-# 整形值不动"）。达到阈值只是打标记与告警，不清空任何状态——差分基线
-# 保留，节点恢复后差分立即可用。
+# 触发单节点降级的连续采样失败次数（连续 10s 失败则告警并打 degraded
+# 标记）。达到阈值只是打标记与告警，不清空任何状态——差分基线保留，
+# 节点恢复后差分立即可用。
 DEGRADED_FAILURE_THRESHOLD = 10
 # 限制"Target 从采样结果中消失后其计数基线还保留多少个该节点的成功 tick"。
 # 保留一段时间是为了容忍 HAProxy reload 等短暂消失场景（回来后差分依旧
@@ -119,8 +116,7 @@ class Collector:
         self._failures: dict[str, int] = {}           # node -> 连续采样失败次数
         self._degraded: set[str] = set()              # 已越过失败阈值的节点集合
         self._targets: dict[model.Target, _TargetState] = {}  # 差分基线
-        self._envs: dict[str, _EnvState] = {}         # env 级窗口/EWMA
-        self._target_ewma: dict[model.Target, Ewma] = {}  # per-Target 60s EWMA（加权分配输入）
+        self._envs: dict[str, _EnvState] = {}         # 单元级窗口/EWMA
         # 以下两个集合只为"同类日志只记一次"，防止每秒刷屏。
         self._logged_unmapped: set[model.Target] = set()
         self._logged_missing_node: set[model.Target] = set()
@@ -135,7 +131,7 @@ class Collector:
 
     def degraded_nodes(self) -> set[str]:
         """返回当前处于 degraded 状态（连续失败 ≥ 阈值）的节点名集合。
-        上层据此告警并冻结对应环境的整形值（fail-static）。"""
+        上层据此暂停对应单元的超限判定并在控制台标红。"""
         return set(self._degraded)
 
     async def tick(self, now: float) -> list[model.EnvUsage]:
@@ -156,7 +152,7 @@ class Collector:
             return_exceptions=True)
 
         # mapping 中引用到的每个 env 都会被输出，哪怕本 tick 没有任何存活
-        # 的 Target——下游（governor/执行路径）因此看到稳定的 env 集合，
+        # 的 Target——下游（超限判定/控制台）因此看到稳定的单元集合，
         # 无需处理"env 忽隐忽现"的情况。
         sums: dict[str, _Agg] = {}
         env_targets: dict[str, list[model.Target]] = {}
@@ -187,8 +183,7 @@ class Collector:
         # 缺席计数——节点失联时 Target 不算缺席（它只是采不到，不是没了）。
         # 超过 ABSENT_TICK_LIMIT（约 1 分钟）后淘汰基线，防止已下线的
         # frontend 造成状态泄漏；限期内回归的 Target（如 reload 抖动）差分
-        # 保持连续。淘汰基线的同时淘汰其 per-Target EWMA：一个消失一分钟的
-        # 挂载点不应再以冻结的旧用量参与加权分配。
+        # 保持连续。
         for target in list(self._targets):
             if target.node not in ok_nodes or target in present:
                 continue
@@ -196,25 +191,21 @@ class Collector:
             ts.absent_ticks += 1
             if ts.absent_ticks >= ABSENT_TICK_LIMIT:
                 del self._targets[target]
-                self._target_ewma.pop(target, None)
                 self._log.info(
-                    "frontend 已连续多个采样周期未出现，超过保留上限，淘汰其计数差分基线与"
-                    "加权分配用的 per-Target EWMA；此后同名 frontend 再出现将按首次采样重建基线 "
+                    "frontend 已连续多个采样周期未出现，超过保留上限，淘汰其计数差分基线；"
+                    "此后同名 frontend 再出现将按首次采样重建基线 "
                     "node=%s frontend=%s absent_ticks=%d absent_tick_limit=%d",
                     target.node, target.frontend, ts.absent_ticks, ABSENT_TICK_LIMIT)
 
-        # 聚合状态生命周期：mapping 里不再出现的 env，其窗口/EWMA 一并
-        # 丢弃——陈旧的平滑状态若保留，env 将来重新上线时会带着过期历史
-        # 起步。per-Target EWMA 同理跟随 mapping 生命周期。
+        # 聚合状态生命周期：mapping 里不再出现的单元，其窗口/EWMA 一并
+        # 丢弃——陈旧的平滑状态若保留，单元将来重新上线时会带着过期历史
+        # 起步。
         for env_id in list(self._envs):
             if env_id not in sums:
                 del self._envs[env_id]
                 self._log.debug(
-                    "环境已不在映射中，丢弃其滑动窗口与 EWMA 聚合状态，"
+                    "单元已不在映射中，丢弃其滑动窗口与 EWMA 聚合状态，"
                     "避免将来重新上线时携带过期历史 env=%s", env_id)
-        for target in list(self._target_ewma):
-            if target not in mapping:
-                del self._target_ewma[target]
 
         # env.degraded = 该 env 存在挂在 degraded 节点上的 Target（按 mapping
         # 判定，而非本 tick 是否实际采到——degraded 描述的是采样通道健康度）。
@@ -239,13 +230,6 @@ class Collector:
                 ewma60_bps=st.ewma.value,
                 conn_cur=agg.conn,
                 degraded=degraded,
-                # 只输出已有测量历史的 Target（EWMA 未 seed 的不输出，
-                # 避免加权分配把"未知"当作 0 权重与真实 0 混淆）。
-                target_ewma={
-                    t: self._target_ewma[t].value
-                    for t in env_targets.get(env_id, ())
-                    if t in self._target_ewma
-                },
             ))
         usages.sort(key=lambda u: u.env_id)  # 输出顺序确定，便于测试比对与日志稳定阅读
 
@@ -270,7 +254,7 @@ class Collector:
 
         该节点全部已知且已映射的 Target 沿用上一秒的速率与连接数继续参与
         聚合，让 mean10/ewma60 在陈旧数据上继续推进，而不是留下空洞或骤降
-        为零——速率归零会诱导快环误放松限速，方向上不安全。连续失败计数
+        为零——速率骤降为零会让均值与告警判定失真。连续失败计数
         达到阈值时把该节点标记为 degraded 并升级为 error 日志（只在恰好
         越线的那一次发，避免每秒重复告警）。
         """
@@ -298,9 +282,6 @@ class Collector:
                 agg.conn += ts.last_conn
                 agg.measured = True
                 held += 1
-                # 沿用值同样喂 per-Target EWMA，与 env 级"陈旧数据上继续
-                # 推进"的口径保持一致（分子分母同源，加权比例不失真）。
-                self._feed_target_ewma(target, ts.last_rate)
             else:
                 # 刚建基线就失联：速率仍是未知而非零，按 baseline-only 处理。
                 agg.conn += ts.last_conn
@@ -308,14 +289,14 @@ class Collector:
 
         self._log.warning(
             "节点采样失败，该节点上各已映射 target 本秒沿用上一秒速率与连接数继续参与聚合"
-            "（fail-static，避免速率骤降为零诱导快环误放松限速） "
+            "（fail-static，避免速率骤降为零让均值/告警判定失真） "
             "node=%s err=%s consecutive_failures=%d "
             "degraded_threshold=%d degraded=%s held_targets=%d",
             node, err, failures, DEGRADED_FAILURE_THRESHOLD, degraded, held)
         if crossed:
             self._log.error(
                 "节点连续采样失败达到降级阈值，该节点进入降级状态，"
-                "挂载其上的各环境整形值将被冻结（fail-static），直至采样恢复 "
+                "其带宽视图停留在陈旧数据、超限判定暂停，直至采样恢复 "
                 "node=%s threshold=%d consecutive_failures=%d",
                 node, DEGRADED_FAILURE_THRESHOLD, failures)
 
@@ -400,14 +381,3 @@ class Collector:
                 agg.rate += rate
                 agg.conn += fs.conn_cur
                 agg.measured = True
-                self._feed_target_ewma(target, rate)
-
-    def _feed_target_ewma(self, target: model.Target, rate: float) -> None:
-        """把一次测量值（或 fail-static 沿用值）折入该 Target 的 60s EWMA。
-        首次测量即 seed（见 Ewma 注释），baseline-only 的 tick 不会走到
-        这里——EWMA 只吃"已知"的速率。"""
-        e = self._target_ewma.get(target)
-        if e is None:
-            e = Ewma(EWMA60_ALPHA)
-            self._target_ewma[target] = e
-        e.update(rate)

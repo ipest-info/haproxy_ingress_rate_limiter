@@ -56,7 +56,7 @@ async def test_steady_rate_window_and_baseline_only_skip():
     col.set_mapping({T("n1", "fe"): "env1"})
 
     # tick1：首次采样只建基线——速率未知，rate=0 且**不喂窗口**，但连接数
-    # 是瞬时值可直接计入；target_ewma 也不应包含未测量的 Target。
+    # 是瞬时值可直接计入。
     n1.set("fe", 1000, conn=5)
     us = by_env(await col.tick(1.0))
     assert list(us) == ["env1"]
@@ -65,7 +65,6 @@ async def test_steady_rate_window_and_baseline_only_skip():
     assert u.mean10_bps == 0.0
     assert u.conn_cur == 5
     assert u.degraded is False
-    assert u.target_ewma == {}
 
     # tick2：差分出 1000 B/s。若 tick1 的 0 被误喂进窗口，这里 mean10 会是
     # 500——断言 1000 即证明 baseline-only 被正确跳过。
@@ -75,7 +74,6 @@ async def test_steady_rate_window_and_baseline_only_skip():
     assert u.mean10_bps == pytest.approx(1000.0)
     assert u.ewma60_bps == pytest.approx(1000.0)  # EWMA 首样本 seed
     assert u.conn_cur == 6
-    assert u.target_ewma == {T("n1", "fe"): pytest.approx(1000.0)}
 
     # tick3/4：窗口均值在真实测量值上推进。
     n1.set("fe", 3000)
@@ -102,10 +100,6 @@ async def test_multi_node_sum():
     u = by_env(await col.tick(2.0))["env1"]
     assert u.rate_bps == pytest.approx(1000.0)
     assert u.conn_cur == 7
-    assert u.target_ewma == {
-        T("n1", "fe"): pytest.approx(600.0),
-        T("n2", "fe"): pytest.approx(400.0),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -306,10 +300,10 @@ async def test_unmapped_frontend_logged_once(caplog):
 
 
 # ---------------------------------------------------------------------------
-# per-Target EWMA 输出
+# 同节点多 frontend 求和
 # ---------------------------------------------------------------------------
 
-async def test_per_target_ewma_output():
+async def test_multi_frontend_same_node_sum():
     n1 = FakeNode()
     col = Collector({"n1": n1})
     t1, t2 = T("n1", "fe_a"), T("n1", "fe_b")
@@ -319,15 +313,11 @@ async def test_per_target_ewma_output():
     n1.set("fe_b", 0)
     await col.tick(1.0)
 
-    # 稳定的 300/700 分布：EWMA seed 后保持恒定，加权分配可直接使用。
     for i in range(5):
         n1.add("fe_a", 300)
         n1.add("fe_b", 700)
         u = by_env(await col.tick(2.0 + i))["env1"]
     assert u.rate_bps == pytest.approx(1000.0)
-    assert u.target_ewma[t1] == pytest.approx(300.0)
-    assert u.target_ewma[t2] == pytest.approx(700.0)
-    assert set(u.target_ewma) == {t1, t2}
 
 
 # ---------------------------------------------------------------------------
@@ -368,8 +358,8 @@ async def test_absent_target_evicted_after_limit(caplog):
     n1.add("fe", 1000)
     await col.tick(2.0)
 
-    # 消失满 ABSENT_TICK_LIMIT 个成功 tick：基线（连同 per-Target EWMA）
-    # 被淘汰，防止已下线的 frontend 造成状态泄漏。
+    # 消失满 ABSENT_TICK_LIMIT 个成功 tick：基线被淘汰，防止已下线的
+    # frontend 造成状态泄漏。
     n1.remove("fe")
     with caplog.at_level(logging.INFO, logger="rl_limiter.collector"):
         for i in range(ABSENT_TICK_LIMIT):
@@ -381,7 +371,6 @@ async def test_absent_target_evicted_after_limit(caplog):
     n1.set("fe", 10_000_000)
     u = by_env(await col.tick(100.0))["env1"]
     assert u.rate_bps == 0.0
-    assert u.target_ewma == {}  # EWMA 随基线一并淘汰，旧权重不复活
     n1.add("fe", 800)
     u = by_env(await col.tick(101.0))["env1"]
     assert u.rate_bps == pytest.approx(800.0)

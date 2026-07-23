@@ -1,9 +1,9 @@
 # rl-limiter systemd unit。
 #
-# 部署形态：本服务与 HAProxy 分离，独立部署在限速服务器上，通过内网 TCP
-# 控制多台 HAProxy。崩溃由 systemd 拉起（设计 §3.7）；服务宕机期间各台
-# HAProxy 保持最后写入的 map 限速值不变，且 tc 内核兜底仍在各 HAProxy
-# 机器上生效——限速不会因本服务离线而放开。
+# 部署形态：本服务与 HAProxy 分离，独立部署在监控服务器上，通过内网 TCP
+# 只读采样多台 HAProxy。崩溃由 systemd 拉起（设计 §3.7）；限速由各台
+# HAProxy 自身的 shared bwlim 配置执行，本服务宕机对限速没有任何影响，
+# 只是监控/超限告警暂停。
 #
 # 配置来源二选一（docs/03 §2）：
 #   - MySQL 配置库（生产推荐）：取消下方 Environment 行的注释并填入接入
@@ -15,7 +15,7 @@
 #   systemctl daemon-reload && systemctl enable --now rl-limiter
 
 [Unit]
-Description=rl-limiter - centralized HAProxy ingress bandwidth rate limiter
+Description=rl-limiter - centralized HAProxy ingress bandwidth monitor (limits enforced by HAProxy shared bwlim)
 Documentation=https://github.com/ipest-info/haproxy_ingress_rate_limiter
 # 需要通往各 HAProxy 节点与 MySQL 配置库的网络路径。
 After=network-online.target

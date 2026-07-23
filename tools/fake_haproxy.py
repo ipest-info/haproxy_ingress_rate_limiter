@@ -8,7 +8,8 @@
 #     bytes_out 计数器按 --frontends 指定的速率 × 真实流逝时间持续增长
 #     （附带 --jitter 抖动），scur 在 5~50 之间随机游走，模拟真实流量；
 #   - "set map <path> <key> <value>" / "add map ..."：记录到内存 map 并在
-#     值变化时打 info 日志（这就是观察 enforce 模式下发效果的窗口），
+#     值变化时打 info 日志（保留自旧的 runtime map 方案，聚合限速架构
+#     下 rl-limiter 不再调用，仅供手工联调 runtime API），
 #     回包为空（与真实 HAProxy 成功时的行为一致）。
 #
 # 协议要点（与真实 runtime socket 一致）：非交互模式下一次连接只服务
@@ -89,7 +90,7 @@ class FakeHAProxy:
         self.maps[(map_path, key)] = value
         if old != value:
             # 值发生变化才打日志：这是观察限速值真实下发的主要窗口。
-            log.info("收到 map 更新，本节点限速值已改写（enforce 下发的观察窗口） "
+            log.info("收到 map 更新（当前架构下 rl-limiter 不会调用，多半来自手工联调） "
                      "peer=%s map=%s key=%s old=%s new=%s",
                      peer, map_path, key, old if old is not None else "-", value)
         return "\n"

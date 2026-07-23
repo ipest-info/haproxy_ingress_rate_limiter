@@ -4,7 +4,7 @@
 # 角色：docker compose 演示环境里的"客户端群"替身。维持 N 个并发 worker
 # 持续请求目标 URL（经 HAProxy 入口，可给多个、逗号分隔，每请求随机挑一），
 # 把响应体完整读完并累计字节数——制造出可控强度的下行带宽压力，供观察
-# rl-limiter 的 AIMD 收紧/恢复与跨节点聚合限速行为。
+# 各入口 shared bwlim 聚合限速的效果（总速率贴限额、连接间动态分享）。
 #
 # 并发数可两种方式调节：
 #   - 启动参数 --concurrency / 环境变量 LOADGEN_CONCURRENCY：初始并发；
@@ -49,7 +49,7 @@ DEFAULT_CONTROL_PORT = 8081
 DEFAULT_REPORT_S = 2.0
 # 每条 TCP 连接复用的请求数，之后由**客户端侧**优雅关闭并重建。
 # 两头兼顾：TCP L4 整形的每连接限速在建连时定格，周期轮转连接让
-# rl-limiter 的新整形值在几秒内生效；同时绝不能用 Connection: close
+# 限额调整后新连接尽快进入新额度；同时绝不能用 Connection: close
 # 让服务端先关（server 提前 FIN 会与 HAProxy bwlim 过滤器尚未放完的
 # 整形数据竞争，导致 client 侧响应截断——实测短连接全部报
 # ContentLengthError，keep-alive 由客户端关则完全正常）。
@@ -155,7 +155,7 @@ class LoadGen:
 
         - 连接生命周期：每个 worker 独立 session（keep-alive，连接池 1），
           复用 REQUESTS_PER_CONNECTION 个请求后由客户端优雅关闭重建
-          （理由见常量注释：跟随新整形值 + 避开 server 先 FIN 的截断竞争）；
+          （理由见常量注释：跟随限额调整 + 避开 server 先 FIN 的截断竞争）；
         - 读响应用分块迭代而不是 read()——限速生效时单个响应会拖长到
           数秒，分块累计让吞吐统计平滑跟随实际到达的字节，而不是在
           响应结束时跳变一大块。

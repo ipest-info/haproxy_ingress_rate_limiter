@@ -1,20 +1,21 @@
-# rl_limiter.webconsole —— 内置 Web 控制台：实时观测 + 在线调参。
+# rl_limiter.webconsole —— 内置 Web 控制台：实时观测 + 配置管理。
 #
-# 设计取向（与 v2.0 集中式架构一致）：
+# 设计取向：
 #
-#   - 观测侧零额外采集：快环每拍本就产出各环境的速率/均值/连接数/整形值/
-#     AIMD 状态，控制台只是把这份内存数据经 StatusHub 留存最近几分钟并
-#     以 SSE 推给页面——不引入第二条采集链路，页面看到的就是决策依据；
-#   - 调参侧写库不写内存：所有修改（配额、模式、AIMD 参数）UPDATE 到
-#     MySQL（配置唯一事实源），由 dbconfig.watch 的既有轮询链路热生效。
-#     好处：页面与库永远一致、重启不丢、复用统一校验管线；代价是修改
-#     有一个轮询周期（默认几秒）的生效延迟，接口应答里明确告知。
-#     未启用数据库配置模式（纯 YAML 部署）时调参接口返回 409 说明原因；
+#   - 观测侧零额外采集：监控循环每拍本就产出各节点的速率/均值/连接数，
+#     控制台只是把这份内存数据经 StatusHub 留存最近几分钟并以 SSE 推给
+#     页面——不引入第二条采集链路；
+#   - 配置侧写库不写内存：所有修改（节点登记限额、环境分组/挂载点）
+#     UPDATE 到 MySQL（配置唯一事实源），由 dbconfig.watch 的既有轮询
+#     链路热生效。注意：登记限额只是**监控基准**——真实限速在各节点
+#     HAProxy 的 shared bwlim 配置里，需同步修改并 reload（接口应答与
+#     页面都有提示）。未启用数据库配置模式（纯 YAML 部署）时写接口
+#     返回 409 说明原因；
 #   - 日志经进程内环形缓冲（LogBuffer 挂在根 logger 上）曝光最近若干条，
 #     页面增量拉取；生产量级的持久化检索交给外部日志系统，不在此造轮子；
-#   - "限速生效证据"：页面上把 实时速率 / 10s 均值（计费口径）/ 整形值 /
-#     配额 画在同一条时间轴上，配合 AIMD 状态与收紧次数——曲线被压在
-#     配额线下即是效果本身，无需引入口径含混的"丢包数"。
+#   - "限速生效证据"：页面上把 实时速率 / 10s 均值（计费口径）/ 登记
+#     限额 画在同一条时间轴上——曲线被压在限额线下即是效果本身；持续
+#     压不住则以超限状态高亮（提示 HAProxy 配置与库不一致）。
 #
 # 安全边界：控制台无鉴权，定位与 HAProxy 的 stats socket 相同——只允许
 # 绑定内网/受防火墙保护的端口（docker compose 演示中仅映射到宿主机）。
@@ -80,24 +81,23 @@ class LogBuffer(logging.Handler):
 
 
 class StatusHub:
-    """快环实时数据的发布枢纽（单事件循环内使用，无锁）。
+    """监控实时数据的发布枢纽（单事件循环内使用，无锁）。
 
-    - record：快环 sampler 每拍调用，合成快照 → 留存历史 + 广播给 SSE 订阅者；
-    - update_config：配置（引导或热更）经过时调用，缓存配额/挂载点/参数视图，
-      使快照能携带 quota 供页面画配额参考线；
+    - record：监控循环 sampler 每拍调用，合成快照 → 留存历史 + 广播给
+      SSE 订阅者；
+    - update_config：配置（引导或热更）经过时调用，缓存限额/挂载点视图，
+      使快照能携带 quota 供页面画限额参考线与超限判定；
     - overview/history：REST 拉取口径。
     """
 
     def __init__(
         self,
         service_version: str,
-        mode_fn: Callable[[], str],
         version_fn: Callable[[], int],
         nodes: list[model.NodeConfig] | None = None,
         degraded_fn: Callable[[], set] | None = None,
     ):
         self._service_version = service_version
-        self._mode_fn = mode_fn
         self._version_fn = version_fn
         # 受控节点接线视图（启动时定型，与 RuntimeClient 集合一致）。
         self._nodes = list(nodes or [])
@@ -106,13 +106,11 @@ class StatusHub:
         self._history: collections.deque[dict[str, Any]] = collections.deque(
             maxlen=HISTORY_TICKS)
         self._subs: set[asyncio.Queue] = set()
-        # 节点名 → 控制单元配置视图（quota/frontends/params）。v2.1 起
-        # 控制单元 = 节点（cfg.envs 的 env_id 字段装节点名）。
+        # 节点名 → 监控单元配置视图（quota/frontends）。监控单元 = 节点
+        # （cfg.envs 的 env_id 字段装节点名）。
         self._unit_config: dict[str, dict[str, Any]] = {}
         # 业务环境分组（env_id → 成员节点列表），仅聚合展示。
         self._env_groups: dict[str, list[str]] = {}
-        # 节点名 → 模式覆盖（不含 = 继承全局默认），随配置热更。
-        self._node_modes: dict[str, str] = {}
         self._started = time.time()
 
     # ---- 配置与数据注入 ----
@@ -123,53 +121,46 @@ class StatusHub:
                 "quota_bps": u.quota_bits_per_sec,
                 "quota_bytes_per_s": u.quota_bytes_per_sec,
                 "frontends": [t.frontend for t in u.targets],
-                "params": u.params.to_dict() if u.params is not None else None,
             }
             for u in cfg.envs
         }
         self._env_groups = {k: list(v) for k, v in cfg.env_groups.items()}
-        self._node_modes = dict(cfg.node_modes)
 
     def _nodes_view(self) -> dict[str, Any]:
-        """节点视图：接线 + 生效模式（覆盖或继承全局）+ 采样健康。"""
+        """节点视图：接线 + 采样健康。"""
         degraded = self._degraded_fn()
-        default_mode = self._mode_fn()
         return {
             n.name: {
                 "host": n.host,
                 "port": n.port,
-                "override": self._node_modes.get(n.name),
-                "mode": self._node_modes.get(n.name) or default_mode,
                 "degraded": n.name in degraded,
             }
             for n in self._nodes
         }
 
-    def record(self, now: float, usages, decisions) -> None:
-        """快环 sampler 回调：把一拍的采集/决策结果合成快照并发布。
+    def record(self, now: float, usages) -> None:
+        """监控循环 sampler 回调：把一拍的采集结果合成快照并发布。
 
-        v2.1：控制单元 = 节点，usages/decisions 的 env_id 字段即节点名，
-        快照按节点键发布（units）；环境聚合视图由前端按 env_groups 把
-        成员节点的序列求和得出，服务端不再有环境级数据。
+        监控单元 = 节点，usages 的 env_id 字段即节点名，快照按节点键
+        发布（units）；环境聚合视图由前端按 env_groups 把成员节点的
+        序列求和得出，服务端不再有环境级数据。over 为瞬时超限标记
+        （mean10 > 登记限额），持续超限的判定与告警在监控循环里。
         """
-        dec_by_unit = {d.env_id: d for d in decisions}
         units: dict[str, Any] = {}
         for u in usages:
-            d = dec_by_unit.get(u.env_id)
             conf = self._unit_config.get(u.env_id, {})
+            quota = conf.get("quota_bytes_per_s")
             units[u.env_id] = {
                 "rate_bytes_per_s": u.rate_bps,
                 "mean10_bytes_per_s": u.mean10_bps,
                 "ewma60_bytes_per_s": u.ewma60_bps,
                 "conn": u.conn_cur,
                 "degraded": u.degraded,
-                "bwlim_bytes_per_s": d.bwlim_bps if d is not None else None,
-                "state": str(d.state) if d is not None else None,
-                "quota_bytes_per_s": conf.get("quota_bytes_per_s"),
+                "quota_bytes_per_s": quota,
+                "over": bool(quota and not u.degraded and u.mean10_bps > quota),
             }
         snap = {
             "ts": now,
-            "mode": self._mode_fn(),
             "config_version": self._version_fn(),
             "units": units,
             "env_groups": {k: list(v) for k, v in self._env_groups.items()},
@@ -198,16 +189,12 @@ class StatusHub:
     def overview(self) -> dict[str, Any]:
         return {
             "service_version": self._service_version,
-            "mode": self._mode_fn(),
             "config_version": self._version_fn(),
             "uptime_s": time.time() - self._started,
-            # 节点控制单元配置（quota/frontends/params）与环境分组。
+            # 节点监控单元配置（quota/frontends）与环境分组。
             "node_config": self._unit_config,
             "env_groups": {k: list(v) for k, v in self._env_groups.items()},
             "nodes": self._nodes_view(),
-            # AIMD 参数的默认值：页面参数表单以此为占位符/说明，
-            # 不在前端硬编码，跟随 model.GovParams 演进。
-            "default_params": model.GovParams().to_dict(),
             "latest": self._history[-1] if self._history else None,
         }
 
@@ -272,23 +259,25 @@ def build_app(
             hub.unsubscribe(q)
         return resp
 
-    # ---- 调参（写 MySQL，经轮询热生效）----
+    # ---- 配置管理（写 MySQL，经轮询热生效）----
 
-    def _mutation_note() -> str:
+    def _mutation_note(extra: str = "") -> str:
         poll = db_opts.poll_interval_s if db_opts is not None else 0
-        return f"已写入数据库，将在一个轮询周期（约 {poll:g}s）内热生效"
+        note = f"已写入数据库，将在一个轮询周期（约 {poll:g}s）内热生效"
+        return note + (f"；{extra}" if extra else "")
 
     def _require_db() -> web.Response | None:
         if db_opts is None:
             return _json_error(
                 409,
                 "当前实例使用本地 YAML 配置（未设置 RL_MYSQL_HOST），"
-                "控制台调参依赖 MySQL 配置源，请改用数据库配置模式")
+                "控制台配置管理依赖 MySQL 配置源，请改用数据库配置模式")
         return None
 
     async def _mutate(request: web.Request, action,
-                      allow_empty_body: bool = False) -> web.Response:
-        """调参公共骨架：DB 模式检查 → 解析 JSON → 执行 → 统一应答/报错。"""
+                      allow_empty_body: bool = False,
+                      note_extra: str = "") -> web.Response:
+        """写接口公共骨架：DB 模式检查 → 解析 JSON → 执行 → 统一应答/报错。"""
         denied = _require_db()
         if denied is not None:
             return denied
@@ -305,17 +294,10 @@ def build_app(
         except ValueError as e:
             return _json_error(400, str(e))
         except Exception as e:
-            log.warning("控制台调参写库失败 path=%s err=%s", request.path, e)
+            log.warning("控制台写库失败 path=%s err=%s", request.path, e)
             return _json_error(502, f"写入数据库失败：{e}")
         log.info("控制台已写入配置变更 path=%s", request.path)
-        return web.json_response({"ok": True, "note": _mutation_note()})
-
-    async def handle_set_mode(request: web.Request) -> web.Response:
-        async def action(payload):
-            if not isinstance(payload, dict):
-                raise ValueError('请求体须为 {"mode": "dry-run"|"enforce"}')
-            await dbconfig.update_mode(db_opts, str(payload.get("mode", "")))
-        return await _mutate(request, action)
+        return web.json_response({"ok": True, "note": _mutation_note(note_extra)})
 
     async def handle_set_node_quota(request: web.Request) -> web.Response:
         name = request.match_info["name"]
@@ -330,28 +312,11 @@ def build_app(
                     f"quota_bps 必须是整数（比特每秒），"
                     f"当前值 {payload['quota_bps']!r}") from None
             await dbconfig.update_node_quota(db_opts, name, quota)
-        return await _mutate(request, action)
-
-    async def handle_set_node_params(request: web.Request) -> web.Response:
-        name = request.match_info["name"]
-
-        async def action(payload):
-            if not isinstance(payload, dict) or "params" not in payload:
-                raise ValueError('请求体须为 {"params": {…} 或 null}')
-            await dbconfig.update_node_params(db_opts, name, payload["params"])
-        return await _mutate(request, action)
-
-    async def handle_set_node_mode(request: web.Request) -> web.Response:
-        name = request.match_info["name"]
-
-        async def action(payload):
-            if not isinstance(payload, dict) or "mode" not in payload:
-                raise ValueError(
-                    '请求体须为 {"mode": "dry-run"|"enforce"|null}（null=继承全局）')
-            mode = payload["mode"]
-            await dbconfig.update_node_mode(
-                db_opts, name, None if mode is None else str(mode))
-        return await _mutate(request, action)
+        return await _mutate(
+            request, action,
+            note_extra="注意：这只更新监控基准——真实限速需同步修改该节点 "
+                       "haproxy.cfg 里 shared bwlim 的 limit 并 reload，"
+                       "否则将触发持续超限告警")
 
     async def handle_set_targets(request: web.Request) -> web.Response:
         env_id = request.match_info["env_id"]
@@ -368,7 +333,7 @@ def build_app(
             if not isinstance(payload, dict):
                 raise ValueError(
                     '请求体须为 {"env_id": …, "targets": […]}'
-                    '（v2.1：环境是节点分组，带宽限制设在成员节点上）')
+                    '（环境是节点分组，限额登记在成员节点上）')
             await dbconfig.create_env(
                 db_opts, str(payload.get("env_id", "")),
                 payload.get("targets"))
@@ -387,11 +352,8 @@ def build_app(
     app.router.add_get("/api/history", handle_history)
     app.router.add_get("/api/logs", handle_logs)
     app.router.add_get("/api/stream", handle_stream)
-    app.router.add_put("/api/mode", handle_set_mode)
-    app.router.add_put("/api/nodes/{name}/mode", handle_set_node_mode)
-    # v2.1：带宽限制与 AIMD 参数按节点设置。
+    # 节点登记限额（监控基准；真实限速在该节点 HAProxy 配置里）。
     app.router.add_put("/api/nodes/{name}/quota", handle_set_node_quota)
-    app.router.add_put("/api/nodes/{name}/params", handle_set_node_params)
     app.router.add_post("/api/envs", handle_create_env)
     app.router.add_put("/api/envs/{env_id}/targets", handle_set_targets)
     app.router.add_delete("/api/envs/{env_id}", handle_delete_env)
@@ -411,7 +373,7 @@ async def run_console(
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     log.info(
-        "Web 控制台已启动（实时观测 + 在线调参） port=%d db_mode=%s",
+        "Web 控制台已启动（实时观测 + 配置管理） port=%d db_mode=%s",
         port, db_opts is not None)
     try:
         await asyncio.Event().wait()  # 挂起至任务被取消

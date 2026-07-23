@@ -1,6 +1,0 @@
-# bwlim map 种子（HAProxy 启动时装载；运行期条目归 rl-limiter 所有，
-# 每次 AIMD 调整经 runtime API 重写，手改本文件只在 reload 时生效）。
-# v2.1：限速按节点——种子值 = 本节点配额 × 弹性上限 1.10（bytes/s）。
-# 演示里每台节点 40 Mbps（5,000,000 bytes/s）× 1.10 = 5,500,000。
-fe_env_a 5500000
-fe_env_b 5500000
