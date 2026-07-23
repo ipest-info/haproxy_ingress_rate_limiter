@@ -34,9 +34,9 @@ cfg 里的配置常量，节点间无自动调配）；**rl-limiter 做集中监
 | ---- | ---- | ---- |
 | `mysql` | 配置库（表结构与种子数据：`deploy/mysql/init.sql`） | `127.0.0.1:3306` |
 | `haproxy1` / `haproxy2` / `haproxy3` | 真实 HAProxy 2.8，**TCP L4 + shared bwlim 聚合限速**（按环境角色分用 `deploy/docker/haproxy-env-a/b.cfg`，limit 各 5,000,000 bytes/s = 40 Mbps） | `8080`、`8082`、`8083` |
-| `web` | 模拟业务后端，每次请求返回 256 KiB～2 MiB 随机大小响应（`tools/random_web.py`） | 无 |
+| `web` | 模拟业务后端，每次请求返回 256 KiB～2 MiB 随机大小响应；`/big` 为大文件下载端点（默认 512 MiB，`WEB_BIG_BYTES` 可调）（`tools/random_web.py`） | 无 |
 | `rl-limiter` | 集中监控服务，配置来自 MySQL；内置 Web 控制台 | `8090`（控制台） |
-| `loadgen` | 压测服务，打散到全部入口，并发数可在线调节（`tools/loadgen.py`） | `8084`（控制口） |
+| `loadgen` | 压测服务，打散到全部入口，并发数可在线调节；默认每入口另挂 1 条**长连接大文件下载**（`tools/loadgen.py`） | `8084`（控制口） |
 
 演示种子：hap-1 / hap-2 / hap-3 登记限额各 **40 Mbps**（与各自 cfg 的
 limit 一致）；环境是纯分组——env-a = hap-1 + hap-2（聚合视图显示合计
@@ -118,6 +118,33 @@ curl -X PUT http://localhost:8084/concurrency -d '0'           # 暂停打流
 要点观察：并发调大/调小，每台节点的**总**吞吐都精确贴着自己的 40M
 限额——shared bwlim 限总量，各连接动态分享额度（新连接加入时存量
 连接立即让出份额，无需重连）。
+
+## 长连接大文件下载场景（存量连接持续受控的实证）
+
+默认每个入口挂 1 条长连接大文件下载 worker（同一条 TCP 连接上循环
+请求 `/big`，单个响应 512 MiB，与 4 条短请求 worker 分享 40M 限额时
+约 8 Mbps、要下 ~9 分钟）——这是触发旧方案生产事故的工作负载，现在
+专门作为常驻测试场景：
+
+```bash
+curl -X PUT http://localhost:8084/big -d '{"per_target": 2}'   # 每入口 2 条
+curl -X PUT http://localhost:8084/big -d '0'                   # 关闭该场景
+curl http://localhost:8084/status    # big_downloads[]：每条在途下载的
+                                     # 进度/下载时长/连接年龄
+```
+
+要点观察：
+
+- loadgen 表格多了"大文件"列；短请求 + 长下载合计仍精确贴 40M，
+  长下载拿到公平份额（≈ 限额 ÷ 连接数）——shared bwlim 对存量长连接
+  **持续**限速，不存在"建连定格"；
+- 每个下载完成时打
+  `大文件下载完成（同一长连接继续下一个） ... conn_age_s=532`——
+  连接年龄数百秒，是真正的长连接（实测 512 MiB / 531.9s / 8.1 Mbps）；
+- 做上面的"限额调整 SOP"时，在途下载在 hard-stop 宽限期末被断开，
+  loadgen 打 `大文件下载被中断（多半是限额调整 reload 的 hard-stop
+  断连…）` 并自动重连重下，随后按**新限额**继续——调低即时压住、
+  调高吞吐回升，长连接不再像旧方案那样把旧限速带到天荒地老。
 
 ## 调整某台节点的限额（完整 SOP 演示）
 

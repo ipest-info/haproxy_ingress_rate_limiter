@@ -2,9 +2,10 @@
 # 业务后端 + 可调并发压测服务。详细玩法见 docs/04-DockerCompose演示.md。
 #
 #   启动：docker compose up -d --build
-#   控制台：http://localhost:8090（实时曲线、按节点切模式、环境/挂载点管理）
+#   控制台：http://localhost:8090（实时曲线、限额登记、环境/挂载点管理）
 #   观察：docker compose logs -f rl-limiter loadgen
 #   调并发：curl -X PUT http://localhost:8084/concurrency -d '{"concurrency": 32}'
+#   长连接大文件下载：curl -X PUT http://localhost:8084/big -d '{"per_target": 2}'
 #   收场：docker compose down -v
 #
 # 拓扑（三台 TCP L4 HAProxy；节点是环境的独占资源——一个环境可横跨
@@ -12,10 +13,10 @@
 #   loadgen ==打散==> haproxy1:8080、haproxy2:8080 (fe_env_a → env-a 独占)
 #                    haproxy3:8080 (fe_env_b → env-b 独占)
 #                          └──> web:9000（随机大小响应）
-#   rl-limiter ──轮询──> mysql（配置：节点/环境/挂载点/模式）
+#   rl-limiter ──轮询──> mysql（配置：节点/环境/挂载点/登记限额）
 #   rl-limiter ──show stat（只读采样）──> haproxy{1,2,3}:9999
-# env-a（80Mbps）独占 hap-1+hap-2（跨节点聚合限速）；env-b（40Mbps）
-# 独占 hap-3；模式可全局或按节点（haproxy_nodes.mode）控制。
+# 限速由各台 HAProxy 的 shared bwlim（各 40 Mbps）在本机执行；env-a =
+# hap-1+hap-2（聚合视图 80Mbps），env-b = hap-3（节点是环境的独占资源）。
 
 services:
   # ---- 配置源：MySQL（表结构与演示种子数据见 deploy/mysql/init.sql）----
@@ -49,12 +50,15 @@ services:
       # 响应体大小区间（字节）：默认 256 KiB ~ 2 MiB，可按需覆盖。
       WEB_MIN_BYTES: ${WEB_MIN_BYTES:-262144}
       WEB_MAX_BYTES: ${WEB_MAX_BYTES:-2097152}
+      # /big 大文件下载端点的默认大小：512 MiB（40 Mbps 限速下约 100s
+      # 下完），供长连接大文件场景（loadgen 的 big worker）使用。
+      WEB_BIG_BYTES: ${WEB_BIG_BYTES:-536870912}
     restart: unless-stopped
 
-  # ---- 数据面：三台真实 HAProxy 2.8（TCP L4 + bwlim-out 整形 + admin
-  # 级 stats socket）。节点独占环境：haproxy1/haproxy2 只跑 env-a 的
-  # fe_env_a（一环境横跨两节点），haproxy3 只跑 env-b 的 fe_env_b。
-  # 9999（runtime API，admin 权限）不映射宿主机：仅 compose 网络内可达。
+  # ---- 数据面：三台真实 HAProxy 2.8（TCP L4 + shared bwlim 聚合限速
+  # + stats socket 供只读采样）。节点独占环境：haproxy1/haproxy2 只跑
+  # env-a 的 fe_env_a（一环境横跨两节点），haproxy3 只跑 env-b 的
+  # fe_env_b。9999（runtime API）不映射宿主机：仅 compose 网络内可达。
   haproxy1:
     image: haproxy:2.8
     volumes:
@@ -114,7 +118,7 @@ services:
   loadgen:
     build: .
     # 三个入口（env-a×2 节点 + env-b×1 节点）：worker 轮转绑定入口，
-    # 既能观察跨节点聚合限速，也能观察两环境相互独立的配额。
+    # 每台节点各自被 shared bwlim 压在自己的限额内、互不影响。
     command: >-
       python3 tools/loadgen.py
       --target http://haproxy1:8080/,http://haproxy2:8080/,http://haproxy3:8080/
@@ -123,6 +127,10 @@ services:
       # 初始并发：LOADGEN_CONCURRENCY=32 docker compose up -d 即可改；
       # 运行中用控制端口在线调节（见文件头速查）。
       LOADGEN_CONCURRENCY: ${LOADGEN_CONCURRENCY:-12}
+      # 长连接大文件下载场景：每个入口 N 条长连接循环下载 /big（默认
+      # 每入口 1 条）。验证 shared bwlim 对存量长连接的持续限速与限额
+      # 调整（reload + hard-stop）对在途下载的影响。
+      LOADGEN_BIG_PER_TARGET: ${LOADGEN_BIG_PER_TARGET:-1}
     ports:
       - "8084:8081"   # 控制端口（宿主机 8084）：GET /status、PUT /concurrency
     depends_on:
