@@ -27,6 +27,7 @@ import sys
 
 from . import config as configmod
 from . import dbconfig
+from . import enforcer as enforcermod
 from . import haproxy, model
 from . import webconsole
 from .collector import Collector
@@ -51,6 +52,21 @@ ENV_NODE_NAME = "RL_NODE_NAME"
 # 由运维显式设成内网地址并配合防火墙/安全组限制来源。
 ENV_CONSOLE_BIND = "RL_CONSOLE_BIND"
 DEFAULT_CONSOLE_BIND = "127.0.0.1"
+
+# 限额自动应用（同机部署才可能做到的事）：设为本机 haproxy.cfg 路径即
+# 启用——配置库里的 quota_bps 一改，本机 rl-limiter 立刻把它写进 cfg 的
+# shared bwlim limit 并 reload，无需人工做第二步。不设则完全不写盘、
+# 不 reload，退化为只读监控 + 漂移告警（原有行为）。
+#
+# 这两项**只能来自本机环境变量，绝不从配置库读**：若 reload 命令可由库
+# 指定，拿到库写权限就等于在每台 HAProxy 上远程执行任意命令。
+ENV_APPLY_CFG = "RL_APPLY_HAPROXY_CFG"
+ENV_APPLY_RELOAD_CMD = "RL_APPLY_RELOAD_CMD"
+DEFAULT_RELOAD_CMD = "systemctl reload haproxy"
+# reconcile 兜底周期（秒）：变更是事件驱动的，这个只用来纠正手改 cfg
+# 与重试失败的应用。
+ENV_APPLY_PERIOD_S = "RL_APPLY_PERIOD_S"
+DEFAULT_APPLY_PERIOD_S = 30.0
 
 
 def _summarize_nodes(nodes: list[model.NodeConfig]) -> str:
@@ -80,7 +96,9 @@ async def _amain(cfg, log: logging.Logger,
                  console_port: int = 0,
                  logbuf: "webconsole.LogBuffer | None" = None,
                  scope_node: str | None = None,
-                 console_bind: str = DEFAULT_CONSOLE_BIND) -> None:
+                 console_bind: str = DEFAULT_CONSOLE_BIND,
+                 enforcer: "enforcermod.HAProxyEnforcer | None" = None,
+                 apply_period_s: float = DEFAULT_APPLY_PERIOD_S) -> None:
     """事件循环内的主体：组装组件、引导配置、并发运行监控循环与配置源。
 
     db_opts 非 None 表示配置来自 MySQL（数据库配置模式，生产权威）：
@@ -115,7 +133,11 @@ async def _amain(cfg, log: logging.Logger,
             scope_node=scope_node)
 
     sampler = hub.record if hub is not None else None
-    ctl = MonitorLoop(col, sampler=sampler, log=log)
+    # 限额自动应用启用时，监控循环每应用一份配置就 set 这个事件，
+    # enforcer 任务据此立刻把新限额落到本机 HAProxy（见 enforcer 模块头）。
+    config_applied = asyncio.Event() if enforcer is not None else None
+    ctl = MonitorLoop(col, sampler=sampler, log=log,
+                      config_applied=config_applied)
 
     # --- 启动引导（seed）：用加载到的配置（数据库或本地 YAML）构造首份
     # 运行期配置直接喂给监控循环。数据库配置模式下引导配置的版本号取
@@ -197,9 +219,24 @@ async def _amain(cfg, log: logging.Logger,
             webconsole.run_console(console_port, hub, logbuf, db_opts, log,
                                    bind=console_bind),
             name="web-console"))
+    if enforcer is not None and config_applied is not None:
+        # 目标限额取自监控循环当前生效的那份配置（单元=节点，挂载点给出
+        # 该节点的 frontend 名）。每次 reconcile 现算，因此配置热更后拿到
+        # 的必然是新值。
+        def _desired() -> dict[str, int]:
+            return ctl.frontend_limits()
 
-    log.info("rl-limiter 服务已启动，监控循环开始运行 mode=%s nodes=%d version=%s",
+        tasks.append(asyncio.create_task(
+            enforcermod.run_enforcer(
+                enforcer, _desired, config_applied, log,
+                on_result=(hub.record_enforce if hub is not None else None),
+                period_s=apply_period_s),
+            name="limit-enforcer"))
+
+    log.info("rl-limiter 服务已启动，监控循环开始运行 mode=%s apply=%s "
+             "nodes=%d version=%s",
              f"同机（本机节点 {scope_node}）" if scope_node else "集中监控",
+             enforcer.cfg_path if enforcer is not None else "off",
              len(cfg.nodes), SERVICE_VERSION)
 
     # 等待退出信号；任一常驻任务意外结束（本应永续运行）也触发整体退出，
@@ -280,6 +317,41 @@ def main() -> None:
     # 未设置 → 集中监控（一个实例采多台）。
     scope_node = (os.environ.get(ENV_NODE_NAME) or "").strip() or None
 
+    # 限额自动应用：设了本机 haproxy.cfg 路径即启用。
+    apply_cfg = (os.environ.get(ENV_APPLY_CFG) or "").strip()
+    enforcer = None
+    apply_period_s = DEFAULT_APPLY_PERIOD_S
+    if apply_cfg:
+        if scope_node is None:
+            # 集中监控形态下本进程根本不在 HAProxy 机器上，改的是"自己这台"
+            # 的文件——几乎必然是误配，拦下比写坏别处强。
+            print(f"rl-limiter: 设置了 {ENV_APPLY_CFG} 但未设置 {ENV_NODE_NAME}；"
+                  f"限额自动应用只在同机部署模式下有意义"
+                  f"（本进程要能改到被它监控的那台 HAProxy 的配置）",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        if not os.path.isfile(apply_cfg):
+            print(f"rl-limiter: {ENV_APPLY_CFG} 指向的文件不存在: {apply_cfg}",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        raw_period = (os.environ.get(ENV_APPLY_PERIOD_S) or "").strip()
+        if raw_period:
+            try:
+                apply_period_s = float(raw_period)
+            except ValueError:
+                print(f"rl-limiter: {ENV_APPLY_PERIOD_S} 必须是数字，"
+                      f"当前值 {raw_period!r}", file=sys.stderr)
+                raise SystemExit(1)
+            if apply_period_s <= 0:
+                print(f"rl-limiter: {ENV_APPLY_PERIOD_S} 必须为正数，"
+                      f"当前值 {apply_period_s}", file=sys.stderr)
+                raise SystemExit(1)
+        enforcer = enforcermod.HAProxyEnforcer(
+            apply_cfg,
+            (os.environ.get(ENV_APPLY_RELOAD_CMD) or "").strip()
+            or DEFAULT_RELOAD_CMD,
+            log)
+
     # 配置来源判定：RL_MYSQL_HOST 已设置 → 数据库配置模式；否则本地 YAML。
     try:
         db_opts = dbconfig.from_env()
@@ -329,7 +401,8 @@ def main() -> None:
     try:
         asyncio.run(_amain(cfg, log, db_opts,
                            console_port=console_port, logbuf=logbuf,
-                           scope_node=scope_node, console_bind=console_bind))
+                           scope_node=scope_node, console_bind=console_bind,
+                           enforcer=enforcer, apply_period_s=apply_period_s))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
     log.info("rl-limiter 服务已停止")

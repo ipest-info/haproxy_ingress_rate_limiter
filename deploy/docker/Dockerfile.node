@@ -46,8 +46,12 @@ RUN python3 -m venv /opt/rl-limiter \
     && /opt/rl-limiter/bin/pip install --no-cache-dir .
 ENV PATH=/opt/rl-limiter/bin:$PATH
 
-# HAProxy 的 unix stats socket 落在这里；rl-limiter 同机读它。
-RUN mkdir -p /run/haproxy
+# /run/haproxy：unix stats socket（rl-limiter 同机只读采样）+ master pid
+#   （限额自动应用靠它给 master 发 SIGUSR2 触发 reload）。
+# /etc/rl-limiter：只读挂进来的 cfg 模板；入口脚本把它复制成
+#   /etc/haproxy/haproxy.cfg —— 那份必须**可写**，因为限额自动应用要
+#   原地改写它（bind mount 的单文件无法被 rename 覆盖，见入口脚本注释）。
+RUN mkdir -p /run/haproxy /etc/rl-limiter /etc/haproxy
 
 COPY deploy/docker/node-entrypoint.sh /usr/local/bin/node-entrypoint.sh
 RUN chmod +x /usr/local/bin/node-entrypoint.sh

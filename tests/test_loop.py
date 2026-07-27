@@ -208,3 +208,58 @@ async def test_over_quota_alert_paused_when_degraded(caplog):
     warns = [r for r in caplog.records
              if "持续高于登记限额" in r.getMessage()]
     assert not warns
+
+
+# ---------------------------------------------------------------------------
+# frontend_limits：限额自动应用的目标值来源
+# ---------------------------------------------------------------------------
+
+def _unit(env_id, quota_bps, targets):
+    return model.EnvQuota(
+        env_id=env_id, quota_bits_per_sec=quota_bps,
+        targets=[model.Target(n, f) for n, f in targets])
+
+
+def test_frontend_limits_maps_node_quota_to_its_frontend():
+    """单元（节点）的限额落到它那个受控 frontend 上，单位换成 bytes/s
+    ——这正是要写进 haproxy.cfg `limit` 的口径。"""
+    ctl = MonitorLoop(FakeCollector())
+    ctl.seed(model.ControllerConfig(version=1, envs=[
+        _unit("hap-1", 40_000_000, [("hap-1", "fe_env_a")]),
+        _unit("hap-3", 8_000_000, [("hap-3", "fe_env_b")]),
+    ]))
+    assert ctl.frontend_limits() == {"fe_env_a": 5_000_000, "fe_env_b": 1_000_000}
+
+
+def test_frontend_limits_skips_node_with_multiple_frontends():
+    """一个节点挂多个 frontend 时不猜怎么分：原样各写一份会让实际总量
+    翻倍，平均分摊又没有业务依据——跳过并留日志，交人工决定。"""
+    ctl = MonitorLoop(FakeCollector())
+    ctl.seed(model.ControllerConfig(version=1, envs=[
+        _unit("hap-1", 40_000_000, [("hap-1", "fe_a"), ("hap-1", "fe_b")]),
+        _unit("hap-2", 16_000_000, [("hap-2", "fe_c")]),
+    ]))
+    assert ctl.frontend_limits() == {"fe_c": 2_000_000}
+
+
+def test_frontend_limits_follows_hot_reload():
+    """限额热更后目标值立刻跟着变——enforcer 每轮都现算，因此不会拿旧值
+    去写数据面。"""
+    ctl = MonitorLoop(FakeCollector())
+    ctl.seed(model.ControllerConfig(version=1, envs=[
+        _unit("hap-1", 40_000_000, [("hap-1", "fe_env_a")])]))
+    assert ctl.frontend_limits() == {"fe_env_a": 5_000_000}
+    ctl.seed(model.ControllerConfig(version=2, envs=[
+        _unit("hap-1", 20_000_000, [("hap-1", "fe_env_a")])]))
+    assert ctl.frontend_limits() == {"fe_env_a": 2_500_000}
+
+
+def test_config_applied_event_signals_enforcer():
+    """每次应用配置都叫醒 enforcer——"改完立刻生效"靠的就是这个事件，
+    而不是干等下一个周期性 reconcile。"""
+    ev = asyncio.Event()
+    ctl = MonitorLoop(FakeCollector(), config_applied=ev)
+    assert not ev.is_set()
+    ctl.seed(model.ControllerConfig(version=1, envs=[
+        _unit("hap-1", 40_000_000, [("hap-1", "fe_env_a")])]))
+    assert ev.is_set()

@@ -130,10 +130,22 @@ h3.section { font-size: 14px; color: var(--text-secondary); margin: 22px 4px 10p
   border-radius: 8px; padding: 10px 14px; max-width: 420px; box-shadow: 0 6px 20px rgba(0,0,0,.25);
 }
 .toast.err { border-left-color: var(--status-critical); }
-#scope-banner {
+#scope-banner, #apply-banner {
   margin: 0 16px 12px; padding: 10px 14px; border-radius: 8px;
   border-left: 4px solid var(--status-warn, #d9822b);
   background: rgba(217,130,43,.10); font-size: 13px; line-height: 1.6;
+}
+#apply-banner.ok {
+  border-left-color: var(--status-ok, #2d9d5f);
+  background: rgba(45,157,95,.10);
+}
+#apply-banner.err {
+  border-left-color: var(--status-critical, #d64545);
+  background: rgba(214,69,69,.12);
+}
+#apply-banner pre {
+  margin: 6px 0 0; white-space: pre-wrap; word-break: break-all;
+  font-size: 12px; opacity: .85;
 }
 </style>
 </head>
@@ -161,6 +173,10 @@ h3.section { font-size: 14px; color: var(--text-secondary); margin: 22px 4px 10p
   只含本机成员，<b>不是该环境的全量带宽</b>——环境全量视图需要各节点的
   控制台分别查看，或由后续的集中后台汇总。
 </div>
+<!-- 限额自动应用的状态。运维改完限额最关心一件事：数据面到底生效了没有。
+     启用时显示"改完即生效"，失败时把原因顶到最显眼处——这时数据面还在
+     按旧限额跑，不说清楚就会以为已经改好了。 -->
+<div id="apply-banner" style="display:none"></div>
 <main>
   <div class="card">
     <div class="row">
@@ -208,6 +224,11 @@ h3.section { font-size: 14px; color: var(--text-secondary); margin: 22px 4px 10p
 "use strict";
 /* ================= 工具 ================= */
 const $ = (sel, el) => (el || document).querySelector(sel);
+// 往 innerHTML 里塞任何非本页面写死的文本前都要过这一道：限额自动应用
+// 的错误信息里带着 `haproxy -c` 的原始 stderr（内容来自 cfg 文件），
+// 直接拼进 HTML 会把配置文件变成脚本注入面。
+const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
+  {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const mbps = b => b == null ? null : b * 8 / 1e6;          // bytes/s → Mbps
 const fmtMbps = v => v == null ? "–" : (v >= 100 ? v.toFixed(0) : v.toFixed(1));
 const fmtTime = ts => new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour12: false });
@@ -711,6 +732,32 @@ function setSse(ok, text) {
   $("#sse-text").textContent = text;
 }
 
+// 限额自动应用横幅。enforce 为 null = 未启用该能力（改库后仍要人工改
+// cfg + reload），此时不显示横幅——限额卡片上本来就有"需同步 HAProxy"
+// 的提示，两处都喊反而稀释了真正出问题时的信号。
+function renderApplyBanner(en) {
+  const el = $("#apply-banner");
+  if (!en || !en.enabled) { el.style.display = "none"; return; }
+  el.style.display = "";
+  if (en.ok) {
+    el.className = "ok";
+    const t = en.last_change_ts
+      ? new Date(en.last_change_ts * 1000).toLocaleTimeString() : null;
+    el.innerHTML =
+      "<b>限额自动应用已启用</b>：在这里修改登记限额会被立刻写入本机 " +
+      "haproxy.cfg 并 reload，<b>数据面即时生效</b>（新建连接立即按新限额；" +
+      "存量连接在 HAProxy 的 hard-stop-after 宽限期后进入新限额）。" +
+      (t ? ` 最近一次应用：${escapeHtml(t)}。` : " 当前与配置库一致，无需改动。");
+  } else {
+    el.className = "err";
+    el.innerHTML =
+      "<b>限额自动应用失败——数据面仍在按<u>调整前</u>的限额运行</b>：" +
+      "配置库已改，但没能写进本机 haproxy.cfg / reload 未成功。" +
+      "请按下方原因处理后重试（会自动重试）。" +
+      `<pre>${escapeHtml(en.error || "")}</pre>`;
+  }
+}
+
 async function loadOverview() {
   const r = await fetch("/api/overview"); const o = await r.json();
   state.nodeConfig = o.node_config || {};
@@ -725,6 +772,7 @@ async function loadOverview() {
   } else {
     $("#scope-banner").style.display = "none";
   }
+  renderApplyBanner(o.enforce);
   const up = Math.floor(o.uptime_s || 0);
   $("#uptime").textContent = up >= 3600 ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
 }

@@ -186,26 +186,46 @@ curl http://localhost:8084/status    # big_downloads[]：每条在途下载的
 
 ## 调整某台节点的限额（完整 SOP 演示）
 
-限额调整是两步（与生产一致，见 docs/03 §3）：
+演示环境**已启用限额自动应用**（`RL_APPLY_HAPROXY_CFG`），所以限额调整
+只有一步——改库，剩下的由 node1 里的 rl-limiter 自动完成：
 
 ```bash
-# 1) 改库（监控基准，热生效；只做这一步会触发持续超限告警）
+# 唯一一步：改库（也可以直接在控制台的节点卡上就地编辑）
 docker compose exec mysql mysql -url -prl_pass rl_limiter \
   -e "UPDATE haproxy_nodes SET quota_bps = 20000000 WHERE name = 'hap-1';"
 
-# 2) 改数据面：原地编辑 deploy/docker/haproxy-env-a.cfg，把
-#    「limit 5000000」改为「limit 2500000」（bytes/s = bit/s ÷ 8），然后
-#    给容器内的 haproxy master 发 SIGUSR2 平滑 reload：
-docker compose exec node1 pkill -USR2 -x haproxy
+# 几秒内（一个 RL_MYSQL_POLL_S 轮询周期）观察它自动落到数据面：
+docker compose logs --tail=5 node1 | grep 已把登记限额
+docker compose exec node1 grep -o 'limit [0-9]*' /etc/haproxy/haproxy.cfg
+#   → limit 2500000   （20 Mbps ÷ 8）
 ```
 
-> 注意：`haproxy-env-a.cfg` 被 node1 与 node2 共用，改一次会同时影响
-> 两台——本例只 reload 了 node1，因此只有 hap-1 的数据面变了，hap-2
-> 仍按旧限额跑（要一起改就把两个容器都 reload）。
+日志里会出现一行：
 
-> 容器单文件挂载的坑：必须**原地修改** cfg（保持 inode 不变，编辑器/
-> `python -c` 的 r+ 写法都行）；`sed -i` 会替换文件 inode，容器内看到的
-> 还是旧内容。生产环境（配置管理 + systemctl reload）无此问题。
+```
+WARNING 已把登记限额应用到本机 HAProxy 并 reload（数据面已按新限额执行）
+        cfg=/etc/haproxy/haproxy.cfg changes=fe_env_a:5000000->2500000bytes/s
+```
+
+控制台顶部同时会显示绿色的"限额自动应用已启用"横幅与最近一次应用时间；
+应用失败时是红色横幅 + 具体原因（那时数据面仍按**调整前**的限额运行）。
+
+**每台节点各有一份自己的 cfg**：`deploy/docker/haproxy-env-a.cfg` 只是
+只读挂进去的**模板**，入口脚本会把它复制成容器内可写的
+`/etc/haproxy/haproxy.cfg`。所以改 hap-1 的限额不会牵动 hap-2——与生产
+上"每台机器一份自己的 cfg"完全一致。（也正因为要原地改写，cfg 不能是
+只读的单文件 bind mount：那种挂载无法被 rename 覆盖，而原子写必须靠
+rename。）
+
+**配置漂移自动修复**——手动把 cfg 改回去，看它被拉回来：
+
+```bash
+docker compose exec node1 sed -i 's/limit 2500000/limit 5000000/' /etc/haproxy/haproxy.cfg
+docker compose exec node1 kill -USR2 "$(docker compose exec -T node1 cat /run/haproxy/master.pid)"
+sleep 35   # 等一个兜底 reconcile 周期（RL_APPLY_PERIOD_S，默认 30s）
+docker compose exec node1 grep -o 'limit [0-9]*' /etc/haproxy/haproxy.cfg
+#   → limit 2500000   ← 已被拉回配置库登记值
+```
 
 观察：reload 后新连接立即按 20M；存量连接最迟 15s（`hard-stop-after`）
 断开重连进入新限额；loadgen 表格里 node1 行降到 ≈20 Mbps，其余两台
@@ -217,7 +237,7 @@ docker compose exec node1 pkill -USR2 -x haproxy
 
 | 表 | 内容 | 改表后 |
 | ---- | ---- | ---- |
-| `haproxy_nodes.quota_bps` | 节点登记限额（监控基准；真实限速在该节点 cfg 的 limit） | **热生效**（一个轮询周期内）；与 cfg 不一致会触发持续超限告警 |
+| `haproxy_nodes.quota_bps` | 节点限额 | **热生效**：监控基准立刻跟随，且（演示已启用限额自动应用）自动写进本机 cfg 并 reload，数据面即时生效 |
 | `envs` / `env_targets` | 环境分组、挂载点归属 | **热生效** |
 | `service_config` | log_level / tick_interval_s | 重启生效 |
 | `haproxy_nodes` 其余列 | 节点接线（`socket_path` 或 `host`/`port`、超时） | 重启生效（检测到变化会记 warning；引用新增节点的环境会被拒绝热应用） |
@@ -236,7 +256,12 @@ docker compose exec node1 pkill -USR2 -x haproxy
 - `RL_MYSQL_HOST`（设置即启用数据库模式）、`RL_MYSQL_PORT`、
   `RL_MYSQL_USER`、`RL_MYSQL_PASSWORD`、`RL_MYSQL_DB`、`RL_MYSQL_POLL_S`；
   不设 `RL_MYSQL_HOST` 则回落到 `-c` 指定的本地 YAML；
-- `RL_CONSOLE_PORT` / `RL_CONSOLE_BIND`：控制台端口与监听地址。
+- `RL_CONSOLE_PORT` / `RL_CONSOLE_BIND`：控制台端口与监听地址；
+- `RL_APPLY_HAPROXY_CFG` / `RL_APPLY_RELOAD_CMD`：**限额自动应用**。
+  演示里 reload 命令是 `kill -USR2 $(cat /run/haproxy/master.pid)`
+  （容器里没有 systemd）；生产上默认 `systemctl reload haproxy`。
+  reload 命令只从本机环境变量读、绝不从配置库读——否则拿到库写权限
+  就等于在每台 HAProxy 上远程执行任意命令。
 
 ## 验证"监控与限速互不牵连"
 

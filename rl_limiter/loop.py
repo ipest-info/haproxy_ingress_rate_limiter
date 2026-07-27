@@ -69,7 +69,8 @@ class MonitorLoop:
         每拍快照。
     """
 
-    def __init__(self, collector, sampler=None, log=None):
+    def __init__(self, collector, sampler=None, log=None,
+                 config_applied: "asyncio.Event | None" = None):
         self._collector = collector
         self._sampler = sampler
         self._log = log if log is not None else logging.getLogger("rl_limiter.loop")
@@ -79,8 +80,14 @@ class MonitorLoop:
         self._ticks: int = 0
         # 节点名 → 限额（bytes/s），超限判定的基准；随配置热更。
         self._quotas: dict[str, float] = {}
+        # 节点名 → 该节点挂的 frontend 集合（限额自动应用用它定位配置段）。
+        self._unit_frontends: dict[str, set[str]] = {}
         # 节点名 → 超限滞回状态。
         self._over: dict[str, _OverState] = {}
+        # 每次应用配置后被 set 的信号量：同机部署下，限额应用任务
+        # （enforcer）靠它做到"库里一改就立刻落到本机 HAProxy"，而不是
+        # 干等下一个周期性 reconcile。None = 没人关心（纯监控形态）。
+        self._config_applied = config_applied
 
     @property
     def version(self) -> int:
@@ -88,6 +95,31 @@ class MonitorLoop:
         数据库模式下是配置内容的校验和；控制台展示它，便于核对配置
         是否已热更到位。"""
         return self._version
+
+    def frontend_limits(self) -> dict[str, int]:
+        """当前生效配置里"每个受控 frontend 应有的限额"（bytes/s）。
+
+        限额自动应用（enforcer）拿它当目标值。监控单元 = 节点，一个节点
+        的限额由它挂的全部 frontend 共同承担；同机形态下本机通常只有一个
+        受控 frontend，直接把节点限额给它。
+
+        一个节点挂了多个 frontend 时不做拆分而是整体跳过：把节点限额原样
+        写给每个 frontend 会让实际总量翻倍（每个 frontend 各限这么多），
+        平均分摊又没有业务依据。这种拓扑必须人工决定怎么分，宁可不动
+        数据面并在日志里说清楚。
+        """
+        out: dict[str, int] = {}
+        for env_id, limit in self._quotas.items():
+            fes = sorted(self._unit_frontends.get(env_id, ()))
+            if len(fes) != 1:
+                if fes:
+                    self._log.warning(
+                        "节点挂了多个受控 frontend，限额自动应用跳过该节点"
+                        "（拆分方式需要人工决定：原样各写一份会让实际总量"
+                        "翻倍） node=%s frontends=%s", env_id, ",".join(fes))
+                continue
+            out[fes[0]] = int(limit)
+        return out
 
     def seed(self, cfg: model.ControllerConfig) -> None:
         """在 run 启动之前同步应用一份初始配置，即"引导"语义：让循环从
@@ -104,6 +136,10 @@ class MonitorLoop:
         run 内单任务），组件间不会看到半新半旧的配置。"""
         self._collector.set_mapping(cfg.target_to_env())
         self._quotas = {e.env_id: e.quota_bytes_per_sec for e in cfg.envs}
+        # 单元（节点）→ 它挂的 frontend 集合，供限额自动应用定位改哪一段。
+        self._unit_frontends = {
+            e.env_id: {t.frontend for t in e.targets} for e in cfg.envs
+        }
         # 已下线单元的滞回状态一并丢弃；限额变化的单元保留计数（判定基准
         # 换了，但"持续性"语义连续——限额下调后本就该尽快告警）。
         for env_id in list(self._over):
@@ -115,6 +151,10 @@ class MonitorLoop:
             "version=%s units=%d unit_quotas=%s",
             cfg.version, len(cfg.envs), _summarize_quotas(cfg.envs),
         )
+        # 叫醒限额应用任务。放在最后：等本循环的基准先更新完，避免
+        # enforcer 已经把新限额写进数据面、监控这边还在按旧基准判超限。
+        if self._config_applied is not None:
+            self._config_applied.set()
 
     async def run(self, config_queue: asyncio.Queue | None,
                   tick_interval_s: float = 1.0) -> None:

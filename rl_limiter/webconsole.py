@@ -110,6 +110,9 @@ class StatusHub:
         self._scope_node = scope_node
         # 受控节点接线视图（启动时定型，与 RuntimeClient 集合一致）。
         self._nodes = list(nodes or [])
+        # 限额自动应用的最近一次结果（None = 未启用该能力）。页面据此
+        # 区分"改了库就已经生效"与"改了库还等人工同步数据面"。
+        self._enforce: dict | None = None
         # 采样已持续失败的节点集合（collector.degraded_nodes 闭包）。
         self._degraded_fn = degraded_fn if degraded_fn is not None else (lambda: set())
         self._history: collections.deque[dict[str, Any]] = collections.deque(
@@ -123,6 +126,23 @@ class StatusHub:
         self._started = time.time()
 
     # ---- 配置与数据注入 ----
+
+    def record_enforce(self, result) -> None:
+        """记录一次限额自动应用的结果（enforcer 每轮 reconcile 后回调）。
+
+        页面靠它回答运维最关心的那个问题：我刚在这儿改的限额，**数据面
+        到底生效了没有**。失败时把原因原样带出来——这时数据面还在按旧
+        限额跑，不说清楚就会以为已经改好了。
+        """
+        self._enforce = {
+            "enabled": True,
+            "ok": result.ok,
+            "error": result.error,
+            "last_change_ts": time.time() if result.changed else (
+                (self._enforce or {}).get("last_change_ts")),
+            "applied": dict(result.applied) if result.changed else (
+                (self._enforce or {}).get("applied") or {}),
+        }
 
     def update_config(self, cfg: model.ControllerConfig) -> None:
         self._unit_config = {
@@ -205,6 +225,8 @@ class StatusHub:
             "config_version": self._version_fn(),
             # None = 集中监控；非 None = 同机部署，值为本机节点名。
             "scope_node": self._scope_node,
+            # None = 未启用限额自动应用（改库后仍需人工改 cfg + reload）。
+            "enforce": self._enforce,
             "uptime_s": time.time() - self._started,
             # 节点监控单元配置（quota/frontends）与环境分组。
             "node_config": self._unit_config,

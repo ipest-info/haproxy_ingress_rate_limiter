@@ -14,6 +14,29 @@
 #        useradd --system --no-create-home --shell /usr/sbin/nologin rl-limiter
 #        usermod -aG haproxy rl-limiter
 #
+# 可选但推荐——**限额自动应用**（RL_APPLY_HAPROXY_CFG，见下）：库里改了
+# 限额，本服务立刻改写本机 haproxy.cfg 的 shared bwlim limit 并 reload，
+# 无需人工做第二步。启用它额外需要两项授权：
+#   a) cfg 文件可写（连同所在目录——原子替换要在同目录建临时文件）：
+#        chgrp rl-limiter /etc/haproxy /etc/haproxy/haproxy.cfg
+#        chmod g+w        /etc/haproxy /etc/haproxy/haproxy.cfg
+#   b) 能 reload haproxy。**推荐 polkit**（不必放宽本 unit 的加固项）：
+#        # /etc/polkit-1/rules.d/50-rl-limiter-haproxy.rules
+#        polkit.addRule(function(action, subject) {
+#          if (action.id == "org.freedesktop.systemd1.manage-units" &&
+#              action.lookup("unit") == "haproxy.service" &&
+#              action.lookup("verb") == "reload" &&
+#              subject.user == "rl-limiter") { return polkit.Result.YES; }
+#        });
+#      保持 RL_APPLY_RELOAD_CMD 的默认值 "systemctl reload haproxy" 即可。
+#
+#      也可以用 sudoers（精确到这一条命令，不要给整个 systemctl）：
+#        rl-limiter ALL=(root) NOPASSWD: /usr/bin/systemctl reload haproxy
+#      但**走 sudo 就必须把下面的 NoNewPrivileges 改成 no**——否则 sudo
+#      提权会被内核直接拒绝，reload 每次都失败（这类失败只会体现在
+#      "限额没生效"上，很难联想到这一行，所以优先选 polkit）。
+# 不启用时本服务完全不写盘、不 reload（只读监控 + 漂移告警）。
+#
 # 配置来源二选一（docs/03 §2）：
 #   - MySQL 配置库（生产推荐）：取消下方 Environment 行的注释并填入接入
 #     参数，-c 参数将被忽略；
@@ -42,6 +65,15 @@ Environment=RL_NODE_NAME=hap-1
 # 要让内网访问必须显式设 RL_CONSOLE_BIND 并用防火墙/安全组限制来源。
 # Environment=RL_CONSOLE_PORT=8090
 # Environment=RL_CONSOLE_BIND=10.0.0.11
+#
+# 限额自动应用（同机部署才可能做到的事，见文件头前置条件 a/b）。设了
+# cfg 路径即启用：库里的 quota_bps 一改，本服务立刻写进这份 cfg 的
+# shared bwlim limit 并 reload，数据面即时生效。不设 = 只读监控。
+# Environment=RL_APPLY_HAPROXY_CFG=/etc/haproxy/haproxy.cfg
+# Environment=RL_APPLY_RELOAD_CMD=sudo systemctl reload haproxy
+# 兜底 reconcile 周期（秒）：限额变更是事件驱动的即时生效，这个只用来
+# 纠正"有人手改了 cfg"和重试失败的应用。
+# Environment=RL_APPLY_PERIOD_S=30
 ExecStart=/usr/local/bin/rl-limiter -c /etc/rl-limiter/config.yaml
 Restart=always
 RestartSec=2
@@ -56,6 +88,10 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+# 启用限额自动应用时必须放开 haproxy 配置目录的写权限（ProtectSystem=strict
+# 会把 /etc 整个挂成只读）。**目录**而不只是文件：原子替换要在同目录里
+# 建临时文件再 rename。不启用自动应用时把这行注释掉，保持全只读。
+# ReadWritePaths=/etc/haproxy
 LimitNOFILE=65536
 
 [Install]

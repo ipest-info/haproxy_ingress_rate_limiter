@@ -70,7 +70,7 @@ services:
       context: .
       dockerfile: deploy/docker/Dockerfile.node
     volumes:
-      - ./deploy/docker/haproxy-env-a.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./deploy/docker/haproxy-env-a.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
       # 同机模式开关：本实例只采本机这台 HAProxy（配置在全量校验后被
       # 裁剪到该节点）。值必须与配置库 haproxy_nodes.name 一致。
@@ -85,6 +85,11 @@ services:
       # 演示需要从宿主机打开控制台，故绑 0.0.0.0；宿主机侧只映射到回环
       # （下方 ports）。生产默认是 127.0.0.1，控制台无鉴权，切勿裸奔。
       RL_CONSOLE_BIND: 0.0.0.0
+      # 限额自动应用：库里改 quota_bps → 本机 rl-limiter 立刻改写这份
+      # cfg 的 shared bwlim limit 并 reload（容器里没有 systemctl，
+      # 用入口脚本落的 master pid 发 SIGUSR2）。
+      RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
+      RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
     ports:
       - "8080:8080"              # hap-1 / fe_env_a（宿主机可 curl 体验限速）
       - "127.0.0.1:8090:8090"    # hap-1 的控制台
@@ -100,7 +105,7 @@ services:
       context: .
       dockerfile: deploy/docker/Dockerfile.node
     volumes:
-      - ./deploy/docker/haproxy-env-a.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./deploy/docker/haproxy-env-a.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
       RL_NODE_NAME: hap-2
       RL_MYSQL_HOST: mysql
@@ -111,6 +116,11 @@ services:
       RL_MYSQL_POLL_S: "3"
       RL_CONSOLE_PORT: "8090"
       RL_CONSOLE_BIND: 0.0.0.0
+      # 限额自动应用：库里改 quota_bps → 本机 rl-limiter 立刻改写这份
+      # cfg 的 shared bwlim limit 并 reload（容器里没有 systemctl，
+      # 用入口脚本落的 master pid 发 SIGUSR2）。
+      RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
+      RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
     ports:
       - "8082:8080"              # hap-2 / fe_env_a
       - "127.0.0.1:8092:8090"    # hap-2 的控制台
@@ -126,7 +136,7 @@ services:
       context: .
       dockerfile: deploy/docker/Dockerfile.node
     volumes:
-      - ./deploy/docker/haproxy-env-b.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./deploy/docker/haproxy-env-b.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
       RL_NODE_NAME: hap-3
       RL_MYSQL_HOST: mysql
@@ -137,6 +147,11 @@ services:
       RL_MYSQL_POLL_S: "3"
       RL_CONSOLE_PORT: "8090"
       RL_CONSOLE_BIND: 0.0.0.0
+      # 限额自动应用：库里改 quota_bps → 本机 rl-limiter 立刻改写这份
+      # cfg 的 shared bwlim limit 并 reload（容器里没有 systemctl，
+      # 用入口脚本落的 master pid 发 SIGUSR2）。
+      RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
+      RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
     ports:
       - "8083:8080"              # hap-3 / fe_env_b
       - "127.0.0.1:8093:8090"    # hap-3 的控制台

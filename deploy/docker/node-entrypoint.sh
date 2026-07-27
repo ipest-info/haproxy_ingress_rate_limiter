@@ -14,19 +14,34 @@
 #   4. 转发 SIGTERM/SIGINT 给两个子进程，docker stop 能干净收场。
 set -euo pipefail
 
-HAPROXY_CFG=${HAPROXY_CFG:-/usr/local/etc/haproxy/haproxy.cfg}
+# 只读挂进来的配置模板 → 复制成容器内可写的真实配置。
+# 为什么要复制：限额自动应用（rl-limiter 的 enforcer）要**原地改写**
+# haproxy.cfg，而 compose 的单文件 bind mount 既是只读的、也无法被
+# rename 覆盖（临时文件+rename 是原子写的必要手段，跨挂载点会失败）。
+# 复制一份到容器自己的文件系统后，形态就和生产上"cfg 是本机一个普通
+# 文件"完全一致了。
+HAPROXY_TEMPLATE=${HAPROXY_TEMPLATE:-/etc/rl-limiter/haproxy-template.cfg}
+HAPROXY_CFG=${HAPROXY_CFG:-/etc/haproxy/haproxy.cfg}
 HAPROXY_SOCK=${HAPROXY_SOCK:-/run/haproxy/admin.sock}
+HAPROXY_PIDFILE=${HAPROXY_PIDFILE:-/run/haproxy/master.pid}
 SOCK_WAIT_S=${SOCK_WAIT_S:-30}
 
 log() { echo "$(date -Is) ENTRYPOINT $*" >&2; }
 
-mkdir -p "$(dirname "$HAPROXY_SOCK")"
+mkdir -p "$(dirname "$HAPROXY_SOCK")" "$(dirname "$HAPROXY_CFG")"
+if [ -f "$HAPROXY_TEMPLATE" ]; then
+    cp "$HAPROXY_TEMPLATE" "$HAPROXY_CFG"
+    log "已从模板生成可写配置 template=$HAPROXY_TEMPLATE cfg=$HAPROXY_CFG"
+fi
 
 # -W: master-worker（与生产的 systemd 形态一致，reload 走 SIGUSR2）
 # -db: 不后台化，让 master 进程留在前台受本脚本管理
 log "启动 HAProxy cfg=$HAPROXY_CFG"
 haproxy -W -db -f "$HAPROXY_CFG" &
 HAPROXY_PID=$!
+# 自己写 master pid：`-p` 在 -db 模式下不落盘，而限额自动应用要靠它
+# 定位该给谁发 SIGUSR2（容器里没有 systemctl reload haproxy）。
+echo "$HAPROXY_PID" > "$HAPROXY_PIDFILE"
 
 # 等 stats socket 就绪：这是 rl-limiter 的采样入口，没它启动就是白转。
 waited=0
