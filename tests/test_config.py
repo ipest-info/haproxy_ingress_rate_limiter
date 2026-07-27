@@ -313,3 +313,142 @@ def test_node_exclusive_to_single_env(tmp_path):
     )
     with pytest.raises(ValueError, match="只允许服务一个环境"):
         load_from(tmp_path, yaml_text)
+
+
+# ---------------------------------------------------------------------------
+# 同机部署形态：unix stats socket 接线 + 按本机节点裁剪配置
+# ---------------------------------------------------------------------------
+
+# 三台节点全部走本机 unix socket（socket_path），env-a 横跨 lb-1/lb-2，
+# env-b 独占 lb-3——与 deploy/mysql/init.sql 的演示种子同构。
+COLOCATED_YAML = """\
+haproxy_nodes:
+  - name: lb-1
+    socket_path: /run/haproxy/admin.sock
+    quota_bps: 40000000
+  - name: lb-2
+    socket_path: /run/haproxy/admin.sock
+    quota_bps: 40000000
+  - name: lb-3
+    socket_path: /run/haproxy/admin.sock
+    quota_bps: 40000000
+envs:
+  - env_id: env-a
+    targets:
+      - {node: lb-1, frontend: fe_a}
+      - {node: lb-2, frontend: fe_a}
+  - env_id: env-b
+    targets:
+      - {node: lb-3, frontend: fe_b}
+"""
+
+
+def test_unix_socket_node_parsed(tmp_path):
+    """同机形态：只给 socket_path，host/port 留空即可通过校验。"""
+    cfg = load_from(tmp_path, COLOCATED_YAML)
+    n = cfg.nodes[0]
+    assert n.socket_path == "/run/haproxy/admin.sock"
+    assert n.is_unix is True
+    assert n.endpoint() == "/run/haproxy/admin.sock"
+    assert (n.host, n.port) == ("", 0)
+
+
+def test_tcp_node_endpoint_description(tmp_path):
+    """跨机形态：endpoint 仍是 host:port，is_unix 为假。"""
+    cfg = load_from(tmp_path, VALID_YAML)
+    n = cfg.nodes[0]
+    assert n.is_unix is False
+    assert n.endpoint() == "10.0.0.1:9999"
+
+
+@pytest.mark.parametrize(
+    "node_yaml,match",
+    [
+        # 两种接线同时给 → 二义，必须拒绝（同机部署里最容易犯的配错：
+        # 加了 socket_path 却忘了删旧的 host/port，结果采到了别的节点）。
+        pytest.param(
+            "  - {name: lb-1, host: 10.0.0.1, port: 9999, "
+            "socket_path: /run/haproxy/admin.sock, quota_bps: 1}\n",
+            r"只能二选一",
+            id="both-wirings",
+        ),
+        # 一种都不给 → 无法接线。
+        pytest.param(
+            "  - {name: lb-1, quota_bps: 1}\n",
+            r"host 不能为空",
+            id="no-wiring",
+        ),
+        # 相对路径 → 解析结果取决于工作目录，必须拒绝。
+        pytest.param(
+            "  - {name: lb-1, socket_path: run/haproxy/admin.sock, quota_bps: 1}\n",
+            r"必须是绝对路径",
+            id="relative-socket-path",
+        ),
+    ],
+)
+def test_wiring_validation_errors(tmp_path, node_yaml, match):
+    with pytest.raises(ValueError, match=match):
+        load_from(tmp_path, "haproxy_nodes:\n" + node_yaml)
+
+
+def test_scope_to_node_keeps_only_local_view(tmp_path):
+    """同机部署裁剪：只留本机的接线/限额/监控单元，环境分组的成员列表
+    也裁到只剩本机（页面据此显示本地模式横幅，避免聚合曲线被误读）。"""
+    full = load_from(tmp_path, COLOCATED_YAML)
+    assert len(full.nodes) == 3 and len(full.envs) == 3
+
+    scoped = config.scope_to_node(full, "lb-1")
+    assert [n.name for n in scoped.nodes] == ["lb-1"]
+    assert [u.env_id for u in scoped.envs] == ["lb-1"]
+    assert scoped.envs[0].targets == [model.Target("lb-1", "fe_a")]
+    assert scoped.node_quotas == {"lb-1": 40000000}
+    # env-a 的成员被裁到只剩本机；本机不属于的 env-b 整个消失。
+    assert scoped.env_groups == {"env-a": ["lb-1"]}
+    # 服务级参数原样保留。
+    assert scoped.log_level == full.log_level
+    assert scoped.tick_interval_s == full.tick_interval_s
+
+
+def test_scope_to_node_unknown_node_rejected(tmp_path):
+    """RL_NODE_NAME 拼错必须在启动时炸掉：否则服务连不上任何东西，
+    却"看起来在正常运行"。"""
+    full = load_from(tmp_path, COLOCATED_YAML)
+    with pytest.raises(ValueError, match=r"lb-9.*未出现在 haproxy_nodes"):
+        config.scope_to_node(full, "lb-9")
+
+
+def test_scope_applied_after_global_validation(tmp_path):
+    """裁剪发生在**全量校验之后**：即使坏配置与本机节点无关（这里是
+    lb-3 被两个环境抢占），本机实例也必须拒绝整份快照——节点独占是
+    跨节点的不变量，只看本机那部分根本校验不出来。"""
+    bad = COLOCATED_YAML + (
+        "  - env_id: env-c\n"
+        "    targets:\n"
+        "      - {node: lb-3, frontend: fe_c}\n"
+    )
+    p = tmp_path / "config.yaml"
+    p.write_text(textwrap.dedent(bad), encoding="utf-8")
+    with pytest.raises(ValueError, match="只允许服务一个环境"):
+        config.load(str(p), scope_node="lb-1")
+
+
+def test_load_with_scope_node(tmp_path):
+    """load(path, scope_node) 是同机部署的入口：一份全量配置文件，
+    三台机器只靠 RL_NODE_NAME 区分。"""
+    p = tmp_path / "config.yaml"
+    p.write_text(textwrap.dedent(COLOCATED_YAML), encoding="utf-8")
+    for node, env in (("lb-1", "env-a"), ("lb-2", "env-a"), ("lb-3", "env-b")):
+        cfg = config.load(str(p), scope_node=node)
+        assert [n.name for n in cfg.nodes] == [node]
+        assert list(cfg.env_groups) == [env]
+
+
+def test_socket_path_too_long_rejected(tmp_path):
+    """AF_UNIX 的 sun_path 有定长上限（Linux 107 字节）。超限只在 connect()
+    时报错，而采样每秒一次——不在启动时拦下就会变成每秒一条看不懂的告警。"""
+    long_path = "/" + "x" * 120
+    with pytest.raises(ValueError, match="socket_path 过长"):
+        load_from(
+            tmp_path,
+            f"haproxy_nodes:\n  - {{name: lb-1, socket_path: {long_path}, quota_bps: 1}}\n",
+        )

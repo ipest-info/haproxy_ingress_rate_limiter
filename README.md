@@ -3,11 +3,16 @@
 带宽账密计费模式下的入口限速与监控系统：**限速由各台 HAProxy（TCP L4
 负载均衡）自身的 shared bwlim 聚合限速执行**——本机受控 frontend 全部
 连接（含存量长连接）的总速率被硬性压在限额内，限额是配置常量，调整走
-"改库 + 改 cfg + reload"的发布流程。**rl-limiter（Python）是独立部署的
-集中监控服务**：通过内网 TCP 只读采样多台 HAProxy 的下行带宽，按节点/
-环境展示实时视图，对照 MySQL 配置库中登记的限额做**持续超限告警**
-（发现配置漂移/漏配限速）。内置 **Web 控制台**（实时曲线、环境聚合、
+"改库 + 改 cfg + reload"的发布流程。**rl-limiter（Python）与 HAProxy
+同机部署**：每台 HAProxy 服务器上一个实例，通过**本机 unix stats
+socket**只读采样本机下行带宽，对照 MySQL 配置库中登记的限额做**持续
+超限告警**（发现配置漂移/漏配限速）。内置 **Web 控制台**（实时曲线、
 限额登记、日志）。
+
+> 同机部署由 `RL_NODE_NAME=<本机节点名>` 开启（推荐形态）：stats socket
+> 不占任何网络端口、无需对内网开放；一台机器的监控故障不外溢。不设该
+> 变量则退回**集中监控**形态（一个实例经内网 TCP 采样多台，提供跨节点
+> 的环境聚合视图），代码同时支持两者。
 
 ## 文档
 
@@ -22,20 +27,22 @@
 ## 系统组成
 
 ```
-rl_limiter/       # Python 3.11 + asyncio 集中监控服务
-  model.py        #   共享领域类型（单位约定、Target/EnvQuota=监控单元等）
-  haproxy.py      #   HAProxy runtime API 客户端（内网 TCP stats socket，只读采样）
+rl_limiter/       # Python 3.11 + asyncio 监控服务（与 HAProxy 同机）
+  model.py        #   共享领域类型（单位约定、Target/EnvQuota=监控单元、节点接线）
+  haproxy.py      #   HAProxy runtime API 客户端（unix / TCP stats socket，只读采样）
   window.py       #   滑动窗口 + EWMA
-  collector.py    #   多节点并发采样、按监控单元（节点）聚合、节点级容错
+  collector.py    #   并发采样、按监控单元（节点）聚合、节点级容错
   dbconfig.py     #   MySQL 配置源（启动加载 + 轮询热更新 + 控制台写回，RL_MYSQL_* 接线）
-  config.py       #   配置解析与校验（YAML 与数据库共用同一管线）
-  webconsole.py   #   内置 Web 控制台（节点带宽视图/环境聚合视图/限额登记/日志）
+  config.py       #   配置解析与校验（YAML 与数据库共用同一管线）+ 按本机节点裁剪
+  webconsole.py   #   内置 Web 控制台（节点带宽视图/限额登记/日志）
   loop.py         #   1s 监控主循环（采集 → 超限判定 → 发布）
-tools/            # fake_haproxy.py（联调假节点）
+tools/            # fake_haproxy.py（联调假节点，支持 unix / TCP）
                   # random_web.py（随机大小响应的模拟后端）、loadgen.py（可调并发压测）
-deploy/           # systemd、haproxy 聚合限速配置示例、tc 兜底脚本、YAML 示例配置
-                  # mysql/init.sql（配置库建表+种子）、docker/（compose 用 HAProxy 配置）
-docker-compose.yml # 一键演示：MySQL + 三台 HAProxy + 模拟后端 + 压测 + 控制台
+deploy/           # systemd（同机形态）、haproxy 聚合限速配置示例、tc 兜底脚本、
+                  # YAML 示例配置、mysql/init.sql（配置库建表+种子）
+  docker/         #   Dockerfile.node（Ubuntu 24.04 + HAProxy + 同机 rl-limiter）、
+                  #   node-entrypoint.sh、compose 用的 HAProxy 配置
+docker-compose.yml # 一键演示：MySQL + 三台 Ubuntu 24.04 节点 + 模拟后端 + 压测
 ```
 
 ## 核心思路一句话
@@ -44,27 +51,37 @@ docker-compose.yml # 一键演示：MySQL + 三台 HAProxy + 模拟后端 + 压�
 frontend 的**总**下行速率硬限在限额内——与连接数、单连接快慢无关，
 存量长连接持续受控，限额调整（reload + hard-stop-after）对存量连接也
 生效；节点之间互不调配、故障互不影响；上游流量靠 TCP 背压自然收敛，
-tc 在各节点作硬兜底。rl-limiter 每秒并发采样所有节点各 frontend 的
-`bytes_out`（前提 `option contstats`），按节点聚合成 10 秒滑动均值，
-持续高于库中登记限额即告警（配置漂移的兜底检验）；监控服务宕机不影响
-限速。
+tc 在各节点作硬兜底。同机的 rl-limiter 每秒经本机 unix socket 采样本机
+各 frontend 的 `bytes_out`（前提 `option contstats`），聚合成 10 秒滑动
+均值，持续高于库中登记限额即告警（配置漂移的兜底检验）；监控进程宕机
+不影响限速。
 
 ## 快速开始
 
 ```bash
 make install    # pip install -e ".[test]"
 make test       # 全量单元测试
-# 本地最小演示（假 HAProxy + standalone YAML）见 docs/03
+# 本地最小演示（假 HAProxy unix socket + standalone YAML）见 docs/03
 
-make demo-up    # docker compose 一键演示：MySQL 配置 + 三台真实 HAProxy
-                # (TCP L4 shared bwlim) + 随机大小响应后端 + 可调并发压测
-                # 浏览器打开 http://localhost:8090 进入 Web 控制台：
-                # 每节点带宽曲线 + 环境聚合视图 + 超限告警 + 日志
-make demo-logs  # 观察 rl-limiter 监控与 loadgen 分入口吞吐表格
+make demo-up    # docker compose 一键演示：MySQL 配置 + 三台 Ubuntu 24.04
+                # 节点（每台 = HAProxy TCP L4 shared bwlim + 同机 rl-limiter）
+                # + 随机大小响应后端 + 可调并发压测
+                # 每台节点各一个控制台：http://localhost:8090 / :8092 / :8093
+make demo-logs  # 观察各节点监控与 loadgen 分入口吞吐表格
 make demo-down  # 收场（含 MySQL 数据卷）
 ```
 
-配置来源二选一：设置 `RL_MYSQL_HOST` 等环境变量时从 **MySQL** 读取并
-轮询热更新（登记限额/环境分组改表即生效）；否则回落到 `-c` 指定的
+**部署形态**：设 `RL_NODE_NAME=<本机节点名>` 进入同机模式（只采本机，
+走 `socket_path` 指向的本机 unix stats socket）；不设则为集中监控模式
+（采多台，走 `host`/`port` 内网 TCP）。配置文件/配置库**始终写全量**并
+按全量校验（节点独占等是跨节点不变量），校验通过后才裁剪到本机——三台
+机器可共用同一份配置，只有 `RL_NODE_NAME` 不同。
+
+**配置来源二选一**：设置 `RL_MYSQL_HOST` 等环境变量时从 **MySQL** 读取
+并轮询热更新（登记限额/环境分组改表即生效）；否则回落到 `-c` 指定的
 本地 YAML（standalone/开发用）。限额的真实执行在各节点 haproxy.cfg 的
 shared bwlim `limit`，与库中登记值由发布流程保持一致（docs/03 §3）。
+
+**Web 控制台**：`RL_CONSOLE_PORT` 启用，`RL_CONSOLE_BIND` 指定监听地址
+（默认 `127.0.0.1`）。控制台**无鉴权且带写接口**，放到内网必须配合
+防火墙/安全组限制来源。

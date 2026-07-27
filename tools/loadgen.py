@@ -503,7 +503,7 @@ def main() -> None:
                     "持续请求目标 URL 以模拟并发带宽")
     parser.add_argument("--target", required=True,
                         help="压测目标 URL，逗号分隔可给多个（经 HAProxy 入口，"
-                             "例如 http://haproxy1:8080/,http://haproxy2:8080/），"
+                             "例如 http://node1:8080/,http://node2:8080/），"
                              "每个请求随机挑一个目标")
     parser.add_argument("--concurrency", type=int,
                         default=env_int("LOADGEN_CONCURRENCY", DEFAULT_CONCURRENCY, "loadgen"),

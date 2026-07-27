@@ -1,31 +1,39 @@
-# Docker Compose 一键演示环境（MySQL 配置 + 三台 HAProxy TCP L4 聚合限速）
+# Docker Compose 一键演示环境（MySQL 配置 + 三台 Ubuntu 24.04 节点）
 
-本演示把完整链路装进一个 `docker compose`：**三台真实 HAProxy 2.8
-（TCP L4 负载均衡形态）各自用 shared bwlim 聚合限速**（限额是各自
-cfg 里的配置常量，节点间无自动调配）；**rl-limiter 做集中监控**——
-配置存 MySQL（启动加载、轮询热更新），每秒采样各节点带宽、对照库中
-登记限额做持续超限告警，内置 Web 控制台。后端挂一个**每次请求返回
-随机大小响应**的模拟 web 服务，再用一个**可在线调节并发数的压测服务**
-打散到全部入口。
+本演示把完整链路装进一个 `docker compose`。**每个 node 容器 = 生产上的
+一台 ECS**：基于 **Ubuntu 24.04 LTS**，容器内同时跑发行版自带的
+**HAProxy 2.8**（TCP L4 + shared bwlim 聚合限速）与**同机的
+rl-limiter**——rl-limiter 通过容器内的 unix socket
+（`/run/haproxy/admin.sock`）只采本机那台 HAProxy，stats socket
+不占任何网络端口、也无需跨容器可达。配置存 MySQL（启动加载、轮询热
+更新），各节点独立轮询、对照库中登记限额做持续超限告警，各自带一个
+Web 控制台。后端挂一个**每次请求返回随机大小响应**的模拟 web 服务，
+再用一个**可在线调节并发数的压测服务**打散到全部入口。
+
+> 为什么不用 haproxy 官方镜像：官方镜像只有 haproxy 一个进程，而本项目
+> 的部署形态是"rl-limiter 与 HAProxy 同机"。用 Ubuntu 基础镜像装两个
+> 组件，容器形态才和生产的单台 ECS 一致。镜像构建时会校验 haproxy
+> 版本 ≥ 2.8（shared bwlim 的下限），不满足直接构建失败。
 
 ## 拓扑
 
 ```
-                 ┌────────────┐   轮询配置（每 RL_MYSQL_POLL_S 秒）
-                 │   mysql    │◄────────────────┐
-                 │ (配置四表)  │                 │
-                 └────────────┘          ┌──────┴──────┐   :8090 Web 控制台
-                                         │ rl-limiter  │◄── 实时曲线/限额登记/日志
-                 show stat（只读采样）     └──┬───────┬──┘
-                 （:9999 stats socket）      │       │
-   HTTP 并发        ┌───────────────────────┘       └───────────┐
-┌─────────┐         ▼                                           ▼
-│ loadgen │──┬─►┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│ :8084   │  ├─►│ haproxy1(hap-1) │ │ haproxy2(hap-2) │ │ haproxy3(hap-3) │
-└─────────┘  └─►│ :8080 fe_env_a  │ │ :8082 fe_env_a  │ │ :8083 fe_env_b  │
-                │ shared bwlim 40M │ │ shared bwlim 40M │ │ shared bwlim 40M │
-                └────────┬────────┘ └────────┬────────┘ └────────┬────────┘
-                         └───────────────────┼───────────────────┘
+                 ┌────────────┐   各节点独立轮询配置（每 RL_MYSQL_POLL_S 秒）
+                 │   mysql    │◄──────────┬───────────┬───────────┐
+                 │ (配置四表)  │           │           │           │
+                 └────────────┘           │           │           │
+   HTTP 并发                               │           │           │
+┌─────────┐   ┌──────────────────────┐ ┌──┴───────────┴──┐ ┌──────┴────────┐
+│ loadgen │──►│ node1  (Ubuntu 24.04)│ │ node2           │ │ node3         │
+│ :8084   │──►│  haproxy fe_env_a    │ │  haproxy fe_env_a│ │ haproxy fe_env_b│
+└─────────┘──►│   shared bwlim 40M   │ │   bwlim 40M      │ │  bwlim 40M     │
+              │   :8080              │ │   :8082          │ │  :8083         │
+              │      │ unix socket   │ │                  │ │                │
+              │      ▼ (只读采样)     │ │                  │ │                │
+              │  rl-limiter hap-1    │ │ rl-limiter hap-2 │ │ rl-limiter hap-3│
+              │   控制台 :8090        │ │  控制台 :8092     │ │  控制台 :8093   │
+              └──────────┬───────────┘ └────────┬─────────┘ └───────┬────────┘
+                         └───────────────────┬──┴───────────────────┘
                                              ▼
                                       web:9000（随机大小响应）
 ```
@@ -33,10 +41,13 @@ cfg 里的配置常量，节点间无自动调配）；**rl-limiter 做集中监
 | 服务 | 说明 | 宿主机端口 |
 | ---- | ---- | ---- |
 | `mysql` | 配置库（表结构与种子数据：`deploy/mysql/init.sql`） | `127.0.0.1:3306` |
-| `haproxy1` / `haproxy2` / `haproxy3` | 真实 HAProxy 2.8，**TCP L4 + shared bwlim 聚合限速**（按环境角色分用 `deploy/docker/haproxy-env-a/b.cfg`，limit 各 5,000,000 bytes/s = 40 Mbps） | `8080`、`8082`、`8083` |
+| `node1` / `node2` / `node3` | **Ubuntu 24.04 + HAProxy 2.8 + 同机 rl-limiter**（`deploy/docker/Dockerfile.node`）。HAProxy 按环境角色分用 `deploy/docker/haproxy-env-a/b.cfg`，limit 各 5,000,000 bytes/s = 40 Mbps；rl-limiter 用 `RL_NODE_NAME` 锁定本机节点 | 代理 `8080`/`8082`/`8083`；控制台 `127.0.0.1:8090`/`8092`/`8093` |
 | `web` | 模拟业务后端，每次请求返回 256 KiB～2 MiB 随机大小响应；`/big` 为大文件下载端点（默认 512 MiB，`WEB_BIG_BYTES` 可调）（`tools/random_web.py`） | 无 |
-| `rl-limiter` | 集中监控服务，配置来自 MySQL；内置 Web 控制台 | `8090`（控制台） |
 | `loadgen` | 压测服务，打散到全部入口，并发数可在线调节；默认每入口另挂 1 条**长连接大文件下载**（`tools/loadgen.py`） | `8084`（控制口） |
+
+每个 node 容器的进程编排见 `deploy/docker/node-entrypoint.sh`：先起
+HAProxy 并等 unix socket 就绪，再起 rl-limiter；任一进程退出即整体退出
+（对齐生产上 systemd `Restart=always` 的语义），由 compose 拉起。
 
 演示种子：hap-1 / hap-2 / hap-3 登记限额各 **40 Mbps**（与各自 cfg 的
 limit 一致）；环境是纯分组——env-a = hap-1 + hap-2（聚合视图显示合计
@@ -51,33 +62,55 @@ reload）后存量连接最迟在 `hard-stop-after`（演示 15s）宽限期结�
 
 ```bash
 docker compose up -d --build        # 或 make demo-up
+                                    # 首次构建要装 Ubuntu 包 + Python 依赖，
+                                    # 比官方 haproxy 镜像慢，属正常
 docker compose logs -f loadgen      # 看各入口吞吐被压在 40 Mbps 的过程
+docker compose logs -f node1        # 看 node1 里 haproxy + rl-limiter 的日志
+```
+
+确认每台节点确实是"HAProxy + 同机 rl-limiter"：
+
+```bash
+docker compose exec node1 ps -eo comm | sort -u | grep -E 'haproxy|rl-limiter'
+docker compose exec node1 ls -l /run/haproxy/admin.sock   # 采样用的本机 socket
+docker compose exec node1 haproxy -v                      # Ubuntu 24.04 自带 2.8.x
 ```
 
 `loadgen` 日志每 2 秒一行（`rate_mbps` 与限额同口径）：
 
 ```
 吞吐观测 concurrency=24 total_mbps=115.8 ...（表格按入口逐行：并发/速率/请求/错误/状态）
-  http://haproxy1:8080/  …  ≈40 Mbps  正常   ← 每台节点被 shared bwlim 精确压在 40M
+  http://node1:8080/  …  ≈40 Mbps  正常   ← 每台节点被 shared bwlim 精确压在 40M
 ```
 
 宿主机也可以直接体验：`curl -o /dev/null http://localhost:8080/`。
 
 ## Web 控制台（实时观测 + 配置管理）
 
-浏览器打开 **http://localhost:8090**（rl-limiter 内置，`RL_CONSOLE_PORT`
-启用，无需额外服务）：
+**每台节点各有一个控制台**（同机部署形态）：
 
-- **节点带宽视图**：每台 HAProxy 一张图（实时速率 / 10s 均值 + 登记
+| 节点 | 控制台 |
+| ---- | ---- |
+| `hap-1`（node1） | http://localhost:8090 |
+| `hap-2`（node2） | http://localhost:8092 |
+| `hap-3`（node3） | http://localhost:8093 |
+
+页面顶部会显示**同机部署模式**横幅，标明本控制台属于哪个节点。演示里
+容器内绑 `0.0.0.0`（`RL_CONSOLE_BIND`）、宿主机只映射到 `127.0.0.1`；
+生产默认就是 `127.0.0.1`。
+
+- **节点带宽视图**：本机 HAProxy 一张图（实时速率 / 10s 均值 + 登记
   限额虚线，1s 粒度）——曲线被压在限额线下即该节点限速生效的直接
   证据；实测持续高于限额时节点卡出现**超限**徽标（说明 HAProxy 配置
   与库不一致）；登记限额就在节点卡上编辑（写库热生效，页面提示需
   同步 HAProxy limit）；
-- **环境聚合视图**：每个环境一张只读聚合图（成员节点各序列**求和**），
-  以及挂载点管理；环境没有自己的限额与调节；
+- **环境聚合视图**：同机形态下**只含本机成员**（横幅已说明这不是环境
+  全量带宽）；挂载点管理照常可用——写的是全量配置库，改动会被其它
+  节点的 rl-limiter 一并读到；
 - **生效证据计数**：超限秒数、利用率（均值/限额）、并发连接数、节点
   失联标记；
-- **节点面板**：每台 HAProxy 的地址、所属环境、登记限额、采样健康
+- **节点面板**：本机 HAProxy 的 stats socket 端点
+  （`/run/haproxy/admin.sock (unix)`）、所属环境、登记限额、采样健康
   （失联标红）；
 - **环境与挂载点管理**：环境卡上直接增删挂载点（节点 × frontend）、
   新建环境（环境 ID + 初始挂载点）、删除环境；挂载点迁移 = 原环境
@@ -100,8 +133,13 @@ curl -X POST http://localhost:8090/api/envs \
 curl -X DELETE http://localhost:8090/api/envs/env-c
 ```
 
-安全提示：控制台无鉴权，定位与 HAProxy stats socket 相同——只允许绑定
-内网/受防火墙保护的端口，不要暴露公网。
+> 上面的 `hap-1` / `env-a` 只是示例；每台节点的控制台端口不同（8090 /
+> 8092 / 8093），但写接口写的都是同一个配置库，从哪个控制台改都一样。
+
+安全提示：控制台**无鉴权且带写接口**（改限额、改挂载点、删环境）。
+默认只绑 `127.0.0.1`（`RL_CONSOLE_BIND`）；要放到内网必须显式设置并
+配合防火墙/安全组限制来源，绝不可暴露公网。绑非回环地址时服务会打一条
+warning 留痕。
 
 ## 调节并发（模拟不同强度的客户端群）
 
@@ -157,15 +195,20 @@ docker compose exec mysql mysql -url -prl_pass rl_limiter \
 
 # 2) 改数据面：原地编辑 deploy/docker/haproxy-env-a.cfg，把
 #    「limit 5000000」改为「limit 2500000」（bytes/s = bit/s ÷ 8），然后
-docker kill -s HUP haproxy_ingress_rate_limiter-haproxy1-1   # 平滑 reload
+#    给容器内的 haproxy master 发 SIGUSR2 平滑 reload：
+docker compose exec node1 pkill -USR2 -x haproxy
 ```
+
+> 注意：`haproxy-env-a.cfg` 被 node1 与 node2 共用，改一次会同时影响
+> 两台——本例只 reload 了 node1，因此只有 hap-1 的数据面变了，hap-2
+> 仍按旧限额跑（要一起改就把两个容器都 reload）。
 
 > 容器单文件挂载的坑：必须**原地修改** cfg（保持 inode 不变，编辑器/
 > `python -c` 的 r+ 写法都行）；`sed -i` 会替换文件 inode，容器内看到的
 > 还是旧内容。生产环境（配置管理 + systemctl reload）无此问题。
 
 观察：reload 后新连接立即按 20M；存量连接最迟 15s（`hard-stop-after`）
-断开重连进入新限额；loadgen 表格里 haproxy1 行降到 ≈20 Mbps，其余两台
+断开重连进入新限额；loadgen 表格里 node1 行降到 ≈20 Mbps，其余两台
 不受影响。**反向调大同理**——存量长连接也会在宽限期后进入新限额（这
 正是 shared bwlim 相对旧 per-stream 方案的核心修复：调高限额吞吐必然
 回升，无需重启）。
@@ -177,15 +220,39 @@ docker kill -s HUP haproxy_ingress_rate_limiter-haproxy1-1   # 平滑 reload
 | `haproxy_nodes.quota_bps` | 节点登记限额（监控基准；真实限速在该节点 cfg 的 limit） | **热生效**（一个轮询周期内）；与 cfg 不一致会触发持续超限告警 |
 | `envs` / `env_targets` | 环境分组、挂载点归属 | **热生效** |
 | `service_config` | log_level / tick_interval_s | 重启生效 |
-| `haproxy_nodes` 其余列 | 节点接线（地址/端口/超时） | 重启生效（检测到变化会记 warning；引用新增节点的环境会被拒绝热应用） |
+| `haproxy_nodes` 其余列 | 节点接线（`socket_path` 或 `host`/`port`、超时） | 重启生效（检测到变化会记 warning；引用新增节点的环境会被拒绝热应用） |
 
-校验规则与 YAML 完全一致（同一套管线）：配置写错时 rl-limiter 保留当前
-配置继续监控（fail-static）并打日志。
+校验规则与 YAML 完全一致（同一套管线），且**在全量配置上执行**：任意
+一处写坏（比如让两个环境抢同一台节点），三台节点的 rl-limiter 会一起
+保留当前配置继续监控（fail-static）并打日志。
 
-MySQL 接线环境变量（`docker-compose.yml` 中注入）：`RL_MYSQL_HOST`（设置
-即启用数据库模式）、`RL_MYSQL_PORT`、`RL_MYSQL_USER`、`RL_MYSQL_PASSWORD`、
-`RL_MYSQL_DB`、`RL_MYSQL_POLL_S`（轮询周期，秒）。不设 `RL_MYSQL_HOST`
-则回落到 `-c` 指定的本地 YAML。
+同机模式下变更检测是**本机口径**的：改 hap-3 的限额不会让 node1 产生
+一次无谓的热应用——`docker compose logs node1` 里只会看到与本机相关的
+`检测到数据库配置变化，已提交主循环热生效`。
+
+环境变量（`docker-compose.yml` 中注入）：
+- `RL_NODE_NAME`：**本机节点名，同机模式开关**（演示里三台分别是
+  `hap-1`/`hap-2`/`hap-3`）。拼错会让该节点启动失败并列出已登记节点名；
+- `RL_MYSQL_HOST`（设置即启用数据库模式）、`RL_MYSQL_PORT`、
+  `RL_MYSQL_USER`、`RL_MYSQL_PASSWORD`、`RL_MYSQL_DB`、`RL_MYSQL_POLL_S`；
+  不设 `RL_MYSQL_HOST` 则回落到 `-c` 指定的本地 YAML；
+- `RL_CONSOLE_PORT` / `RL_CONSOLE_BIND`：控制台端口与监听地址。
+
+## 验证"监控与限速互不牵连"
+
+同机形态下故障域完全按节点隔离，可以直接演示：
+
+```bash
+# 只杀 node1 里的 rl-limiter：限速照旧（loadgen 表格里 node1 仍是 40M），
+# 只是该节点的控制台/告警停了；容器整体退出后被 compose 拉起。
+docker compose exec node1 pkill -f rl-limiter
+docker compose logs --tail=20 node1
+
+# 整台 node3 停掉：node1/node2 的监控与限速完全不受影响。
+docker compose stop node3
+curl -s http://localhost:8090/api/overview | head -c 300
+docker compose start node3
+```
 
 ## 调整模拟后端的响应大小
 

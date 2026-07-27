@@ -8,11 +8,15 @@
 # 的 shared bwlim 配置执行，rl-limiter 不写入任何运行期状态，因此
 # stats socket 用 level user（只读）即够。
 #
-# 接线走 HAProxy 在内网监听的 TCP stats socket（haproxy.cfg：
-# `stats socket ipv4@<内网IP>:9999 level user`）。HAProxy runtime socket
-# 在非交互模式下"一次连接只服务一条命令"，命令执行完即由服务端关闭
-# 连接。因此 exec_cmd 每次调用都重新建连，而不是复用长连接——这不是
-# 性能疏忽，而是协议要求。
+# 接线有两种形态（见 model.NodeConfig）：同机部署走本机 unix stats
+# socket（`stats socket /run/haproxy/admin.sock mode 660 level user`，
+# 不占网络端口、按文件权限授权，推荐）；跨机监控走内网 TCP stats socket
+# （`stats socket ipv4@<内网IP>:9999 level user`）。两者只有"怎么建连"
+# 一步不同，命令语义与回包解析完全一致。
+#
+# HAProxy runtime socket 在非交互模式下"一次连接只服务一条命令"，命令
+# 执行完即由服务端关闭连接。因此 exec_cmd 每次调用都重新建连，而不是
+# 复用长连接——这不是性能疏忽，而是协议要求。
 
 from __future__ import annotations
 
@@ -58,25 +62,47 @@ class StatParseError(RuntimeAPIError):
 
 
 class RuntimeClient:
-    """与单台 HAProxy 的 TCP stats socket 通信的客户端。
+    """与单台 HAProxy 的 stats socket 通信的客户端（unix 或 TCP）。
 
     自身无状态（不缓存连接），可被多个协程并发使用；timeout_s 约束每条
     命令的端到端耗时（连接 + 写入 + 读取全过程）；timeout_s <= 0 表示关闭
     客户端侧预算，完全交由调用方控制（测试场景常用）。
+
+    socket_path 非空时走本机 unix socket（同机部署形态），host/port 被
+    忽略；否则走 TCP。两种形态的差异被完全收敛在 _open 一个方法里。
     """
 
-    def __init__(self, host: str, port: int, timeout_s: float = 0.5,
-                 log: logging.Logger | None = None):
+    def __init__(self, host: str = "", port: int = 0, timeout_s: float = 0.5,
+                 log: logging.Logger | None = None, socket_path: str = ""):
         self._host = host
         self._port = port
+        self._socket_path = socket_path
         self._timeout_s = timeout_s
         # 日志仅用于调试观测（命令、耗时、回退事件），不参与控制逻辑。
         self._log = log if log is not None else logging.getLogger(__name__)
 
+    @classmethod
+    def from_node(cls, node: model.NodeConfig,
+                  log: logging.Logger | None = None) -> "RuntimeClient":
+        """按节点配置构造客户端——把"该用 unix 还是 TCP"的判断收在一处，
+        调用方（__main__ 的接线装配）不必重复分支。"""
+        return cls(node.host, node.port, node.timeout_s, log,
+                   socket_path=node.socket_path)
+
+    def endpoint(self) -> str:
+        """人类可读的端点描述，用于日志。"""
+        return self._socket_path if self._socket_path else f"{self._host}:{self._port}"
+
+    async def _open(self):
+        """建立到 stats socket 的连接，返回 (reader, writer)。"""
+        if self._socket_path:
+            return await asyncio.open_unix_connection(self._socket_path)
+        return await asyncio.open_connection(self._host, self._port)
+
     async def exec_cmd(self, cmd: str) -> str:
         """发送一条命令并返回去除首尾空白后的回包。
 
-        每次调用都新建 TCP 连接：HAProxy 在非交互模式下执行完一条命令就会
+        每次调用都新建连接：HAProxy 在非交互模式下执行完一条命令就会
         关闭 runtime socket，长连接复用在协议上不可行。读到 EOF 即为"回包
         结束"的信号，无需（也无法）依赖长度前缀或分隔符。回包若命中已知
         错误前缀则抛 CommandError（回包原文在异常属性上，便于上层记录）；
@@ -90,7 +116,7 @@ class RuntimeClient:
         # timeout <= 0 时传 None：asyncio.timeout(None) 即"无超时"。
         budget = self._timeout_s if self._timeout_s > 0 else None
         async with asyncio.timeout(budget):
-            reader, writer = await asyncio.open_connection(self._host, self._port)
+            reader, writer = await self._open()
             try:
                 writer.write((cmd + "\n").encode())
                 await writer.drain()
@@ -106,8 +132,9 @@ class RuntimeClient:
 
         out = raw.decode("utf-8", errors="replace").strip()
         self._log.debug(
-            "已执行 HAProxy runtime API 命令并完整读取回包 cmd=%r duration_ms=%d reply_bytes=%d",
-            cmd, int((time.monotonic() - start) * 1000), len(raw))
+            "已执行 HAProxy runtime API 命令并完整读取回包 "
+            "endpoint=%s cmd=%r duration_ms=%d reply_bytes=%d",
+            self.endpoint(), cmd, int((time.monotonic() - start) * 1000), len(raw))
         if _is_error_reply(out):
             raise CommandError(cmd, out)
         return out

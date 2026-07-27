@@ -31,13 +31,27 @@ CREATE TABLE IF NOT EXISTS service_config (
 
 -- ---------------------------------------------------------------------------
 -- 2. haproxy_nodes：受控 HAProxy 节点清单。
---    host:port 指向各节点的内网 TCP stats socket（level user 即够，
---    rl-limiter 只做只读采样）。
+--    采样通道二选一（校验强制恰好给一种）：
+--      - socket_path：该节点本机的 unix stats socket 路径（**同机部署**，
+--        rl-limiter 与 HAProxy 装在同一台服务器上，推荐）。此时
+--        host/port 留 NULL。
+--      - host:port：该节点的内网 TCP stats socket（跨机集中监控形态）。
+--        此时 socket_path 留 NULL。
+--    两种形态 rl-limiter 都只做只读采样，haproxy 侧 level user 即够。
+--
+--    从 5 列旧版本升级：
+--      ALTER TABLE haproxy_nodes
+--        ADD COLUMN socket_path VARCHAR(255) NULL DEFAULT NULL,
+--        MODIFY host VARCHAR(255) NULL DEFAULT NULL,
+--        MODIFY port INT UNSIGNED NULL DEFAULT NULL;
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS haproxy_nodes (
     name            VARCHAR(64)  NOT NULL PRIMARY KEY,
-    host            VARCHAR(255) NOT NULL,
-    port            INT UNSIGNED NOT NULL,
+    -- 跨机 TCP 形态填这两列；同机 unix socket 形态留 NULL。
+    host            VARCHAR(255) NULL DEFAULT NULL,
+    port            INT UNSIGNED NULL DEFAULT NULL,
+    -- 同机形态填这一列（绝对路径）；跨机 TCP 形态留 NULL。
+    socket_path     VARCHAR(255) NULL DEFAULT NULL,
     -- 单次 runtime API 命令超时（连接 + 读写，毫秒）；<=0 按默认 500 处理。
     timeout_ms      INT          NOT NULL DEFAULT 500,
     -- 节点登记限额（bits/s，运维口径，40000000 = 40 Mbps）——超限告警
@@ -83,15 +97,17 @@ CREATE TABLE IF NOT EXISTS env_targets (
 INSERT INTO service_config (id, log_level, tick_interval_s)
 VALUES (1, 'info', 1.0);
 
--- compose 里的三台 HAProxy：容器内 9999 端口为 TCP stats socket。
+-- compose 里的三台节点（Ubuntu 24.04 容器，每台跑 HAProxy + 同机的
+-- rl-limiter）：采样走**本机 unix stats socket**，不占任何网络端口。
+-- 注意 socket_path 是"该节点本机上的路径"，三台恰好同路径。
 -- 归属约定（校验强制）：节点是环境的独占资源——一个环境可横跨多台
 -- HAProxy，但一台 HAProxy 只允许服务一个环境。
 -- 每台节点登记限额 40 Mbps，与 deploy/docker/haproxy-env-*.cfg 里
 -- shared bwlim 的 limit（5_000_000 bytes/s）一致。
-INSERT INTO haproxy_nodes (name, host, port, timeout_ms, quota_bps)
-VALUES ('hap-1', 'haproxy1', 9999, 500, 40000000),
-       ('hap-2', 'haproxy2', 9999, 500, 40000000),
-       ('hap-3', 'haproxy3', 9999, 500, 40000000);
+INSERT INTO haproxy_nodes (name, socket_path, timeout_ms, quota_bps)
+VALUES ('hap-1', '/run/haproxy/admin.sock', 500, 40000000),
+       ('hap-2', '/run/haproxy/admin.sock', 500, 40000000),
+       ('hap-3', '/run/haproxy/admin.sock', 500, 40000000);
 
 -- 演示环境两套（纯分组）：env-a = hap-1 + hap-2，env-b = hap-3。
 INSERT INTO envs (env_id)
@@ -113,7 +129,11 @@ VALUES ('env-a', 'hap-1', 'fe_env_a'),
 --        UPDATE haproxy_nodes SET quota_bps = 20000000 WHERE name = 'hap-1';
 --     2) 同步真实限速（原地改该节点 cfg 的 limit 为 2500000 bytes/s
 --        后 reload）：
---        docker kill -s HUP <haproxy 容器>
+--        docker compose exec node1 pkill -USR2 -x haproxy
 --        （生产：改 haproxy.cfg + systemctl reload haproxy）
---     只做第 1 步不做第 2 步 → rl-limiter 打持续超限告警。
+--     只做第 1 步不做第 2 步 → 该节点的 rl-limiter 打持续超限告警。
+--
+--   同机部署下每台节点的 rl-limiter 只读本机那条记录（RL_NODE_NAME），
+--   但**校验仍在全量配置上做**：改坏任意一行（比如让两个环境抢同一台
+--   节点）会让所有节点的 rl-limiter 一起 fail-static 拒绝该快照。
 -- ===========================================================================

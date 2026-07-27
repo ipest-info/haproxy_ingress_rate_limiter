@@ -4,9 +4,10 @@
 # 四块内容（建表与种子数据见 deploy/mysql/init.sql）：
 #
 #   service_config   单行表：log_level / tick_interval_s
-#   haproxy_nodes    受控 HAProxy 节点清单：接线（host/port/超时）+
-#                    quota_bps（登记限额=超限告警基准，可热更；应与该
-#                    节点 haproxy.cfg 里 shared bwlim 的 limit 一致）
+#   haproxy_nodes    受控 HAProxy 节点清单：接线（socket_path 或
+#                    host/port，二选一 + 超时）+ quota_bps（登记限额=
+#                    超限告警基准，可热更；应与该节点 haproxy.cfg 里
+#                    shared bwlim 的 limit 一致）
 #   envs             业务环境分组（仅 env_id：环境=节点分组+聚合视图）
 #   env_targets      环境挂载点（env_id × node × frontend）
 #
@@ -71,7 +72,7 @@ _SQL_SERVICE = (
     "FROM service_config WHERE id = 1"
 )
 _SQL_NODES = (
-    "SELECT name, host, port, timeout_ms, quota_bps "
+    "SELECT name, host, port, timeout_ms, quota_bps, socket_path "
     "FROM haproxy_nodes ORDER BY name"
 )
 # v2.1：envs 表只剩分组标识——配额/参数已下沉到 haproxy_nodes。
@@ -174,12 +175,19 @@ def rows_to_raw(
             raw["tick_interval_s"] = tick
 
     nodes_out: list[dict[str, Any]] = []
-    for (name, host, port, timeout_ms, quota_bps) in node_rows:
+    for row in node_rows:
+        # socket_path 是后加的列；容忍 5 列的旧行序（老库尚未 ALTER TABLE
+        # 时不至于整份配置解析不了，而是退化成纯 TCP 形态）。
+        name, host, port, timeout_ms, quota_bps = row[:5]
+        socket_path = row[5] if len(row) > 5 else None
         node: dict[str, Any] = {
             "name": name,
-            "host": host,
-            "port": port,
+            # NULL 列统一规整成空/零：同机形态下 host/port 就是空的，
+            # 交给 config._validate 判定"二选一"是否成立。
+            "host": host or "",
+            "port": port or 0,
             "timeout_ms": timeout_ms or 0,
+            "socket_path": socket_path or "",
         }
         # quota_bps 是节点行里唯一的**可热更**运行列（其余为接线字段，
         # 重启生效）。
@@ -286,19 +294,28 @@ async def _fetch_raw(opts: MySQLOptions) -> dict[str, Any]:
     return rows_to_raw(service_row, node_rows, env_rows, target_rows)
 
 
-async def fetch_service_config(opts: MySQLOptions) -> configmod.ServiceConfig:
+async def fetch_service_config(
+    opts: MySQLOptions, scope_node: str | None = None,
+) -> configmod.ServiceConfig:
     """拉取一次全量配置并走统一校验管线，返回 ServiceConfig。
 
     rows_to_raw 阶段若抛 ValueError，它发生在 from_raw
     的来源包装之前，这里补上同样的来源前缀——保证"所有配置内容错误都
     带来源描述"的承诺对数据库路径同样成立（多实例对接不同配置库时靠它
     定位是哪个库写坏了）。
+
+    scope_node 非 None（同机部署模式）时，**先在全量配置上完成校验**再
+    裁剪到本机节点：节点独占、Target 唯一这些约束是跨节点的不变量，只
+    看本机那部分根本校验不出来。
     """
     try:
         raw = await _fetch_raw(opts)
     except ValueError as e:
         raise ValueError(f"{opts.describe()} 无效: {e}") from None
-    return configmod.from_raw(raw, source=opts.describe())
+    cfg = configmod.from_raw(raw, source=opts.describe())
+    if scope_node is not None:
+        cfg = configmod.scope_to_node(cfg, scope_node, source=opts.describe())
+    return cfg
 
 
 # pymysql/MySQL 的"重试也不会好"的错误码：库/凭据配置写错，属于部署
@@ -325,6 +342,7 @@ def _is_permanent_error(e: Exception) -> bool:
 async def load_service_config(
     opts: MySQLOptions,
     log: logging.Logger,
+    scope_node: str | None = None,
 ) -> configmod.ServiceConfig:
     """启动阶段的配置加载：数据库暂不可达时在 STARTUP_RETRY_FOR_S 内重试。
 
@@ -344,7 +362,7 @@ async def load_service_config(
     while True:
         attempt += 1
         try:
-            return await fetch_service_config(opts)
+            return await fetch_service_config(opts, scope_node)
         except ValueError:
             raise  # 配置内容错误：重试无意义，带着 from_raw 的中文诊断直接失败
         except Exception as e:
@@ -575,6 +593,7 @@ async def watch(
     queue: "asyncio.Queue[model.ControllerConfig]",
     boot_cfg: configmod.ServiceConfig,
     log: logging.Logger,
+    scope_node: str | None = None,
 ) -> None:
     """常驻轮询任务：发现配置内容变化就把新 ControllerConfig 投入 queue。
 
@@ -592,6 +611,10 @@ async def watch(
           里），但进程内没有它的 client：应用了该单元也采不到任何量；
     - 任何失败（连接断、校验不过）都保留当前配置继续监控（fail-static），
       下一轮再试。
+
+    scope_node（同机部署模式）会一路传给 fetch_service_config，因此变更
+    检测天然也是"本机口径"的：兄弟节点改限额/改挂载点不会在本机产生
+    一次无谓的热应用与日志。
     """
     last_canonical = canonical_config(boot_cfg.envs, boot_cfg.env_groups)
     last_nodes = list(boot_cfg.nodes)  # NodeConfig 是 dataclass，逐字段相等
@@ -602,7 +625,7 @@ async def watch(
     while True:
         await asyncio.sleep(opts.poll_interval_s)
         try:
-            cfg = await fetch_service_config(opts)
+            cfg = await fetch_service_config(opts, scope_node)
         except Exception as e:
             log.warning(
                 "轮询数据库配置失败，保留当前配置继续监控（fail-static），下一轮再试 "

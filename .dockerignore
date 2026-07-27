@@ -2,7 +2,13 @@
 .gitignore
 docs
 tests
-deploy
+# 注意：deploy/ 不可整体排除——deploy/docker/Dockerfile.node 需要
+# COPY deploy/docker/node-entrypoint.sh。只排掉与镜像构建无关的子目录。
+deploy/config
+deploy/mysql
+deploy/systemd
+deploy/tc
+deploy/haproxy
 Makefile
 README.md
 docker-compose.yml

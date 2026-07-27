@@ -1,9 +1,18 @@
 # rl-limiter systemd unit。
 #
-# 部署形态：本服务与 HAProxy 分离，独立部署在监控服务器上，通过内网 TCP
-# 只读采样多台 HAProxy。崩溃由 systemd 拉起（设计 §3.7）；限速由各台
-# HAProxy 自身的 shared bwlim 配置执行，本服务宕机对限速没有任何影响，
-# 只是监控/超限告警暂停。
+# 部署形态：**与 HAProxy 同机**——每台 HAProxy 服务器上装一个
+# rl-limiter，只采本机那台 HAProxy（本机 unix stats socket），
+# RL_NODE_NAME 指定本机在配置库 haproxy_nodes 里的节点名。崩溃由
+# systemd 拉起（设计 §3.7）；限速由本机 HAProxy 自身的 shared bwlim
+# 配置执行，本服务宕机对限速没有任何影响，只是本机监控/超限告警暂停。
+#
+# 前置条件（见 deploy/haproxy/bwlim-example.cfg）：
+#   1. 本机 haproxy.cfg 的 global 段有
+#        stats socket /run/haproxy/admin.sock mode 660 level user
+#   2. 本服务的运行用户在 haproxy 组里（socket 的 mode 660 靠属组授权），
+#      因此**不需要 root**：
+#        useradd --system --no-create-home --shell /usr/sbin/nologin rl-limiter
+#        usermod -aG haproxy rl-limiter
 #
 # 配置来源二选一（docs/03 §2）：
 #   - MySQL 配置库（生产推荐）：取消下方 Environment 行的注释并填入接入
@@ -15,23 +24,38 @@
 #   systemctl daemon-reload && systemctl enable --now rl-limiter
 
 [Unit]
-Description=rl-limiter - centralized HAProxy ingress bandwidth monitor (limits enforced by HAProxy shared bwlim)
+Description=rl-limiter - HAProxy ingress bandwidth monitor (co-located; limits enforced by HAProxy shared bwlim)
 Documentation=https://github.com/ipest-info/haproxy_ingress_rate_limiter
-# 需要通往各 HAProxy 节点与 MySQL 配置库的网络路径。
-After=network-online.target
+# 同机部署：HAProxy 先起，它的 unix stats socket 才存在。刻意不写
+# Requires——haproxy 挂了本服务只是采不到数（打 degraded 告警），不该
+# 被连坐停掉。仍需网络：配置库在远端 MySQL。
+After=network-online.target haproxy.service
 Wants=network-online.target
 
 [Service]
 Type=simple
+# 同机模式（必设）：本机在配置库 haproxy_nodes 里的节点名。不设则退化
+# 为集中监控模式（一个实例采多台，走内网 TCP stats socket）。
+Environment=RL_NODE_NAME=hap-1
 # Environment=RL_MYSQL_HOST=10.0.0.5 RL_MYSQL_USER=rl RL_MYSQL_PASSWORD=xxx RL_MYSQL_DB=rl_limiter
-# Environment=RL_CONSOLE_PORT=8090   # 内置 Web 控制台（只应经防火墙内访问）
+# 内置 Web 控制台。控制台**无鉴权且带写接口**，默认只绑 127.0.0.1；
+# 要让内网访问必须显式设 RL_CONSOLE_BIND 并用防火墙/安全组限制来源。
+# Environment=RL_CONSOLE_PORT=8090
+# Environment=RL_CONSOLE_BIND=10.0.0.11
 ExecStart=/usr/local/bin/rl-limiter -c /etc/rl-limiter/config.yaml
 Restart=always
 RestartSec=2
-# 注意：无需 CAP_NET_ADMIN——tc 内核兜底（deploy/tc/backstop.sh）部署于
-# 各台 HAProxy 机器本机，与本服务无关；本服务只通过内网 TCP 调用
-# HAProxy runtime API，无需任何附加特权。
+# 以专用非特权用户运行；读 HAProxy 的 unix stats socket 靠 haproxy 属组。
+User=rl-limiter
+Group=rl-limiter
+SupplementaryGroups=haproxy
+# 注意：无需 CAP_NET_ADMIN——tc 内核兜底（deploy/tc/backstop.sh）由运维
+# 或配置管理单独部署，与本服务无关；本服务只读本机 HAProxy runtime API。
 NoNewPrivileges=yes
+# 同机形态下本服务只需要读一个 unix socket + 连 MySQL，权限可以收得很紧。
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
 LimitNOFILE=65536
 
 [Install]

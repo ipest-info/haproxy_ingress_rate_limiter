@@ -3,36 +3,53 @@
 # RL_MYSQL_HOST 即启用，见 docs/03 §2.1），两种来源走同一套校验管线。
 #
 # 架构要点：限速由各节点 HAProxy 的 shared bwlim（聚合限速，配置常量
-# + reload 调整）执行；rl-limiter 是分离部署的集中监控服务——通过内网
-# TCP 采样多台 HAProxy 的下行带宽，对照这里登记的节点限额做持续超限
-# 告警。envs 是业务环境分组（纯分组，仅供聚合查看），挂载点
+# + reload 调整）执行；rl-limiter **与 HAProxy 同机部署**——每台服务器
+# 一个实例，只采本机那台 HAProxy 的下行带宽，对照这里登记的节点限额做
+# 持续超限告警。envs 是业务环境分组（纯分组，仅供聚合查看），挂载点
 # (节点, frontend) 声明 frontend 归属。
+#
+# 同机模式的开关是环境变量 RL_NODE_NAME=<本机节点名>：配置文件本身
+# **仍写全量**（节点独占等约束是跨节点的不变量，必须在全量上校验），
+# 校验通过后才裁剪到本机。三台机器可以共用同一份配置文件，只有
+# RL_NODE_NAME 不同。不设 RL_NODE_NAME 则为集中监控模式（一个实例采
+# 多台，此时节点要填 host/port 走内网 TCP）。
 #
 # 单位约定：quota_bps 一律为 bit/s（运维口径，40000000 = 40 Mbps），
 # 服务内部统一换算为 bytes/s（唯一换算点在 model.EnvQuota）。
 
-log_level: info                 # debug | info | warning | error
-tick_interval_s: 1.0            # 采样节拍（秒）；1 秒是设计基准，一般无需改动
+log_level: info                 # debug | info | warn | error
+tick_interval_s: 1.0            # 采样节拍（秒）；1 秒是设计基准，不要改动
 
-# 受控 HAProxy 节点清单。接线字段（host/port/timeout）重启生效；
-# quota_bps（登记限额）在 MySQL 模式下可热更。
-# 每台节点需在 haproxy.cfg 的 global 段开启内网 TCP stats socket：
-#   stats socket ipv4@<内网IP>:9999 level user
-# （rl-limiter 只做只读采样，user 级即够；端口只绑内网并用安全组/
-# 防火墙限制仅本服务所在机器可达，见 deploy/haproxy/bwlim-example.cfg）
+# 受控 HAProxy 节点清单。接线字段（socket_path / host / port / timeout）
+# 重启生效；quota_bps（登记限额）在 MySQL 模式下可热更。
+#
+# 采样通道二选一（校验强制恰好给一种）：
+#   - socket_path（**同机部署，推荐**）：本机 unix stats socket 绝对路径。
+#     该节点 haproxy.cfg 的 global 段需有：
+#       stats socket /run/haproxy/admin.sock mode 660 level user
+#     不占任何网络端口，访问权由文件属主/属组控制。
+#   - host + port（跨机集中监控）：内网 TCP stats socket。
+#       stats socket ipv4@<内网IP>:9999 level user
+#     端口只绑内网并用安全组/防火墙限制来源。
+# 两种形态 rl-limiter 都只做只读采样，user 级即够。
+# 详见 deploy/haproxy/bwlim-example.cfg。
 haproxy_nodes:
-  - name: hap-1                 # 节点名：envs[].targets[].node 引用它，必须全局唯一
-    host: 10.0.0.11             # 该节点的内网地址
-    port: 9999                  # TCP stats socket 端口
+  - name: hap-1                 # 节点名：envs[].targets[].node 引用它，必须全局唯一。
+                                # 同机模式下本机那台的 name 要与 RL_NODE_NAME 一致
+    socket_path: /run/haproxy/admin.sock   # 本机 unix stats socket（同机形态）
     quota_bps: 40000000         # 登记限额（bit/s），40 Mbps；被挂载的节点必填。
                                 # 应与该节点 haproxy.cfg 里 shared bwlim 的
                                 # limit（bytes/s，此例 5000000）保持一致；
                                 # 实测持续超过该值会触发持续超限告警
     timeout_ms: 500             # 单次 runtime API 命令超时（连接 + 读写，毫秒）
   - name: hap-2
-    host: 10.0.0.12
-    port: 9999
+    socket_path: /run/haproxy/admin.sock   # 注意：是"该节点本机上的路径"
     quota_bps: 40000000
+  # 跨机集中监控形态的写法（与上面二选一，不可混填）：
+  # - name: hap-3
+  #   host: 10.0.0.13
+  #   port: 9999
+  #   quota_bps: 40000000
 
 # 业务环境分组（纯分组）：环境不携带限额——限额登记在上方节点上。
 # 约束：节点是环境的独占资源（一个环境可横跨多台节点，一台节点只允许

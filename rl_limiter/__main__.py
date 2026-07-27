@@ -1,11 +1,20 @@
-# rl_limiter.__main__ —— rl-limiter 服务入口（集中监控，监控单元=节点）。
+# rl_limiter.__main__ —— rl-limiter 服务入口（监控单元=节点）。
 #
 # 限速由各台 HAProxy 自身的 shared bwlim（聚合限速，配置常量 + reload
-# 调整）执行；rl-limiter 是与 HAProxy 分离部署的集中监控服务：通过内网
-# TCP 连接多台 HAProxy 的 stats socket，每秒采样各节点受控 frontend 的
-# bytes_out，按节点聚合出带宽视图（Web 控制台实时展示 + 环境聚合），
-# 并对照配置库中登记的节点限额做持续超限告警。与配置来源断联时按最后
-# 一次加载的配置继续监控（fail-static）。
+# 调整）执行；rl-limiter 每秒采样受控 frontend 的 bytes_out，按节点聚合
+# 出带宽视图（Web 控制台实时展示），并对照配置库中登记的节点限额做持续
+# 超限告警。与配置来源断联时按最后一次加载的配置继续监控（fail-static）。
+#
+# 两种部署形态，由 RL_NODE_NAME 决定：
+#
+#   - **同机部署（默认推荐，设 RL_NODE_NAME=<本机节点名>）**：rl-limiter
+#     与 HAProxy 装在同一台服务器上，每台机器一个实例，只采本机那台
+#     HAProxy（走本机 unix stats socket，不占网络端口）。配置库仍是全量
+#     权威、仍做全量校验，只是校验后被裁剪到本机（config.scope_to_node）。
+#     好处：stats socket 不必对内网开放；一台机器的监控故障不外溢；
+#     监控进程与被监控对象同生共死，不存在"跨机网络分区导致误判"。
+#   - **集中监控（不设 RL_NODE_NAME，兼容保留）**：一个实例通过内网 TCP
+#     采样多台 HAProxy，提供跨节点的环境聚合视图。
 
 from __future__ import annotations
 
@@ -33,12 +42,23 @@ try:
 except Exception:  # pragma: no cover - 未安装场景
     SERVICE_VERSION = "dev"
 
+# 同机部署模式开关：设为本机在配置库 haproxy_nodes 里的节点名，该实例
+# 就只采本机那台 HAProxy（配置在全量校验后被裁剪到本机）。不设则退回
+# 集中监控形态（一个实例采多台）。
+ENV_NODE_NAME = "RL_NODE_NAME"
+# Web 控制台监听地址。默认只绑回环：控制台**没有鉴权**且带写接口（改
+# 限额、改挂载点、删环境），默认对外可达是不可接受的。要让同网段访问，
+# 由运维显式设成内网地址并配合防火墙/安全组限制来源。
+ENV_CONSOLE_BIND = "RL_CONSOLE_BIND"
+DEFAULT_CONSOLE_BIND = "127.0.0.1"
+
 
 def _summarize_nodes(nodes: list[model.NodeConfig]) -> str:
     """把受控 HAProxy 节点清单压缩成单个日志字段，格式：
-    "name=hap-1,addr=10.0.0.11:9999;..."。"""
+    "name=hap-1,endpoint=/run/haproxy/admin.sock;..."（同机形态）或
+    "name=hap-1,endpoint=10.0.0.11:9999;..."（跨机 TCP 形态）。"""
     return ";".join(
-        f"name={n.name},addr={n.host}:{n.port}"
+        f"name={n.name},endpoint={n.endpoint()}"
         for n in nodes
     )
 
@@ -58,7 +78,9 @@ def _summarize_envs(envs: list[model.EnvQuota]) -> str:
 async def _amain(cfg, log: logging.Logger,
                  db_opts: dbconfig.MySQLOptions | None = None,
                  console_port: int = 0,
-                 logbuf: "webconsole.LogBuffer | None" = None) -> None:
+                 logbuf: "webconsole.LogBuffer | None" = None,
+                 scope_node: str | None = None,
+                 console_bind: str = DEFAULT_CONSOLE_BIND) -> None:
     """事件循环内的主体：组装组件、引导配置、并发运行监控循环与配置源。
 
     db_opts 非 None 表示配置来自 MySQL（数据库配置模式，生产权威）：
@@ -69,10 +91,11 @@ async def _amain(cfg, log: logging.Logger,
     模块）：sampler 每拍向 StatusHub 发布一帧快照，配置热更经中继队列
     同步给控制台的配置视图。
     """
-    # --- 组装与各台 HAProxy 的 runtime API 客户端（内网 TCP，只读采样）。
+    # --- 组装与各台 HAProxy 的 runtime API 客户端（只读采样）。同机形态
+    # 下 cfg.nodes 已被裁剪为本机一条，这里天然只建一个 unix 客户端。
     # 客户端字典以节点名为键，与 Target.node / NodeConfig.name 对齐。
     clients = {
-        n.name: haproxy.RuntimeClient(n.host, n.port, n.timeout_s, log)
+        n.name: haproxy.RuntimeClient.from_node(n, log)
         for n in cfg.nodes
     }
 
@@ -88,7 +111,8 @@ async def _amain(cfg, log: logging.Logger,
             SERVICE_VERSION,
             version_fn=lambda: ctl.version,
             nodes=cfg.nodes,
-            degraded_fn=col.degraded_nodes)
+            degraded_fn=col.degraded_nodes,
+            scope_node=scope_node)
 
     sampler = hub.record if hub is not None else None
     ctl = MonitorLoop(col, sampler=sampler, log=log)
@@ -166,14 +190,16 @@ async def _amain(cfg, log: logging.Logger,
         ctl.run(config_queue, tick_interval_s), name="monitor-loop"))
     if db_opts is not None:
         tasks.append(asyncio.create_task(
-            dbconfig.watch(db_opts, source_queue, cfg, log),
+            dbconfig.watch(db_opts, source_queue, cfg, log, scope_node),
             name="db-config-watch"))
     if hub is not None:
         tasks.append(asyncio.create_task(
-            webconsole.run_console(console_port, hub, logbuf, db_opts, log),
+            webconsole.run_console(console_port, hub, logbuf, db_opts, log,
+                                   bind=console_bind),
             name="web-console"))
 
-    log.info("rl-limiter 服务已启动，监控循环开始运行 nodes=%d version=%s",
+    log.info("rl-limiter 服务已启动，监控循环开始运行 mode=%s nodes=%d version=%s",
+             f"同机（本机节点 {scope_node}）" if scope_node else "集中监控",
              len(cfg.nodes), SERVICE_VERSION)
 
     # 等待退出信号；任一常驻任务意外结束（本应永续运行）也触发整体退出，
@@ -193,12 +219,17 @@ async def _amain(cfg, log: logging.Logger,
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="rl-limiter",
-        description="集中式 HAProxy 入口带宽监控服务：远程采样多台 HAProxy "
-                    "的下行带宽，按节点/环境展示并做持续超限告警"
+        description="HAProxy 入口带宽监控服务：采样 HAProxy 的下行带宽，"
+                    "按节点展示并做持续超限告警"
                     "（限速由各节点 HAProxy 的 shared bwlim 配置执行）",
-        epilog="配置来源二选一：设置 RL_MYSQL_HOST（及 RL_MYSQL_PORT/USER/"
+        epilog="部署形态：设置 RL_NODE_NAME=<本机节点名> 进入同机部署模式"
+               "（与 HAProxy 同机，只采本机那台，推荐）；不设则为集中监控"
+               "模式（一个实例采多台）。"
+               "配置来源二选一：设置 RL_MYSQL_HOST（及 RL_MYSQL_PORT/USER/"
                "PASSWORD/DB/POLL_S）后从 MySQL 数据库读取配置并轮询热更新；"
-               "未设置时回落到 -c 指定的本地 YAML 文件。")
+               "未设置时回落到 -c 指定的本地 YAML 文件。"
+               "Web 控制台：设置 RL_CONSOLE_PORT 启用，RL_CONSOLE_BIND 指定"
+               "监听地址（默认 127.0.0.1——控制台无鉴权且带写接口）。")
     parser.add_argument(
         "-c", "--config", default="/etc/rl-limiter/config.yaml",
         help="YAML 配置文件路径（默认 %(default)s；设置 RL_MYSQL_HOST 时忽略）")
@@ -242,6 +273,12 @@ def main() -> None:
     if console_port:
         logbuf = webconsole.LogBuffer()
         logging.getLogger().addHandler(logbuf)
+    console_bind = (os.environ.get(ENV_CONSOLE_BIND) or "").strip() \
+        or DEFAULT_CONSOLE_BIND
+
+    # 部署形态判定：RL_NODE_NAME 已设置 → 同机部署（只采本机那台 HAProxy）；
+    # 未设置 → 集中监控（一个实例采多台）。
+    scope_node = (os.environ.get(ENV_NODE_NAME) or "").strip() or None
 
     # 配置来源判定：RL_MYSQL_HOST 已设置 → 数据库配置模式；否则本地 YAML。
     try:
@@ -254,9 +291,10 @@ def main() -> None:
         if db_opts is not None:
             # 启动加载单独跑一个事件循环：加载内含"等待数据库就绪"的重试，
             # 与主循环生命周期无关，分开跑让失败路径干净退出。
-            cfg = asyncio.run(dbconfig.load_service_config(db_opts, log))
+            cfg = asyncio.run(
+                dbconfig.load_service_config(db_opts, log, scope_node))
         else:
-            cfg = configmod.load(args.config)
+            cfg = configmod.load(args.config, scope_node)
     except KeyboardInterrupt:
         # 等待数据库就绪的重试窗口（最长两分钟）里按 Ctrl-C 是常规操作，
         # 必须干净退出；KeyboardInterrupt 是 BaseException，不加这条会
@@ -277,9 +315,12 @@ def main() -> None:
     # 受控节点清单、限额基准与配置来源。
     log.info(
         "服务配置加载完成，以下为完整配置摘要（排障第一条要看的日志） "
-        "config_source=%s log_level=%s tick_interval_s=%s "
-        "nodes=%d nodes_detail=%s units=%d units_detail=%s",
-        config_source, cfg.log_level,
+        "config_source=%s deploy_mode=%s scope_node=%s log_level=%s "
+        "tick_interval_s=%s nodes=%d nodes_detail=%s units=%d units_detail=%s",
+        config_source,
+        "colocated" if scope_node else "central",
+        scope_node or "-",
+        cfg.log_level,
         getattr(cfg, "tick_interval_s", 1.0),
         len(cfg.nodes), _summarize_nodes(cfg.nodes),
         len(cfg.envs), _summarize_envs(cfg.envs),
@@ -287,7 +328,8 @@ def main() -> None:
 
     try:
         asyncio.run(_amain(cfg, log, db_opts,
-                           console_port=console_port, logbuf=logbuf))
+                           console_port=console_port, logbuf=logbuf,
+                           scope_node=scope_node, console_bind=console_bind))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
     log.info("rl-limiter 服务已停止")

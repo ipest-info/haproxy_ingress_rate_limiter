@@ -179,3 +179,67 @@ def test_parse_show_stat_empty_output_raises():
 def test_parse_show_stat_bad_number_raises():
     with pytest.raises(StatParseError):
         parse_show_stat("# pxname,svname,scur,bout\nfe,FRONTEND,1,notanumber\n")
+
+
+# ---------------------------------------------------------------------------
+# 同机部署形态：本机 unix stats socket
+# ---------------------------------------------------------------------------
+
+class FakeUnixHAProxy(FakeHAProxy):
+    """同 FakeHAProxy，但监听 unix socket——复刻同机部署下 haproxy.cfg 的
+    `stats socket /run/haproxy/admin.sock mode 660 level user`。"""
+
+    def __init__(self, reply_fn, path):
+        super().__init__(reply_fn)
+        self.path = str(path)
+
+    async def start(self):
+        self._server = await asyncio.start_unix_server(self._handle, self.path)
+
+
+@contextlib.asynccontextmanager
+async def fake_unix_haproxy(reply_fn, path):
+    srv = FakeUnixHAProxy(reply_fn, path)
+    await srv.start()
+    try:
+        yield srv
+    finally:
+        await srv.stop()
+
+
+async def test_show_stat_over_unix_socket(tmp_path):
+    """unix socket 形态下命令语义与回包解析与 TCP 完全一致——两种接线
+    只有"怎么建连"一步不同。"""
+    sock = tmp_path / "admin.sock"
+    async with fake_unix_haproxy(lambda cmd: CANNED_CSV, sock) as srv:
+        c = RuntimeClient(socket_path=str(sock))
+        stats = await c.show_stat()
+        assert srv.commands == [SHOW_STAT_CMD]
+        assert stats == [
+            model.FrontendStat(name="fe_env1", bytes_out=12345, conn_cur=3),
+            model.FrontendStat(name="fe_idle", bytes_out=0, conn_cur=0),
+        ]
+        assert c.endpoint() == str(sock)
+
+
+async def test_from_node_picks_wiring(tmp_path):
+    """from_node 是"该走 unix 还是 TCP"的唯一判断点，接线装配不必重复分支。"""
+    sock = tmp_path / "admin.sock"
+    async with fake_unix_haproxy(lambda cmd: CANNED_CSV, sock) as srv:
+        node = model.NodeConfig(name="hap-1", socket_path=str(sock))
+        stats = await RuntimeClient.from_node(node).show_stat()
+        assert [s.name for s in stats] == ["fe_env1", "fe_idle"]
+        assert srv.commands == [SHOW_STAT_CMD]
+
+    async with fake_haproxy(lambda cmd: CANNED_CSV) as srv:
+        node = model.NodeConfig(name="hap-2", host="127.0.0.1", port=srv.port)
+        stats = await RuntimeClient.from_node(node).show_stat()
+        assert [s.name for s in stats] == ["fe_env1", "fe_idle"]
+
+
+async def test_unix_socket_missing_raises(tmp_path):
+    """socket 文件不存在（HAProxy 未起/路径写错）按普通采样失败上抛，
+    由 collector 的单节点容错兜住（fail-static + degraded）。"""
+    c = RuntimeClient(socket_path=str(tmp_path / "nope.sock"), timeout_s=1.0)
+    with pytest.raises((FileNotFoundError, ConnectionError, OSError)):
+        await c.show_stat()

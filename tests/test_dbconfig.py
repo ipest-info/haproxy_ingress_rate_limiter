@@ -136,3 +136,82 @@ def test_canonical_config_is_exact_identity():
                       target_rows=[("env-x", "hap-1", "fe_env_a")])
     assert dbconfig.canonical_config(regrouped.envs, regrouped.env_groups) != \
         dbconfig.canonical_config(cfg.envs, cfg.env_groups)
+
+
+# ---------------------------------------------------------------------------
+# 同机部署形态：socket_path 列 + 按本机节点裁剪
+# ---------------------------------------------------------------------------
+
+# 与更新后的 deploy/mysql/init.sql 种子同构：三台节点全部走本机 unix
+# socket（host/port 为 NULL），env-a 横跨 hap-1/hap-2，env-b 独占 hap-3。
+UNIX_NODE_ROWS = [
+    ("hap-1", None, None, 500, 40_000_000, "/run/haproxy/admin.sock"),
+    ("hap-2", None, None, 500, 40_000_000, "/run/haproxy/admin.sock"),
+    ("hap-3", None, None, 500, 40_000_000, "/run/haproxy/admin.sock"),
+]
+UNIX_ENV_ROWS = [("env-a",), ("env-b",)]
+UNIX_TARGET_ROWS = [
+    ("env-a", "hap-1", "fe_env_a"),
+    ("env-a", "hap-2", "fe_env_a"),
+    ("env-b", "hap-3", "fe_env_b"),
+]
+
+
+def test_unix_socket_rows_roundtrip():
+    """socket_path 列被组装进原始 dict；NULL 的 host/port 规整为空/零，
+    交由统一校验管线按"二选一"判定通过。"""
+    cfg = build(node_rows=UNIX_NODE_ROWS, env_rows=UNIX_ENV_ROWS,
+                target_rows=UNIX_TARGET_ROWS)
+    n = cfg.nodes[0]
+    assert n.socket_path == "/run/haproxy/admin.sock"
+    assert n.is_unix is True
+    assert (n.host, n.port) == ("", 0)
+    assert len(cfg.envs) == 3  # 每台有挂载点的节点一个监控单元
+
+
+def test_legacy_five_column_rows_still_parse():
+    """老库尚未 ALTER TABLE 加 socket_path 时，5 列行序仍能解析（退化为
+    纯 TCP 形态）——升级顺序不必严格"先改表再发版"。"""
+    cfg = build()  # NODE_ROWS 是 5 列的历史行序
+    assert cfg.nodes[0].socket_path == ""
+    assert cfg.nodes[0].is_unix is False
+    assert (cfg.nodes[0].host, cfg.nodes[0].port) == ("haproxy1", 9999)
+
+
+def test_scoped_checksum_ignores_other_nodes():
+    """同机模式下变更检测是"本机口径"的：兄弟节点改限额不应让本机产生
+    一次无谓的热应用。裁剪后的内容校验和对他节点的变更不敏感。"""
+    full = build(node_rows=UNIX_NODE_ROWS, env_rows=UNIX_ENV_ROWS,
+                 target_rows=UNIX_TARGET_ROWS)
+    scoped = config.scope_to_node(full, "hap-1")
+    before = dbconfig.config_checksum(scoped.envs, scoped.env_groups)
+
+    # 只改 hap-3（他环境的节点）的限额。
+    changed_rows = [
+        r if r[0] != "hap-3" else (r[0], r[1], r[2], r[3], 20_000_000, r[5])
+        for r in UNIX_NODE_ROWS
+    ]
+    full2 = build(node_rows=changed_rows, env_rows=UNIX_ENV_ROWS,
+                  target_rows=UNIX_TARGET_ROWS)
+    scoped2 = config.scope_to_node(full2, "hap-1")
+    assert dbconfig.config_checksum(scoped2.envs, scoped2.env_groups) == before
+
+    # 改本机限额则必须被检测到。
+    changed_local = [
+        r if r[0] != "hap-1" else (r[0], r[1], r[2], r[3], 20_000_000, r[5])
+        for r in UNIX_NODE_ROWS
+    ]
+    full3 = build(node_rows=changed_local, env_rows=UNIX_ENV_ROWS,
+                  target_rows=UNIX_TARGET_ROWS)
+    scoped3 = config.scope_to_node(full3, "hap-1")
+    assert dbconfig.config_checksum(scoped3.envs, scoped3.env_groups) != before
+
+
+def test_mixed_wiring_row_rejected():
+    """同时填了 socket_path 与 host/port 的行必须被拒——同机部署里最容易
+    犯的配错（加了 socket_path 却忘了清掉旧的 host/port）。"""
+    rows = [("hap-1", "haproxy1", 9999, 500, 40_000_000,
+             "/run/haproxy/admin.sock")]
+    with pytest.raises(ValueError, match="只能二选一"):
+        build(node_rows=rows, env_rows=[("env-a",)],
+              target_rows=[("env-a", "hap-1", "fe_env_a")])

@@ -41,6 +41,11 @@ DEFAULT_TIMEOUT_MS = 500
 # 合法日志级别枚举。拼错的级别若静默回落会让运维误以为已调级，必须显式拒绝。
 _LOG_LEVELS = ("debug", "info", "warn", "error")
 
+# unix socket 路径长度上限：AF_UNIX 的 sun_path 在 Linux 上是 108 字节的
+# 定长数组（含结尾 NUL），故可用长度为 107。超限只会在 connect() 时报
+# "AF_UNIX path too long"，必须在启动校验里提前拦下。
+_UNIX_PATH_MAX = 107
+
 
 @dataclass(slots=True)
 class ServiceConfig:
@@ -62,12 +67,15 @@ class ServiceConfig:
     envs: list[model.EnvQuota] = field(default_factory=list)
 
 
-def load(path: str) -> ServiceConfig:
+def load(path: str, scope_node: str | None = None) -> ServiceConfig:
     """读取 path 指向的 YAML 配置：解析、补默认值、校验，全部通过后返回。
 
     任何解析/校验失败都抛 ValueError，信息中带上文件路径与具体原因；
     文件不存在等 I/O 错误按原生 OSError 抛出（调用方能区分"配置写错"
     与"文件缺失"两类问题）。
+
+    scope_node 非 None 时，校验通过后把配置裁剪到该节点（同机部署模式，
+    见 scope_to_node）。
     """
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
@@ -75,7 +83,55 @@ def load(path: str) -> ServiceConfig:
         raw = yaml.safe_load(text)
     except yaml.YAMLError as e:
         raise ValueError(f"配置文件 {path} 解析失败（不是合法的 YAML）: {e}") from e
-    return from_raw(raw, source=f"配置文件 {path}")
+    cfg = from_raw(raw, source=f"配置文件 {path}")
+    if scope_node is not None:
+        cfg = scope_to_node(cfg, scope_node, source=f"配置文件 {path}")
+    return cfg
+
+
+def scope_to_node(cfg: ServiceConfig, node: str,
+                  source: str = "配置") -> ServiceConfig:
+    """把一份**已校验的全量配置**裁剪成"只关于 node 这一台机器"的视图。
+
+    这是同机部署模式（rl-limiter 与 HAProxy 装在同一台服务器上，
+    RL_NODE_NAME 指定本机节点名）的核心：配置库依然是全量的权威——
+    节点独占、Target 唯一等结构性约束本来就是**跨节点**的不变量，必须
+    在全量配置上校验（先 from_raw 再裁剪，顺序不可反）；裁剪只发生在
+    校验之后，决定"这个进程实际去采谁"。
+
+    裁剪后：
+      - nodes 只留本机一条（接线信息，用来建唯一那个 RuntimeClient）；
+      - envs（监控单元）只留 env_id == node 的那个单元——单元本就等于
+        节点，本机限速是否越限只取决于本机用量；
+      - env_groups 只留包含本机的环境，且**成员列表裁到只剩本机**。
+        为什么要裁成员而不是原样保留：控制台的环境聚合视图靠"把成员
+        节点的序列求和"得出，本进程采不到兄弟节点的数据，保留成员名
+        只会画出一条系统性偏低却看不出偏低的聚合曲线——宁可诚实地退化
+        成单节点视图（页面另有本地模式横幅说明）。
+
+    node 不在配置里直接抛 ValueError：RL_NODE_NAME 拼错会让服务连不上
+    任何东西却"看起来在跑"，必须在启动时炸掉。
+    """
+    names = [n.name for n in cfg.nodes]
+    if node not in names:
+        raise ValueError(
+            f"{source} 无效: 本机节点名 {node!r}（RL_NODE_NAME）未出现在 "
+            f"haproxy_nodes 中，已登记的节点为 "
+            f"{', '.join(repr(n) for n in names) or '（空）'}——"
+            f"同机部署模式下该名字必须与配置库里本机那条节点记录一致"
+        )
+    return ServiceConfig(
+        log_level=cfg.log_level,
+        tick_interval_s=cfg.tick_interval_s,
+        nodes=[n for n in cfg.nodes if n.name == node],
+        node_quotas={k: v for k, v in cfg.node_quotas.items() if k == node},
+        env_groups={
+            env_id: [node]
+            for env_id, members in cfg.env_groups.items()
+            if node in members
+        },
+        envs=[e for e in cfg.envs if e.env_id == node],
+    )
 
 
 def from_raw(raw: Any, source: str) -> ServiceConfig:
@@ -171,7 +227,7 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
                 f"haproxy_nodes[{i}]: 每个节点必须是键值映射，"
                 f"当前为 {type(n).__name__}"
             )
-        port_raw = n.get("port", 0)
+        port_raw = n.get("port", 0) or 0
         try:
             port = int(port_raw)
         except (TypeError, ValueError):
@@ -203,9 +259,12 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
         cfg.nodes.append(
             model.NodeConfig(
                 name=name,
-                host=str(n.get("host", "") or ""),
+                host=str(n.get("host", "") or "").strip(),
                 port=port,
                 timeout_s=timeout_ms / 1000.0,
+                # 同机部署形态：本机 unix stats socket 路径。与 host/port
+                # 互斥，二选一（校验在 _validate）。
+                socket_path=str(n.get("socket_path", "") or "").strip(),
             )
         )
         # 节点登记限额（bits/s，运维口径）——超限告警基准。有挂载点的
@@ -297,15 +356,47 @@ def _validate(cfg: ServiceConfig) -> None:
                 f"节点名是 target.node 的引用键，必须唯一"
             )
         node_index[n.name] = i
-        if not n.host:
+        # 采样通道二选一：本机 unix socket（同机部署）或内网 TCP（跨机）。
+        # 两者都给会产生"到底连哪个"的二义（同机部署里 socket_path 与
+        # 一个陈旧的 host:port 并存，是最容易采错节点的配错法），一个都
+        # 不给则根本无法接线——两种情况都必须在启动时拦下。
+        if n.socket_path and (n.host or n.port):
             raise ValueError(
-                f"haproxy_nodes[{i}] ({n.name}): host 不能为空——"
-                f"它是该节点 TCP stats socket 的内网地址"
+                f"haproxy_nodes[{i}] ({n.name}): socket_path 与 host/port "
+                f"只能二选一（当前 socket_path={n.socket_path!r}、"
+                f"host={n.host!r}、port={n.port!r}）——同机部署填 socket_path"
+                f"（本机 unix stats socket），跨机监控填 host/port"
+                f"（内网 TCP stats socket）"
             )
-        if n.port < 1 or n.port > 65535:
+        if not n.socket_path:
+            if not n.host:
+                raise ValueError(
+                    f"haproxy_nodes[{i}] ({n.name}): host 不能为空——"
+                    f"跨机监控形态下它是该节点 TCP stats socket 的内网地址；"
+                    f"同机部署请改填 socket_path（本机 unix stats socket 路径）"
+                )
+            if n.port < 1 or n.port > 65535:
+                raise ValueError(
+                    f"haproxy_nodes[{i}] ({n.name}): port 必须在 1-65535 范围内，"
+                    f"当前值 {n.port!r}"
+                )
+        elif not n.socket_path.startswith("/"):
+            # 相对路径的解析结果取决于服务的工作目录（systemd 下通常是 /），
+            # 同一份配置在不同启动方式下会连到不同的位置——必须写绝对路径。
             raise ValueError(
-                f"haproxy_nodes[{i}] ({n.name}): port 必须在 1-65535 范围内，"
-                f"当前值 {n.port!r}"
+                f"haproxy_nodes[{i}] ({n.name}): socket_path 必须是绝对路径"
+                f"（当前值 {n.socket_path!r}）——相对路径的解析依赖服务的"
+                f"工作目录，同一份配置换个启动方式就会连到别处"
+            )
+        elif len(n.socket_path.encode("utf-8")) > _UNIX_PATH_MAX:
+            # AF_UNIX 的 sun_path 是定长数组（Linux 上 108 字节含结尾 NUL）。
+            # 超长路径要到 connect() 才报 "AF_UNIX path too long"，而采样
+            # 每秒一次——那会变成每秒一条看不懂的告警。启动时拦下。
+            raise ValueError(
+                f"haproxy_nodes[{i}] ({n.name}): socket_path 过长"
+                f"（{len(n.socket_path.encode('utf-8'))} 字节，上限 "
+                f"{_UNIX_PATH_MAX}）——unix socket 路径长度受内核 sun_path "
+                f"限制，请换用更短的路径（如 /run/haproxy/admin.sock）"
             )
 
     # Target → env_id 的归属表，用于检出跨环境（或同环境重复书写）的冲突。

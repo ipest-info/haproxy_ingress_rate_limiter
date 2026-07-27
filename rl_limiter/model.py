@@ -168,13 +168,31 @@ class ControllerConfig:
 class NodeConfig:
     """一台受控 HAProxy 节点的连接配置（基础设施配置，启动时定型）。
 
-    采样走 HAProxy 在内网监听的 TCP stats socket（haproxy.cfg：
-    `stats socket ipv4@<内网IP>:9999 level user`——rl-limiter 只做只读
-    采样，user 级即够）。端口必须只绑内网并用安全组/防火墙限制仅限速
-    服务可达。
+    采样通道二选一，由配置决定（校验强制恰好给一种）：
+
+    - **本机 unix socket（同机部署，推荐）**：rl-limiter 与 HAProxy 装在
+      同一台服务器上，haproxy.cfg 写
+      `stats socket /run/haproxy/admin.sock mode 660 level user`，配置里
+      填 socket_path。stats socket 完全不占网络端口，访问权靠文件属主/
+      属组控制——同机形态下这是最小攻击面的接法。
+    - **内网 TCP（跨机监控，兼容保留）**：haproxy.cfg 写
+      `stats socket ipv4@<内网IP>:9999 level user`，配置里填 host/port。
+      端口必须只绑内网并用安全组/防火墙限制仅监控服务可达。
+
+    两种形态下 rl-limiter 都只做只读采样，`level user` 即够。
     """
 
     name: str                # 节点名（Target.node 引用它）
-    host: str                # 内网地址
-    port: int                # TCP stats socket 端口
+    host: str = ""           # 内网地址（TCP 形态）
+    port: int = 0            # TCP stats socket 端口（TCP 形态）
     timeout_s: float = 0.5   # 单次 runtime API 命令超时（连接 + 读写）
+    socket_path: str = ""    # 本机 unix stats socket 路径（同机形态）
+
+    @property
+    def is_unix(self) -> bool:
+        """该节点是否走本机 unix socket 采样（同机部署形态）。"""
+        return bool(self.socket_path)
+
+    def endpoint(self) -> str:
+        """人类可读的采样端点描述，用于日志与控制台展示。"""
+        return self.socket_path if self.is_unix else f"{self.host}:{self.port}"

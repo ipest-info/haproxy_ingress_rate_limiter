@@ -131,8 +131,27 @@ def test_hub_nodes_view_degraded():
         version=1, envs=[_unit()],
         env_groups={"env-a": ["hap-1", "hap-2"]}))
     view = hub.overview()["nodes"]
-    assert view["hap-1"] == {"host": "haproxy1", "port": 9999, "degraded": False}
+    assert view["hap-1"] == {
+        "host": "haproxy1", "port": 9999, "endpoint": "haproxy1:9999",
+        "unix": False, "degraded": False,
+    }
     assert view["hap-2"]["degraded"] is True
+    # 集中监控模式下没有本机节点概念。
+    assert hub.overview()["scope_node"] is None
     # 快照同样携带节点视图（SSE 帧里实时可见采样健康）。
     hub.record(1.0, [_usage()])
     assert hub.history()[-1]["nodes"]["hap-2"]["degraded"] is True
+
+
+def test_hub_nodes_view_unix_socket_and_scope_node():
+    """同机部署形态：节点视图的 endpoint 是 unix socket 路径，
+    overview 带上本机节点名供页面挂本地模式横幅。"""
+    hub = webconsole.StatusHub(
+        "test", version_fn=lambda: 1,
+        nodes=[model.NodeConfig(
+            name="hap-1", socket_path="/run/haproxy/admin.sock")],
+        scope_node="hap-1")
+    view = hub.overview()["nodes"]
+    assert view["hap-1"]["endpoint"] == "/run/haproxy/admin.sock"
+    assert view["hap-1"]["unix"] is True
+    assert hub.overview()["scope_node"] == "hap-1"

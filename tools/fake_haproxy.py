@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 # tools/fake_haproxy.py —— 本地演示/联调用的"假 HAProxy stats socket"。
 #
-# 用途：在没有真实 HAProxy 的开发机上模拟一台受控节点——
-# 一个监听内网 TCP 的 stats socket（真实部署中对应 haproxy.cfg 的
-# `stats socket ipv4@<内网IP>:9999 level admin`）。rl-limiter 连上来后：
+# 用途：在没有真实 HAProxy 的开发机上模拟一台受控节点的 stats socket。
+# 两种形态与真实部署一一对应：
+#   --unix-path /run/haproxy/admin.sock  → 同机部署（haproxy.cfg 的
+#       `stats socket /run/haproxy/admin.sock mode 660 level user`）
+#   --port 19991                         → 跨机集中监控（haproxy.cfg 的
+#       `stats socket ipv4@<内网IP>:9999 level user`）
+# rl-limiter 连上来后：
 #   - "show stat -1 1 -1"：返回带 "# " 列头的 CSV，其中各 frontend 的
 #     bytes_out 计数器按 --frontends 指定的速率 × 真实流逝时间持续增长
 #     （附带 --jitter 抖动），scur 在 5~50 之间随机游走，模拟真实流量；
@@ -15,15 +19,19 @@
 # 协议要点（与真实 runtime socket 一致）：非交互模式下一次连接只服务
 # 一条命令，应答完即由服务端关闭连接——客户端每条命令都要重新拨号。
 #
-# 用法示例（模拟两台 HAProxy，见 docs/03-限速服务运行指南.md）：
-#   python3 tools/fake_haproxy.py --port 19991 --frontends fe_env_a:2000000,fe_env_b:500000
-#   python3 tools/fake_haproxy.py --port 19992 --frontends fe_env_a:1500000
+# 用法示例（见 docs/03-限速服务运行指南.md）：
+#   同机形态：
+#     python3 tools/fake_haproxy.py --unix-path /tmp/hap1.sock --frontends fe_env_a:2000000
+#   跨机形态：
+#     python3 tools/fake_haproxy.py --port 19991 --frontends fe_env_a:2000000,fe_env_b:500000
+#     python3 tools/fake_haproxy.py --port 19992 --frontends fe_env_a:1500000
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import logging
+import pathlib
 import random
 import time
 
@@ -148,21 +156,46 @@ def parse_frontends(spec: str, jitter: float) -> list[FakeFrontend]:
 
 async def amain(args: argparse.Namespace) -> None:
     fake = FakeHAProxy(parse_frontends(args.frontends, args.jitter))
-    server = await asyncio.start_server(fake.handle, host=args.host, port=args.port)
+    frontends = ",".join(
+        f"{f.name}:{f.rate_bps:.0f}" for f in fake.frontends.values())
+    if args.unix_path:
+        # 同机部署形态：模拟 haproxy.cfg 的
+        # `stats socket /run/haproxy/admin.sock mode 660 level user`。
+        # 残留的旧 socket 文件会让 bind 直接失败（"Address already in
+        # use"），先清掉——演示工具，不必为此要求手工 rm。
+        path = pathlib.Path(args.unix_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_socket():
+            path.unlink()
+        server = await asyncio.start_unix_server(fake.handle, path=str(path))
+        endpoint = str(path)
+    else:
+        server = await asyncio.start_server(
+            fake.handle, host=args.host, port=args.port)
+        endpoint = f"{args.host}:{args.port}"
     log.info("假 HAProxy stats socket 已开始监听，等待 rl-limiter 接入 "
-             "addr=%s:%d frontends=%s jitter=%.2f",
-             args.host, args.port,
-             ",".join(f"{f.name}:{f.rate_bps:.0f}" for f in fake.frontends.values()),
-             args.jitter)
-    async with server:
-        await server.serve_forever()
+             "endpoint=%s frontends=%s jitter=%.2f",
+             endpoint, frontends, args.jitter)
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        if args.unix_path:
+            pathlib.Path(args.unix_path).unlink(missing_ok=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="假 HAProxy stats socket（TCP），本地演示/联调 rl-limiter 用")
+        description="假 HAProxy stats socket（unix 或 TCP），"
+                    "本地演示/联调 rl-limiter 用")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 %(default)s）")
-    parser.add_argument("--port", type=int, required=True, help="监听端口（模拟内网 TCP stats socket）")
+    parser.add_argument(
+        "--port", type=int,
+        help="TCP 监听端口（模拟内网 TCP stats socket；与 --unix-path 二选一）")
+    parser.add_argument(
+        "--unix-path", default="",
+        help="unix socket 路径（模拟同机部署形态的本机 stats socket；"
+             "与 --port 二选一）")
     parser.add_argument(
         "--frontends", default="fe_env_a:2000000",
         help="frontend 清单：name:每秒增长字节数，逗号分隔（默认 %(default)s）")
@@ -170,6 +203,8 @@ def main() -> None:
         "--jitter", type=float, default=0.2,
         help="流量抖动幅度，0.2 表示 ±20%%（默认 %(default)s）")
     args = parser.parse_args()
+    if bool(args.port) == bool(args.unix_path):
+        parser.error("--port 与 --unix-path 必须且只能指定一个")
 
     logging.basicConfig(
         level=logging.INFO,

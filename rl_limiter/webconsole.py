@@ -17,8 +17,12 @@
 #     限额 画在同一条时间轴上——曲线被压在限额线下即是效果本身；持续
 #     压不住则以超限状态高亮（提示 HAProxy 配置与库不一致）。
 #
-# 安全边界：控制台无鉴权，定位与 HAProxy 的 stats socket 相同——只允许
-# 绑定内网/受防火墙保护的端口（docker compose 演示中仅映射到宿主机）。
+# 安全边界：控制台无鉴权，定位与 HAProxy 的 stats socket 相同。默认只
+# 绑回环（127.0.0.1），要放到内网必须由运维显式设 RL_CONSOLE_BIND 并配合
+# 防火墙/安全组限制来源；绑非回环地址时会打一条 warning 留痕。
+#
+# 同机部署形态下每台 HAProxy 各有一个控制台，只展示本机节点；环境聚合
+# 视图退化为"只含本机成员"，页面顶部会挂本地模式横幅说明这一点。
 
 from __future__ import annotations
 
@@ -96,9 +100,14 @@ class StatusHub:
         version_fn: Callable[[], int],
         nodes: list[model.NodeConfig] | None = None,
         degraded_fn: Callable[[], set] | None = None,
+        scope_node: str | None = None,
     ):
         self._service_version = service_version
         self._version_fn = version_fn
+        # 同机部署模式下的本机节点名（None = 集中监控模式）。页面据此
+        # 显示"本地模式"横幅：环境聚合视图此时只含本机，不标出来会被
+        # 误读成"整个环境只跑了这么多流量"。
+        self._scope_node = scope_node
         # 受控节点接线视图（启动时定型，与 RuntimeClient 集合一致）。
         self._nodes = list(nodes or [])
         # 采样已持续失败的节点集合（collector.degraded_nodes 闭包）。
@@ -133,6 +142,10 @@ class StatusHub:
             n.name: {
                 "host": n.host,
                 "port": n.port,
+                # 采样端点的统一展示口径：同机形态是 unix socket 路径，
+                # 跨机形态是 host:port。页面直接显示这个字段。
+                "endpoint": n.endpoint(),
+                "unix": n.is_unix,
                 "degraded": n.name in degraded,
             }
             for n in self._nodes
@@ -190,6 +203,8 @@ class StatusHub:
         return {
             "service_version": self._service_version,
             "config_version": self._version_fn(),
+            # None = 集中监控；非 None = 同机部署，值为本机节点名。
+            "scope_node": self._scope_node,
             "uptime_s": time.time() - self._started,
             # 节点监控单元配置（quota/frontends）与环境分组。
             "node_config": self._unit_config,
@@ -366,15 +381,26 @@ async def run_console(
     logbuf: LogBuffer,
     db_opts: dbconfig.MySQLOptions | None,
     log: logging.Logger,
+    bind: str = "127.0.0.1",
 ) -> None:
-    """常驻任务：启动控制台 HTTP 服务并挂起到被取消，取消时干净回收。"""
+    """常驻任务：启动控制台 HTTP 服务并挂起到被取消，取消时干净回收。
+
+    bind 默认只绑回环：控制台无鉴权且带写接口，默认对外可达不可接受
+    （由 RL_CONSOLE_BIND 显式放开，见 __main__）。绑到非回环地址时打一条
+    warning，让"我以为它只在本机"的误配在日志里留痕。
+    """
     runner = web.AppRunner(build_app(hub, logbuf, db_opts, log), access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, bind, port)
     await site.start()
     log.info(
-        "Web 控制台已启动（实时观测 + 配置管理） port=%d db_mode=%s",
-        port, db_opts is not None)
+        "Web 控制台已启动（实时观测 + 配置管理） bind=%s port=%d db_mode=%s",
+        bind, port, db_opts is not None)
+    if bind not in ("127.0.0.1", "::1", "localhost"):
+        log.warning(
+            "Web 控制台绑定在非回环地址上，而控制台**没有任何鉴权**且提供"
+            "写接口（改登记限额/改挂载点/删环境）——请确认该地址只在内网"
+            "且已由防火墙/安全组限制来源 bind=%s port=%d", bind, port)
     try:
         await asyncio.Event().wait()  # 挂起至任务被取消
     finally:

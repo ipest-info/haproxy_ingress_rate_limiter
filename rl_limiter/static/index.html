@@ -130,6 +130,11 @@ h3.section { font-size: 14px; color: var(--text-secondary); margin: 22px 4px 10p
   border-radius: 8px; padding: 10px 14px; max-width: 420px; box-shadow: 0 6px 20px rgba(0,0,0,.25);
 }
 .toast.err { border-left-color: var(--status-critical); }
+#scope-banner {
+  margin: 0 16px 12px; padding: 10px 14px; border-radius: 8px;
+  border-left: 4px solid var(--status-warn, #d9822b);
+  background: rgba(217,130,43,.10); font-size: 13px; line-height: 1.6;
+}
 </style>
 </head>
 <body>
@@ -147,6 +152,15 @@ h3.section { font-size: 14px; color: var(--text-secondary); margin: 22px 4px 10p
     </select>
   </span>
 </header>
+<!-- 同机部署模式的横幅：本实例只采本机那台 HAProxy，环境聚合视图里
+     只有本机成员。不标出来，聚合曲线会被误读成"整个环境只跑了这么
+     多"。集中监控模式下这块保持隐藏。 -->
+<div id="scope-banner" style="display:none">
+  <b>同机部署模式</b>：本控制台属于节点 <b id="scope-node">–</b>，只监控**本机**
+  这台 HAProxy（采样走本机 unix stats socket）。下方「环境聚合视图」因此
+  只含本机成员，<b>不是该环境的全量带宽</b>——环境全量视图需要各节点的
+  控制台分别查看，或由后续的集中后台汇总。
+</div>
 <main>
   <div class="card">
     <div class="row">
@@ -262,14 +276,18 @@ function renderNodes() {
   const names = Object.keys(state.nodes);
   if (!names.length) { table.innerHTML = ""; return; }
   const owners = nodeOwners();
-  table.innerHTML = `<tr><th>节点</th><th>地址（stats socket）</th><th>所属环境</th><th>登记限额</th><th>采样状态</th></tr>`;
+  table.innerHTML = `<tr><th>节点</th><th>stats socket</th><th>所属环境</th><th>登记限额</th><th>采样状态</th></tr>`;
   for (const name of names) {
     const n = state.nodes[name];
     const conf = state.nodeConfig[name];
+    // endpoint 同时覆盖两种接线形态：同机是 unix socket 路径，跨机是
+    // host:port（老快照没有该字段时回落到 host:port）。
+    const endpoint = n.endpoint || `${n.host}:${n.port}`;
+    const kind = n.unix ? "unix" : "tcp";
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td class="nname">${name}</td>
-      <td class="naddr">${n.host}:${n.port}</td>
+      <td class="naddr">${endpoint} <span class="hint">(${kind})</span></td>
       <td>${owners[name] ? `<b>${owners[name]}</b>` : '<span class="hint">未分配</span>'}</td>
       <td class="naddr">${conf ? (conf.quota_bps / 1e6) + " Mbps" : "–"}</td>
       <td>${n.degraded
@@ -700,6 +718,13 @@ async function loadOverview() {
   if (o.nodes) { state.nodes = o.nodes; renderNodes(); nodeOptions($("#new-env-node"), null); }
   $("#svc-version").textContent = o.service_version || "–";
   $("#cfg-version").textContent = o.config_version ?? "–";
+  // 同机部署模式横幅：scope_node 非空即本机节点名。
+  if (o.scope_node) {
+    $("#scope-node").textContent = o.scope_node;
+    $("#scope-banner").style.display = "";
+  } else {
+    $("#scope-banner").style.display = "none";
+  }
   const up = Math.floor(o.uptime_s || 0);
   $("#uptime").textContent = up >= 3600 ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
 }
