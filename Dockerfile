@@ -1,5 +1,14 @@
-# deploy/docker/Dockerfile.node —— 一台"HAProxy 节点"的镜像：
-# **Ubuntu 24.04 LTS + 发行版自带 HAProxy + 同机的 rl-limiter**。
+# 本仓库的统一镜像：**Ubuntu 24.04 LTS + 发行版自带 HAProxy +
+# 同机的 rl-limiter**。docker compose 里所有自建服务都用它，靠"给不给
+# command"区分两种角色：
+#
+#   node1/2/3  不给 command → 走 ENTRYPOINT，即"HAProxy 节点"角色：
+#              容器内同时跑 haproxy 与 rl-limiter（同机部署）
+#   web        command: python3 tools/random_web.py ...
+#   loadgen    command: python3 tools/loadgen.py ...
+#              → 这两个只借用镜像里的 Python 环境。入口脚本发现有参数就
+#                exec 它，不会把 haproxy 也拉起来（`command:` 覆盖的是
+#                CMD 而非 ENTRYPOINT，没有那个分支它们会跑成节点）。
 #
 # 为什么不用 haproxy 官方镜像：官方镜像只有 haproxy 一个进程，而本项目
 # 的部署形态是"rl-limiter 与 HAProxy 装在同一台服务器上"——用 Ubuntu
@@ -56,4 +65,6 @@ RUN mkdir -p /run/haproxy /etc/rl-limiter /etc/haproxy
 COPY deploy/docker/node-entrypoint.sh /usr/local/bin/node-entrypoint.sh
 RUN chmod +x /usr/local/bin/node-entrypoint.sh
 
+# 不带参数 = HAProxy 节点角色；带参数（compose 的 command:）= 直接执行
+# 那条命令，见入口脚本开头的 exec "$@" 分支。
 ENTRYPOINT ["/usr/local/bin/node-entrypoint.sh"]

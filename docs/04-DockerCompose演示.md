@@ -41,7 +41,7 @@ Web 控制台。后端挂一个**每次请求返回随机大小响应**的模拟
 | 服务 | 说明 | 宿主机端口 |
 | ---- | ---- | ---- |
 | `mysql` | 配置库（表结构与种子数据：`deploy/mysql/init.sql`） | `127.0.0.1:3306` |
-| `node1` / `node2` / `node3` | **Ubuntu 24.04 + HAProxy 2.8 + 同机 rl-limiter**（`deploy/docker/Dockerfile.node`）。HAProxy 按环境角色分用 `deploy/docker/haproxy-env-a/b.cfg`，limit 各 5,000,000 bytes/s = 40 Mbps；rl-limiter 用 `RL_NODE_NAME` 锁定本机节点 | 代理 `8080`/`8082`/`8083`；控制台 `127.0.0.1:8090`/`8092`/`8093` |
+| `node1` / `node2` / `node3` | **Ubuntu 24.04 + HAProxy 2.8 + 同机 rl-limiter**（根目录 `Dockerfile`，全仓库统一镜像）。HAProxy 按环境角色分用 `deploy/docker/haproxy-env-a/b.cfg`，limit 各 5,000,000 bytes/s = 40 Mbps；rl-limiter 用 `RL_NODE_NAME` 锁定本机节点 | 代理 `8080`/`8082`/`8083`；控制台 `127.0.0.1:8090`/`8092`/`8093` |
 | `web` | 模拟业务后端，每次请求返回 256 KiB～2 MiB 随机大小响应；`/big` 为大文件下载端点（默认 512 MiB，`WEB_BIG_BYTES` 可调）（`tools/random_web.py`） | 无 |
 | `loadgen` | 压测服务，打散到全部入口，并发数可在线调节；默认每入口另挂 1 条**长连接大文件下载**（`tools/loadgen.py`） | `8084`（控制口） |
 

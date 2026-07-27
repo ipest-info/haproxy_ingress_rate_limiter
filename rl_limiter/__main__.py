@@ -374,6 +374,20 @@ def main() -> None:
         print("rl-limiter: 启动在配置加载阶段被中断（Ctrl-C），已退出",
               file=sys.stderr)
         raise SystemExit(130)
+    except FileNotFoundError as e:
+        # 配置文件不存在时，光报一个 errno 帮不上忙——真正的问题往往是
+        # "本该走数据库模式却没设 RL_MYSQL_HOST"，于是静默回落到了本地
+        # YAML 这条路上（容器里尤其常见）。把两条出路都点明。
+        print(
+            f"rl-limiter: 找不到配置文件 {args.config}（{e.strerror}）。\n"
+            f"  配置来源二选一：\n"
+            f"    - 数据库模式：设置 RL_MYSQL_HOST（及 RL_MYSQL_USER/"
+            f"PASSWORD/DB 等），此时 -c 会被忽略；\n"
+            f"    - 本地 YAML：用 -c 指向一份实际存在的配置文件"
+            f"（示例见 deploy/config/limiter.example.yaml）。\n"
+            f"  当前 RL_MYSQL_HOST 未设置，因此走的是本地 YAML 这条路。",
+            file=sys.stderr)
+        raise SystemExit(1)
     except Exception as e:
         print(f"rl-limiter: {e}", file=sys.stderr)
         raise SystemExit(1)

@@ -2,13 +2,14 @@
 
 带宽账密计费模式下的入口限速与监控系统：**限速由各台 HAProxy（TCP L4
 负载均衡）自身的 shared bwlim 聚合限速执行**——本机受控 frontend 全部
-连接（含存量长连接）的总速率被硬性压在限额内，限额是配置常量，调整走
-"改库 + 改 cfg + reload"的发布流程。**rl-limiter（Python）与 HAProxy
-同机部署**：每台 HAProxy 服务器上一个实例，做两件事——①通过**本机 unix
-stats socket** 只读采样本机下行带宽并做持续超限告警；②**把配置库里的
-限额自动落到本机数据面**：限额一改就改写本机 haproxy.cfg 的 bwlim limit
-并 reload，实测 ~74 ms 生效。内置 **Web 控制台**（实时曲线、限额登记、
-日志）。
+连接（含存量长连接）的总速率被硬性压在限额内。限额是 haproxy.cfg 里的
+配置常量，但**调整已自动化**：改库即改数据面。
+
+**rl-limiter（Python）与 HAProxy 同机部署**：每台 HAProxy 服务器上一个
+实例，做两件事——①通过**本机 unix stats socket** 只读采样本机下行带宽
+并做持续超限告警；②**把配置库里的限额自动落到本机数据面**：限额一改就
+改写本机 haproxy.cfg 的 bwlim limit 并 reload，实测 ~74 ms 生效。内置
+**Web 控制台**（实时曲线、限额登记、日志）。
 
 > **同机部署的首要理由就是"改完立刻生效"**：只有在同一台机器上，服务
 > 才有可能直接改本机配置并 reload；跨机的集中服务做不到（要么开 SSH，
@@ -47,8 +48,8 @@ tools/            # fake_haproxy.py（联调假节点，支持 unix / TCP）
                   # random_web.py（随机大小响应的模拟后端）、loadgen.py（可调并发压测）
 deploy/           # systemd（同机形态）、haproxy 聚合限速配置示例、tc 兜底脚本、
                   # YAML 示例配置、mysql/init.sql（配置库建表+种子）
-  docker/         #   Dockerfile.node（Ubuntu 24.04 + HAProxy + 同机 rl-limiter）、
-                  #   node-entrypoint.sh、compose 用的 HAProxy 配置
+  docker/         #   node-entrypoint.sh（节点入口：haproxy + 同机 rl-limiter）、
+                  #   compose 用的 HAProxy 配置模板
 docker-compose.yml # 一键演示：MySQL + 三台 Ubuntu 24.04 节点 + 模拟后端 + 压测
 ```
 

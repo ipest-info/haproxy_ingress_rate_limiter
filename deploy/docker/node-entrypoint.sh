@@ -14,6 +14,20 @@
 #   4. 转发 SIGTERM/SIGINT 给两个子进程，docker stop 能干净收场。
 set -euo pipefail
 
+# 带参数时直接执行参数，不走 HAProxy 节点那套。
+#
+# 本镜像身兼两职：既是"HAProxy 节点"（不带参数 = 默认角色），也被 web /
+# loadgen 等**只借用它的 Python 环境**的服务复用。后者在 compose 里用
+# `command:` 指定要跑的程序，而 `command:` 覆盖的是 CMD、**不是
+# ENTRYPOINT**——没有这个分支，它们会连同 haproxy 一起被拉起来，且因为
+# 没有 RL_NODE_NAME / RL_MYSQL_HOST / cfg 模板而反复失败重启，症状是
+#   ENTRYPOINT 启动 rl-limiter（同机模式）node=<未设置>
+#   rl-limiter: [Errno 2] No such file or directory: '/etc/rl-limiter/config.yaml'
+# 而真正该跑的 random_web.py / loadgen.py 一次都没执行。
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+fi
+
 # 只读挂进来的配置模板 → 复制成容器内可写的真实配置。
 # 为什么要复制：限额自动应用（rl-limiter 的 enforcer）要**原地改写**
 # haproxy.cfg，而 compose 的单文件 bind mount 既是只读的、也无法被
@@ -47,7 +61,12 @@ elif [ -f "$LEGACY_CFG" ] && [ "$LEGACY_CFG" != "$HAPROXY_CFG" ]; then
         "$HAPROXY_TEMPLATE（限额自动应用要求 cfg 可写，只读单文件 bind" \
         "mount 无法被原子替换）"
 elif [ -f "$HAPROXY_CFG" ]; then
-    log "未挂载模板，沿用镜像内已有的配置 cfg=$HAPROXY_CFG"
+    # 注意：Ubuntu 的 haproxy 包**自带**一份 /etc/haproxy/haproxy.cfg，
+    # 所以这条分支很容易在"忘了挂模板"时静默命中——haproxy 会正常起来、
+    # stats socket 也有（发行版默认配置里就有那一行），看着一切正常，
+    # 实际却没有任何限速。下面的 bwlim 自检就是为这种情况准备的。
+    log "未挂载模板，沿用镜像内已有的配置 cfg=$HAPROXY_CFG" \
+        "（若非有意为之，请检查 compose 是否挂了 $HAPROXY_TEMPLATE）"
 else
     log "致命：找不到 HAProxy 配置。已依次查找："
     log "  模板（compose 应挂在这里）: $HAPROXY_TEMPLATE"
@@ -56,6 +75,15 @@ else
     log "最常见的原因是**镜像与 compose 版本不匹配**（compose 已更新、" \
         "镜像还是旧的）。请重建镜像：docker compose up -d --build"
     exit 1
+fi
+
+# 限速自检：本项目的全部限速能力都来自 shared bwlim 过滤器。配置里一行
+# 都没有，说明这个容器只是个普通反代——限速静默失效是本项目最不能接受的
+# 故障（用户以为限住了，实际没有），所以宁可喊得刺眼一点。
+if ! grep -qE '^\s*filter\s+bwlim-out\s' "$HAPROXY_CFG"; then
+    log "警告：$HAPROXY_CFG 里没有任何 shared bwlim 配置（filter bwlim-out），"
+    log "警告：本节点将**不做任何限速**。多半是 cfg 模板没挂载、用成了"
+    log "警告：发行版自带的默认配置。参照 deploy/docker/haproxy-env-a.cfg。"
 fi
 
 # -W: master-worker（与生产的 systemd 形态一致，reload 走 SIGUSR2）
