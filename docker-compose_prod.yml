@@ -1,0 +1,62 @@
+
+services:
+  # ---- 配置源：MySQL（表结构与演示种子数据见 deploy/mysql/init.sql）----
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pass
+      MYSQL_DATABASE: rl_limiter
+      MYSQL_USER: rl
+      MYSQL_PASSWORD: rl_pass
+    volumes:
+      - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - mysql-data:/var/lib/mysql
+    # 只在本机回环暴露 3306，方便宿主机直接用 mysql 客户端改配置。
+    ports:
+      - "127.0.0.1:3306:3306"
+    healthcheck:
+      # TCP ping：初始化阶段的临时实例只监听 unix socket，ping 通 TCP
+      # 即表示真实实例（含 init.sql 灌数）已就绪。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    restart: unless-stopped
+
+  # ---- 三台节点：Ubuntu 24.04 + HAProxy 2.8(发行版自带) + 同机 rl-limiter。
+  # 每个容器 = 生产上的一台 ECS。节点独占环境：node1/node2 只跑 env-a 的
+  # fe_env_a（一环境横跨两节点），node3 只跑 env-b 的 fe_env_b。
+  # stats socket 是容器内的 unix socket，不映射、也不需要跨容器可达。
+  node:
+    build:
+      context: .
+    volumes:
+      - .haproxy.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
+    environment:
+      # 同机模式开关：本实例只采本机这台 HAProxy（配置在全量校验后被
+      # 裁剪到该节点）。值必须与配置库 haproxy_nodes.name 一致。
+      RL_NODE_NAME: hap-1
+      RL_MYSQL_HOST: mysql
+      RL_MYSQL_PORT: "3306"
+      RL_MYSQL_USER: rl
+      RL_MYSQL_PASSWORD: rl_pass
+      RL_MYSQL_DB: rl_limiter
+      RL_MYSQL_POLL_S: "3"
+      RL_CONSOLE_PORT: "8090"
+      # 演示需要从宿主机打开控制台，故绑 0.0.0.0；宿主机侧只映射到回环
+      # （下方 ports）。生产默认是 127.0.0.1，控制台无鉴权，切勿裸奔。
+      RL_CONSOLE_BIND: 0.0.0.0
+      # 限额自动应用：库里改 quota_bps → 本机 rl-limiter 立刻改写这份
+      # cfg 的 shared bwlim limit 并 reload（容器里没有 systemctl，
+      # 用入口脚本落的 master pid 发 SIGUSR2）。
+      RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
+      RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
+    network_mode: host
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+
+volumes:
+  mysql-data:
