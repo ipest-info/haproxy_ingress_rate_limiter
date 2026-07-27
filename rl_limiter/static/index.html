@@ -3,172 +3,299 @@
 <title>rl-limiter 控制台</title>
 <style>
 /* 单 HAProxy 模型的控制台：一台 HAProxy、若干受管 frontend。
-   每个 frontend 一张卡片 = 实时曲线 + 配置表单（监听端口、限额、
-   后端服务器）。改完提交即写库，随后由 enforcer 写进 haproxy.cfg
-   并 reload——所以页面上的每一次保存都是真正生效的配置变更。 */
+   每个 frontend 一张卡片 = 实时曲线 + 配置编辑。改完保存即写库，随后由
+   enforcer 写进 haproxy.cfg 并 reload——页面上的每一次保存都是真正生效
+   的配置变更，所以表单的设计目标是"不容易点错"，而不是"字段都摆出来"。
+
+   布局按**操作频率**分层，而不是按字段清单平铺：
+     监听（端口/地址/模式）→ 限速（限额）→ 后端服务器 → 折叠的高级项。
+   限额与 timeout 这类冷热差别极大的字段若并排等宽陈列，眼睛得横扫整屏
+   才能找到真正要改的那一个。 */
 :root {
-  --surface-0: #f4f4f2;
-  --surface-1: #fcfcfb;
-  --surface-2: #eeedea;
-  --border:    #e2e1dd;
-  --text-primary:   #0b0b0b;
-  --text-secondary: #52514e;
-  --text-muted:     #8a8983;
+  --surface-0: #f5f5f4;
+  --surface-1: #ffffff;
+  --surface-2: #f0efed;
+  --surface-3: #e8e7e4;
+  --border:    #dedcd8;
+  --border-strong: #c8c6c1;
+  --text-primary:   #16150f;
+  --text-secondary: #5c5b55;
+  --text-muted:     #8d8c85;
   --series-rate:   #2a78d6;
   --series-mean:   #008300;
-  --ref-quota:     #52514e;
-  --status-good:     #0ca30c;
-  --status-warning:  #fab219;
-  --status-critical: #d03b3b;
-  --grid: rgba(0,0,0,.07);
-  --accent: #2a78d6;
+  --ref-quota:     #77766f;
+  --ok:       #0f9d3a;
+  --warn:     #b8790a;
+  --critical: #cf3a3a;
+  --accent:   #2a78d6;
+  --accent-weak: rgba(42,120,214,.10);
+  --grid: rgba(0,0,0,.06);
+  --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 12px rgba(0,0,0,.04);
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --surface-0: #16161a; --surface-1: #1e1e23; --surface-2: #26262c;
-    --border: #34343c;
-    --text-primary: #f2f2f0; --text-secondary: #b9b8b4; --text-muted: #86857f;
-    --grid: rgba(255,255,255,.08);
-    --ref-quota: #b9b8b4;
+    --surface-0: #131316; --surface-1: #1c1c20; --surface-2: #24242a;
+    --surface-3: #2d2d34;
+    --border: #33333b; --border-strong: #45454f;
+    --text-primary: #f0efec; --text-secondary: #b4b3ae; --text-muted: #85847e;
+    --ref-quota: #b4b3ae;
+    --grid: rgba(255,255,255,.07);
+    --accent-weak: rgba(42,120,214,.16);
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 12px rgba(0,0,0,.25);
   }
 }
 * { box-sizing: border-box; }
 body {
   margin: 0; background: var(--surface-0); color: var(--text-primary);
-  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC",
+  font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC",
         "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
+/* 内容限宽并居中：2000px 宽屏上铺满会让每行的视线行程长得离谱，
+   表单字段也会被拉成荒唐的宽度。 */
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 20px; }
+
 header {
-  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-  padding: 12px 16px; background: var(--surface-1);
-  border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 20;
+  background: var(--surface-1); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 30;
 }
-h1 { font-size: 16px; margin: 0; font-weight: 650; }
-.meta { color: var(--text-secondary); font-size: 12.5px; }
-.meta b { color: var(--text-primary); font-weight: 600; }
+header .wrap {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding-top: 12px; padding-bottom: 12px;
+}
+h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .01em; }
+.meta { color: var(--text-secondary); font-size: 12.5px; white-space: nowrap; }
+.meta b { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+.grow { flex: 1 1 auto; }
 .badge {
-  display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px;
-  padding: 2px 9px; border-radius: 999px; background: var(--surface-2);
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+  padding: 3px 10px; border-radius: 999px; background: var(--surface-2);
+  color: var(--text-secondary); white-space: nowrap;
 }
-.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-main { padding: 16px; display: grid; gap: 16px; }
+.dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+
+main { padding: 20px 0 64px; }
+main > .wrap > * + * { margin-top: 16px; }
+
 .banner {
-  padding: 10px 14px; border-radius: 8px; font-size: 13px; line-height: 1.6;
-  border-left: 4px solid var(--status-warning); background: rgba(250,178,25,.10);
+  padding: 11px 15px; border-radius: 9px; font-size: 13px; line-height: 1.65;
+  border: 1px solid transparent; border-left-width: 3px;
+  background: rgba(184,121,10,.09); border-left-color: var(--warn);
 }
-.banner.ok  { border-left-color: var(--status-good); background: rgba(12,163,12,.10); }
-.banner.err { border-left-color: var(--status-critical); background: rgba(208,59,59,.12); }
+.banner.ok  { background: rgba(15,157,58,.09); border-left-color: var(--ok); }
+.banner.err { background: rgba(207,58,58,.10); border-left-color: var(--critical); }
 .banner pre {
-  margin: 6px 0 0; white-space: pre-wrap; word-break: break-all;
-  font-size: 12px; opacity: .85;
+  margin: 7px 0 0; white-space: pre-wrap; word-break: break-all;
+  font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  background: rgba(0,0,0,.05); padding: 8px 10px; border-radius: 6px;
 }
+
 .card {
   background: var(--surface-1); border: 1px solid var(--border);
-  border-radius: 10px; padding: 14px;
+  border-radius: 11px; box-shadow: var(--shadow); overflow: hidden;
 }
-.card > h2 {
-  font-size: 14.5px; margin: 0 0 10px; font-weight: 650;
+.card + .card { margin-top: 16px; }
+.card-head {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 13px 16px; border-bottom: 1px solid var(--border);
 }
-.grow { flex: 1; }
-canvas { width: 100%; height: 150px; display: block; }
-.stats { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; font-size: 12.5px; }
-.stats span { color: var(--text-secondary); }
-.stats b { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.card-title { font-size: 14.5px; font-weight: 650; }
+.card-body { padding: 14px 16px; }
+
+.tag {
+  font: 11.5px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  padding: 2px 7px; border-radius: 5px;
+  background: var(--surface-2); color: var(--text-secondary);
+}
+.tag.alert { background: rgba(207,58,58,.14); color: var(--critical); font-weight: 600; }
+.tag.warn  { background: rgba(184,121,10,.16); color: var(--warn); font-weight: 600; }
+
+/* 指标条：等宽数字 + 标签在上、数值在下，扫一眼就能对齐比较。 */
+.stats { display: flex; gap: 26px; flex-wrap: wrap; margin-top: 12px; }
+.stat-l { font-size: 11.5px; color: var(--text-muted); }
+.stat-v {
+  font-size: 15px; font-weight: 620; font-variant-numeric: tabular-nums;
+  margin-top: 1px;
+}
+.stat-v small { font-size: 11.5px; font-weight: 400; color: var(--text-muted); margin-left: 3px; }
+canvas { width: 100%; height: 132px; display: block; }
+
 button {
-  font: inherit; font-size: 13px; padding: 5px 12px; border-radius: 6px;
-  border: 1px solid var(--border); background: var(--surface-2);
-  color: var(--text-primary); cursor: pointer;
+  font: inherit; font-size: 13px; padding: 6px 13px; border-radius: 7px;
+  border: 1px solid var(--border-strong); background: var(--surface-1);
+  color: var(--text-primary); cursor: pointer; white-space: nowrap;
+  transition: background .12s, border-color .12s;
 }
-button:hover { border-color: var(--text-muted); }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-button.danger  { color: var(--status-critical); }
-button:disabled { opacity: .5; cursor: not-allowed; }
+button:hover:not(:disabled) { background: var(--surface-2); }
+button.primary {
+  background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 550;
+}
+button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+button.ghost { border-color: transparent; background: transparent; color: var(--text-secondary); }
+button.ghost:hover:not(:disabled) { background: var(--surface-2); }
+button.danger { color: var(--critical); border-color: transparent; background: transparent; }
+button.danger:hover:not(:disabled) { background: rgba(207,58,58,.10); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button.sm { padding: 3px 9px; font-size: 12px; }
+
+/* ---- 编辑面板 ---- */
+.editor {
+  display: none; background: var(--surface-2);
+  border-top: 1px solid var(--border);
+}
+.editor.open { display: block; }
+.sec { padding: 15px 16px; border-bottom: 1px solid var(--border); }
+.sec:last-of-type { border-bottom: 0; }
+.sec-h {
+  font-size: 12px; font-weight: 650; color: var(--text-secondary);
+  letter-spacing: .04em; margin-bottom: 10px;
+  display: flex; align-items: center; gap: 8px;
+}
+.sec-h .hint { font-weight: 400; letter-spacing: 0; }
+/* 字段宽度按内容需要给，不平均分——端口只要 8 个字符宽，没必要和地址一样宽。 */
+.fields { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: flex-start; }
+.f { display: flex; flex-direction: column; }
+.f-name  { width: 190px; } .f-addr { width: 230px; }
+.f-port  { width: 110px; } .f-mode { width: 120px; }
+.f-quota { width: 190px; } .f-num  { width: 130px; }
+.f-bal   { width: 150px; }
+label { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+label .req { color: var(--critical); }
 input, select {
-  font: inherit; font-size: 13px; padding: 4px 8px; border-radius: 6px;
-  border: 1px solid var(--border); background: var(--surface-0);
-  color: var(--text-primary); width: 100%;
+  font: inherit; font-size: 13px; padding: 6px 9px; border-radius: 7px;
+  border: 1px solid var(--border-strong); background: var(--surface-1);
+  color: var(--text-primary); width: 100%; min-width: 0;
 }
-.form { display: none; margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
-.form.open { display: block; }
-.fields {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 10px 14px;
+input:focus, select:focus {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak);
 }
-label { display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 3px; }
-table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 13px; }
-th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); }
-th { color: var(--text-secondary); font-weight: 600; font-size: 12px; }
-td input { min-width: 70px; }
-.hint { color: var(--text-muted); font-size: 12px; }
-.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
-.tag { font-size: 11.5px; padding: 1px 7px; border-radius: 4px; background: var(--surface-2); color: var(--text-secondary); }
-.tag.over { background: rgba(208,59,59,.15); color: var(--status-critical); font-weight: 600; }
-.tag.degraded { background: rgba(250,178,25,.18); color: #8a6100; }
-#logs { max-height: 260px; overflow-y: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+input:disabled { background: var(--surface-3); color: var(--text-muted); }
+input.bad { border-color: var(--critical); }
+input.bad:focus { box-shadow: 0 0 0 3px rgba(207,58,58,.15); }
+.suffix { position: relative; }
+.suffix input { padding-right: 46px; }
+.suffix span {
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  font-size: 12px; color: var(--text-muted); pointer-events: none;
+}
+.err { font-size: 11.5px; color: var(--critical); margin-top: 4px; }
+.hint { font-size: 11.5px; color: var(--text-muted); }
+/* 限额换算提示：Mbps ↔ bytes/s 的 8 倍混淆是本项目最贵的错误来源，
+   把最终写进 cfg 的数值直接显示出来，让人在保存前就能发现。 */
+.conv {
+  font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums;
+  align-self: center; padding-top: 14px; line-height: 1.5;
+}
+.conv b { color: var(--text-primary); font-weight: 600; }
+
+table { width: 100%; max-width: 880px; border-collapse: collapse;
+         table-layout: fixed; font-size: 13px; }
+th {
+  text-align: left; font-size: 11.5px; font-weight: 600; color: var(--text-muted);
+  padding: 0 8px 6px 0; white-space: nowrap;
+}
+td { padding: 3px 8px 3px 0; vertical-align: top; }
+/* 操作列紧跟最后一个输入框，别被推到表格最右端——那样"移除"看着不像
+   属于这一行。 */
+.col-ac { width: 72px; }
+td:last-child, th:last-child { padding-right: 0; padding-left: 10px; }
+th.c, td.c { text-align: center; }
+/* 列宽按内容需要给：端口是 5 位数字，没必要和地址一样宽。 */
+.col-nm { width: 150px; } .col-ad { width: 220px; } .col-pt { width: 96px; }
+.col-wt { width: 84px; }  .col-ck { width: 76px; }  .col-in { width: 108px; }
+input[type=checkbox] { width: auto; }
+.empty { color: var(--text-muted); font-size: 12.5px; padding: 8px 0; }
+
+details.adv { border-top: 1px solid var(--border); }
+details.adv > summary {
+  padding: 11px 16px; cursor: pointer; font-size: 12.5px;
+  color: var(--text-secondary); user-select: none; list-style: none;
+}
+details.adv > summary::-webkit-details-marker { display: none; }
+details.adv > summary::before { content: "▸ "; color: var(--text-muted); }
+details.adv[open] > summary::before { content: "▾ "; }
+details.adv > summary:hover { background: var(--surface-3); }
+
+.actions {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 12px 16px; background: var(--surface-3);
+  border-top: 1px solid var(--border);
+}
+.dirty { font-size: 12px; color: var(--warn); }
+
+#logs {
+  max-height: 280px; overflow-y: auto;
+  font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace;
+}
 #logs div { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
-.lv-WARNING { color: #8a6100; } .lv-ERROR, .lv-CRITICAL { color: var(--status-critical); }
+.lv-WARNING { color: var(--warn); }
+.lv-ERROR, .lv-CRITICAL { color: var(--critical); }
 .lv-DEBUG { color: var(--text-muted); }
-#toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 50; }
+
+#toasts { position: fixed; right: 18px; bottom: 18px; display: grid; gap: 8px; z-index: 60; }
 .toast {
   background: var(--surface-1); border: 1px solid var(--border);
-  border-left: 4px solid var(--status-good); border-radius: 8px;
-  padding: 10px 14px; max-width: 460px; box-shadow: 0 6px 20px rgba(0,0,0,.25);
-  font-size: 13px;
+  border-left: 3px solid var(--ok); border-radius: 9px;
+  padding: 11px 15px; max-width: 440px; box-shadow: var(--shadow);
+  font-size: 13px; line-height: 1.55;
 }
-.toast.err { border-left-color: var(--status-critical); }
+.toast.err { border-left-color: var(--critical); }
+@media (max-width: 720px) {
+  .f-name, .f-addr, .f-quota, .f-bal, .f-mode, .f-num, .f-port { width: 100%; }
+}
 </style>
 
-<header>
-  <h1>rl-limiter 控制台</h1>
-  <span class="badge"><span class="dot" id="sse-dot" style="background:var(--status-critical)"></span><span id="sse-text">连接中…</span></span>
-  <span class="meta">HAProxy <b id="hap-name">–</b> <span class="hint" id="hap-endpoint"></span></span>
-  <span class="meta">配置版本 <b id="cfg-version">–</b></span>
-  <span class="meta">运行时长 <b id="uptime">–</b></span>
-  <span class="meta">服务版本 <b id="svc-version">–</b></span>
+<header><div class="wrap">
+  <h1>rl-limiter</h1>
+  <span class="badge"><span class="dot" id="sse-dot" style="background:var(--critical)"></span><span id="sse-text">连接中…</span></span>
+  <span class="meta">HAProxy <b id="hap-name">–</b></span>
+  <span class="meta" id="hap-endpoint-wrap">端点 <b id="hap-endpoint">–</b></span>
   <span class="grow"></span>
+  <span class="meta">配置版本 <b id="cfg-version">–</b></span>
+  <span class="meta">运行 <b id="uptime">–</b></span>
+  <span class="meta">v<b id="svc-version">–</b></span>
   <span class="meta">窗口
-    <select id="window-sel" style="width:auto;display:inline-block">
+    <select id="window-sel" style="width:auto;display:inline-block;padding:3px 6px">
       <option value="60">1 分钟</option>
       <option value="300" selected>5 分钟</option>
       <option value="600">10 分钟</option>
     </select>
   </span>
-</header>
+</div></header>
 
-<main>
-  <!-- 配置下发状态。运维改完配置最关心的一件事：数据面到底生效了没有。 -->
+<main><div class="wrap">
   <div id="apply-banner" class="banner" style="display:none"></div>
-
   <div id="frontends"></div>
 
   <div class="card">
-    <h2>新增受管 frontend<span class="grow"></span>
-      <button id="new-btn">新增</button>
-    </h2>
-    <div class="hint">
-      新增一个监听端口：填写端口、限额与后端服务器后保存，配置写入数据库，
-      随后由本机 rl-limiter 写进 haproxy.cfg 的受管区块并 reload。
+    <div class="card-head">
+      <span class="card-title">新增监听端口</span>
+      <span class="hint">一个 frontend = 一个监听端口 + 一个限速桶 + 一组后端</span>
+      <span class="grow"></span>
+      <button id="new-btn" class="primary">+ 新增</button>
     </div>
-    <div class="form" id="new-form"></div>
+    <div class="editor" id="new-editor"></div>
   </div>
 
   <div class="card">
-    <h2>运行日志<span class="grow"></span>
-      <select id="log-level" style="width:auto">
+    <div class="card-head">
+      <span class="card-title">运行日志</span>
+      <span class="grow"></span>
+      <select id="log-level" style="width:auto;padding:4px 8px">
         <option value="DEBUG">全部</option>
         <option value="INFO" selected>INFO 及以上</option>
         <option value="WARNING">WARNING 及以上</option>
         <option value="ERROR">仅 ERROR</option>
       </select>
-    </h2>
-    <div id="logs"></div>
+    </div>
+    <div class="card-body"><div id="logs"></div></div>
   </div>
-</main>
+</div></main>
 <div id="toasts"></div>
 
 <script>
 const $ = (s, el) => (el || document).querySelector(s);
+const $$ = (s, el) => [...(el || document).querySelectorAll(s)];
 // 往 innerHTML 里塞任何非本页写死的文本前都要过这一道：配置名、下发失败
 // 时 `haproxy -c` 的原始 stderr 等都来自外部，直接拼进 HTML 就是注入面。
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
@@ -176,15 +303,10 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
 
 // 速率一律以 bytes/s 在内部流转，只在显示时换算成 Mbps（×8÷1e6），
 // 与配置里的 quota_bps（bit/s）口径对齐。
-const toMbps = (bytesPerS) => bytesPerS * 8 / 1e6;
-const fmtMbps = (bytesPerS) => toMbps(bytesPerS).toFixed(2) + " Mbps";
+const fmtMbps = (bps) => (bps * 8 / 1e6).toFixed(2);
 
 const state = {
-  fes: new Map(),      // name -> {buf:[], conf, els, tooltipX}
-  windowS: 300,
-  logAfter: 0,
-  logLevel: "INFO",
-  enforceEnabled: false,
+  fes: new Map(), windowS: 300, logAfter: 0, logLevel: "INFO",
 };
 const LEVELS = {DEBUG:10, INFO:20, WARNING:30, ERROR:40, CRITICAL:50};
 
@@ -193,172 +315,322 @@ function toast(msg, isErr) {
   el.className = "toast" + (isErr ? " err" : "");
   el.textContent = msg;
   $("#toasts").appendChild(el);
-  setTimeout(() => el.remove(), isErr ? 9000 : 4500);
+  setTimeout(() => el.remove(), isErr ? 10000 : 4500);
 }
 
-// ---------------------------------------------------------------- 表单
-// 一个 frontend 的编辑表单：基本参数 + 后端服务器表格。新增与编辑共用，
-// 因为后端接口是 upsert 语义（存在即整体更新），少一类边界情况。
-function formHtml(fe, isNew) {
+// ============================================================ 表单
+// 分组顺序 = 操作频率：监听 → 限速 → 后端 → （折叠）高级。
+// 冷门参数（maxconn/balance/三个 timeout）默认收起，改的人自然会去展开，
+// 不改的人不必每次都从五个 timeout 里找那个限额输入框。
+function editorHtml(fe, isNew) {
   const f = fe || {};
-  const opt = (v, cur) => `<option value="${esc(v)}"${v === cur ? " selected" : ""}>${esc(v)}</option>`;
+  const opt = (v, cur, label) =>
+    `<option value="${esc(v)}"${v === (cur || "") ? " selected" : ""}>${esc(label || v)}</option>`;
   return `
-  <div class="fields">
-    <div><label>frontend 名${isNew ? "" : "（不可改）"}</label>
-      <input class="f-name" value="${esc(f.name || "")}" ${isNew ? "" : "disabled"}
-             placeholder="fe_main"></div>
-    <div><label>监听地址（留空 = 所有地址）</label>
-      <input class="f-addr" value="${esc(f.bind_address || "")}" placeholder="留空"></div>
-    <div><label>监听端口</label>
-      <input class="f-port" type="number" min="1" max="65535" value="${esc(f.bind_port ?? "")}"></div>
-    <div><label>限额（Mbps）</label>
-      <input class="f-quota" type="number" min="0" step="0.1"
-             value="${f.quota_bps ? (f.quota_bps / 1e6) : ""}"></div>
-    <div><label>模式</label>
-      <select class="f-mode">${opt("tcp", f.mode || "tcp")}${opt("http", f.mode)}</select></div>
-    <div><label>负载均衡</label>
-      <select class="f-balance">${["roundrobin","static-rr","leastconn","first","source","random"]
-        .map(v => opt(v, f.balance || "roundrobin")).join("")}</select></div>
-    <div><label>maxconn（0 = 不设）</label>
-      <input class="f-maxconn" type="number" min="0" value="${esc(f.maxconn ?? 0)}"></div>
-    <div><label>timeout connect (ms)</label>
-      <input class="f-tc" type="number" min="1" value="${esc(f.timeout_connect_ms ?? 5000)}"></div>
-    <div><label>timeout client (ms)</label>
-      <input class="f-tcl" type="number" min="1" value="${esc(f.timeout_client_ms ?? 50000)}"></div>
-    <div><label>timeout server (ms)</label>
-      <input class="f-ts" type="number" min="1" value="${esc(f.timeout_server_ms ?? 50000)}"></div>
+  <div class="sec">
+    <div class="sec-h">监听</div>
+    <div class="fields">
+      <div class="f f-name">
+        <label>frontend 名 ${isNew ? '<span class="req">*</span>' : ""}</label>
+        <input class="i-name" value="${esc(f.name || "")}" ${isNew ? "" : "disabled"}
+               placeholder="fe_main" autocomplete="off">
+        ${isNew ? '<div class="hint">字母数字 . _ -</div>'
+                : '<div class="hint">改名请新建后删除旧的</div>'}
+        <div class="err" hidden></div>
+      </div>
+      <div class="f f-addr">
+        <label>监听地址</label>
+        <input class="i-addr" value="${esc(f.bind_address || "")}"
+               placeholder="留空 = 所有地址" autocomplete="off">
+        <div class="err" hidden></div>
+      </div>
+      <div class="f f-port">
+        <label>端口 <span class="req">*</span></label>
+        <input class="i-port" type="number" min="1" max="65535"
+               value="${esc(f.bind_port ?? "")}" placeholder="8080">
+        <div class="err" hidden></div>
+      </div>
+      <div class="f f-mode">
+        <label>模式</label>
+        <select class="i-mode">${opt("tcp", f.mode || "tcp")}${opt("http", f.mode)}</select>
+      </div>
+    </div>
   </div>
-  <table>
-    <thead><tr><th>后端服务器</th><th>地址</th><th>端口</th><th>权重</th><th>健康检查</th><th>间隔(ms)</th><th></th></tr></thead>
-    <tbody class="f-servers"></tbody>
-  </table>
-  <div class="row">
-    <button class="f-addsrv">+ 添加服务器</button>
+
+  <div class="sec">
+    <div class="sec-h">限速</div>
+    <div class="fields">
+      <div class="f f-quota">
+        <label>带宽限额 <span class="req">*</span></label>
+        <div class="suffix">
+          <input class="i-quota" type="number" min="0" step="any"
+                 value="${f.quota_bps ? (f.quota_bps / 1e6) : ""}" placeholder="40">
+          <span>Mbps</span>
+        </div>
+        <div class="err" hidden></div>
+      </div>
+      <div class="conv"></div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-h">后端服务器 <span class="hint">至少一台，否则请求会返回 503</span></div>
+    <table>
+      <thead><tr>
+        <th class="col-nm">名称</th><th class="col-ad">地址</th><th class="col-pt">端口</th>
+        <th class="col-wt">权重</th><th class="col-ck c">健康检查</th>
+        <th class="col-in">检查间隔</th><th class="col-ac"></th>
+      </tr></thead>
+      <tbody class="i-servers"></tbody>
+    </table>
+    <div class="empty" hidden>还没有后端服务器</div>
+    <div style="margin-top:8px"><button class="i-addsrv sm">+ 添加服务器</button></div>
+    <div class="err err-srv" hidden style="margin-top:6px"></div>
+  </div>
+
+  <details class="adv">
+    <summary>高级参数（并发上限、负载均衡、超时）</summary>
+    <div class="sec" style="border-bottom:0">
+      <div class="fields">
+        <div class="f f-num">
+          <label>maxconn</label>
+          <input class="i-maxconn" type="number" min="0" value="${esc(f.maxconn ?? 0)}">
+          <div class="hint">0 = 不限制</div>
+        </div>
+        <div class="f f-bal">
+          <label>负载均衡</label>
+          <select class="i-balance">${
+            ["roundrobin","static-rr","leastconn","first","source","random"]
+              .map(v => opt(v, f.balance || "roundrobin")).join("")}</select>
+        </div>
+        <div class="f f-num">
+          <label>timeout connect</label>
+          <div class="suffix"><input class="i-tc" type="number" min="1"
+            value="${esc(f.timeout_connect_ms ?? 5000)}"><span>ms</span></div>
+        </div>
+        <div class="f f-num">
+          <label>timeout client</label>
+          <div class="suffix"><input class="i-tcl" type="number" min="1"
+            value="${esc(f.timeout_client_ms ?? 50000)}"><span>ms</span></div>
+        </div>
+        <div class="f f-num">
+          <label>timeout server</label>
+          <div class="suffix"><input class="i-ts" type="number" min="1"
+            value="${esc(f.timeout_server_ms ?? 50000)}"><span>ms</span></div>
+        </div>
+      </div>
+    </div>
+  </details>
+
+  <div class="actions">
+    ${isNew ? "" : '<button class="i-del danger">删除此监听端口</button>'}
     <span class="grow"></span>
-    <button class="f-cancel">取消</button>
-    <button class="f-save primary">保存并下发</button>
-  </div>
-  <div class="hint" style="margin-top:8px">
-    保存即写入配置库；本机 rl-limiter 随后把它渲染进 haproxy.cfg 的受管区块、
-    <code>haproxy -c</code> 校验通过后原子替换并 reload。新建连接立即按新配置，
-    存量连接在 HAProxy 的 hard-stop-after 宽限期后进入新配置。
+    <span class="dirty" hidden>● 有未保存的修改</span>
+    <button class="i-cancel ghost">取消</button>
+    <button class="i-save primary" disabled>${isNew ? "创建并下发" : "保存并下发"}</button>
   </div>`;
 }
 
 function serverRow(s) {
-  const tr = document.createElement("tr");
   s = s || {};
+  const tr = document.createElement("tr");
   tr.innerHTML = `
-    <td><input class="s-name" value="${esc(s.name || "")}" placeholder="web1"></td>
-    <td><input class="s-addr" value="${esc(s.address || "")}" placeholder="10.0.0.21"></td>
-    <td><input class="s-port" type="number" min="1" max="65535" value="${esc(s.port ?? "")}"></td>
+    <td><input class="s-name" value="${esc(s.name || "")}" placeholder="web1" autocomplete="off"></td>
+    <td><input class="s-addr" value="${esc(s.address || "")}" placeholder="10.0.0.21" autocomplete="off"></td>
+    <td><input class="s-port" type="number" min="1" max="65535" value="${esc(s.port ?? "")}" placeholder="9000"></td>
     <td><input class="s-weight" type="number" min="0" max="256" value="${esc(s.weight ?? 100)}"></td>
-    <td style="text-align:center"><input class="s-check" type="checkbox" ${s.check === false ? "" : "checked"} style="width:auto"></td>
+    <td class="c"><input class="s-check" type="checkbox" ${s.check === false ? "" : "checked"}></td>
     <td><input class="s-inter" type="number" min="1" value="${esc(s.check_inter_ms ?? 2000)}"></td>
-    <td><button class="s-del danger">删除</button></td>`;
-  tr.querySelector(".s-del").onclick = () => tr.remove();
+    <td><button class="s-del danger sm">移除</button></td>`;
+  tr.querySelector(".s-del").onclick = () => { tr.remove(); tr.dispatchEvent(new Event("x")); };
   return tr;
 }
 
-function readForm(root, fallbackName) {
-  const q = parseFloat($(".f-quota", root).value);
-  const servers = [...root.querySelectorAll(".f-servers tr")].map(tr => ({
-    name: $(".s-name", tr).value.trim(),
-    address: $(".s-addr", tr).value.trim(),
-    port: parseInt($(".s-port", tr).value, 10),
-    weight: parseInt($(".s-weight", tr).value, 10),
-    check: $(".s-check", tr).checked,
-    check_inter_ms: parseInt($(".s-inter", tr).value, 10),
-  }));
+function readEditor(root, fallbackName) {
+  const q = parseFloat($(".i-quota", root).value);
   return {
-    name: ($(".f-name", root).value || fallbackName || "").trim(),
-    bind_address: $(".f-addr", root).value.trim(),
-    bind_port: parseInt($(".f-port", root).value, 10),
+    name: ($(".i-name", root).value || fallbackName || "").trim(),
+    bind_address: $(".i-addr", root).value.trim(),
+    bind_port: parseInt($(".i-port", root).value, 10),
     // 界面按运维习惯用 Mbps，接口用 bit/s——换算只在这一处。
     quota_bps: Math.round((isFinite(q) ? q : 0) * 1e6),
-    mode: $(".f-mode", root).value,
-    balance: $(".f-balance", root).value,
-    maxconn: parseInt($(".f-maxconn", root).value, 10) || 0,
-    timeout_connect_ms: parseInt($(".f-tc", root).value, 10),
-    timeout_client_ms: parseInt($(".f-tcl", root).value, 10),
-    timeout_server_ms: parseInt($(".f-ts", root).value, 10),
-    servers,
+    mode: $(".i-mode", root).value,
+    balance: $(".i-balance", root).value,
+    maxconn: parseInt($(".i-maxconn", root).value, 10) || 0,
+    timeout_connect_ms: parseInt($(".i-tc", root).value, 10),
+    timeout_client_ms: parseInt($(".i-tcl", root).value, 10),
+    timeout_server_ms: parseInt($(".i-ts", root).value, 10),
+    servers: $$(".i-servers tr", root).map(tr => ({
+      name: $(".s-name", tr).value.trim(),
+      address: $(".s-addr", tr).value.trim(),
+      port: parseInt($(".s-port", tr).value, 10),
+      weight: parseInt($(".s-weight", tr).value, 10),
+      check: $(".s-check", tr).checked,
+      check_inter_ms: parseInt($(".s-inter", tr).value, 10),
+    })),
   };
 }
 
-function wireForm(root, fe, isNew, onDone) {
-  const tbody = $(".f-servers", root);
+const NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const ADDR_RE = /^[A-Za-z0-9._:-]{1,255}$/;
+
+/** 前端校验只为**尽早**给出人话反馈；服务端有同一套规则的权威校验，
+ *  两边不一致时以服务端为准（它的错误会通过 toast 显示出来）。 */
+function validate(root, p, isNew) {
+  const errs = new Map();
+  if (isNew && !NAME_RE.test(p.name))
+    errs.set(".i-name", "只能用字母、数字、点、下划线、连字符");
+  if (!(p.bind_port >= 1 && p.bind_port <= 65535))
+    errs.set(".i-port", "端口需在 1–65535");
+  if (p.bind_address && !ADDR_RE.test(p.bind_address))
+    errs.set(".i-addr", "地址含非法字符");
+  if (!(p.quota_bps > 0)) errs.set(".i-quota", "限额必须大于 0");
+  else if (p.quota_bps < 8) errs.set(".i-quota", "限额太小（不足 1 byte/s）");
+
+  let srvErr = "";
+  if (!p.servers.length) srvErr = "至少要有一台后端服务器";
+  const seen = new Set();
+  for (const s of p.servers) {
+    if (!s.name) { srvErr = "请填写服务器名"; break; }
+    if (!NAME_RE.test(s.name)) {
+      srvErr = `服务器名「${s.name}」非法：只能用字母、数字、点、下划线、连字符`; break;
+    }
+    if (seen.has(s.name)) { srvErr = `服务器名「${s.name}」重复`; break; }
+    seen.add(s.name);
+    if (!s.address) { srvErr = `请填写「${s.name}」的后端地址`; break; }
+    if (!ADDR_RE.test(s.address)) { srvErr = `「${s.name}」的地址含非法字符`; break; }
+    if (!(s.port >= 1 && s.port <= 65535)) {
+      srvErr = `「${s.name}」的端口需在 1–65535`; break;
+    }
+    if (!(s.weight >= 0 && s.weight <= 256)) { srvErr = `「${s.name}」的权重需在 0–256`; break; }
+  }
+
+  // 渲染内联错误：错在哪个字段就标哪个字段，不弹一个笼统的失败提示。
+  for (const sel of [".i-name", ".i-port", ".i-addr", ".i-quota"]) {
+    const input = $(sel, root); if (!input) continue;
+    const box = input.closest(".f").querySelector(".err");
+    const msg = errs.get(sel);
+    input.classList.toggle("bad", !!msg);
+    box.hidden = !msg; box.textContent = msg || "";
+  }
+  const sbox = $(".err-srv", root);
+  if (sbox) { sbox.hidden = !srvErr; sbox.textContent = srvErr; }
+  return errs.size === 0 && !srvErr;
+}
+
+function wireEditor(root, fe, isNew, onDone) {
+  const tbody = $(".i-servers", root);
+  const emptyHint = $(".empty", root);
   ((fe && fe.servers) || []).forEach(s => tbody.appendChild(serverRow(s)));
   if (isNew && !tbody.children.length) tbody.appendChild(serverRow());
-  $(".f-addsrv", root).onclick = () => tbody.appendChild(serverRow());
-  $(".f-cancel", root).onclick = () => onDone(false);
-  $(".f-save", root).onclick = async (ev) => {
-    const btn = ev.target; btn.disabled = true;
-    const payload = readForm(root, fe && fe.name);
+
+  const initial = JSON.stringify(readEditor(root, fe && fe.name));
+  const refresh = () => {
+    const p = readEditor(root, fe && fe.name);
+    // 限额换算提示。Mbps ↔ bytes/s 的 8 倍混淆是本项目最贵的错误来源，
+    // 把最终写进 cfg 的数值直接显示出来，保存前就能发现填错了一位。
+    const conv = $(".conv", root);
+    conv.innerHTML = p.quota_bps > 0
+      ? `↔ <b>${(p.quota_bps / 8 / 1e6).toFixed(2)} MB/s</b>　`
+        + `写入 haproxy.cfg 的 <code>limit</code> = <b>${Math.floor(p.quota_bps / 8)}</b> bytes/s`
+      : "";
+    emptyHint.hidden = tbody.children.length > 0;
+    const dirty = JSON.stringify(p) !== initial;
+    $(".dirty", root).hidden = !dirty;
+    const valid = validate(root, p, isNew);
+    // 没改动就不给保存：避免"手滑点一下"触发一次真实的 reload。
+    $(".i-save", root).disabled = !(dirty && valid);
+  };
+  root.addEventListener("input", refresh);
+  root.addEventListener("change", refresh);
+  root.addEventListener("x", refresh);          // 移除服务器行
+  $(".i-addsrv", root).onclick = (e) => {
+    e.preventDefault(); tbody.appendChild(serverRow()); refresh();
+  };
+  refresh();
+
+  $(".i-cancel", root).onclick = () => {
+    if (!$(".dirty", root).hidden && !confirm("有未保存的修改，确定放弃？")) return;
+    onDone(false);
+  };
+  if (!isNew) $(".i-del", root).onclick = () => delFrontend(fe.name);
+  $(".i-save", root).onclick = async (ev) => {
+    const btn = ev.target, p = readEditor(root, fe && fe.name);
+    if (!validate(root, p, isNew)) return;
+    btn.disabled = true; btn.textContent = "下发中…";
     try {
-      const r = await fetch("/api/frontends/" + encodeURIComponent(payload.name),
-        {method: "PUT", body: JSON.stringify(payload)});
+      const r = await fetch("/api/frontends/" + encodeURIComponent(p.name),
+        {method: "PUT", body: JSON.stringify(p)});
       const j = await r.json();
-      if (!r.ok) { toast(j.error || "保存失败", true); btn.disabled = false; return; }
+      if (!r.ok) {
+        toast(j.error || "保存失败", true);
+        btn.disabled = false; btn.textContent = isNew ? "创建并下发" : "保存并下发";
+        return;
+      }
       toast(j.note || "已保存");
       onDone(true);
-    } catch (e) { toast("请求失败: " + e, true); btn.disabled = false; }
+    } catch (e) {
+      toast("请求失败: " + e, true);
+      btn.disabled = false; btn.textContent = isNew ? "创建并下发" : "保存并下发";
+    }
   };
 }
 
-// ---------------------------------------------------------------- 卡片
+// ============================================================ 卡片
 function ensureCard(name) {
   let fe = state.fes.get(name);
   if (fe) return fe;
   const card = document.createElement("div");
   card.className = "card";
   card.innerHTML = `
-    <h2><span class="fe-title"></span>
+    <div class="card-head">
+      <span class="card-title fe-name"></span>
       <span class="tag fe-bind"></span>
       <span class="tag fe-mode"></span>
-      <span class="tag over fe-over" style="display:none">超限</span>
-      <span class="tag degraded fe-degraded" style="display:none">采样失联</span>
+      <span class="tag alert fe-over" hidden>超限</span>
+      <span class="tag warn fe-degraded" hidden>采样失联</span>
       <span class="grow"></span>
       <button class="fe-edit">编辑</button>
-      <button class="fe-del danger">删除</button>
-    </h2>
-    <canvas></canvas>
-    <div class="stats">
-      <span>实时 <b class="st-rate">–</b></span>
-      <span>10s 均值 <b class="st-mean">–</b></span>
-      <span>限额 <b class="st-quota">–</b></span>
-      <span>利用率 <b class="st-util">–</b></span>
-      <span>连接数 <b class="st-conn">–</b></span>
-      <span>后端 <b class="st-srv">–</b></span>
     </div>
-    <div class="form"></div>`;
+    <div class="card-body">
+      <canvas></canvas>
+      <div class="stats">
+        <div><div class="stat-l">实时</div><div class="stat-v st-rate">–<small>Mbps</small></div></div>
+        <div><div class="stat-l">10s 均值</div><div class="stat-v st-mean">–<small>Mbps</small></div></div>
+        <div><div class="stat-l">限额</div><div class="stat-v st-quota">–<small>Mbps</small></div></div>
+        <div><div class="stat-l">利用率</div><div class="stat-v st-util">–</div></div>
+        <div><div class="stat-l">连接数</div><div class="stat-v st-conn">–</div></div>
+        <div><div class="stat-l">后端</div><div class="stat-v st-srv">–<small>台</small></div></div>
+      </div>
+    </div>
+    <div class="editor"></div>`;
   $("#frontends").appendChild(card);
   const canvas = $("canvas", card);
   fe = {name, buf: [], conf: null, card, canvas, tooltipX: null};
-  canvas.addEventListener("mousemove", (e) => {
-    fe.tooltipX = e.offsetX; draw(fe);
-  });
+  canvas.addEventListener("mousemove", (e) => { fe.tooltipX = e.offsetX; draw(fe); });
   canvas.addEventListener("mouseleave", () => { fe.tooltipX = null; draw(fe); });
   new ResizeObserver(() => draw(fe)).observe(canvas);
-  $(".fe-edit", card).onclick = () => openEdit(fe);
-  $(".fe-del", card).onclick = () => delFrontend(name);
+  $(".fe-edit", card).onclick = () => toggleEdit(fe);
   state.fes.set(name, fe);
   return fe;
 }
 
-function openEdit(fe) {
-  const form = $(".form", fe.card);
-  if (form.classList.contains("open")) { form.classList.remove("open"); return; }
-  form.innerHTML = formHtml(fe.conf, false);
-  form.classList.add("open");
-  wireForm(form, fe.conf, false, (saved) => {
-    form.classList.remove("open");
-    if (saved) setTimeout(loadOverview, 600);
+function toggleEdit(fe) {
+  const ed = $(".editor", fe.card), btn = $(".fe-edit", fe.card);
+  if (ed.classList.contains("open")) {
+    ed.classList.remove("open"); btn.textContent = "编辑"; return;
+  }
+  ed.innerHTML = editorHtml(fe.conf, false);
+  ed.classList.add("open"); btn.textContent = "收起";
+  wireEditor(ed, fe.conf, false, (saved) => {
+    ed.classList.remove("open"); btn.textContent = "编辑";
+    if (saved) setTimeout(loadOverview, 700);
   });
 }
 
 async function delFrontend(name) {
-  if (!confirm(`删除 frontend「${name}」？\n\n该监听端口会在下一次 reload 后停止服务。`)) return;
+  if (!confirm(`删除监听端口「${name}」？\n\n该端口会在下一次 reload 后停止服务，`
+             + `经它转发的连接会被断开。`)) return;
   try {
     const r = await fetch("/api/frontends/" + encodeURIComponent(name), {method: "DELETE"});
     const j = await r.json();
@@ -366,29 +638,31 @@ async function delFrontend(name) {
     toast(j.note || "已删除");
     const fe = state.fes.get(name);
     if (fe) { fe.card.remove(); state.fes.delete(name); }
-    setTimeout(loadOverview, 600);
+    setTimeout(loadOverview, 700);
   } catch (e) { toast("请求失败: " + e, true); }
 }
 
 function updateCard(fe, u) {
-  const c = fe.card;
-  $(".fe-title", c).textContent = fe.name;
-  const conf = fe.conf || {};
+  const c = fe.card, conf = fe.conf || {};
+  $(".fe-name", c).textContent = fe.name;
   $(".fe-bind", c).textContent = (conf.bind_address || "*") + ":" + (conf.bind_port ?? "?");
   $(".fe-mode", c).textContent = conf.mode || "tcp";
-  $(".st-srv", c).textContent = (conf.servers || []).length;
+  $(".st-srv", c).innerHTML = (conf.servers || []).length + "<small>台</small>";
   if (!u) return;
-  $(".st-rate", c).textContent = fmtMbps(u.rate_bytes_per_s);
-  $(".st-mean", c).textContent = fmtMbps(u.mean10_bytes_per_s);
-  $(".st-quota", c).textContent = u.quota_bytes_per_s ? fmtMbps(u.quota_bytes_per_s) : "–";
-  $(".st-util", c).textContent = u.quota_bytes_per_s
-    ? (u.mean10_bytes_per_s / u.quota_bytes_per_s * 100).toFixed(0) + "%" : "–";
-  $(".st-conn", c).textContent = u.conn;
-  $(".fe-over", c).style.display = u.over ? "" : "none";
-  $(".fe-degraded", c).style.display = u.degraded ? "" : "none";
+  const set = (sel, v, unit) =>
+    $(sel, c).innerHTML = esc(v) + (unit ? `<small>${unit}</small>` : "");
+  set(".st-rate", fmtMbps(u.rate_bytes_per_s), "Mbps");
+  set(".st-mean", fmtMbps(u.mean10_bytes_per_s), "Mbps");
+  set(".st-quota", u.quota_bytes_per_s ? fmtMbps(u.quota_bytes_per_s) : "–",
+      u.quota_bytes_per_s ? "Mbps" : "");
+  set(".st-util", u.quota_bytes_per_s
+    ? (u.mean10_bytes_per_s / u.quota_bytes_per_s * 100).toFixed(0) + "%" : "–");
+  set(".st-conn", u.conn);
+  $(".fe-over", c).hidden = !u.over;
+  $(".fe-degraded", c).hidden = !u.degraded;
 }
 
-// ---------------------------------------------------------------- 图表
+// ============================================================ 图表
 function draw(fe) {
   const cv = fe.canvas, dpr = window.devicePixelRatio || 1;
   const w = cv.clientWidth, h = cv.clientHeight;
@@ -415,11 +689,19 @@ function draw(fe) {
     const yy = Math.round(h * i / 4) + .5;
     g.beginPath(); g.moveTo(0, yy); g.lineTo(w, yy); g.stroke();
   }
+  g.font = "10.5px sans-serif";
+  g.fillStyle = css.getPropertyValue("--text-muted");
+  // 纵轴上界的数值：没有它就看不出曲线的绝对高度，只能看出形状。
+  g.fillText(fmtMbps(top) + " Mbps", 4, 12);
   if (quota > 0) {
     g.strokeStyle = css.getPropertyValue("--ref-quota");
     g.setLineDash([5, 4]); g.beginPath();
     g.moveTo(0, y(quota)); g.lineTo(w, y(quota)); g.stroke();
     g.setLineDash([]);
+    // 限额线就地标注，免得和上界刻度混淆。
+    const lbl = "限额 " + fmtMbps(quota);
+    g.fillStyle = css.getPropertyValue("--ref-quota");
+    g.fillText(lbl, w - g.measureText(lbl).width - 4, Math.max(10, y(quota) - 4));
   }
   const line = (key, color) => {
     g.strokeStyle = color; g.lineWidth = 1.6; g.beginPath();
@@ -435,18 +717,18 @@ function draw(fe) {
     const px = x(best.ts);
     g.strokeStyle = css.getPropertyValue("--text-muted");
     g.beginPath(); g.moveTo(px, 0); g.lineTo(px, h); g.stroke();
-    const label = `${fmtMbps(best.rate)} / 均 ${fmtMbps(best.mean)}`;
+    const label = `${fmtMbps(best.rate)} / 均 ${fmtMbps(best.mean)} Mbps`;
     g.font = "12px sans-serif";
-    const tw = g.measureText(label).width + 10;
+    const tw = g.measureText(label).width + 12;
     const bx = Math.min(Math.max(px - tw / 2, 2), w - tw - 2);
     g.fillStyle = css.getPropertyValue("--surface-2");
-    g.fillRect(bx, 4, tw, 20);
+    g.fillRect(bx, 4, tw, 21);
     g.fillStyle = css.getPropertyValue("--text-primary");
-    g.fillText(label, bx + 5, 18);
+    g.fillText(label, bx + 6, 19);
   }
 }
 
-// ---------------------------------------------------------------- 数据
+// ============================================================ 数据
 function applySnapshot(snap, live) {
   $("#cfg-version").textContent = snap.config_version ?? "–";
   if (snap.haproxy) {
@@ -463,29 +745,26 @@ function applySnapshot(snap, live) {
 
 function renderApplyBanner(en) {
   const el = $("#apply-banner");
-  state.enforceEnabled = !!(en && en.enabled);
+  el.style.display = "";
   if (!en || !en.enabled) {
-    // 未启用下发时也要说清楚：否则用户会以为在界面上保存就已经生效了。
-    el.style.display = ""; el.className = "banner";
-    el.innerHTML = "<b>配置自动下发未启用</b>：在这里保存的改动只会写入配置库，" +
-      "<b>不会</b>自动写进 haproxy.cfg。要让改动真正生效，请设置 " +
-      "<code>RL_APPLY_HAPROXY_CFG=&lt;本机 haproxy.cfg 路径&gt;</code> 后重启本服务，" +
-      "或人工同步配置并 reload。";
+    // 未启用下发时必须说清楚：否则用户会以为在界面上保存就已经生效了。
+    el.className = "banner";
+    el.innerHTML = "<b>配置自动下发未启用</b>：这里保存的改动只会写入配置库，"
+      + "<b>不会</b>自动写进 haproxy.cfg。要让改动真正生效，请设置 "
+      + "<code>RL_APPLY_HAPROXY_CFG=&lt;本机 haproxy.cfg 路径&gt;</code> 后重启本服务。";
     return;
   }
-  el.style.display = "";
   if (en.ok) {
     el.className = "banner ok";
     const t = en.last_change_ts ? new Date(en.last_change_ts * 1000).toLocaleTimeString() : null;
-    el.innerHTML = "<b>配置自动下发已启用</b>：在这里保存的改动会被写入本机 " +
-      "haproxy.cfg 的受管区块并 reload，<b>数据面即时生效</b>" +
-      "（新建连接立即按新配置；存量连接在 hard-stop-after 宽限期后进入新配置）。" +
-      (t ? ` 最近一次下发：${esc(t)}。` : " 当前与配置库一致。");
+    el.innerHTML = "<b>配置自动下发已启用</b>：保存后会写入本机 haproxy.cfg 并 reload，"
+      + "数据面即时生效（新建连接立即按新配置；存量连接在 hard-stop-after 宽限期后跟上）。"
+      + (t ? ` 最近一次下发 ${esc(t)}。` : " 当前与配置库一致。");
   } else {
     el.className = "banner err";
-    el.innerHTML = "<b>配置下发失败——数据面仍在按<u>调整前</u>的配置运行</b>：" +
-      "配置库已改，但没能写进本机 haproxy.cfg / reload 未成功。" +
-      "请按下方原因处理（会自动重试）。" + `<pre>${esc(en.error || "")}</pre>`;
+    el.innerHTML = "<b>配置下发失败——数据面仍在按<u>调整前</u>的配置运行</b>："
+      + "配置库已改，但没能写进本机 haproxy.cfg / reload 未成功（会自动重试）。"
+      + `<pre>${esc(en.error || "")}</pre>`;
   }
 }
 
@@ -505,21 +784,20 @@ async function loadOverview() {
   const names = Object.keys(o.frontends || {}).sort();
   for (const name of names) {
     const fe = ensureCard(name);
-    fe.conf = o.frontends[name];
+    // 编辑面板开着时不覆盖 conf：否则轮询会把用户正在填的表单初值换掉。
+    if (!$(".editor", fe.card).classList.contains("open")) fe.conf = o.frontends[name];
     updateCard(fe, (o.latest && o.latest.units) ? o.latest.units[name] : null);
   }
-  // 配置里已删掉的 frontend：移除卡片，避免留下一张永不更新的僵尸图。
   for (const [name, fe] of [...state.fes]) {
     if (!names.includes(name)) { fe.card.remove(); state.fes.delete(name); }
   }
 }
 
 async function loadLogs() {
-  const r = await fetch("/api/logs?after=" + state.logAfter);
-  const j = await r.json();
+  const j = await (await fetch("/api/logs?after=" + state.logAfter)).json();
   const box = $("#logs");
   const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
-  for (const e of j.entries || []) {
+  for (const e of j.logs || []) {
     state.logAfter = Math.max(state.logAfter, e.seq);
     const d = document.createElement("div");
     d.className = "lv-" + e.level;
@@ -535,17 +813,17 @@ async function loadLogs() {
 function connectSSE() {
   const es = new EventSource("/api/stream");
   es.onopen = () => {
-    $("#sse-dot").style.background = "var(--status-good)";
+    $("#sse-dot").style.background = "var(--ok)";
     $("#sse-text").textContent = "实时连接正常";
   };
   es.onerror = () => {
-    $("#sse-dot").style.background = "var(--status-critical)";
+    $("#sse-dot").style.background = "var(--critical)";
     $("#sse-text").textContent = "连接断开，重试中…";
   };
   es.onmessage = (ev) => { try { applySnapshot(JSON.parse(ev.data), true); } catch (e) {} };
 }
 
-// ---------------------------------------------------------------- 启动
+// ============================================================ 启动
 $("#window-sel").onchange = (e) => {
   state.windowS = parseInt(e.target.value, 10);
   for (const fe of state.fes.values()) draw(fe);
@@ -557,15 +835,21 @@ $("#log-level").onchange = (e) => {
     d.style.display = (LEVELS[d.dataset.level] || 0) >= min ? "" : "none";
 };
 $("#new-btn").onclick = () => {
-  const form = $("#new-form");
-  if (form.classList.contains("open")) { form.classList.remove("open"); return; }
-  form.innerHTML = formHtml(null, true);
-  form.classList.add("open");
-  wireForm(form, null, true, (saved) => {
-    form.classList.remove("open");
-    if (saved) setTimeout(loadOverview, 600);
+  const ed = $("#new-editor"), btn = $("#new-btn");
+  if (ed.classList.contains("open")) {
+    ed.classList.remove("open"); btn.textContent = "+ 新增"; return;
+  }
+  ed.innerHTML = editorHtml(null, true);
+  ed.classList.add("open"); btn.textContent = "收起";
+  wireEditor(ed, null, true, (saved) => {
+    ed.classList.remove("open"); btn.textContent = "+ 新增";
+    if (saved) setTimeout(loadOverview, 700);
   });
 };
+// 有未保存修改时离开页面要拦一下——这里的每次保存都是真实的配置变更。
+window.addEventListener("beforeunload", (e) => {
+  if ($$(".editor.open .dirty").some(d => !d.hidden)) { e.preventDefault(); e.returnValue = ""; }
+});
 
 (async function boot() {
   await loadOverview();
@@ -573,10 +857,7 @@ $("#new-btn").onclick = () => {
     const h = await (await fetch("/api/history")).json();
     for (const snap of h.snapshots || []) applySnapshot(snap, false);
   } catch (e) {}
-  for (const fe of state.fes.values()) {
-    const last = fe.buf[fe.buf.length - 1];
-    if (last) draw(fe);
-  }
+  for (const fe of state.fes.values()) draw(fe);
   await loadLogs();
   connectSSE();
   setInterval(loadLogs, 2000);
