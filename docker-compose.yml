@@ -68,7 +68,6 @@ services:
   node1:
     build:
       context: .
-      dockerfile: deploy/docker/Dockerfile.node
     volumes:
       - ./deploy/docker/haproxy-env-a.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
@@ -103,7 +102,6 @@ services:
   node2:
     build:
       context: .
-      dockerfile: deploy/docker/Dockerfile.node
     volumes:
       - ./deploy/docker/haproxy-env-a.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
@@ -134,7 +132,6 @@ services:
   node3:
     build:
       context: .
-      dockerfile: deploy/docker/Dockerfile.node
     volumes:
       - ./deploy/docker/haproxy-env-b.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
