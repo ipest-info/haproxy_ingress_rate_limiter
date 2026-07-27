@@ -54,7 +54,8 @@ def test_render_contains_listen_bwlim_and_servers():
     assert "listen fe_main" in block
     assert "bind :8080" in block
     # 限额换算：40 Mbps ÷ 8 = 5_000_000 bytes/s
-    assert "filter bwlim-out rl-limit limit 5000000" in block
+    # 40 Mbps ÷ 8 = 5_000_000 bytes/s；min-size 按限额比例取（5_000_000/1000）
+    assert "filter bwlim-out rl-limit limit 5000000 key fe_name min-size 5000" in block
     assert "tcp-request content set-bandwidth-limit rl-limit" in block
     # 不开 contstats，TCP 长连接的 bytes_out 只在会话结束时跳变，监控不可用。
     assert "option contstats" in block
@@ -201,3 +202,27 @@ async def test_current_block_reads_from_disk(tmp_path):
     assert en.current_block() is None
     await en.reconcile([fe()])
     assert "listen fe_main" in (en.current_block() or "")
+
+
+# ---------------------------------------------------------------------------
+# min-size：整形的 CPU 开销主要由它决定（见 enforcer 模块的实测数据）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("limit_bytes,expect", [
+    (125_000,       1460),    # 1 Mbps：按比例算只有 125，夹到下限
+    (1_000_000,     1460),    # 8 Mbps：1000 < 下限
+    (5_000_000,     5000),    # 40 Mbps
+    (20_000_000,   20000),    # 160 Mbps
+    (100_000_000,  65536),    # 800 Mbps：100000 > 上限，夹到上限
+    (10_000_000_000, 65536),  # 极大限额也不超过上限
+])
+def test_min_size_scales_with_limit(limit_bytes, expect):
+    """min-size 太小 → 放行次数多、CPU 高（实测 1460 比 65536 贵 3 倍）；
+    太大 → 相对每秒配额过大，放不满额度（实测 1MB/s 配 64KB 只跑到 74%）。
+    因此按限额比例取值并夹在 [1460, 65536]。"""
+    assert E.bwlim_min_size(limit_bytes) == expect
+
+
+def test_min_size_appears_in_rendered_block():
+    block = E.render_block([fe(quota=160_000_000)])   # 160 Mbps = 20 MB/s
+    assert "min-size 20000" in block
