@@ -14,15 +14,15 @@
 # unix socket（/run/haproxy/admin.sock）只采本机那台 HAProxy——stats
 # socket 不占任何网络端口，容器之间也无需互相可达。
 #
-# 拓扑（三台 TCP L4 节点；节点是环境的独占资源——一个环境可横跨多台
-# 节点，一台节点只服务一个环境）：
-#   loadgen ==打散==> node1:8080、node2:8080 (fe_env_a → env-a 独占)
-#                    node3:8080 (fe_env_b → env-b 独占)
+# 拓扑（三台 TCP L4 节点，各自独立；监听端口/限额/后端服务器都由各自的
+# rl-limiter 从配置库渲染进本机 haproxy.cfg 的受管区块）：
+#   loadgen ==打散==> node1:8080、node2:8080、node3:8080（各自 fe_main）
 #                          └──> web:9000（随机大小响应）
-#   node{1,2,3} 内的 rl-limiter ──轮询──> mysql（节点/环境/挂载点/限额）
+#   node{1,2,3} 内的 rl-limiter ──轮询──> mysql（实例/frontend/后端服务器）
 #   node{1,2,3} 内的 rl-limiter ──show stat──> 本机 unix socket（不出容器）
-# 限速由各台 HAProxy 的 shared bwlim（各 40 Mbps）在本机执行；env-a =
-# hap-1+hap-2，env-b = hap-3。同机模式下每个控制台只展示本机节点。
+# 限速由各台 HAProxy 的 shared bwlim（各 40 Mbps）在本机执行。每个控制台
+# 只管本机那台 HAProxy：可在页面上增删改监听端口、限额与后端服务器，
+# 保存即写库、随后自动写进 cfg 并 reload。
 
 services:
   # ---- 配置源：MySQL（表结构与演示种子数据见 deploy/mysql/init.sql）----
@@ -62,17 +62,17 @@ services:
     restart: unless-stopped
 
   # ---- 三台节点：Ubuntu 24.04 + HAProxy 2.8(发行版自带) + 同机 rl-limiter。
-  # 每个容器 = 生产上的一台 ECS。节点独占环境：node1/node2 只跑 env-a 的
-  # fe_env_a（一环境横跨两节点），node3 只跑 env-b 的 fe_env_b。
-  # stats socket 是容器内的 unix socket，不映射、也不需要跨容器可达。
+  # 每个容器 = 生产上的一台 ECS，各管各的。挂进去的 haproxy-base.cfg 只是
+  # global/defaults 骨架，监听端口与后端由各自的 rl-limiter 从配置库渲染
+  # 进受管区块。stats socket 是容器内的 unix socket，不映射也无需互通。
   node1:
     build:
       context: .
     volumes:
-      - ./deploy/docker/haproxy-env-a.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
+      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
-      # 同机模式开关：本实例只采本机这台 HAProxy（配置在全量校验后被
-      # 裁剪到该节点）。值必须与配置库 haproxy_nodes.name 一致。
+      # 本实例对应配置库 haproxy_instances 里的哪一行（读写都只碰自己
+      # 那些行）。值必须与库中登记的实例名一致。
       RL_NODE_NAME: hap-1
       RL_MYSQL_HOST: mysql
       RL_MYSQL_PORT: "3306"
@@ -84,13 +84,13 @@ services:
       # 演示需要从宿主机打开控制台，故绑 0.0.0.0；宿主机侧只映射到回环
       # （下方 ports）。生产默认是 127.0.0.1，控制台无鉴权，切勿裸奔。
       RL_CONSOLE_BIND: 0.0.0.0
-      # 限额自动应用：库里改 quota_bps → 本机 rl-limiter 立刻改写这份
-      # cfg 的 shared bwlim limit 并 reload（容器里没有 systemctl，
-      # 用入口脚本落的 master pid 发 SIGUSR2）。
+      # 配置自动下发：库里改监听端口/限额/后端服务器 → 本机 rl-limiter
+      # 立刻把它们渲染进这份 cfg 的受管区块并 reload（容器里没有
+      # systemctl，用入口脚本落的 master pid 发 SIGUSR2）。
       RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
       RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
     ports:
-      - "8080:8080"              # hap-1 / fe_env_a（宿主机可 curl 体验限速）
+      - "8080:8080"              # hap-1 / fe_main（宿主机可 curl 体验限速）
       - "127.0.0.1:8090:8090"    # hap-1 的控制台
     depends_on:
       mysql:
@@ -103,7 +103,7 @@ services:
     build:
       context: .
     volumes:
-      - ./deploy/docker/haproxy-env-a.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
+      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
       RL_NODE_NAME: hap-2
       RL_MYSQL_HOST: mysql
@@ -114,13 +114,13 @@ services:
       RL_MYSQL_POLL_S: "3"
       RL_CONSOLE_PORT: "8090"
       RL_CONSOLE_BIND: 0.0.0.0
-      # 限额自动应用：库里改 quota_bps → 本机 rl-limiter 立刻改写这份
-      # cfg 的 shared bwlim limit 并 reload（容器里没有 systemctl，
-      # 用入口脚本落的 master pid 发 SIGUSR2）。
+      # 配置自动下发：库里改监听端口/限额/后端服务器 → 本机 rl-limiter
+      # 立刻把它们渲染进这份 cfg 的受管区块并 reload（容器里没有
+      # systemctl，用入口脚本落的 master pid 发 SIGUSR2）。
       RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
       RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
     ports:
-      - "8082:8080"              # hap-2 / fe_env_a
+      - "8082:8080"              # hap-2 / fe_main
       - "127.0.0.1:8092:8090"    # hap-2 的控制台
     depends_on:
       mysql:
@@ -133,7 +133,7 @@ services:
     build:
       context: .
     volumes:
-      - ./deploy/docker/haproxy-env-b.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
+      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
       RL_NODE_NAME: hap-3
       RL_MYSQL_HOST: mysql
@@ -144,13 +144,13 @@ services:
       RL_MYSQL_POLL_S: "3"
       RL_CONSOLE_PORT: "8090"
       RL_CONSOLE_BIND: 0.0.0.0
-      # 限额自动应用：库里改 quota_bps → 本机 rl-limiter 立刻改写这份
-      # cfg 的 shared bwlim limit 并 reload（容器里没有 systemctl，
-      # 用入口脚本落的 master pid 发 SIGUSR2）。
+      # 配置自动下发：库里改监听端口/限额/后端服务器 → 本机 rl-limiter
+      # 立刻把它们渲染进这份 cfg 的受管区块并 reload（容器里没有
+      # systemctl，用入口脚本落的 master pid 发 SIGUSR2）。
       RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
       RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
     ports:
-      - "8083:8080"              # hap-3 / fe_env_b
+      - "8083:8080"              # hap-3 / fe_main
       - "127.0.0.1:8093:8090"    # hap-3 的控制台
     depends_on:
       mysql:
@@ -162,8 +162,8 @@ services:
   # ---- 客户端群：可在线调节并发数的压测服务（模拟并发带宽）----
   loadgen:
     build: .
-    # 三个入口（env-a×2 节点 + env-b×1 节点）：worker 轮转绑定入口，
-    # 每台节点各自被本机 shared bwlim 压在自己的限额内、互不影响。
+    # 三个入口各是一台独立节点：worker 轮转绑定入口，每台节点各自被
+    # 本机 shared bwlim 压在自己的限额内、互不影响。
     command: >-
       python3 tools/loadgen.py
       --target http://node1:8080/,http://node2:8080/,http://node3:8080/

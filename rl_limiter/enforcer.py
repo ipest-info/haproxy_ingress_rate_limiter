@@ -1,10 +1,27 @@
-# rl_limiter.enforcer —— 把配置库里登记的限额**落到本机 HAProxy 上**。
+# rl_limiter.enforcer —— 把配置渲染进本机 haproxy.cfg 的**受管区块**并 reload。
 #
 # 这是同机部署的核心价值：rl-limiter 与 HAProxy 在同一台机器上，因此能
-# 直接改本机 haproxy.cfg 并触发 reload，让"改完立刻生效"成立——跨机的
-# 集中服务做不到这件事（要么开 SSH，要么另装 agent）。
+# 直接改本机 haproxy.cfg 并触发 reload，让"在 Web 界面上改完立刻生效"
+# 成立——跨机的集中服务做不到这件事（要么开 SSH，要么另装 agent）。
 #
-# ## 为什么必须走"改配置 + reload"，而不是 runtime API
+# ## 受管区块（managed block）
+#
+# cfg 里用一对标记圈出一段，**只有这段由 rl-limiter 生成**：
+#
+#     # >>> BEGIN rl-limiter managed >>>
+#     listen fe_main
+#         bind :8080
+#         ...
+#     # <<< END rl-limiter managed <<<
+#
+# 标记之外的一切（global、defaults、TLS、ACL、日志、运维手写的其它
+# backend…）原样保留，rl-limiter 一个字节都不碰。这样既能把监听端口、
+# 后端服务器、限额都做进标准化界面，又不夺走运维手写配置的空间。
+#
+# 首次运行时若文件里没有标记，区块会被**追加到文件末尾**——这让"给一台
+# 已有的 HAProxy 接上 rl-limiter"不需要先手工改配置。
+#
+# ## 为什么限速必须走"改配置 + reload"，而不是 runtime API
 #
 # 实测 HAProxy 2.8.16（Ubuntu 24.04 自带版本）：
 #
@@ -12,38 +29,38 @@
 #     `set-bandwidth-limit` 带上动态 limit 表达式会在配置解析阶段就被
 #     拒绝：`set-bandwidth-limit rule cannot define a limit for a shared
 #     bwlim filter`；runtime API 的命令表里也没有任何 bwlim/bandwidth
-#     相关命令（`show/set` 都没有）。
+#     相关命令。
 #   - 带动态 limit（map 表 + `set map` 热更）只有 **per-stream** 形态支持
 #     ——而 per-stream 正是设计文档 §3.2 记载的、生产事故后废弃的方案
 #     （限速值建连时定格、按连接数均分、正反馈锁死）。不能为了"免 reload"
 #     退回去。
 #
-# 所以路径只剩一条：**原地改 cfg 里的 limit 数值 + reload**。实测这条路
-# 足够快，"立刻生效"名副其实（同一台机器、400MB 下载、hard-stop-after 6s）：
+# 何况监听端口、后端服务器这些本来就只能靠改配置 + reload 生效。实测这
+# 条路足够快，"立刻生效"名副其实（同机、400MB 下载、hard-stop-after 6s）：
 #
 #   | 观测项 | 实测 |
 #   | ------ | ---- |
+#   | 一次完整应用（校验 + 原子写 + reload） | ~74 ms |
 #   | 新 worker 接管 | ~23 ms |
 #   | reload 后**新建**连接 | 立刻按新限额（1→4 MB/s，实测稳定 4.00 MB/s）|
 #   | **存量**连接 | 保持旧限额，直到 hard-stop-after 宽限期结束被断开重连 |
 #
-# 存量连接的行为由运维自己的 `hard-stop-after` 决定，本模块不碰它：
-# 宽限期短 = 限额调整对存量连接也快速生效（代价是长下载被断开重来），
-# 宽限期长/不设 = 存量连接自然放完。这是业务取舍，不该由限速器替运维定。
+# 存量连接的行为由运维自己的 `hard-stop-after` 决定，本模块不碰它。
 #
-# ## 安全边界（本模块唯一有写权限的地方，逐条都是刻意的）
+# ## 安全边界（本模块是全服务唯一有写权限的地方，逐条都是刻意的）
 #
-#   1. **只做定点数值替换，绝不重新生成整份 cfg**。运维手写的一切
-#      （ACL、后端、TLS、日志……）原样不动——本模块只认受控 frontend 段
-#      里那一行 `filter bwlim-out ... limit <数字>`，且只改那个数字。
+#   1. **只重写标记之间的内容**，标记之外一律不动；
 #   2. **reload 前必过 `haproxy -c`**。把坏配置 reload 进生产 = 整台机器
-#      的入口挂掉，比限额没改过去严重得多。校验不过就原样留着并告警。
-#   3. **写入是原子的**（同目录临时文件 + rename），并留一份 .bak。
-#      任何一步失败都回到调用前的状态。
+#      的入口挂掉，比配置没改过去严重得多。校验不过就原样留着并告警；
+#   3. **写入是原子的**（同目录临时文件 + rename），并留一份 .rl-bak。
+#      任何一步失败都回到调用前的状态；
 #   4. **reload 命令绝不来自数据库**。它是本机环境变量。若允许配置库指定
-#      要执行的命令，拿到库写权限 = 在每一台 HAProxy 上远程执行任意命令。
-#   5. **默认关闭**。不设 RL_APPLY_HAPROXY_CFG 就完全不写盘、不 reload，
-#      退化成原来的只读监控 + 漂移告警。
+#      要执行的命令，拿到库写权限 = 在每一台 HAProxy 上远程执行任意命令；
+#   5. **进入区块的每个值都过白名单校验**（config._validate 里的字符集/
+#      范围检查）。这些值被原样渲染进配置文件，放任任意字符等于允许通过
+#      配置库往 haproxy.cfg 注入任意指令；本模块渲染前还会再查一遍，
+#      两道闸都过不去的值宁可整份不写；
+#   6. **默认关闭**。不设 RL_APPLY_HAPROXY_CFG 就完全不写盘、不 reload。
 
 from __future__ import annotations
 
@@ -55,129 +72,147 @@ import shlex
 import tempfile
 from dataclasses import dataclass, field
 
-# 段落起始关键字：出现在行首（顶格）时开启一个新的配置段。用来把 cfg
-# 切成段，从而把"改哪一行"限制在目标 frontend 自己的段落里——同一份 cfg
-# 里多个 frontend 各有自己的 bwlim 行，认错段就会改到别的环境头上。
-_SECTION_KEYWORDS = (
-    "global", "defaults", "listen", "frontend", "backend", "resolvers",
-    "peers", "userlist", "ring", "http-errors", "program", "mailers",
-    "cache", "log-forward", "traces", "crt-store", "acme",
+from . import model
+
+BEGIN_MARKER = "# >>> BEGIN rl-limiter managed >>>"
+END_MARKER = "# <<< END rl-limiter managed <<<"
+
+_BLOCK_RE = re.compile(
+    re.escape(BEGIN_MARKER) + r".*?" + re.escape(END_MARKER),
+    re.DOTALL,
 )
 
-# 顶格的段落头，形如 `listen fe_env_a` / `frontend fe_env_a` / `global`。
-_SECTION_RE = re.compile(
-    r"^(" + "|".join(_SECTION_KEYWORDS) + r")(?:\s+(\S+))?\s*$"
-)
-
-# 受控的 shared bwlim 行。只匹配 bwlim-out（下行整形；上行由 TCP 背压
-# 自然收敛，见设计 §3.2），且必须带 `limit <数字>`——per-stream 形态用的
-# 是 `default-limit`，不会被这个正则命中，等于天然把"只改 shared 限额"
-# 这条约束写进了匹配规则。
-_BWLIM_RE = re.compile(
-    r"^(?P<head>\s*filter\s+bwlim-out\s+\S+\s+(?:.*?\s)??limit\s+)"
-    r"(?P<limit>\d+)"
-    r"(?P<tail>(?:\s.*)?)$"
-)
+# 渲染前的最后一道防线。config._validate 已经按同样的规则校验过，这里
+# 再查一遍是因为本模块是"把字符串写进配置文件"的那一步：任何绕过配置
+# 校验的路径（未来新增的写接口、手工构造的对象）都不能突破这里。
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_SAFE_ADDR = re.compile(r"^[A-Za-z0-9._:-]{1,255}$")
+_SAFE_MODE = ("tcp", "http")
+_SAFE_BALANCE = ("roundrobin", "static-rr", "leastconn", "first", "source", "random")
 
 
 class EnforceError(Exception):
-    """应用限额失败。消息面向运维，说清楚"卡在哪一步、现在是什么状态"。"""
+    """应用配置失败。消息面向运维，说清楚"卡在哪一步、现在是什么状态"。"""
 
 
 @dataclass(slots=True)
 class EnforceResult:
     """一次 reconcile 的结果，用于日志与控制台展示。"""
 
-    changed: bool = False                      # 是否真的改了 cfg 并 reload
-    applied: dict[str, int] = field(default_factory=dict)   # frontend → 新 limit(bytes/s)
-    previous: dict[str, int] = field(default_factory=dict)  # frontend → 旧 limit(bytes/s)
-    error: str = ""                            # 非空表示失败（保持原状）
+    changed: bool = False       # 是否真的改了 cfg 并 reload
+    error: str = ""             # 非空表示失败（数据面保持原状）
+    frontends: list[str] = field(default_factory=list)   # 本次写入的 frontend 名
 
     @property
     def ok(self) -> bool:
         return not self.error
 
 
-def parse_limits(text: str) -> dict[str, int]:
-    """从 haproxy.cfg 文本里读出每个 frontend 当前的 shared bwlim limit
-    （bytes/s）。
+def _check_renderable(frontends: list[model.FrontendConfig]) -> None:
+    """渲染前的白名单复核（见模块头 §安全边界 第 5 条）。"""
+    for f in frontends:
+        if not _SAFE_NAME.match(f.name):
+            raise EnforceError(f"frontend 名 {f.name!r} 含非法字符，拒绝写入配置文件")
+        if f.mode not in _SAFE_MODE:
+            raise EnforceError(f"frontend {f.name}: mode {f.mode!r} 非法")
+        if f.balance not in _SAFE_BALANCE:
+            raise EnforceError(f"frontend {f.name}: balance {f.balance!r} 非法")
+        if not (1 <= f.bind_port <= 65535):
+            raise EnforceError(f"frontend {f.name}: bind_port {f.bind_port} 越界")
+        if f.bind_address and not _SAFE_ADDR.match(f.bind_address):
+            raise EnforceError(
+                f"frontend {f.name}: bind_address {f.bind_address!r} 含非法字符")
+        if int(f.quota_bytes_per_sec) < 1:
+            raise EnforceError(
+                f"frontend {f.name}: 限额 {f.quota_bits_per_sec} bit/s 换算后不足 "
+                f"1 byte/s，HAProxy 会拒绝")
+        for s in f.servers:
+            if not _SAFE_NAME.match(s.name):
+                raise EnforceError(
+                    f"frontend {f.name}: server 名 {s.name!r} 含非法字符")
+            if not _SAFE_ADDR.match(s.address):
+                raise EnforceError(
+                    f"frontend {f.name}/{s.name}: address {s.address!r} 含非法字符")
+            if not (1 <= s.port <= 65535):
+                raise EnforceError(
+                    f"frontend {f.name}/{s.name}: port {s.port} 越界")
 
-    返回 {frontend 名: limit}。没有 bwlim 行的段落不出现在结果里——
-    调用方据此判断"这个 frontend 根本没配限速"，那是配置缺失，不是 0。
+
+def render_block(frontends: list[model.FrontendConfig]) -> str:
+    """把受管 frontend 清单渲染成受管区块文本（含首尾标记）。
+
+    每个 frontend 渲染成一个 `listen` 段：监听端口、模式、超时、
+    shared bwlim 限速、后端服务器。用 listen 而不是 frontend+backend
+    分写，是因为本模型里两者一一对应，合成一段更短、也让 stats 里的
+    pxname 与配置里的段名直接相等（采样按 pxname 匹配）。
+
+    输出是**确定性**的（同样的输入永远得到同样的字节），reconcile 的
+    幂等性依赖这一点——否则每轮都会认为"有变化"而反复 reload。
     """
-    out: dict[str, int] = {}
-    section_name = ""
-    section_kind = ""
-    for line in text.splitlines():
-        m = _SECTION_RE.match(line)
-        if m:
-            section_kind, section_name = m.group(1), (m.group(2) or "")
-            continue
-        if section_kind not in ("listen", "frontend") or not section_name:
-            continue
-        bm = _BWLIM_RE.match(line)
-        if bm:
-            out[section_name] = int(bm.group("limit"))
-    return out
+    _check_renderable(frontends)
+    lines = [
+        BEGIN_MARKER,
+        "# 本区块由 rl-limiter 自动生成，请勿手工编辑——改动会在下一次",
+        "# reconcile（默认 30 秒内）被原样覆盖。要调整监听端口、限额或",
+        "# 后端服务器，请用 rl-limiter 的 Web 控制台（或直接改配置库）。",
+        "# 标记之外的内容 rl-limiter 一个字节都不会碰。",
+    ]
+    for f in frontends:
+        limit_bytes = int(f.quota_bytes_per_sec)
+        lines.append("")
+        lines.append(f"listen {f.name}")
+        lines.append(f"    bind {f.bind_spec}")
+        lines.append(f"    mode {f.mode}")
+        if f.maxconn > 0:
+            # 资源保护水位，不是限速手段：限速导致连接堆积时防止耗尽内存/fd。
+            lines.append(f"    maxconn {f.maxconn}")
+        lines.append(f"    balance {f.balance}")
+        lines.append(f"    timeout connect {f.timeout_connect_ms}ms")
+        lines.append(f"    timeout client {f.timeout_client_ms}ms")
+        lines.append(f"    timeout server {f.timeout_server_ms}ms")
+        # 连续统计：不开的话 TCP 长连接的 bytes_out 只在会话结束时跳变，
+        # 逐秒差分出来的速率会是"0 与巨大脉冲交替"，监控完全不可用。
+        lines.append("    option contstats")
+        # shared bwlim 的速率桶存在这张 stick-table 里，key 取 frontend 名
+        # ——本段全部连接共用一个桶，于是限的是"该端口的总下行速率"。
+        lines.append(
+            "    stick-table type string len 64 size 1k expire 1h "
+            "store bytes_out_rate(1s)")
+        # min-size 1460：小于一个 MSS 的报文不参与整形，避免把小包切碎。
+        lines.append(
+            f"    filter bwlim-out rl-limit limit {limit_bytes} "
+            f"key fe_name min-size 1460")
+        lines.append("    tcp-request content set-bandwidth-limit rl-limit")
+        for s in f.servers:
+            parts = [f"    server {s.name} {s.address}:{s.port}"]
+            parts.append(f"weight {s.weight}")
+            if s.check:
+                parts.append(f"check inter {s.check_inter_ms}ms")
+            lines.append(" ".join(parts))
+    lines.append(END_MARKER)
+    return "\n".join(lines) + "\n"
 
 
-def replace_limits(text: str, desired: dict[str, int]) -> tuple[str, dict[str, int]]:
-    """把 desired（frontend → 目标 limit bytes/s）写进 cfg 文本。
+def splice_block(text: str, block: str) -> str:
+    """把受管区块塞回 cfg 文本：有标记就替换，没有就追加到末尾。
 
-    返回 (新文本, {frontend: 旧值})，只有确实发生变化的 frontend 才出现在
-    旧值字典里。不做任何其它改动：行的缩进、注释、参数顺序全部保留，
-    只有那个十进制数字被换掉。
-
-    目标 frontend 不存在、或它的段里没有 shared bwlim 行、或有多行，
-    一律抛 EnforceError——这三种情况下"猜一个去改"比不改危险得多。
+    追加而不是报错，是为了让"给一台已有的 HAProxy 接上 rl-limiter"这件事
+    不需要先手工改配置——第一次 reconcile 自己把区块建出来。
     """
-    lines = text.splitlines(keepends=True)
-    section_name = ""
-    section_kind = ""
-    hits: dict[str, list[int]] = {}
-    for i, line in enumerate(lines):
-        m = _SECTION_RE.match(line.rstrip("\n"))
-        if m:
-            section_kind, section_name = m.group(1), (m.group(2) or "")
-            continue
-        if section_kind not in ("listen", "frontend") or section_name not in desired:
-            continue
-        if _BWLIM_RE.match(line.rstrip("\n")):
-            hits.setdefault(section_name, []).append(i)
+    if _BLOCK_RE.search(text):
+        return _BLOCK_RE.sub(lambda _: block.rstrip("\n"), text, count=1)
+    sep = "" if text.endswith("\n") or not text else "\n"
+    return f"{text}{sep}\n{block}"
 
-    missing = [f for f in desired if f not in hits]
-    if missing:
-        raise EnforceError(
-            f"haproxy.cfg 里找不到这些受控 frontend 的 shared bwlim 配置行："
-            f"{', '.join(sorted(missing))}——请确认该 frontend 段里有形如 "
-            f"`filter bwlim-out <名字> limit <字节/秒> key ...` 的一行"
-            f"（per-stream 的 default-limit 不算，见 deploy/haproxy/bwlim-example.cfg）"
-        )
-    ambiguous = {f: len(v) for f, v in hits.items() if len(v) > 1}
-    if ambiguous:
-        raise EnforceError(
-            f"这些 frontend 的段里有多行 shared bwlim 配置，无法确定改哪一行："
-            f"{ambiguous}——请人工收敛成一行后再启用自动应用"
-        )
 
-    previous: dict[str, int] = {}
-    for frontend, idxs in hits.items():
-        i = idxs[0]
-        raw = lines[i]
-        newline = "\n" if raw.endswith("\n") else ""
-        bm = _BWLIM_RE.match(raw.rstrip("\n"))
-        assert bm is not None                       # 上面已按同一正则筛过
-        old = int(bm.group("limit"))
-        want = desired[frontend]
-        if old == want:
-            continue
-        previous[frontend] = old
-        lines[i] = f"{bm.group('head')}{want}{bm.group('tail')}{newline}"
-    return "".join(lines), previous
+def extract_block(text: str) -> str | None:
+    """取出当前 cfg 里的受管区块原文；没有标记时返回 None。"""
+    m = _BLOCK_RE.search(text)
+    return m.group(0) if m else None
 
 
 class HAProxyEnforcer:
-    """把限额落到本机 haproxy.cfg 并 reload。
+    """把受管 frontend 配置落到本机 haproxy.cfg 并 reload。
 
     cfg_path / reload_cmd / validate_cmd 全部来自**本机**配置（环境变量），
     绝不来自配置库——见模块头 §安全边界 第 4 条。
@@ -195,32 +230,43 @@ class HAProxyEnforcer:
     def cfg_path(self) -> str:
         return self._cfg_path
 
-    def current_limits(self) -> dict[str, int]:
-        """读出本机 cfg 当前的限额（bytes/s），供控制台展示"数据面实际值"。"""
+    @property
+    def reload_cmd(self) -> str:
+        return self._reload_cmd
+
+    def current_block(self) -> str | None:
+        """读出本机 cfg 当前的受管区块，供控制台展示"数据面实际配置"。"""
         with open(self._cfg_path, "r", encoding="utf-8") as f:
-            return parse_limits(f.read())
+            return extract_block(f.read())
 
-    async def reconcile(self, desired: dict[str, int]) -> EnforceResult:
-        """让本机 cfg 收敛到 desired（frontend → limit bytes/s）。
+    async def reconcile(self, frontends: list[model.FrontendConfig]) -> EnforceResult:
+        """让本机 cfg 的受管区块收敛到 frontends。
 
-        幂等：已经一致就什么都不做（不写盘、不 reload），返回 changed=False。
-        因此它既是"配置变更时立刻生效"的执行者，也是"有人手改了 cfg"时的
-        自动纠偏——配置库是唯一真相源这件事，靠周期性调用它来维持。
+        幂等：渲染结果与文件里现有区块逐字节相同就什么都不做（不写盘、
+        不 reload），返回 changed=False。因此它既是"配置一变立刻生效"的
+        执行者，也是"有人手改了 cfg"时的自动纠偏——配置库是唯一真相源
+        这件事，靠周期性调用它来维持。
         """
-        if not desired:
-            return EnforceResult()
+        if not frontends:
+            # 空清单会把区块写成空的，等于删掉全部监听端口。配置校验已经
+            # 拒绝了空 frontends，这里是防御性兜底：宁可不动。
+            return EnforceResult(
+                error="受管 frontend 清单为空，拒绝写入（那会删掉全部监听端口）")
+        try:
+            block = render_block(frontends)
+        except EnforceError as e:
+            return EnforceResult(error=str(e))
+
         try:
             with open(self._cfg_path, "r", encoding="utf-8") as f:
                 original = f.read()
-            new_text, previous = replace_limits(original, desired)
-        except EnforceError as e:
-            return EnforceResult(error=str(e))
         except OSError as e:
             return EnforceResult(error=f"读取 {self._cfg_path} 失败: {e}")
 
-        if not previous:
-            return EnforceResult()                  # 已一致，无需改动
+        if extract_block(original) == block.rstrip("\n"):
+            return EnforceResult()          # 已一致，无需改动
 
+        new_text = splice_block(original, block)
         try:
             await self._write_validated(new_text)
         except EnforceError as e:
@@ -234,17 +280,19 @@ class HAProxyEnforcer:
             # 下次机器重启会悄悄用上这份从未被验证过能 reload 的配置。
             await self._restore_backup()
             return EnforceResult(
-                error=f"{e}（cfg 已回滚，HAProxy 仍按调整前的限额运行）")
+                error=f"{e}（cfg 已回滚，HAProxy 仍按调整前的配置运行）")
 
-        applied = {f: desired[f] for f in previous}
+        names = [f.name for f in frontends]
         self._log.warning(
-            "已把登记限额应用到本机 HAProxy 并 reload（数据面已按新限额执行） "
-            "cfg=%s changes=%s reload_cmd=%r",
+            "已把受管配置写入本机 haproxy.cfg 并 reload（数据面已按新配置运行） "
+            "cfg=%s frontends=%s reload_cmd=%r",
             self._cfg_path,
-            ";".join(f"{f}:{previous[f]}->{applied[f]}bytes/s" for f in sorted(previous)),
+            ";".join(
+                f"{f.name}:{f.bind_spec}:{int(f.quota_bytes_per_sec)}bytes/s:"
+                f"{len(f.servers)}srv" for f in frontends),
             self._reload_cmd,
         )
-        return EnforceResult(changed=True, applied=applied, previous=previous)
+        return EnforceResult(changed=True, frontends=names)
 
     async def _write_validated(self, new_text: str) -> None:
         """原子替换 cfg，但**先让 haproxy -c 校验通过**。
@@ -259,9 +307,8 @@ class HAProxyEnforcer:
                 dir=d, prefix=".rl-limiter-", suffix=".cfg")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(new_text)
-            # 校验用的临时文件权限默认 0600，haproxy -c 以当前用户跑，没问题；
-            # 但最终落盘的文件要沿用原文件的权限，避免把 cfg 改成 0600 后
-            # 别的运维工具读不了。
+            # 临时文件默认 0600；最终落盘的文件要沿用原文件的权限，
+            # 避免把 cfg 改成 0600 后别的运维工具读不了。
             try:
                 os.chmod(tmp_path, os.stat(self._cfg_path).st_mode & 0o7777)
             except OSError:
@@ -320,39 +367,39 @@ async def run_enforcer(
     on_result=None,
     period_s: float = 30.0,
 ) -> None:
-    """常驻任务：让本机 HAProxy 的限额持续收敛到配置库登记值。
+    """常驻任务：让本机 HAProxy 的受管区块持续收敛到配置。
 
     两种触发，缺一不可：
 
-      - **配置变更即触发**（config_applied 事件）：这是"改完立刻生效"
-        那条路径——控制台或 SQL 改了 quota_bps，配置轮询把它送进监控
-        循环，循环 set 事件，这里立刻 reconcile 并 reload。
+      - **配置变更即触发**（config_applied 事件）：这是"在界面上改完立刻
+        生效"那条路径——控制台或 SQL 改了配置，轮询把它送进监控循环，
+        循环 set 事件，这里立刻 reconcile 并 reload。
       - **周期性兜底**（period_s）：有人手改了 cfg、或上一次 reload 失败
         需要重试时，靠它把状态拉回来。配置库是唯一真相源这件事，是靠
         持续 reconcile 维持的，不是靠"变更时改一次"。
 
-    desired_fn() 返回 {frontend: limit bytes/s}；失败只记录不抛，让任务
-    活到下一轮——限额应用失败绝不能顺带把监控也带走。
+    desired_fn() 返回受管 frontend 列表；失败只记录不抛，让任务活到下一轮
+    ——配置下发失败绝不能顺带把监控也带走。
     """
     log.info(
-        "限额自动应用已启用（本机 HAProxy 的 limit 将持续跟随配置库） "
+        "配置自动下发已启用（本机 haproxy.cfg 的受管区块将持续跟随配置） "
         "cfg=%s reload_cmd=%r reconcile_period_s=%s",
-        enforcer.cfg_path, enforcer._reload_cmd, period_s)
+        enforcer.cfg_path, enforcer.reload_cmd, period_s)
     last_error = ""
     while True:
         try:
             desired = desired_fn()
         except Exception as e:                       # pragma: no cover - 防御
-            log.error("计算目标限额失败，本轮跳过 err=%s", e)
-            desired = {}
+            log.error("计算目标配置失败，本轮跳过 err=%s", e)
+            desired = []
         if desired:
             result = await enforcer.reconcile(desired)
             if result.error:
                 # 同一个错误反复刷屏没有信息量；变化了才再喊一次。
                 if result.error != last_error:
                     log.error(
-                        "把登记限额应用到本机 HAProxy 失败，数据面维持原状"
-                        "（限速仍在按调整前的值执行，监控与告警不受影响） "
+                        "把配置写入本机 haproxy.cfg 失败，数据面维持原状"
+                        "（HAProxy 仍按调整前的配置运行，监控与告警不受影响） "
                         "cfg=%s err=%s", enforcer.cfg_path, result.error)
                 last_error = result.error
             else:

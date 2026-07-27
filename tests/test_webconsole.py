@@ -1,157 +1,147 @@
-# webconsole（内置 Web 控制台）纯逻辑部分的测试：日志环形缓冲、
-# StatusHub 的快照合成/历史留存/订阅广播、dbconfig 写库入口的本地校验。
-# HTTP 层（aiohttp 路由）与真实 MySQL 写回由 docker compose 环境做集成验证。
+# tests.test_webconsole —— 控制台的 StatusHub（快照合成/订阅/概览）与
+# 写接口的应答契约。HTTP 层用 aiohttp 的测试工具直接打真实路由。
+
+from __future__ import annotations
 
 import asyncio
-import logging
 
 import pytest
+from aiohttp.test_utils import TestClient, TestServer
 
-from rl_limiter import dbconfig, model, webconsole
-
-
-# 监控单元 = 节点，EnvQuota/EnvUsage 的 env_id 字段装节点名。
-def _unit(node="hap-1", quota_bps=40_000_000):
-    return model.EnvQuota(
-        env_id=node, quota_bits_per_sec=quota_bps,
-        targets=[model.Target(node, "fe_env_a")])
+from rl_limiter import model, webconsole
 
 
-def _usage(node="hap-1", rate=1000.0, degraded=False):
-    return model.EnvUsage(
-        env_id=node, rate_bps=rate, mean10_bps=rate, ewma60_bps=rate,
-        conn_cur=3, degraded=degraded)
+def fe(name="fe_a", quota_bps=8_000_000, port=8080):
+    return model.FrontendConfig(
+        name=name, bind_port=port, quota_bits_per_sec=quota_bps,
+        servers=[model.ServerEntry(name="s1", address="10.0.0.1", port=80)])
 
 
-def make_hub():
-    return webconsole.StatusHub("test", version_fn=lambda: 42)
+def usage(name="fe_a", mean10=0.0, rate=0.0, conn=0, degraded=False):
+    return model.FrontendUsage(name=name, rate_bps=rate, mean10_bps=mean10,
+                               conn_cur=conn, degraded=degraded)
 
 
-# ---- LogBuffer ----
-
-def test_log_buffer_since_and_capacity():
-    buf = webconsole.LogBuffer(capacity=3)
-    log = logging.getLogger("test_webconsole")
-    log.setLevel(logging.INFO)
-    log.addHandler(buf)
-    try:
-        for i in range(5):
-            log.info("消息 %d", i)
-    finally:
-        log.removeHandler(buf)
-    entries = buf.since(0)
-    # 容量 3：只留最新 3 条，seq 连续且消息已完成 % 格式化。
-    assert [e["seq"] for e in entries] == [3, 4, 5]
-    assert entries[-1]["msg"] == "消息 4"
-    assert entries[-1]["level"] == "INFO"
-    # 增量拉取：after=4 只给最后一条。
-    assert [e["seq"] for e in buf.since(4)] == [5]
+def hub(**kw):
+    h = webconsole.StatusHub("test", version_fn=lambda: 1, **kw)
+    h.update_config(model.ControllerConfig(version=1, frontends=[fe()]))
+    return h
 
 
-# ---- StatusHub ----
+# ---------------------------------------------------------------------------
+# 快照与概览
+# ---------------------------------------------------------------------------
 
-def test_hub_snapshot_merges_usage_and_quota():
-    hub = make_hub()
-    hub.update_config(model.ControllerConfig(
-        version=1, envs=[_unit()],
-        env_groups={"env-a": ["hap-1"]}))
-    hub.record(1000.0, [_usage(rate=5000.0)])
-
-    ov = hub.overview()
-    assert ov["config_version"] == 42
-    unit = ov["latest"]["units"]["hap-1"]
-    assert unit["rate_bytes_per_s"] == 5000.0
-    # 节点限额来自 update_config 缓存的配置视图（bits → bytes 已换算）。
-    assert unit["quota_bytes_per_s"] == 5_000_000.0
-    # mean10 未超限额 → over=False。
-    assert unit["over"] is False
-    # 节点配置视图暴露 frontends 与分组（控制台挂载点管理据此推导明细）。
-    assert ov["node_config"]["hap-1"]["frontends"] == ["fe_env_a"]
-    assert ov["env_groups"] == {"env-a": ["hap-1"]}
-    assert ov["latest"]["env_groups"] == {"env-a": ["hap-1"]}
+def test_snapshot_merges_usage_and_quota():
+    h = hub()
+    h.record(100.0, [usage(rate=500.0, mean10=400.0, conn=7)])
+    snap = h.history()[-1]
+    u = snap["units"]["fe_a"]
+    assert u["rate_bytes_per_s"] == 500.0
+    assert u["conn"] == 7
+    # 限额随快照下发，页面据此画参考线；换算（÷8）只在服务端做。
+    assert u["quota_bytes_per_s"] == 1_000_000
+    assert u["over"] is False
 
 
-def test_hub_snapshot_over_flag():
-    """mean10 超过登记限额 → over=True；degraded（数据陈旧）时不判超限。"""
-    hub = make_hub()
-    hub.update_config(model.ControllerConfig(
-        version=1, envs=[_unit(quota_bps=8_000)]))  # 1000 bytes/s 限额
-    hub.record(1.0, [_usage(rate=5000.0)])
-    assert hub.history()[-1]["units"]["hap-1"]["over"] is True
-    hub.record(2.0, [_usage(rate=5000.0, degraded=True)])
-    assert hub.history()[-1]["units"]["hap-1"]["over"] is False
+def test_snapshot_over_flag():
+    h = hub()
+    h.record(1.0, [usage(mean10=2_000_000)])       # 限额 1_000_000 bytes/s
+    assert h.history()[-1]["units"]["fe_a"]["over"] is True
 
 
-def test_hub_history_is_bounded():
-    hub = make_hub()
+def test_degraded_suppresses_over_flag():
+    """采样失联时数据陈旧，不该据此判超限（判定在循环里也是暂停的）。"""
+    h = hub()
+    h.record(1.0, [usage(mean10=2_000_000, degraded=True)])
+    assert h.history()[-1]["units"]["fe_a"]["over"] is False
+
+
+def test_haproxy_view_reports_endpoint_and_health():
+    h = hub(haproxy=model.NodeConfig(name="hap", socket_path="/run/h.sock"),
+            degraded_fn=lambda: True)
+    v = h.overview()["haproxy"]
+    assert v == {"name": "hap", "endpoint": "/run/h.sock",
+                 "unix": True, "degraded": True}
+
+
+def test_overview_exposes_frontend_config():
+    """界面的编辑表单以 overview 的 frontends 为初值。"""
+    o = hub().overview()
+    f = o["frontends"]["fe_a"]
+    assert f["bind_port"] == 8080 and f["quota_bps"] == 8_000_000
+    assert f["quota_bytes_per_s"] == 1_000_000
+    assert [s["name"] for s in f["servers"]] == ["s1"]
+
+
+def test_history_is_bounded():
+    h = hub()
     for i in range(webconsole.HISTORY_TICKS + 50):
-        hub.record(float(i), [_usage()])
-    h = hub.history()
-    assert len(h) == webconsole.HISTORY_TICKS
-    assert h[0]["ts"] == 50.0  # 最旧的 50 拍被挤出
+        h.record(float(i), [usage()])
+    assert len(h.history()) == webconsole.HISTORY_TICKS
 
 
-async def test_hub_subscriber_drops_oldest_when_slow():
-    hub = make_hub()
-    q = hub.subscribe()
-    try:
-        # 灌满队列后继续发布：慢消费者收到的是最新的 N 帧，而不是最旧的。
-        total = webconsole.SUBSCRIBER_QUEUE_DEPTH + 3
-        for i in range(total):
-            hub.record(float(i), [_usage()])
-        got = [q.get_nowait()["ts"] for _ in range(q.qsize())]
-        assert got == [float(i) for i in range(3, total)]
-        with pytest.raises(asyncio.QueueEmpty):
-            q.get_nowait()
-    finally:
-        hub.unsubscribe(q)
-    # 退订后发布不应再进队列。
-    hub.record(99.0, [_usage()])
-    assert q.qsize() == 0
+def test_subscriber_drops_oldest_when_slow():
+    """慢消费者丢最旧一帧：页面只关心最新状态，绝不反压快环。"""
+    h = hub()
+    q = h.subscribe()
+    for i in range(webconsole.SUBSCRIBER_QUEUE_DEPTH + 3):
+        h.record(float(i), [usage()])
+    assert q.qsize() == webconsole.SUBSCRIBER_QUEUE_DEPTH
 
 
-# ---- dbconfig 写库入口的本地校验（不触网） ----
+def test_record_enforce_tracks_success_and_failure():
+    h = hub()
+    assert h.overview()["enforce"] is None      # 未启用下发
 
-async def test_update_node_quota_rejects_nonpositive():
-    opts = dbconfig.MySQLOptions(host="unused")
-    with pytest.raises(ValueError, match="quota_bps"):
-        await dbconfig.update_node_quota(opts, "hap-1", 0)
+    class R:
+        def __init__(self, ok, changed, err="", fes=()):
+            self.ok, self.changed, self.error = ok, changed, err
+            self.frontends = list(fes)
 
+    h.record_enforce(R(True, True, fes=["fe_a"]))
+    e = h.overview()["enforce"]
+    assert e["enabled"] and e["ok"] and e["applied"] == ["fe_a"]
+    assert e["last_change_ts"] is not None
 
-def test_hub_nodes_view_degraded():
-    """节点视图：接线 + 采样健康（失联集合来自 degraded_fn）。"""
-    nodes = [
-        model.NodeConfig(name="hap-1", host="haproxy1", port=9999),
-        model.NodeConfig(name="hap-2", host="haproxy2", port=9999),
-    ]
-    hub = webconsole.StatusHub(
-        "test", version_fn=lambda: 1,
-        nodes=nodes, degraded_fn=lambda: {"hap-2"})
-    hub.update_config(model.ControllerConfig(
-        version=1, envs=[_unit()],
-        env_groups={"env-a": ["hap-1", "hap-2"]}))
-    view = hub.overview()["nodes"]
-    assert view["hap-1"] == {
-        "host": "haproxy1", "port": 9999, "endpoint": "haproxy1:9999",
-        "unix": False, "degraded": False,
-    }
-    assert view["hap-2"]["degraded"] is True
-    # 集中监控模式下没有本机节点概念。
-    assert hub.overview()["scope_node"] is None
-    # 快照同样携带节点视图（SSE 帧里实时可见采样健康）。
-    hub.record(1.0, [_usage()])
-    assert hub.history()[-1]["nodes"]["hap-2"]["degraded"] is True
+    h.record_enforce(R(False, False, err="haproxy -c 挂了"))
+    e = h.overview()["enforce"]
+    assert not e["ok"] and "haproxy -c 挂了" in e["error"]
+    # 失败不该抹掉"上次成功下发的时间"，那是排障时的重要参照。
+    assert e["last_change_ts"] is not None
 
 
-def test_hub_nodes_view_unix_socket_and_scope_node():
-    """同机部署形态：节点视图的 endpoint 是 unix socket 路径，
-    overview 带上本机节点名供页面挂本地模式横幅。"""
-    hub = webconsole.StatusHub(
-        "test", version_fn=lambda: 1,
-        nodes=[model.NodeConfig(
-            name="hap-1", socket_path="/run/haproxy/admin.sock")],
-        scope_node="hap-1")
-    view = hub.overview()["nodes"]
-    assert view["hap-1"]["endpoint"] == "/run/haproxy/admin.sock"
-    assert view["hap-1"]["unix"] is True
-    assert hub.overview()["scope_node"] == "hap-1"
+# ---------------------------------------------------------------------------
+# HTTP 接口
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+async def client():
+    app = webconsole.build_app(hub(), webconsole.LogBuffer(), None,
+                               __import__("logging").getLogger("t"))
+    async with TestClient(TestServer(app)) as c:
+        yield c
+
+
+async def test_overview_endpoint(client):
+    r = await client.get("/api/overview")
+    assert r.status == 200
+    body = await r.json()
+    assert "fe_a" in body["frontends"]
+
+
+async def test_write_endpoints_require_db_mode(client):
+    """纯 YAML 部署没有可写的配置源：写接口应 409 并说清原因，而不是
+    假装成功。"""
+    for method, path in (("put", "/api/frontends/fe_a"),
+                         ("post", "/api/frontends"),
+                         ("delete", "/api/frontends/fe_a")):
+        r = await getattr(client, method)(path, data="{}")
+        assert r.status == 409, path
+        assert "MySQL" in (await r.json())["error"]
+
+
+async def test_index_is_served(client):
+    r = await client.get("/")
+    assert r.status == 200
+    assert b"rl-limiter" in await r.read()

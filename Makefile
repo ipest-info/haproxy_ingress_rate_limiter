@@ -1,7 +1,7 @@
 # rl-limiter（Python 3.11 版）开发入口。
 #
 # 本地最小演示（详见 docs/03-限速服务运行指南.md，两个终端，同机形态）：
-#   1. python3 tools/fake_haproxy.py --unix-path /tmp/rl/hap1.sock --frontends fe_env_a:2000000
+#   1. python3 tools/fake_haproxy.py --unix-path /tmp/rl/hap1.sock --frontends fe_main:2000000
 #   2. RL_NODE_NAME=hap-1 rl-limiter -c /tmp/limiter.yaml
 #      （配置由 deploy/config/limiter.example.yaml 改出）
 # 完整演示（MySQL 配置 + 三台 Ubuntu 24.04 节点，每台 HAProxy + 同机

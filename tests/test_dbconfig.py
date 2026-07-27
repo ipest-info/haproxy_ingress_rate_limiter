@@ -1,217 +1,153 @@
-# dbconfig（MySQL 配置源）纯函数部分的测试：数据库行 → 原始 dict 的组装、
-# 与 YAML 管线共用的校验行为、内容校验和（版本号）、环境变量解析。
-# 真实的 SQL 交互（_fetch_raw/watch）依赖 aiomysql 与活的 MySQL，由
-# docker compose 演示环境做集成验证，不进单元测试。
+# tests.test_dbconfig —— MySQL 配置源的纯函数部分：行 → 原始 dict 的组装、
+# 与 YAML 共用的校验行为、内容校验和、环境变量解析。
+#
+# 真实的 SQL 交互（_fetch_raw/watch/写接口）依赖 aiomysql 与活的 MySQL，
+# 由 docker compose 演示环境做集成验证，不进单元测试。
+
+from __future__ import annotations
 
 import pytest
 
 from rl_limiter import config, dbconfig, model
 
-# 与 deploy/mysql/init.sql 种子数据同构的行样本。节点行末列 quota_bps 为
-# 唯一可热更运行列（登记限额=超限告警基准）；环境行只剩分组标识。
+# 与 deploy/mysql/init.sql 种子同构的行样本。
 SERVICE_ROW = ("info", 1.0)
-NODE_ROWS = [("hap-1", "haproxy1", 9999, 500, 80_000_000)]
-ENV_ROWS = [("env-a",)]
-TARGET_ROWS = [("env-a", "hap-1", "fe_env_a")]
+INSTANCE_ROW = ("haproxy", None, None, "/run/haproxy/admin.sock", 500)
+FRONTEND_ROWS = [
+    # name, bind_address, bind_port, mode, quota_bps, maxconn, balance,
+    # timeout_connect_ms, timeout_client_ms, timeout_server_ms
+    ("fe_main", "", 8080, "tcp", 40_000_000, 2000, "roundrobin", 5000, 50000, 50000),
+    ("fe_api", "127.0.0.1", 8081, "http", 8_000_000, None, "leastconn", None, None, None),
+]
+SERVER_ROWS = [
+    # frontend, name, address, port, weight, check_enabled, check_inter_ms
+    ("fe_api", "api1", "10.0.0.31", 8000, 100, 1, 2000),
+    ("fe_main", "web1", "10.0.0.21", 9000, 100, 1, 2000),
+    ("fe_main", "web2", "10.0.0.22", 9000, 50, 0, 2000),
+]
 
 
-def build(service_row=SERVICE_ROW, node_rows=NODE_ROWS,
-          env_rows=ENV_ROWS, target_rows=TARGET_ROWS) -> config.ServiceConfig:
-    raw = dbconfig.rows_to_raw(service_row, node_rows, env_rows, target_rows)
+def build(service_row=SERVICE_ROW, instance_row=INSTANCE_ROW,
+          frontend_rows=None, server_rows=None) -> config.ServiceConfig:
+    raw = dbconfig.rows_to_raw(
+        service_row, instance_row,
+        FRONTEND_ROWS if frontend_rows is None else frontend_rows,
+        SERVER_ROWS if server_rows is None else server_rows)
     return config.from_raw(raw, source="测试数据库")
 
 
 def test_rows_roundtrip_to_service_config():
     """种子数据经 行组装 → 统一校验管线 得到与 YAML 加载同构的 ServiceConfig。"""
     cfg = build()
-    assert cfg.log_level == "info"
-    assert cfg.tick_interval_s == 1.0
-    assert len(cfg.nodes) == 1
-    n = cfg.nodes[0]
-    assert (n.name, n.host, n.port) == ("hap-1", "haproxy1", 9999)
-    assert n.timeout_s == 0.5  # timeout_ms=500 → 秒口径
-    # 监控单元 = 节点（env_id 字段装节点名，quota 来自节点行）。
-    assert len(cfg.envs) == 1
-    u = cfg.envs[0]
-    assert u.env_id == "hap-1"
-    assert u.quota_bits_per_sec == 80_000_000
-    assert u.targets == [model.Target("hap-1", "fe_env_a")]
-    assert cfg.env_groups == {"env-a": ["hap-1"]}
+    assert cfg.log_level == "info" and cfg.tick_interval_s == 1.0
+    assert cfg.haproxy.socket_path == "/run/haproxy/admin.sock"
+    assert cfg.haproxy.is_unix is True
+    assert cfg.haproxy.timeout_s == 0.5
+
+    assert [f.name for f in cfg.frontends] == ["fe_main", "fe_api"]
+    main = cfg.frontends[0]
+    assert main.bind_spec == ":8080" and main.maxconn == 2000
+    assert main.quota_bytes_per_sec == 5_000_000
+    assert [s.name for s in main.servers] == ["web1", "web2"]
+    assert main.servers[1].check is False and main.servers[1].weight == 50
 
 
-def test_service_row_defaults_and_timeout_fallback():
-    """log_level 空值取默认；timeout_ms 非正回落默认 500ms——与 YAML
-    管线的兜底行为一字不差。"""
-    cfg = build(
-        service_row=(None, None),
-        node_rows=[("hap-1", "haproxy", 9999, 0, 80_000_000)],
-    )
-    assert cfg.log_level == "info"
-    assert cfg.tick_interval_s == 1.0
-    assert cfg.nodes[0].timeout_s == 0.5
+def test_null_columns_fall_back_to_defaults():
+    """超时列允许为 NULL：留空即采用配置层默认值，不必在库里逐行填。"""
+    api = build().frontends[1]
+    assert (api.timeout_connect_ms, api.timeout_client_ms,
+            api.timeout_server_ms) == (5000, 50000, 50000)
+    assert api.maxconn == 0
 
 
-def test_missing_service_row_falls_back_to_safe_defaults():
-    """service_config 表缺 id=1 的行 → 服务级键全部取安全默认。"""
-    cfg = build(service_row=None)
-    assert cfg.log_level == "info"
-    assert cfg.tick_interval_s == 1.0
+def test_tcp_instance_row():
+    """远程观测形态：host/port 有值、socket_path 为 NULL。"""
+    cfg = build(instance_row=("haproxy", "10.0.0.11", 9999, None, 500))
+    assert cfg.haproxy.is_unix is False
+    assert cfg.haproxy.endpoint() == "10.0.0.11:9999"
 
 
-def test_unknown_target_node_rejected_like_yaml():
-    """target 引用未声明节点：数据库来源与 YAML 来源同一条拒绝规则。"""
-    with pytest.raises(ValueError, match="未在 haproxy_nodes 中声明"):
-        build(target_rows=[("env-a", "hap-ghost", "fe_env_a")])
+def test_db_and_yaml_share_validation():
+    """数据库来源的坏数据被同一套校验拒绝，错误信息带来源前缀。"""
+    bad = [("fe bad", "", 8080, "tcp", 8000, 0, "roundrobin", None, None, None)]
+    with pytest.raises(ValueError, match="测试数据库"):
+        build(frontend_rows=bad, server_rows=[("fe bad", "s", "1.1.1.1", 80, 100, 1, 2000)])
 
 
-def test_mounted_node_without_quota_rejected():
-    """被挂载的节点必须登记限额（它是超限告警的基准）。"""
-    with pytest.raises(ValueError, match="未设置有效的 quota_bps"):
-        build(node_rows=[("hap-1", "haproxy1", 9999, 500, None)])
+def test_frontend_without_servers_rejected():
+    """没有后端的 frontend 会把所有请求返回 503——拒绝而不是放行。"""
+    with pytest.raises(ValueError, match="servers 不能为空"):
+        build(server_rows=[])
 
 
-def test_checksum_stable_and_content_sensitive():
-    """校验和 = 配置版本号：同内容恒定，限额变化必变。"""
-    cfg = build()
-    base = dbconfig.config_checksum(cfg.envs)
-    assert base == dbconfig.config_checksum(cfg.envs)  # 稳定
+# ---------------------------------------------------------------------------
+# 变更检测
+# ---------------------------------------------------------------------------
 
-    quota_changed = build(node_rows=[
-        ("hap-1", "haproxy1", 9999, 500, 40_000_000)])
-    assert dbconfig.config_checksum(quota_changed.envs) != base
+def test_checksum_changes_with_content():
+    base = build()
+    before = dbconfig.config_checksum(base.frontends)
 
+    changed = [list(r) for r in FRONTEND_ROWS]
+    changed[0][4] = 20_000_000                     # 改 fe_main 限额
+    after = dbconfig.config_checksum(
+        build(frontend_rows=[tuple(r) for r in changed]).frontends)
+    assert after != before
+
+
+def test_checksum_covers_backend_servers():
+    """后端服务器变化也必须被检测到——否则加/删一台机器不会触发下发。"""
+    before = dbconfig.config_checksum(build().frontends)
+    fewer = [r for r in SERVER_ROWS if r[1] != "web2"]
+    assert dbconfig.config_checksum(build(server_rows=fewer).frontends) != before
+
+
+def test_canonical_is_stable_across_equal_content():
+    """同样内容必须得到同样字符串，否则每轮轮询都会误判成"配置变了"。"""
+    a = dbconfig.canonical_config(build().frontends)
+    b = dbconfig.canonical_config(build().frontends)
+    assert a == b
+
+
+# ---------------------------------------------------------------------------
+# 写接口的载荷校验（控制台经它写库）
+# ---------------------------------------------------------------------------
+
+def test_frontend_payload_validation_accepts_good():
+    fe = dbconfig._validate_frontend_payload({
+        "name": "fe_x", "bind_port": 9000, "quota_bps": 8_000_000,
+        "servers": [{"name": "s1", "address": "10.0.0.1", "port": 80}],
+    })["frontend"]
+    assert isinstance(fe, model.FrontendConfig) and fe.name == "fe_x"
+
+
+@pytest.mark.parametrize("payload,match", [
+    ("not a dict", "必须是 JSON 对象"),
+    ({"name": "fe_x"}, "字段缺失或类型错误"),
+    ({"name": "fe x", "bind_port": 1, "quota_bps": 8000,
+      "servers": [{"name": "s", "address": "1.1.1.1", "port": 1}]}, "name 非法"),
+    ({"name": "fe_x", "bind_port": 1, "quota_bps": 8000, "servers": []},
+     "servers 不能为空"),
+])
+def test_frontend_payload_validation_rejects(payload, match):
+    """经控制台写入与直接写库后被加载，两条路径的接受集合必须一致。"""
+    with pytest.raises(ValueError, match=match):
+        dbconfig._validate_frontend_payload(payload)
+
+
+# ---------------------------------------------------------------------------
+# 环境变量解析
+# ---------------------------------------------------------------------------
 
 def test_from_env_disabled_without_host():
     assert dbconfig.from_env({}) is None
-    assert dbconfig.from_env({"RL_MYSQL_HOST": "  "}) is None
 
 
-def test_from_env_defaults_and_overrides():
-    opts = dbconfig.from_env({"RL_MYSQL_HOST": "mysql"})
-    assert opts is not None
-    assert (opts.host, opts.port, opts.user, opts.database) == (
-        "mysql", 3306, "rl", "rl_limiter")
-    assert opts.poll_interval_s == 5.0
-
+def test_from_env_reads_all_fields():
     opts = dbconfig.from_env({
-        "RL_MYSQL_HOST": "db.internal",
-        "RL_MYSQL_PORT": "3307",
-        "RL_MYSQL_USER": "svc",
-        "RL_MYSQL_PASSWORD": "secret",
-        "RL_MYSQL_DB": "cfg",
-        "RL_MYSQL_POLL_S": "2.5",
+        "RL_MYSQL_HOST": "db", "RL_MYSQL_PORT": "3307",
+        "RL_MYSQL_USER": "u", "RL_MYSQL_PASSWORD": "p",
+        "RL_MYSQL_DB": "d", "RL_MYSQL_POLL_S": "9",
     })
-    assert (opts.host, opts.port, opts.user, opts.password, opts.database) == (
-        "db.internal", 3307, "svc", "secret", "cfg")
-    assert opts.poll_interval_s == 2.5
-
-
-@pytest.mark.parametrize("env, match", [
-    ({"RL_MYSQL_HOST": "m", "RL_MYSQL_PORT": "abc"}, "RL_MYSQL_PORT"),
-    ({"RL_MYSQL_HOST": "m", "RL_MYSQL_PORT": "0"}, "1-65535"),
-    ({"RL_MYSQL_HOST": "m", "RL_MYSQL_POLL_S": "x"}, "RL_MYSQL_POLL_S"),
-    ({"RL_MYSQL_HOST": "m", "RL_MYSQL_POLL_S": "-1"}, "RL_MYSQL_POLL_S"),
-    # NaN 与任何数比较都是 False、inf > 0：单纯的 <=0 守卫拦不住它们，
-    # 而 asyncio.sleep(nan/inf) 永不返回会让轮询任务静默挂死。
-    ({"RL_MYSQL_HOST": "m", "RL_MYSQL_POLL_S": "nan"}, "RL_MYSQL_POLL_S"),
-    ({"RL_MYSQL_HOST": "m", "RL_MYSQL_POLL_S": "inf"}, "RL_MYSQL_POLL_S"),
-])
-def test_from_env_rejects_bad_values(env, match):
-    """host 已设置但数值写错：半吊子的数据库配置必须在启动时拦下。"""
-    with pytest.raises(ValueError, match=match):
-        dbconfig.from_env(env)
-
-
-def test_canonical_config_is_exact_identity():
-    """变更检测的身份是规范化 JSON 字符串本身（精确比较，不经哈希），
-    同内容恒等、任一字段变化必不等。"""
-    cfg = build()
-    base = dbconfig.canonical_config(cfg.envs)
-    assert base == dbconfig.canonical_config(cfg.envs)
-    changed = build(node_rows=[
-        ("hap-1", "haproxy1", 9999, 500, 40_000_000)])
-    assert dbconfig.canonical_config(changed.envs) != base
-    # 纯重分组（单元不变、只换环境归属）也必须改变身份。
-    regrouped = build(env_rows=[("env-x",)],
-                      target_rows=[("env-x", "hap-1", "fe_env_a")])
-    assert dbconfig.canonical_config(regrouped.envs, regrouped.env_groups) != \
-        dbconfig.canonical_config(cfg.envs, cfg.env_groups)
-
-
-# ---------------------------------------------------------------------------
-# 同机部署形态：socket_path 列 + 按本机节点裁剪
-# ---------------------------------------------------------------------------
-
-# 与更新后的 deploy/mysql/init.sql 种子同构：三台节点全部走本机 unix
-# socket（host/port 为 NULL），env-a 横跨 hap-1/hap-2，env-b 独占 hap-3。
-UNIX_NODE_ROWS = [
-    ("hap-1", None, None, 500, 40_000_000, "/run/haproxy/admin.sock"),
-    ("hap-2", None, None, 500, 40_000_000, "/run/haproxy/admin.sock"),
-    ("hap-3", None, None, 500, 40_000_000, "/run/haproxy/admin.sock"),
-]
-UNIX_ENV_ROWS = [("env-a",), ("env-b",)]
-UNIX_TARGET_ROWS = [
-    ("env-a", "hap-1", "fe_env_a"),
-    ("env-a", "hap-2", "fe_env_a"),
-    ("env-b", "hap-3", "fe_env_b"),
-]
-
-
-def test_unix_socket_rows_roundtrip():
-    """socket_path 列被组装进原始 dict；NULL 的 host/port 规整为空/零，
-    交由统一校验管线按"二选一"判定通过。"""
-    cfg = build(node_rows=UNIX_NODE_ROWS, env_rows=UNIX_ENV_ROWS,
-                target_rows=UNIX_TARGET_ROWS)
-    n = cfg.nodes[0]
-    assert n.socket_path == "/run/haproxy/admin.sock"
-    assert n.is_unix is True
-    assert (n.host, n.port) == ("", 0)
-    assert len(cfg.envs) == 3  # 每台有挂载点的节点一个监控单元
-
-
-def test_legacy_five_column_rows_still_parse():
-    """老库尚未 ALTER TABLE 加 socket_path 时，5 列行序仍能解析（退化为
-    纯 TCP 形态）——升级顺序不必严格"先改表再发版"。"""
-    cfg = build()  # NODE_ROWS 是 5 列的历史行序
-    assert cfg.nodes[0].socket_path == ""
-    assert cfg.nodes[0].is_unix is False
-    assert (cfg.nodes[0].host, cfg.nodes[0].port) == ("haproxy1", 9999)
-
-
-def test_scoped_checksum_ignores_other_nodes():
-    """同机模式下变更检测是"本机口径"的：兄弟节点改限额不应让本机产生
-    一次无谓的热应用。裁剪后的内容校验和对他节点的变更不敏感。"""
-    full = build(node_rows=UNIX_NODE_ROWS, env_rows=UNIX_ENV_ROWS,
-                 target_rows=UNIX_TARGET_ROWS)
-    scoped = config.scope_to_node(full, "hap-1")
-    before = dbconfig.config_checksum(scoped.envs, scoped.env_groups)
-
-    # 只改 hap-3（他环境的节点）的限额。
-    changed_rows = [
-        r if r[0] != "hap-3" else (r[0], r[1], r[2], r[3], 20_000_000, r[5])
-        for r in UNIX_NODE_ROWS
-    ]
-    full2 = build(node_rows=changed_rows, env_rows=UNIX_ENV_ROWS,
-                  target_rows=UNIX_TARGET_ROWS)
-    scoped2 = config.scope_to_node(full2, "hap-1")
-    assert dbconfig.config_checksum(scoped2.envs, scoped2.env_groups) == before
-
-    # 改本机限额则必须被检测到。
-    changed_local = [
-        r if r[0] != "hap-1" else (r[0], r[1], r[2], r[3], 20_000_000, r[5])
-        for r in UNIX_NODE_ROWS
-    ]
-    full3 = build(node_rows=changed_local, env_rows=UNIX_ENV_ROWS,
-                  target_rows=UNIX_TARGET_ROWS)
-    scoped3 = config.scope_to_node(full3, "hap-1")
-    assert dbconfig.config_checksum(scoped3.envs, scoped3.env_groups) != before
-
-
-def test_mixed_wiring_row_rejected():
-    """同时填了 socket_path 与 host/port 的行必须被拒——同机部署里最容易
-    犯的配错（加了 socket_path 却忘了清掉旧的 host/port）。"""
-    rows = [("hap-1", "haproxy1", 9999, 500, 40_000_000,
-             "/run/haproxy/admin.sock")]
-    with pytest.raises(ValueError, match="只能二选一"):
-        build(node_rows=rows, env_rows=[("env-a",)],
-              target_rows=[("env-a", "hap-1", "fe_env_a")])
+    assert (opts.host, opts.port, opts.user, opts.password, opts.database,
+            opts.poll_interval_s) == ("db", 3307, "u", "p", "d", 9.0)

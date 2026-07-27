@@ -6,8 +6,8 @@
 rl-limiter**——rl-limiter 通过容器内的 unix socket
 （`/run/haproxy/admin.sock`）只采本机那台 HAProxy，stats socket
 不占任何网络端口、也无需跨容器可达。配置存 MySQL（启动加载、轮询热
-更新），各节点独立轮询、对照库中登记限额做持续超限告警，各自带一个
-Web 控制台。后端挂一个**每次请求返回随机大小响应**的模拟 web 服务，
+更新），各节点独立轮询、把配置渲染进本机 haproxy.cfg 的受管区块并
+reload，同时对照限额做持续超限告警，各自带一个 Web 控制台。后端挂一个**每次请求返回随机大小响应**的模拟 web 服务，
 再用一个**可在线调节并发数的压测服务**打散到全部入口。
 
 > 为什么不用 haproxy 官方镜像：官方镜像只有 haproxy 一个进程，而本项目
@@ -20,12 +20,12 @@ Web 控制台。后端挂一个**每次请求返回随机大小响应**的模拟
 ```
                  ┌────────────┐   各节点独立轮询配置（每 RL_MYSQL_POLL_S 秒）
                  │   mysql    │◄──────────┬───────────┬───────────┐
-                 │ (配置四表)  │           │           │           │
+                 │ (配置三表)  │           │           │           │
                  └────────────┘           │           │           │
    HTTP 并发                               │           │           │
 ┌─────────┐   ┌──────────────────────┐ ┌──┴───────────┴──┐ ┌──────┴────────┐
 │ loadgen │──►│ node1  (Ubuntu 24.04)│ │ node2           │ │ node3         │
-│ :8084   │──►│  haproxy fe_env_a    │ │  haproxy fe_env_a│ │ haproxy fe_env_b│
+│ :8084   │──►│  haproxy fe_main     │ │  haproxy fe_main │ │ haproxy fe_main │
 └─────────┘──►│   shared bwlim 40M   │ │   bwlim 40M      │ │  bwlim 40M     │
               │   :8080              │ │   :8082          │ │  :8083         │
               │      │ unix socket   │ │                  │ │                │
@@ -41,7 +41,7 @@ Web 控制台。后端挂一个**每次请求返回随机大小响应**的模拟
 | 服务 | 说明 | 宿主机端口 |
 | ---- | ---- | ---- |
 | `mysql` | 配置库（表结构与种子数据：`deploy/mysql/init.sql`） | `127.0.0.1:3306` |
-| `node1` / `node2` / `node3` | **Ubuntu 24.04 + HAProxy 2.8 + 同机 rl-limiter**（根目录 `Dockerfile`，全仓库统一镜像）。HAProxy 按环境角色分用 `deploy/docker/haproxy-env-a/b.cfg`，limit 各 5,000,000 bytes/s = 40 Mbps；rl-limiter 用 `RL_NODE_NAME` 锁定本机节点 | 代理 `8080`/`8082`/`8083`；控制台 `127.0.0.1:8090`/`8092`/`8093` |
+| `node1` / `node2` / `node3` | **Ubuntu 24.04 + HAProxy 2.8 + 同机 rl-limiter**（根目录 `Dockerfile`，全仓库统一镜像）。挂进去的 `deploy/docker/haproxy-base.cfg` 只是 global/defaults 骨架，监听端口与后端由各自的 rl-limiter 从配置库渲染进受管区块；`RL_NODE_NAME` 指定它管哪个实例 | 代理 `8080`/`8082`/`8083`；控制台 `127.0.0.1:8090`/`8092`/`8093` |
 | `web` | 模拟业务后端，每次请求返回 256 KiB～2 MiB 随机大小响应；`/big` 为大文件下载端点（默认 512 MiB，`WEB_BIG_BYTES` 可调）（`tools/random_web.py`） | 无 |
 | `loadgen` | 压测服务，打散到全部入口，并发数可在线调节；默认每入口另挂 1 条**长连接大文件下载**（`tools/loadgen.py`） | `8084`（控制口） |
 
@@ -49,9 +49,9 @@ Web 控制台。后端挂一个**每次请求返回随机大小响应**的模拟
 HAProxy 并等 unix socket 就绪，再起 rl-limiter；任一进程退出即整体退出
 （对齐生产上 systemd `Restart=always` 的语义），由 compose 拉起。
 
-演示种子：hap-1 / hap-2 / hap-3 登记限额各 **40 Mbps**（与各自 cfg 的
-limit 一致）；环境是纯分组——env-a = hap-1 + hap-2（聚合视图显示合计
-80 Mbps），env-b = hap-3。
+演示种子：hap-1 / hap-2 / hap-3 各有一个 `fe_main`，监听 8080、限额
+**40 Mbps**、后端指向 `web:9000`。这些行由各自机器上的 rl-limiter 渲染成
+haproxy.cfg 的受管区块——**cfg 里的 limit 与库里的 quota_bps 同源**。
 
 聚合限速语义：shared bwlim 限的是**本 frontend 全部连接的总速率**——
 与连接数、单连接快慢无关，存量长连接持续受控；限额调整（改 cfg +
@@ -108,28 +108,23 @@ docker compose exec node1 haproxy -v                      # Ubuntu 24.04 自带 
 | `hap-2`（node2） | http://localhost:8092 |
 | `hap-3`（node3） | http://localhost:8093 |
 
-页面顶部会显示**同机部署模式**横幅，标明本控制台属于哪个节点。演示里
+演示里
 容器内绑 `0.0.0.0`（`RL_CONSOLE_BIND`）、宿主机只映射到 `127.0.0.1`；
 生产默认就是 `127.0.0.1`。
 
-- **节点带宽视图**：本机 HAProxy 一张图（实时速率 / 10s 均值 + 登记
-  限额虚线，1s 粒度）——曲线被压在限额线下即该节点限速生效的直接
-  证据；实测持续高于限额时节点卡出现**超限**徽标（说明 HAProxy 配置
-  与库不一致）；登记限额就在节点卡上编辑（写库热生效，页面提示需
-  同步 HAProxy limit）；
-- **环境聚合视图**：同机形态下**只含本机成员**（横幅已说明这不是环境
-  全量带宽）；挂载点管理照常可用——写的是全量配置库，改动会被其它
-  节点的 rl-limiter 一并读到；
-- **生效证据计数**：超限秒数、利用率（均值/限额）、并发连接数、节点
-  失联标记；
-- **节点面板**：本机 HAProxy 的 stats socket 端点
-  （`/run/haproxy/admin.sock (unix)`）、所属环境、登记限额、采样健康
-  （失联标红）；
-- **环境与挂载点管理**：环境卡上直接增删挂载点（节点 × frontend）、
-  新建环境（环境 ID + 初始挂载点）、删除环境；挂载点迁移 = 原环境
-  移除 + 目标环境添加（同一挂载点同时属于两个环境会被拒绝）；
-- **运行日志**：最近 1000 条结构化日志增量流式展示，按级别过滤
-  （持续超限告警在此可见）。
+- **各 frontend 的带宽视图**：每个受管 frontend 一张图（实时速率 /
+  10s 均值 + 限额虚线，1s 粒度）——曲线被压在限额线下即限速生效的直接
+  证据；持续高于限额时卡片出现**超限**徽标；
+- **标准化配置界面**（本次演示的重点）：卡片上点「编辑」即可改监听地址
+  端口、模式（tcp/http）、限额、maxconn、balance、各项超时，以及后端
+  服务器列表（增删改地址/端口/权重/健康检查）；页面底部可**新增**
+  frontend，卡片上可**删除**。保存即写库，随后自动渲染进 haproxy.cfg
+  并 reload；
+- **下发状态横幅**：绿色 = 已生效并附最近一次下发时间；红色 = 下发失败
+  并附 `haproxy -c` 的原始原因（此时数据面仍按调整前的配置运行）；
+- **实例信息**：本机 stats socket 端点（`/run/haproxy/admin.sock`）与
+  采样健康（失联标红）；
+- **运行日志**：最近 1000 条结构化日志增量流式展示，按级别过滤。
 
 对应的 HTTP API（页面之外也可脚本化调用）：
 
@@ -138,18 +133,20 @@ curl http://localhost:8090/api/overview            # 最新状态 + 配置视图
 curl http://localhost:8090/api/history             # 最近 10 分钟逐拍快照
 curl -N http://localhost:8090/api/stream           # SSE 实时流（每拍一帧）
 curl http://localhost:8090/api/logs?after=0        # 日志增量拉取
-curl -X PUT http://localhost:8090/api/nodes/hap-1/quota -d '{"quota_bps": 20000000}'  # 登记限额
-curl -X PUT http://localhost:8090/api/envs/env-a/targets \
-     -d '{"targets": [{"node":"hap-1","frontend":"fe_env_a"},{"node":"hap-2","frontend":"fe_env_a"}]}'
-curl -X POST http://localhost:8090/api/envs \
-     -d '{"env_id":"env-c","targets":[{"node":"hap-1","frontend":"fe_env_c"}]}'
-curl -X DELETE http://localhost:8090/api/envs/env-c
+# 新建或整体更新一个 frontend（含它的后端服务器列表）
+curl -X PUT http://localhost:8090/api/frontends/fe_main -d '{
+  "name": "fe_main", "bind_port": 8080, "quota_bps": 20000000,
+  "mode": "tcp", "maxconn": 2000, "balance": "roundrobin",
+  "servers": [{"name": "web1", "address": "web", "port": 9000}]
+}'
+curl -X DELETE http://localhost:8090/api/frontends/fe_api
 ```
 
-> 上面的 `hap-1` / `env-a` 只是示例；每台节点的控制台端口不同（8090 /
-> 8092 / 8093），但写接口写的都是同一个配置库，从哪个控制台改都一样。
+> 每台节点的控制台端口不同（8090 / 8092 / 8093），各自只读写属于自己
+> 那台 HAProxy 的配置行——在 8090 上改不会影响 hap-2/hap-3。
 
-安全提示：控制台**无鉴权且带写接口**（改限额、改挂载点、删环境）。
+安全提示：控制台**无鉴权且带写接口**（改监听端口、改限额、改后端、
+删 frontend）。
 默认只绑 `127.0.0.1`（`RL_CONSOLE_BIND`）；要放到内网必须显式设置并
 配合防火墙/安全组限制来源，绝不可暴露公网。绑非回环地址时服务会打一条
 warning 留痕。
@@ -199,31 +196,35 @@ curl http://localhost:8084/status    # big_downloads[]：每条在途下载的
 
 ## 调整某台节点的限额（完整 SOP 演示）
 
-演示环境**已启用限额自动应用**（`RL_APPLY_HAPROXY_CFG`），所以限额调整
-只有一步——改库，剩下的由 node1 里的 rl-limiter 自动完成：
+演示环境**已启用配置自动下发**（`RL_APPLY_HAPROXY_CFG`），所以配置调整
+只有一步——改库（或在控制台上点），剩下的由 node1 里的 rl-limiter 自动
+完成。下面以改限额为例，改监听端口/后端服务器完全同理：
 
 ```bash
-# 唯一一步：改库（也可以直接在控制台的节点卡上就地编辑）
+# 唯一一步：改库（也可以直接在控制台的 frontend 卡片上点「编辑」）
 docker compose exec mysql mysql -url -prl_pass rl_limiter \
-  -e "UPDATE haproxy_nodes SET quota_bps = 20000000 WHERE name = 'hap-1';"
+  -e "UPDATE haproxy_frontends SET quota_bps = 20000000
+      WHERE instance = 'hap-1' AND name = 'fe_main';"
 
 # 几秒内（一个 RL_MYSQL_POLL_S 轮询周期）观察它自动落到数据面：
-docker compose logs --tail=5 node1 | grep 已把登记限额
+docker compose logs --tail=5 node1 | grep 已把受管配置
 docker compose exec node1 grep -o 'limit [0-9]*' /etc/haproxy/haproxy.cfg
 #   → limit 2500000   （20 Mbps ÷ 8）
+docker compose exec node1 sed -n '/BEGIN rl-limiter/,/END rl-limiter/p' \
+  /etc/haproxy/haproxy.cfg      # 看完整的受管区块
 ```
 
 日志里会出现一行：
 
 ```
-WARNING 已把登记限额应用到本机 HAProxy 并 reload（数据面已按新限额执行）
-        cfg=/etc/haproxy/haproxy.cfg changes=fe_env_a:5000000->2500000bytes/s
+WARNING 已把受管配置写入本机 haproxy.cfg 并 reload（数据面已按新配置运行）
+        cfg=/etc/haproxy/haproxy.cfg frontends=fe_main::8080:2500000bytes/s:1srv
 ```
 
-控制台顶部同时会显示绿色的"限额自动应用已启用"横幅与最近一次应用时间；
+控制台顶部同时会显示绿色的"配置自动下发已启用"横幅与最近一次下发时间；
 应用失败时是红色横幅 + 具体原因（那时数据面仍按**调整前**的限额运行）。
 
-**每台节点各有一份自己的 cfg**：`deploy/docker/haproxy-env-a.cfg` 只是
+**每台节点各有一份自己的 cfg**：`deploy/docker/haproxy-base.cfg` 只是
 只读挂进去的**模板**，入口脚本会把它复制成容器内可写的
 `/etc/haproxy/haproxy.cfg`。所以改 hap-1 的限额不会牵动 hap-2——与生产
 上"每台机器一份自己的 cfg"完全一致。（也正因为要原地改写，cfg 不能是
@@ -250,17 +251,17 @@ docker compose exec node1 grep -o 'limit [0-9]*' /etc/haproxy/haproxy.cfg
 
 | 表 | 内容 | 改表后 |
 | ---- | ---- | ---- |
-| `haproxy_nodes.quota_bps` | 节点限额 | **热生效**：监控基准立刻跟随，且（演示已启用限额自动应用）自动写进本机 cfg 并 reload，数据面即时生效 |
-| `envs` / `env_targets` | 环境分组、挂载点归属 | **热生效** |
+| `haproxy_frontends` | 监听地址端口、限额、模式、maxconn、balance、超时 | **热生效**：监控基准立刻跟随，且（演示已启用配置下发）自动渲染进本机 cfg 并 reload，数据面即时生效 |
+| `haproxy_servers` | 后端服务器 | **热生效**，同上 |
 | `service_config` | log_level / tick_interval_s | 重启生效 |
-| `haproxy_nodes` 其余列 | 节点接线（`socket_path` 或 `host`/`port`、超时） | 重启生效（检测到变化会记 warning；引用新增节点的环境会被拒绝热应用） |
+| `haproxy_instances` | stats socket 接线（`socket_path` 或 `host`/`port`、超时） | 重启生效（采样客户端启动时定型；检测到变化会记 warning） |
 
 校验规则与 YAML 完全一致（同一套管线），且**在全量配置上执行**：任意
 一处写坏（比如让两个环境抢同一台节点），三台节点的 rl-limiter 会一起
 保留当前配置继续监控（fail-static）并打日志。
 
-同机模式下变更检测是**本机口径**的：改 hap-3 的限额不会让 node1 产生
-一次无谓的热应用——`docker compose logs node1` 里只会看到与本机相关的
+变更检测是**本机口径**的：改 hap-3 的配置不会让 node1 产生一次无谓的
+热应用——`docker compose logs node1` 里只会看到与本机相关的
 `检测到数据库配置变化，已提交主循环热生效`。
 
 环境变量（`docker-compose.yml` 中注入）：
@@ -270,7 +271,7 @@ docker compose exec node1 grep -o 'limit [0-9]*' /etc/haproxy/haproxy.cfg
   `RL_MYSQL_USER`、`RL_MYSQL_PASSWORD`、`RL_MYSQL_DB`、`RL_MYSQL_POLL_S`；
   不设 `RL_MYSQL_HOST` 则回落到 `-c` 指定的本地 YAML；
 - `RL_CONSOLE_PORT` / `RL_CONSOLE_BIND`：控制台端口与监听地址；
-- `RL_APPLY_HAPROXY_CFG` / `RL_APPLY_RELOAD_CMD`：**限额自动应用**。
+- `RL_APPLY_HAPROXY_CFG` / `RL_APPLY_RELOAD_CMD`：**配置自动下发**。
   演示里 reload 命令是 `kill -USR2 $(cat /run/haproxy/master.pid)`
   （容器里没有 systemd）；生产上默认 `systemctl reload haproxy`。
   reload 命令只从本机环境变量读、绝不从配置库读——否则拿到库写权限

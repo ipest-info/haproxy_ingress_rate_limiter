@@ -2,27 +2,25 @@
 #
 # 设计取向：
 #
-#   - 观测侧零额外采集：监控循环每拍本就产出各节点的速率/均值/连接数，
-#     控制台只是把这份内存数据经 StatusHub 留存最近几分钟并以 SSE 推给
-#     页面——不引入第二条采集链路；
-#   - 配置侧写库不写内存：所有修改（节点登记限额、环境分组/挂载点）
-#     UPDATE 到 MySQL（配置唯一事实源），由 dbconfig.watch 的既有轮询
-#     链路热生效。注意：登记限额只是**监控基准**——真实限速在各节点
-#     HAProxy 的 shared bwlim 配置里，需同步修改并 reload（接口应答与
-#     页面都有提示）。未启用数据库配置模式（纯 YAML 部署）时写接口
-#     返回 409 说明原因；
+#   - 观测侧零额外采集：监控循环每拍本就产出各 frontend 的速率/均值/
+#     连接数，控制台只是把这份内存数据经 StatusHub 留存最近几分钟并以
+#     SSE 推给页面——不引入第二条采集链路；
+#   - 配置侧写库不写内存：所有修改（监听端口、限额、后端服务器）写入
+#     MySQL（配置唯一事实源），由 dbconfig.watch 的既有轮询链路热生效，
+#     再由 enforcer 渲染进本机 haproxy.cfg 并 reload。因此在界面上改完
+#     即真正生效，不需要人工再动配置文件。未启用数据库配置模式（纯 YAML
+#     部署）时写接口返回 409 说明原因；
 #   - 日志经进程内环形缓冲（LogBuffer 挂在根 logger 上）曝光最近若干条，
 #     页面增量拉取；生产量级的持久化检索交给外部日志系统，不在此造轮子；
-#   - "限速生效证据"：页面上把 实时速率 / 10s 均值（计费口径）/ 登记
-#     限额 画在同一条时间轴上——曲线被压在限额线下即是效果本身；持续
-#     压不住则以超限状态高亮（提示 HAProxy 配置与库不一致）。
+#   - "限速生效证据"：页面上把 实时速率 / 10s 均值（计费口径）/ 限额
+#     画在同一条时间轴上——曲线被压在限额线下即是效果本身。
 #
 # 安全边界：控制台无鉴权，定位与 HAProxy 的 stats socket 相同。默认只
 # 绑回环（127.0.0.1），要放到内网必须由运维显式设 RL_CONSOLE_BIND 并配合
 # 防火墙/安全组限制来源；绑非回环地址时会打一条 warning 留痕。
 #
-# 同机部署形态下每台 HAProxy 各有一个控制台，只展示本机节点；环境聚合
-# 视图退化为"只含本机成员"，页面顶部会挂本地模式横幅说明这一点。
+# 单 HAProxy 模型：每台 HAProxy 各有一个控制台，管理并展示本机的全部
+# 受管 frontend。
 
 from __future__ import annotations
 
@@ -89,8 +87,8 @@ class StatusHub:
 
     - record：监控循环 sampler 每拍调用，合成快照 → 留存历史 + 广播给
       SSE 订阅者；
-    - update_config：配置（引导或热更）经过时调用，缓存限额/挂载点视图，
-      使快照能携带 quota 供页面画限额参考线与超限判定；
+    - update_config：配置（引导或热更）经过时调用，缓存各 frontend 的
+      配置视图，使快照能携带 quota 供页面画限额参考线与超限判定；
     - overview/history：REST 拉取口径。
     """
 
@@ -98,41 +96,33 @@ class StatusHub:
         self,
         service_version: str,
         version_fn: Callable[[], int],
-        nodes: list[model.NodeConfig] | None = None,
-        degraded_fn: Callable[[], set] | None = None,
-        scope_node: str | None = None,
+        haproxy: model.NodeConfig | None = None,
+        degraded_fn: Callable[[], bool] | None = None,
     ):
         self._service_version = service_version
         self._version_fn = version_fn
-        # 同机部署模式下的本机节点名（None = 集中监控模式）。页面据此
-        # 显示"本地模式"横幅：环境聚合视图此时只含本机，不标出来会被
-        # 误读成"整个环境只跑了这么多流量"。
-        self._scope_node = scope_node
-        # 受控节点接线视图（启动时定型，与 RuntimeClient 集合一致）。
-        self._nodes = list(nodes or [])
-        # 限额自动应用的最近一次结果（None = 未启用该能力）。页面据此
-        # 区分"改了库就已经生效"与"改了库还等人工同步数据面"。
+        # 本机 HAProxy 的接线视图（启动时定型，与 RuntimeClient 一致）。
+        self._haproxy = haproxy or model.NodeConfig()
+        # 配置自动下发的最近一次结果（None = 未启用该能力）。页面据此
+        # 区分"改完就已经生效"与"改完还等人工同步数据面"。
         self._enforce: dict | None = None
-        # 采样已持续失败的节点集合（collector.degraded_nodes 闭包）。
-        self._degraded_fn = degraded_fn if degraded_fn is not None else (lambda: set())
+        # 采样是否处于降级（collector.degraded 闭包）。
+        self._degraded_fn = degraded_fn if degraded_fn is not None else (lambda: False)
         self._history: collections.deque[dict[str, Any]] = collections.deque(
             maxlen=HISTORY_TICKS)
         self._subs: set[asyncio.Queue] = set()
-        # 节点名 → 监控单元配置视图（quota/frontends）。监控单元 = 节点
-        # （cfg.envs 的 env_id 字段装节点名）。
-        self._unit_config: dict[str, dict[str, Any]] = {}
-        # 业务环境分组（env_id → 成员节点列表），仅聚合展示。
-        self._env_groups: dict[str, list[str]] = {}
+        # frontend 名 → 该 frontend 的完整配置视图（界面表单的初值）。
+        self._fe_config: dict[str, dict[str, Any]] = {}
         self._started = time.time()
 
     # ---- 配置与数据注入 ----
 
     def record_enforce(self, result) -> None:
-        """记录一次限额自动应用的结果（enforcer 每轮 reconcile 后回调）。
+        """记录一次配置下发的结果（enforcer 每轮 reconcile 后回调）。
 
-        页面靠它回答运维最关心的那个问题：我刚在这儿改的限额，**数据面
+        页面靠它回答运维最关心的那个问题：我刚在这儿改的配置，**数据面
         到底生效了没有**。失败时把原因原样带出来——这时数据面还在按旧
-        限额跑，不说清楚就会以为已经改好了。
+        配置跑，不说清楚就会以为已经改好了。
         """
         self._enforce = {
             "enabled": True,
@@ -140,50 +130,39 @@ class StatusHub:
             "error": result.error,
             "last_change_ts": time.time() if result.changed else (
                 (self._enforce or {}).get("last_change_ts")),
-            "applied": dict(result.applied) if result.changed else (
-                (self._enforce or {}).get("applied") or {}),
+            "applied": list(result.frontends) if result.changed else (
+                (self._enforce or {}).get("applied") or []),
         }
 
     def update_config(self, cfg: model.ControllerConfig) -> None:
-        self._unit_config = {
-            u.env_id: {
-                "quota_bps": u.quota_bits_per_sec,
-                "quota_bytes_per_s": u.quota_bytes_per_sec,
-                "frontends": [t.frontend for t in u.targets],
-            }
-            for u in cfg.envs
-        }
-        self._env_groups = {k: list(v) for k, v in cfg.env_groups.items()}
+        """记录当前生效的受管 frontend 配置（界面的编辑表单以它为初值）。"""
+        self._fe_config = {f.name: f.to_dict() for f in cfg.frontends}
+        # 换算好的 bytes/s 一并给出：图表的限额参考线用它，避免前端各处
+        # 重复做 ÷8，单位换算只在服务端一处。
+        for name, d in self._fe_config.items():
+            d["quota_bytes_per_s"] = d["quota_bps"] / 8.0
 
-    def _nodes_view(self) -> dict[str, Any]:
-        """节点视图：接线 + 采样健康。"""
-        degraded = self._degraded_fn()
+    def _haproxy_view(self) -> dict[str, Any]:
+        """本机 HAProxy 视图：接线 + 采样健康。"""
+        n = self._haproxy
         return {
-            n.name: {
-                "host": n.host,
-                "port": n.port,
-                # 采样端点的统一展示口径：同机形态是 unix socket 路径，
-                # 跨机形态是 host:port。页面直接显示这个字段。
-                "endpoint": n.endpoint(),
-                "unix": n.is_unix,
-                "degraded": n.name in degraded,
-            }
-            for n in self._nodes
+            "name": n.name,
+            "endpoint": n.endpoint(),
+            "unix": n.is_unix,
+            "degraded": bool(self._degraded_fn()),
         }
 
     def record(self, now: float, usages) -> None:
         """监控循环 sampler 回调：把一拍的采集结果合成快照并发布。
 
-        监控单元 = 节点，usages 的 env_id 字段即节点名，快照按节点键
-        发布（units）；环境聚合视图由前端按 env_groups 把成员节点的
-        序列求和得出，服务端不再有环境级数据。over 为瞬时超限标记
-        （mean10 > 登记限额），持续超限的判定与告警在监控循环里。
+        监控单位 = frontend，快照按 frontend 名发布。over 为瞬时超限标记
+        （mean10 > 限额），持续超限的判定与告警在监控循环里。
         """
         units: dict[str, Any] = {}
         for u in usages:
-            conf = self._unit_config.get(u.env_id, {})
+            conf = self._fe_config.get(u.name, {})
             quota = conf.get("quota_bytes_per_s")
-            units[u.env_id] = {
+            units[u.name] = {
                 "rate_bytes_per_s": u.rate_bps,
                 "mean10_bytes_per_s": u.mean10_bps,
                 "ewma60_bytes_per_s": u.ewma60_bps,
@@ -196,8 +175,7 @@ class StatusHub:
             "ts": now,
             "config_version": self._version_fn(),
             "units": units,
-            "env_groups": {k: list(v) for k, v in self._env_groups.items()},
-            "nodes": self._nodes_view(),
+            "haproxy": self._haproxy_view(),
         }
         self._history.append(snap)
         for q in list(self._subs):
@@ -223,15 +201,12 @@ class StatusHub:
         return {
             "service_version": self._service_version,
             "config_version": self._version_fn(),
-            # None = 集中监控；非 None = 同机部署，值为本机节点名。
-            "scope_node": self._scope_node,
-            # None = 未启用限额自动应用（改库后仍需人工改 cfg + reload）。
+            # None = 未启用配置自动下发（改配置后仍需人工改 cfg + reload）。
             "enforce": self._enforce,
             "uptime_s": time.time() - self._started,
-            # 节点监控单元配置（quota/frontends）与环境分组。
-            "node_config": self._unit_config,
-            "env_groups": {k: list(v) for k, v in self._env_groups.items()},
-            "nodes": self._nodes_view(),
+            # 各受管 frontend 的完整配置：界面的编辑表单以它为初值。
+            "frontends": self._fe_config,
+            "haproxy": self._haproxy_view(),
             "latest": self._history[-1] if self._history else None,
         }
 
@@ -248,8 +223,13 @@ def build_app(
     logbuf: LogBuffer,
     db_opts: dbconfig.MySQLOptions | None,
     log: logging.Logger,
+    instance: str = "haproxy",
 ) -> web.Application:
-    """组装控制台的 aiohttp 应用（静态页 + 只读 API + 调参 API）。"""
+    """组装控制台的 aiohttp 应用（静态页 + 只读 API + 配置管理 API）。
+
+    instance 是本实例在配置库里对应的 HAProxy 实例名：写接口只会改属于
+    自己的那些行，一个配置库服务多台机器时互不越界。
+    """
 
     index_html = (_STATIC_DIR / "index.html").read_bytes()
 
@@ -336,52 +316,28 @@ def build_app(
         log.info("控制台已写入配置变更 path=%s", request.path)
         return web.json_response({"ok": True, "note": _mutation_note(note_extra)})
 
-    async def handle_set_node_quota(request: web.Request) -> web.Response:
-        name = request.match_info["name"]
+    async def handle_upsert_frontend(request: web.Request) -> web.Response:
+        """新建或整体更新一个受管 frontend（连同它的后端服务器列表）。
 
+        界面上编辑的是"这个监听端口连同它的后端"这一整体，因此接口也按
+        整体提交：服务端在一个事务里替换该 frontend 的全部 server 行，
+        不会出现"改了一半"被轮询读到的中间态。
+        """
         async def action(payload):
-            if not isinstance(payload, dict) or "quota_bps" not in payload:
-                raise ValueError('请求体须为 {"quota_bps": <bits/s 整数>}')
-            try:
-                quota = int(payload["quota_bps"])
-            except (TypeError, ValueError):
-                raise ValueError(
-                    f"quota_bps 必须是整数（比特每秒），"
-                    f"当前值 {payload['quota_bps']!r}") from None
-            await dbconfig.update_node_quota(db_opts, name, quota)
+            await dbconfig.upsert_frontend(db_opts, instance, payload)
         return await _mutate(
             request, action,
-            note_extra="注意：这只更新监控基准——真实限速需同步修改该节点 "
-                       "haproxy.cfg 里 shared bwlim 的 limit 并 reload，"
-                       "否则将触发持续超限告警")
+            note_extra="随后由本机 rl-limiter 写入 haproxy.cfg 受管区块并 "
+                       "reload，数据面即时生效")
 
-    async def handle_set_targets(request: web.Request) -> web.Response:
-        env_id = request.match_info["env_id"]
-
-        async def action(payload):
-            if not isinstance(payload, dict) or "targets" not in payload:
-                raise ValueError(
-                    '请求体须为 {"targets": [{"node": …, "frontend": …}, …]}')
-            await dbconfig.update_env_targets(db_opts, env_id, payload["targets"])
-        return await _mutate(request, action)
-
-    async def handle_create_env(request: web.Request) -> web.Response:
-        async def action(payload):
-            if not isinstance(payload, dict):
-                raise ValueError(
-                    '请求体须为 {"env_id": …, "targets": […]}'
-                    '（环境是节点分组，限额登记在成员节点上）')
-            await dbconfig.create_env(
-                db_opts, str(payload.get("env_id", "")),
-                payload.get("targets"))
-        return await _mutate(request, action)
-
-    async def handle_delete_env(request: web.Request) -> web.Response:
-        env_id = request.match_info["env_id"]
+    async def handle_delete_frontend(request: web.Request) -> web.Response:
+        name = request.match_info["name"]
 
         async def action(_payload):
-            await dbconfig.delete_env(db_opts, env_id)
-        return await _mutate(request, action, allow_empty_body=True)
+            await dbconfig.delete_frontend(db_opts, instance, name)
+        return await _mutate(
+            request, action, allow_empty_body=True,
+            note_extra="该监听端口将在下一次 reload 后停止服务")
 
     app = web.Application(client_max_size=MAX_BODY_BYTES)
     app.router.add_get("/", handle_index)
@@ -389,11 +345,12 @@ def build_app(
     app.router.add_get("/api/history", handle_history)
     app.router.add_get("/api/logs", handle_logs)
     app.router.add_get("/api/stream", handle_stream)
-    # 节点登记限额（监控基准；真实限速在该节点 HAProxy 配置里）。
-    app.router.add_put("/api/nodes/{name}/quota", handle_set_node_quota)
-    app.router.add_post("/api/envs", handle_create_env)
-    app.router.add_put("/api/envs/{env_id}/targets", handle_set_targets)
-    app.router.add_delete("/api/envs/{env_id}", handle_delete_env)
+    # 受管 frontend 的增删改：监听端口、模式、限额、超时、后端服务器。
+    # PUT 用同一个 upsert 语义（存在即整体更新，不存在即新建），界面上
+    # "新增"与"保存"因此走同一条路径，少一类边界情况。
+    app.router.add_put("/api/frontends/{name}", handle_upsert_frontend)
+    app.router.add_post("/api/frontends", handle_upsert_frontend)
+    app.router.add_delete("/api/frontends/{name}", handle_delete_frontend)
     return app
 
 
@@ -404,6 +361,7 @@ async def run_console(
     db_opts: dbconfig.MySQLOptions | None,
     log: logging.Logger,
     bind: str = "127.0.0.1",
+    instance: str = "haproxy",
 ) -> None:
     """常驻任务：启动控制台 HTTP 服务并挂起到被取消，取消时干净回收。
 
@@ -411,7 +369,8 @@ async def run_console(
     （由 RL_CONSOLE_BIND 显式放开，见 __main__）。绑到非回环地址时打一条
     warning，让"我以为它只在本机"的误配在日志里留痕。
     """
-    runner = web.AppRunner(build_app(hub, logbuf, db_opts, log), access_log=None)
+    runner = web.AppRunner(
+        build_app(hub, logbuf, db_opts, log, instance), access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, bind, port)
     await site.start()

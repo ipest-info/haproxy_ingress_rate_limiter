@@ -2,62 +2,77 @@
 # /etc/rl-limiter/config.yaml）。生产推荐用 MySQL 配置库（设置
 # RL_MYSQL_HOST 即启用，见 docs/03 §2.1），两种来源走同一套校验管线。
 #
-# 架构要点：限速由各节点 HAProxy 的 shared bwlim（聚合限速，配置常量
-# + reload 调整）执行；rl-limiter **与 HAProxy 同机部署**——每台服务器
-# 一个实例，只采本机那台 HAProxy 的下行带宽，对照这里登记的节点限额做
-# 持续超限告警。envs 是业务环境分组（纯分组，仅供聚合查看），挂载点
-# (节点, frontend) 声明 frontend 归属。
+# 架构要点（单 HAProxy 模型）：一个 rl-limiter 实例管**一台**与它同机的
+# HAProxy。这份配置描述的就是那台 HAProxy：怎么连它的 stats socket，
+# 以及它上面有哪些受管 frontend（监听端口 + 限额 + 后端服务器）。
 #
-# 同机模式的开关是环境变量 RL_NODE_NAME=<本机节点名>：配置文件本身
-# **仍写全量**（节点独占等约束是跨节点的不变量，必须在全量上校验），
-# 校验通过后才裁剪到本机。三台机器可以共用同一份配置文件，只有
-# RL_NODE_NAME 不同。不设 RL_NODE_NAME 则为集中监控模式（一个实例采
-# 多台，此时节点要填 host/port 走内网 TCP）。
+# frontends 这份清单是**唯一数据源**：
+#   - 监控侧按它判定各 frontend 是否超限；
+#   - 下发侧（启用 RL_APPLY_HAPROXY_CFG 后）按它渲染 haproxy.cfg 的
+#     受管区块并 reload。
+# 两者同源，因此不存在"配置改了、数据面忘了改"的漂移。
 #
 # 单位约定：quota_bps 一律为 bit/s（运维口径，40000000 = 40 Mbps），
-# 服务内部统一换算为 bytes/s（唯一换算点在 model.EnvQuota）。
+# 服务内部统一换算为 bytes/s（唯一换算点在 model.FrontendConfig）。
 
 log_level: info                 # debug | info | warn | error
-tick_interval_s: 1.0            # 采样节拍（秒）；1 秒是设计基准，不要改动
+tick_interval_s: 1.0            # 采样节拍（秒）；只支持 1.0，见校验说明
 
-# 受控 HAProxy 节点清单。接线字段（socket_path / host / port / timeout）
-# 重启生效；quota_bps（登记限额）在 MySQL 模式下可热更。
+# ---------------------------------------------------------------------------
+# 本机 HAProxy 的 stats socket 接线（只读采样用）。重启生效。
 #
 # 采样通道二选一（校验强制恰好给一种）：
 #   - socket_path（**同机部署，推荐**）：本机 unix stats socket 绝对路径。
-#     该节点 haproxy.cfg 的 global 段需有：
+#     haproxy.cfg 的 global 段需有：
 #       stats socket /run/haproxy/admin.sock mode 660 level user
 #     不占任何网络端口，访问权由文件属主/属组控制。
-#   - host + port（跨机集中监控）：内网 TCP stats socket。
+#   - host + port（远程只读观测）：内网 TCP stats socket。
 #       stats socket ipv4@<内网IP>:9999 level user
-#     端口只绑内网并用安全组/防火墙限制来源。
-# 两种形态 rl-limiter 都只做只读采样，user 级即够。
-# 详见 deploy/haproxy/bwlim-example.cfg。
-haproxy_nodes:
-  - name: hap-1                 # 节点名：envs[].targets[].node 引用它，必须全局唯一。
-                                # 同机模式下本机那台的 name 要与 RL_NODE_NAME 一致
-    socket_path: /run/haproxy/admin.sock   # 本机 unix stats socket（同机形态）
-    quota_bps: 40000000         # 登记限额（bit/s），40 Mbps；被挂载的节点必填。
-                                # 应与该节点 haproxy.cfg 里 shared bwlim 的
-                                # limit（bytes/s，此例 5000000）保持一致；
-                                # 实测持续超过该值会触发持续超限告警
-    timeout_ms: 500             # 单次 runtime API 命令超时（连接 + 读写，毫秒）
-  - name: hap-2
-    socket_path: /run/haproxy/admin.sock   # 注意：是"该节点本机上的路径"
-    quota_bps: 40000000
-  # 跨机集中监控形态的写法（与上面二选一，不可混填）：
-  # - name: hap-3
-  #   host: 10.0.0.13
-  #   port: 9999
-  #   quota_bps: 40000000
+#     注意这种形态下**无法下发配置**（改 cfg + reload 必须在本机做）。
+# ---------------------------------------------------------------------------
+haproxy:
+  name: haproxy                 # 实例名；数据库模式下须与 RL_NODE_NAME 一致
+  socket_path: /run/haproxy/admin.sock
+  timeout_ms: 500               # 单次 runtime API 命令超时（连接 + 读写）
+  # 远程观测形态改用（与 socket_path 二选一，不可混填）：
+  # host: 10.0.0.11
+  # port: 9999
 
-# 业务环境分组（纯分组）：环境不携带限额——限额登记在上方节点上。
-# 约束：节点是环境的独占资源（一个环境可横跨多台节点，一台节点只允许
-# 服务一个环境）；每个环境至少一个挂载点。
-envs:
-  - env_id: env-a               # 环境 ID（控制台聚合视图按它汇总成员节点）
-    targets:                    # 挂载点：节点 × 该节点上的 frontend 名（stats 的 pxname 列）
-      - node: hap-1
-        frontend: fe_env_a
-      - node: hap-2
-        frontend: fe_env_a
+# ---------------------------------------------------------------------------
+# 受管 frontend 清单：每项 = 一个监听端口 + 一个 shared bwlim 速率桶 +
+# 一组后端服务器。启用配置下发后，这里的每一项会被渲染成 haproxy.cfg
+# 受管区块里的一个 listen 段。
+# ---------------------------------------------------------------------------
+frontends:
+  - name: fe_main               # = stats 里的 pxname，也是 cfg 里的段名；全局唯一
+    bind_address: ""            # 留空 = 所有地址（HAProxy 的 `bind :port`）
+    bind_port: 8080
+    mode: tcp                   # tcp | http
+    quota_bps: 40000000         # 限额（bit/s），40 Mbps。既是 shared bwlim 的
+                                # limit（真实限速 = 该值 ÷ 8 bytes/s），
+                                # 也是超限告警基准——同源，不会漂移
+    maxconn: 2000               # 资源保护水位（0 = 不写该指令）；不是限速手段
+    balance: roundrobin         # roundrobin|static-rr|leastconn|first|source|random
+    timeout_connect_ms: 5000
+    timeout_client_ms: 50000
+    timeout_server_ms: 50000
+    servers:                    # 后端服务器（至少一个）
+      - name: web1
+        address: 10.0.0.21
+        port: 9000
+        weight: 100             # 0-256
+        check: true             # 主动健康检查
+        check_inter_ms: 2000
+      - name: web2
+        address: 10.0.0.22
+        port: 9000
+
+  # 第二个监听端口的例子（HTTP 模式、更小的限额）。
+  - name: fe_api
+    bind_address: 127.0.0.1     # 只监听回环
+    bind_port: 8081
+    mode: http
+    quota_bps: 8000000          # 8 Mbps
+    balance: leastconn
+    servers:
+      - {name: api1, address: 10.0.0.31, port: 8000}

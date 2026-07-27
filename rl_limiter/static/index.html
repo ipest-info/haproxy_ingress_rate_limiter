@@ -1,863 +1,583 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rl-limiter 控制台</title>
 <style>
-/* ---- 主题令牌（亮/暗双模式，调色板经 dataviz 校验器验证） ---- */
+/* 单 HAProxy 模型的控制台：一台 HAProxy、若干受管 frontend。
+   每个 frontend 一张卡片 = 实时曲线 + 配置表单（监听端口、限额、
+   后端服务器）。改完提交即写库，随后由 enforcer 写进 haproxy.cfg
+   并 reload——所以页面上的每一次保存都是真正生效的配置变更。 */
 :root {
-  color-scheme: light dark;
-  --surface-0: #f4f4f2;      /* 页面底 */
-  --surface-1: #fcfcfb;      /* 卡片面（图表 surface） */
+  --surface-0: #f4f4f2;
+  --surface-1: #fcfcfb;
+  --surface-2: #eeedea;
   --border:    #e2e1dd;
   --text-primary:   #0b0b0b;
   --text-secondary: #52514e;
   --text-muted:     #8a8983;
-  --series-rate:   #2a78d6;  /* 实时速率（slot1 blue） */
-  --series-mean:   #008300;  /* 10s 均值（slot2 green） */
-  --ref-quota:     #52514e;  /* 限额参考线（中性，非序列色） */
+  --series-rate:   #2a78d6;
+  --series-mean:   #008300;
+  --ref-quota:     #52514e;
   --status-good:     #0ca30c;
   --status-warning:  #fab219;
-  --status-serious:  #ec835a;
   --status-critical: #d03b3b;
   --grid: rgba(0,0,0,.07);
+  --accent: #2a78d6;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --surface-0: #121211;
-    --surface-1: #1a1a19;
-    --border:    #33332f;
-    --text-primary:   #ffffff;
-    --text-secondary: #c3c2b7;
-    --text-muted:     #85847c;
-    --series-rate:  #3987e5;
-    --series-mean:  #008300;
-    --ref-quota:    #c3c2b7;
+    --surface-0: #16161a; --surface-1: #1e1e23; --surface-2: #26262c;
+    --border: #34343c;
+    --text-primary: #f2f2f0; --text-secondary: #b9b8b4; --text-muted: #86857f;
     --grid: rgba(255,255,255,.08);
+    --ref-quota: #b9b8b4;
   }
 }
 * { box-sizing: border-box; }
 body {
   margin: 0; background: var(--surface-0); color: var(--text-primary);
-  font: 14px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC",
+        "Microsoft YaHei", sans-serif;
 }
 header {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;
-  padding: 12px 20px; background: var(--surface-1);
-  border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 5;
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 12px 16px; background: var(--surface-1);
+  border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 20;
 }
-header h1 { font-size: 16px; margin: 0 8px 0 0; }
+h1 { font-size: 16px; margin: 0; font-weight: 650; }
 .meta { color: var(--text-secondary); font-size: 12.5px; }
 .meta b { color: var(--text-primary); font-weight: 600; }
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: 1px; }
 .badge {
-  display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px;
-  border-radius: 999px; border: 1px solid var(--border); font-size: 12.5px;
-  color: var(--text-secondary); background: transparent;
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px;
+  padding: 2px 9px; border-radius: 999px; background: var(--surface-2);
 }
-main { max-width: 1180px; margin: 0 auto; padding: 16px 20px 40px; }
-.card {
-  background: var(--surface-1); border: 1px solid var(--border);
-  border-radius: 10px; padding: 14px 16px; margin-bottom: 16px;
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+main { padding: 16px; display: grid; gap: 16px; }
+.banner {
+  padding: 10px 14px; border-radius: 8px; font-size: 13px; line-height: 1.6;
+  border-left: 4px solid var(--status-warning); background: rgba(250,178,25,.10);
 }
-.card h2 { font-size: 15px; margin: 0; }
-.row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
-.stats { display: flex; flex-wrap: wrap; gap: 6px 22px; margin: 10px 0 2px; }
-.stat .k { font-size: 12px; color: var(--text-muted); }
-.stat .v { font-size: 17px; font-variant-numeric: tabular-nums; font-weight: 600; }
-.stat .u { font-size: 12px; color: var(--text-secondary); font-weight: 400; }
-.legend { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 10px 0 4px; font-size: 12.5px; color: var(--text-secondary); }
-.legend .chip { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: 3px; margin-right: 6px; }
-.legend .val { color: var(--text-primary); font-variant-numeric: tabular-nums; margin-left: 4px; }
-.chart-wrap { position: relative; }
-canvas.chart { display: block; width: 100%; height: 210px; cursor: crosshair; }
-.tooltip {
-  position: absolute; pointer-events: none; display: none; z-index: 3;
-  background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
-  padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.18);
-  min-width: 170px;
-}
-.tooltip .t { color: var(--text-muted); margin-bottom: 4px; }
-.tooltip .r { display: flex; justify-content: space-between; gap: 14px; }
-.tooltip .r .n { color: var(--text-secondary); }
-.tooltip .r .v { font-variant-numeric: tabular-nums; color: var(--text-primary); }
-.controls { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-top: 10px; }
-input[type=number], input[type=text], textarea, select {
-  background: var(--surface-0); color: var(--text-primary);
-  border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font: inherit;
-}
-input[type=number] { width: 110px; }
-button {
-  background: var(--surface-0); color: var(--text-primary); border: 1px solid var(--border);
-  border-radius: 6px; padding: 5px 14px; font: inherit; cursor: pointer;
-}
-button:hover { border-color: var(--text-muted); }
-button.primary { background: var(--series-rate); border-color: var(--series-rate); color: #fff; }
-button:disabled { opacity: .5; cursor: not-allowed; }
-input.dirty { border-color: var(--status-warning); }
-/* 节点面板 */
-.nodes-table { border-collapse: collapse; margin-top: 8px; min-width: 560px; }
-.nodes-table td, .nodes-table th { padding: 5px 22px 5px 0; text-align: left; }
-.nodes-table th { color: var(--text-muted); font-size: 12px; font-weight: 500; }
-.nodes-table td.nname { font-weight: 600; }
-.nodes-table td.naddr { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
-/* 挂载点 chips */
-.targets-box { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-.tchip {
-  display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px;
-  border: 1px solid var(--border); border-radius: 999px; font-size: 12.5px;
-  color: var(--text-secondary); font-variant-numeric: tabular-nums;
-}
-.tchip b { color: var(--text-primary); font-weight: 600; }
-.tchip .x { cursor: pointer; color: var(--text-muted); font-weight: 700; padding: 0 2px; }
-.tchip .x:hover { color: var(--status-critical); }
-button.danger { color: var(--status-critical); border-color: var(--status-critical); background: transparent; }
-.hint { font-size: 12px; color: var(--text-muted); }
-.state { font-weight: 600; }
-h3.section { font-size: 14px; color: var(--text-secondary); margin: 22px 4px 10px; }
-/* 日志面板 */
-.logbox { max-height: 320px; overflow: auto; margin-top: 10px; font: 12px/1.55 ui-monospace, Menlo, Consolas, monospace; }
-.logbox table { width: 100%; border-collapse: collapse; }
-.logbox td { padding: 1px 8px 1px 0; vertical-align: top; white-space: nowrap; }
-.logbox td.msg { white-space: pre-wrap; word-break: break-all; }
-.logbox tr.WARNING td { color: var(--status-warning); }
-.logbox tr.ERROR td, .logbox tr.CRITICAL td { color: var(--status-critical); }
-.lvlbtn.off { opacity: .4; }
-.toast {
-  position: fixed; right: 18px; bottom: 18px; z-index: 9; display: none;
-  background: var(--surface-1); border: 1px solid var(--border); border-left: 4px solid var(--status-good);
-  border-radius: 8px; padding: 10px 14px; max-width: 420px; box-shadow: 0 6px 20px rgba(0,0,0,.25);
-}
-.toast.err { border-left-color: var(--status-critical); }
-#scope-banner, #apply-banner {
-  margin: 0 16px 12px; padding: 10px 14px; border-radius: 8px;
-  border-left: 4px solid var(--status-warn, #d9822b);
-  background: rgba(217,130,43,.10); font-size: 13px; line-height: 1.6;
-}
-#apply-banner.ok {
-  border-left-color: var(--status-ok, #2d9d5f);
-  background: rgba(45,157,95,.10);
-}
-#apply-banner.err {
-  border-left-color: var(--status-critical, #d64545);
-  background: rgba(214,69,69,.12);
-}
-#apply-banner pre {
+.banner.ok  { border-left-color: var(--status-good); background: rgba(12,163,12,.10); }
+.banner.err { border-left-color: var(--status-critical); background: rgba(208,59,59,.12); }
+.banner pre {
   margin: 6px 0 0; white-space: pre-wrap; word-break: break-all;
   font-size: 12px; opacity: .85;
 }
+.card {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px;
+}
+.card > h2 {
+  font-size: 14.5px; margin: 0 0 10px; font-weight: 650;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.grow { flex: 1; }
+canvas { width: 100%; height: 150px; display: block; }
+.stats { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; font-size: 12.5px; }
+.stats span { color: var(--text-secondary); }
+.stats b { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+button {
+  font: inherit; font-size: 13px; padding: 5px 12px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--surface-2);
+  color: var(--text-primary); cursor: pointer;
+}
+button:hover { border-color: var(--text-muted); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger  { color: var(--status-critical); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+input, select {
+  font: inherit; font-size: 13px; padding: 4px 8px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--surface-0);
+  color: var(--text-primary); width: 100%;
+}
+.form { display: none; margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
+.form.open { display: block; }
+.fields {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px 14px;
+}
+label { display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 3px; }
+table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 13px; }
+th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); }
+th { color: var(--text-secondary); font-weight: 600; font-size: 12px; }
+td input { min-width: 70px; }
+.hint { color: var(--text-muted); font-size: 12px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+.tag { font-size: 11.5px; padding: 1px 7px; border-radius: 4px; background: var(--surface-2); color: var(--text-secondary); }
+.tag.over { background: rgba(208,59,59,.15); color: var(--status-critical); font-weight: 600; }
+.tag.degraded { background: rgba(250,178,25,.18); color: #8a6100; }
+#logs { max-height: 260px; overflow-y: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+#logs div { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
+.lv-WARNING { color: #8a6100; } .lv-ERROR, .lv-CRITICAL { color: var(--status-critical); }
+.lv-DEBUG { color: var(--text-muted); }
+#toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 50; }
+.toast {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-left: 4px solid var(--status-good); border-radius: 8px;
+  padding: 10px 14px; max-width: 460px; box-shadow: 0 6px 20px rgba(0,0,0,.25);
+  font-size: 13px;
+}
+.toast.err { border-left-color: var(--status-critical); }
 </style>
-</head>
-<body>
+
 <header>
   <h1>rl-limiter 控制台</h1>
-  <span class="badge" id="sse-badge"><span class="dot" id="sse-dot" style="background:var(--status-critical)"></span><span id="sse-text">连接中…</span></span>
+  <span class="badge"><span class="dot" id="sse-dot" style="background:var(--status-critical)"></span><span id="sse-text">连接中…</span></span>
+  <span class="meta">HAProxy <b id="hap-name">–</b> <span class="hint" id="hap-endpoint"></span></span>
   <span class="meta">配置版本 <b id="cfg-version">–</b></span>
   <span class="meta">运行时长 <b id="uptime">–</b></span>
   <span class="meta">服务版本 <b id="svc-version">–</b></span>
+  <span class="grow"></span>
   <span class="meta">窗口
-    <select id="window-sel">
+    <select id="window-sel" style="width:auto;display:inline-block">
       <option value="60">1 分钟</option>
       <option value="300" selected>5 分钟</option>
       <option value="600">10 分钟</option>
     </select>
   </span>
 </header>
-<!-- 同机部署模式的横幅：本实例只采本机那台 HAProxy，环境聚合视图里
-     只有本机成员。不标出来，聚合曲线会被误读成"整个环境只跑了这么
-     多"。集中监控模式下这块保持隐藏。 -->
-<div id="scope-banner" style="display:none">
-  <b>同机部署模式</b>：本控制台属于节点 <b id="scope-node">–</b>，只监控**本机**
-  这台 HAProxy（采样走本机 unix stats socket）。下方「环境聚合视图」因此
-  只含本机成员，<b>不是该环境的全量带宽</b>——环境全量视图需要各节点的
-  控制台分别查看，或由后续的集中后台汇总。
-</div>
-<!-- 限额自动应用的状态。运维改完限额最关心一件事：数据面到底生效了没有。
-     启用时显示"改完即生效"，失败时把原因顶到最显眼处——这时数据面还在
-     按旧限额跑，不说清楚就会以为已经改好了。 -->
-<div id="apply-banner" style="display:none"></div>
+
 <main>
-  <div class="card">
-    <div class="row">
-      <h2>HAProxy 节点</h2>
-      <span class="hint">限速由各节点 HAProxy 的 shared bwlim 配置执行（改 cfg + reload）；这里登记的限额是监控基准，实测持续超过即告警</span>
-    </div>
-    <table class="nodes-table" id="nodes-table"></table>
-  </div>
+  <!-- 配置下发状态。运维改完配置最关心的一件事：数据面到底生效了没有。 -->
+  <div id="apply-banner" class="banner" style="display:none"></div>
 
-  <h3 class="section">节点带宽视图（每台 HAProxy 一个监控单元）</h3>
-  <div id="units"></div>
-
-  <h3 class="section">环境聚合视图（成员节点带宽之和，仅查看）</h3>
-  <div id="groups"></div>
+  <div id="frontends"></div>
 
   <div class="card">
-    <div class="row">
-      <h2>新建环境</h2>
-      <span class="hint">环境 = 节点分组（限额登记在成员节点上）；须携带至少一个挂载点；节点独占，下拉只列未分配节点</span>
+    <h2>新增受管 frontend<span class="grow"></span>
+      <button id="new-btn">新增</button>
+    </h2>
+    <div class="hint">
+      新增一个监听端口：填写端口、限额与后端服务器后保存，配置写入数据库，
+      随后由本机 rl-limiter 写进 haproxy.cfg 的受管区块并 reload。
     </div>
-    <div class="controls" style="margin-top:12px">
-      <label>环境 ID <input type="text" id="new-env-id" placeholder="env-c" style="width:110px"></label>
-      <label>节点 <select id="new-env-node"></select></label>
-      <label>frontend <input type="text" id="new-env-frontend" placeholder="fe_env_c" style="width:130px"></label>
-      <button class="primary" id="new-env-create">创建</button>
-    </div>
+    <div class="form" id="new-form"></div>
   </div>
 
   <div class="card">
-    <div class="row">
-      <h2>运行日志</h2>
-      <span id="lvl-filters">
-        <button class="lvlbtn" data-lvl="INFO">INFO</button>
-        <button class="lvlbtn" data-lvl="WARNING">WARNING</button>
-        <button class="lvlbtn" data-lvl="ERROR">ERROR</button>
-      </span>
-      <label class="hint"><input type="checkbox" id="log-follow" checked> 自动滚动</label>
-    </div>
-    <div class="logbox"><table id="log-table"></table></div>
+    <h2>运行日志<span class="grow"></span>
+      <select id="log-level" style="width:auto">
+        <option value="DEBUG">全部</option>
+        <option value="INFO" selected>INFO 及以上</option>
+        <option value="WARNING">WARNING 及以上</option>
+        <option value="ERROR">仅 ERROR</option>
+      </select>
+    </h2>
+    <div id="logs"></div>
   </div>
 </main>
-<div class="toast" id="toast"></div>
+<div id="toasts"></div>
 
 <script>
-"use strict";
-/* ================= 工具 ================= */
-const $ = (sel, el) => (el || document).querySelector(sel);
-// 往 innerHTML 里塞任何非本页面写死的文本前都要过这一道：限额自动应用
-// 的错误信息里带着 `haproxy -c` 的原始 stderr（内容来自 cfg 文件），
-// 直接拼进 HTML 会把配置文件变成脚本注入面。
-const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
-  {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
-const mbps = b => b == null ? null : b * 8 / 1e6;          // bytes/s → Mbps
-const fmtMbps = v => v == null ? "–" : (v >= 100 ? v.toFixed(0) : v.toFixed(1));
-const fmtTime = ts => new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour12: false });
-const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const $ = (s, el) => (el || document).querySelector(s);
+// 往 innerHTML 里塞任何非本页写死的文本前都要过这一道：配置名、下发失败
+// 时 `haproxy -c` 的原始 stderr 等都来自外部，直接拼进 HTML 就是注入面。
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+// 速率一律以 bytes/s 在内部流转，只在显示时换算成 Mbps（×8÷1e6），
+// 与配置里的 quota_bps（bit/s）口径对齐。
+const toMbps = (bytesPerS) => bytesPerS * 8 / 1e6;
+const fmtMbps = (bytesPerS) => toMbps(bytesPerS).toFixed(2) + " Mbps";
+
+const state = {
+  fes: new Map(),      // name -> {buf:[], conf, els, tooltipX}
+  windowS: 300,
+  logAfter: 0,
+  logLevel: "INFO",
+  enforceEnabled: false,
+};
+const LEVELS = {DEBUG:10, INFO:20, WARNING:30, ERROR:40, CRITICAL:50};
 
 function toast(msg, isErr) {
-  const t = $("#toast");
-  t.textContent = msg;
-  t.className = "toast" + (isErr ? " err" : "");
-  t.style.display = "block";
-  clearTimeout(t._timer);
-  t._timer = setTimeout(() => { t.style.display = "none"; }, 4000);
+  const el = document.createElement("div");
+  el.className = "toast" + (isErr ? " err" : "");
+  el.textContent = msg;
+  $("#toasts").appendChild(el);
+  setTimeout(() => el.remove(), isErr ? 9000 : 4500);
 }
 
-async function apiSend(method, path, body) {
-  const resp = await fetch(path, {
-    method,
-    headers: { "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
-  return data;
-}
-const apiPut = (path, body) => apiSend("PUT", path, body);
-
-/* 输入框"脏"标记：用户改过且尚未提交的输入不被实时刷新覆盖。 */
-function markDirtyOnInput(el) {
-  el.addEventListener("input", () => { el._dirty = true; el.classList.add("dirty"); });
-}
-function clearDirty(el) { el._dirty = false; el.classList.remove("dirty"); }
-/* 可安全回填 = 用户没在编辑（未聚焦）且没有未提交的修改。 */
-const canSync = el => !el._dirty && document.activeElement !== el;
-
-/* ================= 全局状态 ================= */
-const state = {
-  windowS: 300,
-  units: new Map(),       // 节点名 → 节点带宽卡 { card, buf, ... }
-  groups: new Map(),      // env_id → 环境聚合卡 { card, buf, ... }
-  nodeConfig: {},         // 节点名 → {quota_bps, quota_bytes_per_s, frontends}
-  envGroups: {},          // env_id → [节点名]
-  nodes: {},              // 节点视图：name → {host,port,degraded}
-  logsAfter: 0,
-  lvlOn: { DEBUG: true, INFO: true, WARNING: true, ERROR: true, CRITICAL: true },
-};
-
-/* ================= 写库后的配置回读 ================= */
-function refreshSoon() {
-  loadOverview();
-  setTimeout(loadOverview, 4500);
-}
-
-/* ================= 节点归属（独占规则） ================= */
-function nodeOwners() {
-  const owners = {};
-  for (const [envId, members] of Object.entries(state.envGroups)) {
-    for (const n of members) owners[n] = envId;
-  }
-  return owners;
-}
-
-/* ================= 节点面板 ================= */
-function renderNodes() {
-  const table = $("#nodes-table");
-  if (table.contains(document.activeElement)) return;  // 编辑中不重建
-  const names = Object.keys(state.nodes);
-  if (!names.length) { table.innerHTML = ""; return; }
-  const owners = nodeOwners();
-  table.innerHTML = `<tr><th>节点</th><th>stats socket</th><th>所属环境</th><th>登记限额</th><th>采样状态</th></tr>`;
-  for (const name of names) {
-    const n = state.nodes[name];
-    const conf = state.nodeConfig[name];
-    // endpoint 同时覆盖两种接线形态：同机是 unix socket 路径，跨机是
-    // host:port（老快照没有该字段时回落到 host:port）。
-    const endpoint = n.endpoint || `${n.host}:${n.port}`;
-    const kind = n.unix ? "unix" : "tcp";
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td class="nname">${name}</td>
-      <td class="naddr">${endpoint} <span class="hint">(${kind})</span></td>
-      <td>${owners[name] ? `<b>${owners[name]}</b>` : '<span class="hint">未分配</span>'}</td>
-      <td class="naddr">${conf ? (conf.quota_bps / 1e6) + " Mbps" : "–"}</td>
-      <td>${n.degraded
-        ? '<span class="dot" style="background:var(--status-critical)"></span>失联（fail-static）'
-        : '<span class="dot" style="background:var(--status-good)"></span>正常'}</td>`;
-    table.appendChild(tr);
-  }
+// ---------------------------------------------------------------- 表单
+// 一个 frontend 的编辑表单：基本参数 + 后端服务器表格。新增与编辑共用，
+// 因为后端接口是 upsert 语义（存在即整体更新），少一类边界情况。
+function formHtml(fe, isNew) {
+  const f = fe || {};
+  const opt = (v, cur) => `<option value="${esc(v)}"${v === cur ? " selected" : ""}>${esc(v)}</option>`;
+  return `
+  <div class="fields">
+    <div><label>frontend 名${isNew ? "" : "（不可改）"}</label>
+      <input class="f-name" value="${esc(f.name || "")}" ${isNew ? "" : "disabled"}
+             placeholder="fe_main"></div>
+    <div><label>监听地址（留空 = 所有地址）</label>
+      <input class="f-addr" value="${esc(f.bind_address || "")}" placeholder="留空"></div>
+    <div><label>监听端口</label>
+      <input class="f-port" type="number" min="1" max="65535" value="${esc(f.bind_port ?? "")}"></div>
+    <div><label>限额（Mbps）</label>
+      <input class="f-quota" type="number" min="0" step="0.1"
+             value="${f.quota_bps ? (f.quota_bps / 1e6) : ""}"></div>
+    <div><label>模式</label>
+      <select class="f-mode">${opt("tcp", f.mode || "tcp")}${opt("http", f.mode)}</select></div>
+    <div><label>负载均衡</label>
+      <select class="f-balance">${["roundrobin","static-rr","leastconn","first","source","random"]
+        .map(v => opt(v, f.balance || "roundrobin")).join("")}</select></div>
+    <div><label>maxconn（0 = 不设）</label>
+      <input class="f-maxconn" type="number" min="0" value="${esc(f.maxconn ?? 0)}"></div>
+    <div><label>timeout connect (ms)</label>
+      <input class="f-tc" type="number" min="1" value="${esc(f.timeout_connect_ms ?? 5000)}"></div>
+    <div><label>timeout client (ms)</label>
+      <input class="f-tcl" type="number" min="1" value="${esc(f.timeout_client_ms ?? 50000)}"></div>
+    <div><label>timeout server (ms)</label>
+      <input class="f-ts" type="number" min="1" value="${esc(f.timeout_server_ms ?? 50000)}"></div>
+  </div>
+  <table>
+    <thead><tr><th>后端服务器</th><th>地址</th><th>端口</th><th>权重</th><th>健康检查</th><th>间隔(ms)</th><th></th></tr></thead>
+    <tbody class="f-servers"></tbody>
+  </table>
+  <div class="row">
+    <button class="f-addsrv">+ 添加服务器</button>
+    <span class="grow"></span>
+    <button class="f-cancel">取消</button>
+    <button class="f-save primary">保存并下发</button>
+  </div>
+  <div class="hint" style="margin-top:8px">
+    保存即写入配置库；本机 rl-limiter 随后把它渲染进 haproxy.cfg 的受管区块、
+    <code>haproxy -c</code> 校验通过后原子替换并 reload。新建连接立即按新配置，
+    存量连接在 HAProxy 的 hard-stop-after 宽限期后进入新配置。
+  </div>`;
 }
 
-function nodeOptions(sel, forEnv) {
-  // 独占规则过滤：环境卡的添加下拉只给「本环境成员或未分配」的节点；
-  // 新建环境（forEnv 为 null）只给「未分配」的节点。
-  if (document.activeElement === sel) return;
-  const owners = nodeOwners();
-  const names = Object.keys(state.nodes).filter(n =>
-    forEnv === null ? !owners[n] : (!owners[n] || owners[n] === forEnv));
-  const want = names.join(",");
-  if (sel._opts === want) return;
-  sel._opts = want;
-  const cur = sel.value;
-  sel.innerHTML = names.length
-    ? names.map(n => `<option value="${n}">${n}</option>`).join("")
-    : `<option value="">（无可用节点）</option>`;
-  if (cur && names.includes(cur)) sel.value = cur;
+function serverRow(s) {
+  const tr = document.createElement("tr");
+  s = s || {};
+  tr.innerHTML = `
+    <td><input class="s-name" value="${esc(s.name || "")}" placeholder="web1"></td>
+    <td><input class="s-addr" value="${esc(s.address || "")}" placeholder="10.0.0.21"></td>
+    <td><input class="s-port" type="number" min="1" max="65535" value="${esc(s.port ?? "")}"></td>
+    <td><input class="s-weight" type="number" min="0" max="256" value="${esc(s.weight ?? 100)}"></td>
+    <td style="text-align:center"><input class="s-check" type="checkbox" ${s.check === false ? "" : "checked"} style="width:auto"></td>
+    <td><input class="s-inter" type="number" min="1" value="${esc(s.check_inter_ms ?? 2000)}"></td>
+    <td><button class="s-del danger">删除</button></td>`;
+  tr.querySelector(".s-del").onclick = () => tr.remove();
+  return tr;
 }
 
-/* ================= 节点带宽卡（每台 HAProxy 独立视图与调节） ================= */
-function unitCard(node) {
-  let e = state.units.get(node);
-  if (e) return e;
+function readForm(root, fallbackName) {
+  const q = parseFloat($(".f-quota", root).value);
+  const servers = [...root.querySelectorAll(".f-servers tr")].map(tr => ({
+    name: $(".s-name", tr).value.trim(),
+    address: $(".s-addr", tr).value.trim(),
+    port: parseInt($(".s-port", tr).value, 10),
+    weight: parseInt($(".s-weight", tr).value, 10),
+    check: $(".s-check", tr).checked,
+    check_inter_ms: parseInt($(".s-inter", tr).value, 10),
+  }));
+  return {
+    name: ($(".f-name", root).value || fallbackName || "").trim(),
+    bind_address: $(".f-addr", root).value.trim(),
+    bind_port: parseInt($(".f-port", root).value, 10),
+    // 界面按运维习惯用 Mbps，接口用 bit/s——换算只在这一处。
+    quota_bps: Math.round((isFinite(q) ? q : 0) * 1e6),
+    mode: $(".f-mode", root).value,
+    balance: $(".f-balance", root).value,
+    maxconn: parseInt($(".f-maxconn", root).value, 10) || 0,
+    timeout_connect_ms: parseInt($(".f-tc", root).value, 10),
+    timeout_client_ms: parseInt($(".f-tcl", root).value, 10),
+    timeout_server_ms: parseInt($(".f-ts", root).value, 10),
+    servers,
+  };
+}
+
+function wireForm(root, fe, isNew, onDone) {
+  const tbody = $(".f-servers", root);
+  ((fe && fe.servers) || []).forEach(s => tbody.appendChild(serverRow(s)));
+  if (isNew && !tbody.children.length) tbody.appendChild(serverRow());
+  $(".f-addsrv", root).onclick = () => tbody.appendChild(serverRow());
+  $(".f-cancel", root).onclick = () => onDone(false);
+  $(".f-save", root).onclick = async (ev) => {
+    const btn = ev.target; btn.disabled = true;
+    const payload = readForm(root, fe && fe.name);
+    try {
+      const r = await fetch("/api/frontends/" + encodeURIComponent(payload.name),
+        {method: "PUT", body: JSON.stringify(payload)});
+      const j = await r.json();
+      if (!r.ok) { toast(j.error || "保存失败", true); btn.disabled = false; return; }
+      toast(j.note || "已保存");
+      onDone(true);
+    } catch (e) { toast("请求失败: " + e, true); btn.disabled = false; }
+  };
+}
+
+// ---------------------------------------------------------------- 卡片
+function ensureCard(name) {
+  let fe = state.fes.get(name);
+  if (fe) return fe;
   const card = document.createElement("div");
   card.className = "card";
   card.innerHTML = `
-    <div class="row">
-      <h2>节点 <span class="u-name"></span></h2>
-      <span class="badge overbadge" style="display:none"><span class="dot" style="background:var(--status-serious)"></span>超限（实测高于登记限额）</span>
-      <span class="badge degraded" style="display:none"><span class="dot" style="background:var(--status-critical)"></span>失联（fail-static）</span>
-      <span class="meta">所属环境 <b class="u-env">–</b></span>
-      <span class="meta">frontend <b class="u-fes">–</b></span>
-    </div>
+    <h2><span class="fe-title"></span>
+      <span class="tag fe-bind"></span>
+      <span class="tag fe-mode"></span>
+      <span class="tag over fe-over" style="display:none">超限</span>
+      <span class="tag degraded fe-degraded" style="display:none">采样失联</span>
+      <span class="grow"></span>
+      <button class="fe-edit">编辑</button>
+      <button class="fe-del danger">删除</button>
+    </h2>
+    <canvas></canvas>
     <div class="stats">
-      <span class="stat"><div class="k">实时速率</div><div class="v rate">–<span class="u"> Mbps</span></div></span>
-      <span class="stat"><div class="k">10s 均值（计费口径）</div><div class="v mean">–<span class="u"> Mbps</span></div></span>
-      <span class="stat"><div class="k">登记限额</div><div class="v quota">–<span class="u"> Mbps</span></div></span>
-      <span class="stat"><div class="k">利用率（均值/限额）</div><div class="v util">–<span class="u"> %</span></div></span>
-      <span class="stat"><div class="k">并发连接</div><div class="v conn">–</div></span>
-      <span class="stat"><div class="k">超限秒数<span class="u">（本页）</span></div><div class="v oversecs">0</div></span>
+      <span>实时 <b class="st-rate">–</b></span>
+      <span>10s 均值 <b class="st-mean">–</b></span>
+      <span>限额 <b class="st-quota">–</b></span>
+      <span>利用率 <b class="st-util">–</b></span>
+      <span>连接数 <b class="st-conn">–</b></span>
+      <span>后端 <b class="st-srv">–</b></span>
     </div>
-    <div class="legend">
-      <span><span class="chip" style="background:var(--series-rate)"></span>实时速率<span class="val l-rate">–</span></span>
-      <span><span class="chip" style="background:var(--series-mean)"></span>10s 均值<span class="val l-mean">–</span></span>
-      <span><span class="chip" style="background:var(--ref-quota);height:0;border-top:2px dashed var(--ref-quota)"></span>登记限额<span class="val l-quota">–</span></span>
-      <span class="hint">单位 Mbps</span>
-    </div>
-    <div class="chart-wrap">
-      <canvas class="chart"></canvas>
-      <div class="tooltip"></div>
-    </div>
-    <div class="controls">
-      <label>登记限额 <input type="number" class="quota-in" min="1" step="1"> Mbps</label>
-      <button class="primary quota-apply">应用</button>
-      <button class="quota-reset" title="放弃输入，恢复为当前登记值">还原</button>
-      <span class="hint quota-live"></span>
-    </div>
-    <p class="hint" style="margin:8px 0 0">
-      登记限额只是监控基准——真实限速在该节点 haproxy.cfg 的 shared bwlim
-      limit 里，需同步修改并 reload；不同步会触发持续超限告警。
-    </p>`;
-  $(".u-name", card).textContent = node;
-  $("#units").appendChild(card);
-
-  e = { id: node, card, buf: [], overSecs: 0, tooltipX: null };
-  state.units.set(node, e);
-
-  const qin = $(".quota-in", card);
-  markDirtyOnInput(qin);
-
-  $(".quota-apply", card).onclick = async () => {
-    const v = parseFloat(qin.value);
-    if (!(v > 0)) return toast("登记限额必须是 > 0 的数值（Mbps）", true);
-    try {
-      const r = await apiPut(`/api/nodes/${encodeURIComponent(node)}/quota`, { quota_bps: Math.round(v * 1e6) });
-      clearDirty(qin);
-      toast(`节点 ${node} 登记限额已提交为 ${v} Mbps；${r.note}`);
-      refreshSoon();
-    } catch (err) { toast("登记限额修改失败：" + err.message, true); }
-  };
-  $(".quota-reset", card).onclick = () => {
-    clearDirty(qin);
-    const conf = state.nodeConfig[node];
-    if (conf) qin.value = (conf.quota_bps / 1e6).toString();
-  };
-
-  const canvas = $("canvas.chart", card);
-  canvas.addEventListener("mousemove", ev => {
-    const rect = canvas.getBoundingClientRect();
-    e.tooltipX = ev.clientX - rect.left;
-    drawChart(e);
+    <div class="form"></div>`;
+  $("#frontends").appendChild(card);
+  const canvas = $("canvas", card);
+  fe = {name, buf: [], conf: null, card, canvas, tooltipX: null};
+  canvas.addEventListener("mousemove", (e) => {
+    fe.tooltipX = e.offsetX; draw(fe);
   });
-  canvas.addEventListener("mouseleave", () => { e.tooltipX = null; drawChart(e); });
-  new ResizeObserver(() => drawChart(e)).observe(canvas);
-  return e;
+  canvas.addEventListener("mouseleave", () => { fe.tooltipX = null; draw(fe); });
+  new ResizeObserver(() => draw(fe)).observe(canvas);
+  $(".fe-edit", card).onclick = () => openEdit(fe);
+  $(".fe-del", card).onclick = () => delFrontend(name);
+  state.fes.set(name, fe);
+  return fe;
 }
 
-function updateUnitCard(e, d) {
-  const c = e.card;
-  $(".rate", c).firstChild.nodeValue = fmtMbps(mbps(d.rate_bytes_per_s));
-  $(".mean", c).firstChild.nodeValue = fmtMbps(mbps(d.mean10_bytes_per_s));
-  $(".quota", c).firstChild.nodeValue = fmtMbps(mbps(d.quota_bytes_per_s));
-  const util = d.quota_bytes_per_s ? d.mean10_bytes_per_s / d.quota_bytes_per_s * 100 : null;
-  $(".util", c).firstChild.nodeValue = util == null ? "–" : util.toFixed(0);
-  $(".conn", c).firstChild.nodeValue = d.conn ?? "–";
-  $(".oversecs", c).textContent = e.overSecs;
-  $(".l-rate", c).textContent = fmtMbps(mbps(d.rate_bytes_per_s));
-  $(".l-mean", c).textContent = fmtMbps(mbps(d.mean10_bytes_per_s));
-  $(".l-quota", c).textContent = fmtMbps(mbps(d.quota_bytes_per_s));
-  $(".overbadge", c).style.display = d.over ? "" : "none";
-  $(".degraded", c).style.display = d.degraded ? "" : "none";
-
-  $(".u-env", c).textContent = nodeOwners()[e.id] || "未分配";
-  const conf = state.nodeConfig[e.id];
-  if (conf) {
-    $(".u-fes", c).textContent = (conf.frontends || []).join(" | ") || "–";
-    $(".quota-live", c).textContent =
-      `当前登记 ${(conf.quota_bps / 1e6).toString()} Mbps`;
-    const qin = $(".quota-in", c);
-    if (canSync(qin)) qin.value = (conf.quota_bps / 1e6).toString();
-  }
-}
-
-/* ================= 环境聚合卡（成员节点之和，仅查看 + 分组管理） ================= */
-function groupCard(envId) {
-  let g = state.groups.get(envId);
-  if (g) return g;
-  const card = document.createElement("div");
-  card.className = "card";
-  card.innerHTML = `
-    <div class="row">
-      <h2>环境 <span class="g-name"></span> <span class="hint">（聚合视图 = 成员节点之和）</span></h2>
-      <span class="meta">成员节点 <b class="g-members">–</b></span>
-      <span style="flex:1"></span>
-      <button class="danger env-delete" title="删除环境分组（仅影响监控分组视图，不影响各节点 HAProxy 上的限速）">删除环境</button>
-    </div>
-    <div class="stats">
-      <span class="stat"><div class="k">合计实时速率</div><div class="v rate">–<span class="u"> Mbps</span></div></span>
-      <span class="stat"><div class="k">合计 10s 均值</div><div class="v mean">–<span class="u"> Mbps</span></div></span>
-      <span class="stat"><div class="k">合计登记限额</div><div class="v quota">–<span class="u"> Mbps</span></div></span>
-      <span class="stat"><div class="k">合计并发连接</div><div class="v conn">–</div></span>
-      <span class="stat"><div class="k">超限节点</div><div class="v overnodes">–</div></span>
-    </div>
-    <div class="legend">
-      <span><span class="chip" style="background:var(--series-rate)"></span>合计实时速率<span class="val l-rate">–</span></span>
-      <span><span class="chip" style="background:var(--series-mean)"></span>合计 10s 均值<span class="val l-mean">–</span></span>
-      <span><span class="chip" style="background:var(--ref-quota);height:0;border-top:2px dashed var(--ref-quota)"></span>合计限额<span class="val l-quota">–</span></span>
-      <span class="hint">单位 Mbps</span>
-    </div>
-    <div class="chart-wrap">
-      <canvas class="chart"></canvas>
-      <div class="tooltip"></div>
-    </div>
-    <div class="controls">
-      <span style="font-weight:600">挂载点</span>
-      <span class="targets-box"></span>
-      <select class="target-node"></select>
-      <input type="text" class="target-frontend" placeholder="fe_xxx" style="width:120px">
-      <button class="target-add">添加挂载点</button>
-      <span class="hint">节点独占：下拉只列本环境节点与未分配节点</span>
-    </div>`;
-  $(".g-name", card).textContent = envId;
-  $("#groups").appendChild(card);
-
-  g = { id: envId, card, buf: [], tooltipX: null, _targetsJson: "" };
-  state.groups.set(envId, g);
-
-  $(".env-delete", card).onclick = async () => {
-    if (!confirm(`删除环境分组 ${envId}？成员节点的挂载点将被移除（仅影响监控视图，不影响 HAProxy 上的限速）。`)) return;
-    try {
-      const data = await apiSend("DELETE", `/api/envs/${encodeURIComponent(envId)}`);
-      toast(`环境 ${envId} 已删除；${data.note || ""}`);
-      refreshSoon();
-    } catch (err) { toast("删除环境失败：" + err.message, true); }
-  };
-
-  const submitTargets = async targets => {
-    const r = await apiPut(`/api/envs/${encodeURIComponent(envId)}/targets`, { targets });
-    toast(`挂载点已更新；${r.note}`);
-    refreshSoon();
-  };
-  $(".target-add", card).onclick = async () => {
-    const node = $(".target-node", card).value;
-    const frontend = $(".target-frontend", card).value.trim();
-    if (!node || !frontend) return toast("请选择节点并填写 frontend 名", true);
-    const cur = envTargets(envId);
-    if (cur.some(t => t.node === node && t.frontend === frontend)) {
-      return toast("该挂载点已存在于本环境", true);
-    }
-    try {
-      await submitTargets([...cur, { node, frontend }]);
-      $(".target-frontend", card).value = "";
-    } catch (err) { toast("添加挂载点失败：" + err.message, true); }
-  };
-  g.removeTarget = async (node, frontend) => {
-    const cur = envTargets(envId);
-    const next = cur.filter(t => !(t.node === node && t.frontend === frontend));
-    if (!next.length) {
-      return toast("环境至少要保留一个挂载点（要解散分组请用「删除环境」）", true);
-    }
-    if (!confirm(`从环境 ${envId} 移除挂载点 ${node}/${frontend}？`)) return;
-    try { await submitTargets(next); }
-    catch (err) { toast("移除挂载点失败：" + err.message, true); }
-  };
-
-  const canvas = $("canvas.chart", card);
-  canvas.addEventListener("mousemove", ev => {
-    const rect = canvas.getBoundingClientRect();
-    g.tooltipX = ev.clientX - rect.left;
-    drawChart(g);
+function openEdit(fe) {
+  const form = $(".form", fe.card);
+  if (form.classList.contains("open")) { form.classList.remove("open"); return; }
+  form.innerHTML = formHtml(fe.conf, false);
+  form.classList.add("open");
+  wireForm(form, fe.conf, false, (saved) => {
+    form.classList.remove("open");
+    if (saved) setTimeout(loadOverview, 600);
   });
-  canvas.addEventListener("mouseleave", () => { g.tooltipX = null; drawChart(g); });
-  new ResizeObserver(() => drawChart(g)).observe(canvas);
-  return g;
 }
 
-/* 环境的挂载点明细 = 成员节点 × 各自的 frontends（来自节点配置视图）。 */
-function envTargets(envId) {
-  const out = [];
-  for (const n of state.envGroups[envId] || []) {
-    for (const fe of (state.nodeConfig[n] || {}).frontends || []) {
-      out.push({ node: n, frontend: fe });
-    }
+async function delFrontend(name) {
+  if (!confirm(`删除 frontend「${name}」？\n\n该监听端口会在下一次 reload 后停止服务。`)) return;
+  try {
+    const r = await fetch("/api/frontends/" + encodeURIComponent(name), {method: "DELETE"});
+    const j = await r.json();
+    if (!r.ok) { toast(j.error || "删除失败", true); return; }
+    toast(j.note || "已删除");
+    const fe = state.fes.get(name);
+    if (fe) { fe.card.remove(); state.fes.delete(name); }
+    setTimeout(loadOverview, 600);
+  } catch (e) { toast("请求失败: " + e, true); }
+}
+
+function updateCard(fe, u) {
+  const c = fe.card;
+  $(".fe-title", c).textContent = fe.name;
+  const conf = fe.conf || {};
+  $(".fe-bind", c).textContent = (conf.bind_address || "*") + ":" + (conf.bind_port ?? "?");
+  $(".fe-mode", c).textContent = conf.mode || "tcp";
+  $(".st-srv", c).textContent = (conf.servers || []).length;
+  if (!u) return;
+  $(".st-rate", c).textContent = fmtMbps(u.rate_bytes_per_s);
+  $(".st-mean", c).textContent = fmtMbps(u.mean10_bytes_per_s);
+  $(".st-quota", c).textContent = u.quota_bytes_per_s ? fmtMbps(u.quota_bytes_per_s) : "–";
+  $(".st-util", c).textContent = u.quota_bytes_per_s
+    ? (u.mean10_bytes_per_s / u.quota_bytes_per_s * 100).toFixed(0) + "%" : "–";
+  $(".st-conn", c).textContent = u.conn;
+  $(".fe-over", c).style.display = u.over ? "" : "none";
+  $(".fe-degraded", c).style.display = u.degraded ? "" : "none";
+}
+
+// ---------------------------------------------------------------- 图表
+function draw(fe) {
+  const cv = fe.canvas, dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const css = getComputedStyle(document.documentElement);
+  g.clearRect(0, 0, w, h);
+
+  const now = Date.now() / 1000;
+  const pts = fe.buf.filter(p => now - p.ts <= state.windowS);
+  const quota = fe.conf ? (fe.conf.quota_bytes_per_s || 0) : 0;
+  // 纵轴上界取 max(限额, 实测峰值) 的 1.15 倍：限额线永远在视野内，
+  // 超限时的溢出部分也看得见。
+  let peak = quota;
+  for (const p of pts) peak = Math.max(peak, p.rate, p.mean);
+  const top = (peak || 1) * 1.15;
+  const x = (ts) => w - (now - ts) / state.windowS * w;
+  const y = (v) => h - (v / top) * (h - 4) - 2;
+
+  g.strokeStyle = css.getPropertyValue("--grid"); g.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const yy = Math.round(h * i / 4) + .5;
+    g.beginPath(); g.moveTo(0, yy); g.lineTo(w, yy); g.stroke();
   }
-  return out;
-}
-
-function updateGroupCard(g, agg) {
-  const c = g.card;
-  $(".g-members", c).textContent = (state.envGroups[g.id] || []).join("、") || "–";
-  $(".rate", c).firstChild.nodeValue = fmtMbps(mbps(agg.rate_bytes_per_s));
-  $(".mean", c).firstChild.nodeValue = fmtMbps(mbps(agg.mean10_bytes_per_s));
-  $(".quota", c).firstChild.nodeValue = fmtMbps(mbps(agg.quota_bytes_per_s));
-  $(".conn", c).firstChild.nodeValue = agg.conn ?? "–";
-  $(".overnodes", c).textContent = `${agg.over_nodes}/${agg.member_count}`;
-  $(".l-rate", c).textContent = fmtMbps(mbps(agg.rate_bytes_per_s));
-  $(".l-mean", c).textContent = fmtMbps(mbps(agg.mean10_bytes_per_s));
-  $(".l-quota", c).textContent = fmtMbps(mbps(agg.quota_bytes_per_s));
-
-  // 挂载点 chips（内容变化才重建）。
-  const targets = envTargets(g.id);
-  const tjson = JSON.stringify(targets);
-  if (g._targetsJson !== tjson) {
-    g._targetsJson = tjson;
-    const box = $(".targets-box", c);
-    box.innerHTML = "";
-    for (const t of targets) {
-      const chip = document.createElement("span");
-      chip.className = "tchip";
-      chip.innerHTML = `<b>${t.node}</b>/${t.frontend}<span class="x" title="移除">✕</span>`;
-      chip.querySelector(".x").onclick = () => g.removeTarget(t.node, t.frontend);
-      box.appendChild(chip);
-    }
+  if (quota > 0) {
+    g.strokeStyle = css.getPropertyValue("--ref-quota");
+    g.setLineDash([5, 4]); g.beginPath();
+    g.moveTo(0, y(quota)); g.lineTo(w, y(quota)); g.stroke();
+    g.setLineDash([]);
   }
-  nodeOptions($(".target-node", c), g.id);
+  const line = (key, color) => {
+    g.strokeStyle = color; g.lineWidth = 1.6; g.beginPath();
+    pts.forEach((p, i) => i ? g.lineTo(x(p.ts), y(p[key])) : g.moveTo(x(p.ts), y(p[key])));
+    g.stroke();
+  };
+  line("rate", css.getPropertyValue("--series-rate"));
+  line("mean", css.getPropertyValue("--series-mean"));
+
+  if (fe.tooltipX != null && pts.length) {
+    let best = pts[0], bd = Infinity;
+    for (const p of pts) { const d = Math.abs(x(p.ts) - fe.tooltipX); if (d < bd) { bd = d; best = p; } }
+    const px = x(best.ts);
+    g.strokeStyle = css.getPropertyValue("--text-muted");
+    g.beginPath(); g.moveTo(px, 0); g.lineTo(px, h); g.stroke();
+    const label = `${fmtMbps(best.rate)} / 均 ${fmtMbps(best.mean)}`;
+    g.font = "12px sans-serif";
+    const tw = g.measureText(label).width + 10;
+    const bx = Math.min(Math.max(px - tw / 2, 2), w - tw - 2);
+    g.fillStyle = css.getPropertyValue("--surface-2");
+    g.fillRect(bx, 4, tw, 20);
+    g.fillStyle = css.getPropertyValue("--text-primary");
+    g.fillText(label, bx + 5, 18);
+  }
 }
 
-/* ================= 快照消费 ================= */
-function applySnapshot(snap, isLive) {
+// ---------------------------------------------------------------- 数据
+function applySnapshot(snap, live) {
   $("#cfg-version").textContent = snap.config_version ?? "–";
-  if (snap.nodes) { state.nodes = snap.nodes; if (isLive) renderNodes(); }
-  if (snap.env_groups) state.envGroups = snap.env_groups;
-
-  if (isLive) {
-    for (const [node, e] of [...state.units]) {
-      if (!(node in (snap.units || {}))) { e.card.remove(); state.units.delete(node); }
-    }
-    for (const [envId, g] of [...state.groups]) {
-      if (!(envId in (state.envGroups || {}))) { g.card.remove(); state.groups.delete(envId); }
-    }
+  if (snap.haproxy) {
+    $("#hap-name").textContent = snap.haproxy.name || "–";
+    $("#hap-endpoint").textContent = snap.haproxy.endpoint || "";
   }
-
-  const cutoff = snap.ts - 660;
-  for (const [node, d] of Object.entries(snap.units || {})) {
-    const e = unitCard(node);
-    e.buf.push({ ts: snap.ts, ...d });
-    while (e.buf.length && e.buf[0].ts < cutoff) e.buf.shift();
-    if (isLive) {
-      if (d.over) e.overSecs++;
-      updateUnitCard(e, d);
-      drawChart(e);
-    }
-  }
-
-  // 环境聚合：成员节点各序列求和（缺采样的成员按 0 计入合计速率，
-  // 限额仍求和——聚合视图只是查看）。
-  for (const [envId, members] of Object.entries(state.envGroups || {})) {
-    const agg = {
-      rate_bytes_per_s: 0, mean10_bytes_per_s: 0,
-      quota_bytes_per_s: 0, conn: 0, over_nodes: 0,
-      member_count: members.length,
-    };
-    let seen = 0;
-    for (const n of members) {
-      const d = (snap.units || {})[n];
-      const conf = state.nodeConfig[n];
-      if (conf) agg.quota_bytes_per_s += conf.quota_bytes_per_s || 0;
-      if (!d) continue;
-      seen++;
-      agg.rate_bytes_per_s += d.rate_bytes_per_s || 0;
-      agg.mean10_bytes_per_s += d.mean10_bytes_per_s || 0;
-      agg.conn += d.conn || 0;
-      if (d.over) agg.over_nodes++;
-    }
-    if (!seen && !members.length) continue;
-    const g = groupCard(envId);
-    g.buf.push({ ts: snap.ts, ...agg });
-    while (g.buf.length && g.buf[0].ts < cutoff) g.buf.shift();
-    if (isLive) { updateGroupCard(g, agg); drawChart(g); }
+  for (const [name, u] of Object.entries(snap.units || {})) {
+    const fe = ensureCard(name);
+    fe.buf.push({ts: snap.ts, rate: u.rate_bytes_per_s, mean: u.mean10_bytes_per_s});
+    if (fe.buf.length > 1200) fe.buf.shift();
+    if (live) { updateCard(fe, u); draw(fe); }
   }
 }
 
-/* ================= 图表（canvas 折线：2px 线、隐性网格、悬浮十字线+提示） ================= */
-const SERIES = [
-  { key: "rate_bytes_per_s",   name: "实时速率", varName: "--series-rate" },
-  { key: "mean10_bytes_per_s", name: "10s 均值",  varName: "--series-mean" },
-];
-const PAD = { l: 46, r: 10, t: 8, b: 20 };
-
-function drawChart(e) {
-  const canvas = $("canvas.chart", e.card);
-  const tipEl = $(".tooltip", e.card);
-  const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
-  if (!cssW) return;
-  const dpr = window.devicePixelRatio || 1;
-  if (canvas.width !== cssW * dpr) { canvas.width = cssW * dpr; canvas.height = cssH * dpr; }
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, cssW, cssH);
-
-  const now = e.buf.length ? e.buf[e.buf.length - 1].ts : Date.now() / 1000;
-  const t0 = now - state.windowS;
-  const pts = e.buf.filter(p => p.ts >= t0);
-  const plotW = cssW - PAD.l - PAD.r, plotH = cssH - PAD.t - PAD.b;
-
-  let yMax = 1;
-  for (const p of pts) {
-    for (const s of SERIES) yMax = Math.max(yMax, mbps(p[s.key]) || 0);
-    yMax = Math.max(yMax, mbps(p.quota_bytes_per_s) || 0);
-  }
-  yMax *= 1.15;
-  const X = ts => PAD.l + (ts - t0) / state.windowS * plotW;
-  const Y = v => PAD.t + plotH - v / yMax * plotH;
-
-  ctx.strokeStyle = cssVar("--grid"); ctx.lineWidth = 1;
-  ctx.fillStyle = cssVar("--text-muted"); ctx.font = "11px sans-serif";
-  const ySteps = 4;
-  for (let i = 0; i <= ySteps; i++) {
-    const v = yMax / ySteps * i, y = Y(v);
-    ctx.beginPath(); ctx.moveTo(PAD.l, y); ctx.lineTo(cssW - PAD.r, y); ctx.stroke();
-    ctx.textAlign = "right"; ctx.textBaseline = "middle";
-    ctx.fillText(fmtMbps(v), PAD.l - 6, y);
-  }
-  ctx.textAlign = "center"; ctx.textBaseline = "top";
-  for (let i = 0; i <= 4; i++) {
-    const ts = t0 + state.windowS / 4 * i;
-    ctx.fillText(fmtTime(ts), X(ts), PAD.t + plotH + 5);
-  }
-
-  if (pts.length >= 2) {
-    const q = mbps(pts[pts.length - 1].quota_bytes_per_s);
-    if (q) {
-      ctx.save();
-      ctx.strokeStyle = cssVar("--ref-quota"); ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.moveTo(PAD.l, Y(q)); ctx.lineTo(cssW - PAD.r, Y(q)); ctx.stroke();
-      ctx.restore();
-    }
-    for (const s of SERIES) {
-      ctx.strokeStyle = cssVar(s.varName); ctx.lineWidth = 2;
-      ctx.beginPath();
-      let started = false;
-      for (const p of pts) {
-        const v = mbps(p[s.key]);
-        if (v == null) { started = false; continue; }
-        const x = X(p.ts), y = Y(v);
-        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-    }
-  }
-
-  if (e.tooltipX != null && pts.length) {
-    const tsAt = t0 + (e.tooltipX - PAD.l) / plotW * state.windowS;
-    let best = null;
-    for (const p of pts) if (!best || Math.abs(p.ts - tsAt) < Math.abs(best.ts - tsAt)) best = p;
-    if (best && e.tooltipX >= PAD.l && e.tooltipX <= cssW - PAD.r) {
-      const x = X(best.ts);
-      ctx.strokeStyle = cssVar("--text-muted"); ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, PAD.t + plotH); ctx.stroke();
-      for (const s of SERIES) {
-        const v = mbps(best[s.key]);
-        if (v == null) continue;
-        ctx.fillStyle = cssVar(s.varName);
-        ctx.beginPath(); ctx.arc(x, Y(v), 3.5, 0, Math.PI * 2); ctx.fill();
-        ctx.strokeStyle = cssVar("--surface-1"); ctx.lineWidth = 2; ctx.stroke();
-      }
-      const rows = SERIES.map(s =>
-        `<div class="r"><span class="n"><span style="background:${cssVar(s.varName)};display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:5px;vertical-align:2px"></span>${s.name}</span><span class="v">${fmtMbps(mbps(best[s.key]))} Mbps</span></div>`).join("");
-      const extra = best.over !== undefined
-        ? `连接 ${best.conn ?? "–"}${best.over ? " · 超限" : ""}`
-        : `连接 ${best.conn ?? "–"} · 超限节点 ${best.over_nodes}/${best.member_count}`;
-      tipEl.innerHTML = `<div class="t">${fmtTime(best.ts)} · ${extra}</div>${rows}
-        <div class="r"><span class="n">登记限额</span><span class="v">${fmtMbps(mbps(best.quota_bytes_per_s))} Mbps</span></div>`;
-      tipEl.style.display = "block";
-      tipEl.style.left = Math.min(x + 12, canvas.clientWidth - tipEl.offsetWidth - 4) + "px";
-      tipEl.style.top = "12px";
-    } else tipEl.style.display = "none";
-  } else tipEl.style.display = "none";
-}
-
-/* ================= SSE 与数据加载 ================= */
-function setSse(ok, text) {
-  $("#sse-dot").style.background = ok ? "var(--status-good)" : "var(--status-critical)";
-  $("#sse-text").textContent = text;
-}
-
-// 限额自动应用横幅。enforce 为 null = 未启用该能力（改库后仍要人工改
-// cfg + reload），此时不显示横幅——限额卡片上本来就有"需同步 HAProxy"
-// 的提示，两处都喊反而稀释了真正出问题时的信号。
 function renderApplyBanner(en) {
   const el = $("#apply-banner");
-  if (!en || !en.enabled) { el.style.display = "none"; return; }
+  state.enforceEnabled = !!(en && en.enabled);
+  if (!en || !en.enabled) {
+    // 未启用下发时也要说清楚：否则用户会以为在界面上保存就已经生效了。
+    el.style.display = ""; el.className = "banner";
+    el.innerHTML = "<b>配置自动下发未启用</b>：在这里保存的改动只会写入配置库，" +
+      "<b>不会</b>自动写进 haproxy.cfg。要让改动真正生效，请设置 " +
+      "<code>RL_APPLY_HAPROXY_CFG=&lt;本机 haproxy.cfg 路径&gt;</code> 后重启本服务，" +
+      "或人工同步配置并 reload。";
+    return;
+  }
   el.style.display = "";
   if (en.ok) {
-    el.className = "ok";
-    const t = en.last_change_ts
-      ? new Date(en.last_change_ts * 1000).toLocaleTimeString() : null;
-    el.innerHTML =
-      "<b>限额自动应用已启用</b>：在这里修改登记限额会被立刻写入本机 " +
-      "haproxy.cfg 并 reload，<b>数据面即时生效</b>（新建连接立即按新限额；" +
-      "存量连接在 HAProxy 的 hard-stop-after 宽限期后进入新限额）。" +
-      (t ? ` 最近一次应用：${escapeHtml(t)}。` : " 当前与配置库一致，无需改动。");
+    el.className = "banner ok";
+    const t = en.last_change_ts ? new Date(en.last_change_ts * 1000).toLocaleTimeString() : null;
+    el.innerHTML = "<b>配置自动下发已启用</b>：在这里保存的改动会被写入本机 " +
+      "haproxy.cfg 的受管区块并 reload，<b>数据面即时生效</b>" +
+      "（新建连接立即按新配置；存量连接在 hard-stop-after 宽限期后进入新配置）。" +
+      (t ? ` 最近一次下发：${esc(t)}。` : " 当前与配置库一致。");
   } else {
-    el.className = "err";
-    el.innerHTML =
-      "<b>限额自动应用失败——数据面仍在按<u>调整前</u>的限额运行</b>：" +
+    el.className = "banner err";
+    el.innerHTML = "<b>配置下发失败——数据面仍在按<u>调整前</u>的配置运行</b>：" +
       "配置库已改，但没能写进本机 haproxy.cfg / reload 未成功。" +
-      "请按下方原因处理后重试（会自动重试）。" +
-      `<pre>${escapeHtml(en.error || "")}</pre>`;
+      "请按下方原因处理（会自动重试）。" + `<pre>${esc(en.error || "")}</pre>`;
   }
 }
 
 async function loadOverview() {
-  const r = await fetch("/api/overview"); const o = await r.json();
-  state.nodeConfig = o.node_config || {};
-  state.envGroups = o.env_groups || {};
-  if (o.nodes) { state.nodes = o.nodes; renderNodes(); nodeOptions($("#new-env-node"), null); }
+  const o = await (await fetch("/api/overview")).json();
   $("#svc-version").textContent = o.service_version || "–";
   $("#cfg-version").textContent = o.config_version ?? "–";
-  // 同机部署模式横幅：scope_node 非空即本机节点名。
-  if (o.scope_node) {
-    $("#scope-node").textContent = o.scope_node;
-    $("#scope-banner").style.display = "";
-  } else {
-    $("#scope-banner").style.display = "none";
+  if (o.haproxy) {
+    $("#hap-name").textContent = o.haproxy.name || "–";
+    $("#hap-endpoint").textContent = o.haproxy.endpoint || "";
   }
-  renderApplyBanner(o.enforce);
   const up = Math.floor(o.uptime_s || 0);
-  $("#uptime").textContent = up >= 3600 ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
+  $("#uptime").textContent = up >= 3600
+    ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
+  renderApplyBanner(o.enforce);
+
+  const names = Object.keys(o.frontends || {}).sort();
+  for (const name of names) {
+    const fe = ensureCard(name);
+    fe.conf = o.frontends[name];
+    updateCard(fe, (o.latest && o.latest.units) ? o.latest.units[name] : null);
+  }
+  // 配置里已删掉的 frontend：移除卡片，避免留下一张永不更新的僵尸图。
+  for (const [name, fe] of [...state.fes]) {
+    if (!names.includes(name)) { fe.card.remove(); state.fes.delete(name); }
+  }
 }
 
-async function bootstrap() {
-  await loadOverview();
-  const r = await fetch("/api/history"); const h = await r.json();
-  for (const snap of h.snapshots || []) applySnapshot(snap, false);
-  for (const e of state.units.values()) {
-    const last = e.buf[e.buf.length - 1];
-    if (last) { updateUnitCard(e, last); drawChart(e); }
+async function loadLogs() {
+  const r = await fetch("/api/logs?after=" + state.logAfter);
+  const j = await r.json();
+  const box = $("#logs");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  for (const e of j.entries || []) {
+    state.logAfter = Math.max(state.logAfter, e.seq);
+    const d = document.createElement("div");
+    d.className = "lv-" + e.level;
+    d.dataset.level = e.level;
+    d.textContent = `${new Date(e.ts * 1000).toLocaleTimeString()} ${e.level} ${e.msg}`;
+    d.style.display = (LEVELS[e.level] || 0) >= (LEVELS[state.logLevel] || 0) ? "" : "none";
+    box.appendChild(d);
   }
-  for (const g of state.groups.values()) {
-    const last = g.buf[g.buf.length - 1];
-    if (last) { updateGroupCard(g, last); drawChart(g); }
-  }
+  while (box.children.length > 1000) box.removeChild(box.firstChild);
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function connectSSE() {
   const es = new EventSource("/api/stream");
-  es.onopen = () => setSse(true, "实时连接");
-  es.onerror = () => setSse(false, "已断开，自动重连…");
-  es.onmessage = ev => applySnapshot(JSON.parse(ev.data), true);
-}
-
-/* ================= 新建环境（纯分组，无配额） ================= */
-$("#new-env-create").onclick = async () => {
-  const envId = $("#new-env-id").value.trim();
-  const node = $("#new-env-node").value;
-  const frontend = $("#new-env-frontend").value.trim();
-  if (!envId) return toast("请填写环境 ID", true);
-  if (!node || !frontend) return toast("请选择节点并填写 frontend 名", true);
-  try {
-    const data = await apiSend("POST", "/api/envs", {
-      env_id: envId, targets: [{ node, frontend }],
-    });
-    toast(`环境 ${envId} 已创建；${data.note || ""}（成员节点的登记限额在节点卡上设置）`);
-    $("#new-env-id").value = ""; $("#new-env-frontend").value = "";
-    refreshSoon();
-  } catch (err) { toast("创建环境失败：" + err.message, true); }
-};
-
-/* ================= 日志 ================= */
-for (const btn of document.querySelectorAll(".lvlbtn")) {
-  btn.onclick = () => {
-    const lvl = btn.dataset.lvl;
-    state.lvlOn[lvl] = !state.lvlOn[lvl];
-    btn.classList.toggle("off", !state.lvlOn[lvl]);
-    for (const tr of $("#log-table").querySelectorAll("tr." + lvl)) {
-      tr.style.display = state.lvlOn[lvl] ? "" : "none";
-    }
+  es.onopen = () => {
+    $("#sse-dot").style.background = "var(--status-good)";
+    $("#sse-text").textContent = "实时连接正常";
   };
-}
-async function pollLogs() {
-  try {
-    const r = await fetch(`/api/logs?after=${state.logsAfter}`);
-    const { logs } = await r.json();
-    if (logs && logs.length) {
-      const table = $("#log-table");
-      for (const e of logs) {
-        state.logsAfter = Math.max(state.logsAfter, e.seq);
-        const lvl = e.level === "CRITICAL" ? "ERROR" : e.level;
-        const tr = document.createElement("tr");
-        tr.className = e.level;
-        tr.style.display = state.lvlOn[lvl] === false ? "none" : "";
-        tr.innerHTML = `<td>${fmtTime(e.ts)}</td><td>${e.level}</td><td class="msg"></td>`;
-        tr.querySelector(".msg").textContent = e.msg;
-        table.appendChild(tr);
-      }
-      while (table.rows.length > 600) table.deleteRow(0);
-      if ($("#log-follow").checked) {
-        const box = table.closest(".logbox");
-        box.scrollTop = box.scrollHeight;
-      }
-    }
-  } catch (_) { /* 断线由 SSE 徽标提示，这里静默等下一轮 */ }
-  setTimeout(pollLogs, 2000);
+  es.onerror = () => {
+    $("#sse-dot").style.background = "var(--status-critical)";
+    $("#sse-text").textContent = "连接断开，重试中…";
+  };
+  es.onmessage = (ev) => { try { applySnapshot(JSON.parse(ev.data), true); } catch (e) {} };
 }
 
-/* ================= 启动 ================= */
-$("#window-sel").onchange = ev => {
-  state.windowS = parseInt(ev.target.value, 10);
-  for (const e of state.units.values()) drawChart(e);
-  for (const g of state.groups.values()) drawChart(g);
+// ---------------------------------------------------------------- 启动
+$("#window-sel").onchange = (e) => {
+  state.windowS = parseInt(e.target.value, 10);
+  for (const fe of state.fes.values()) draw(fe);
 };
-setInterval(loadOverview, 10000);
-bootstrap().catch(err => toast("初始化失败：" + err.message, true));
-pollLogs();
+$("#log-level").onchange = (e) => {
+  state.logLevel = e.target.value;
+  const min = LEVELS[state.logLevel] || 0;
+  for (const d of $("#logs").children)
+    d.style.display = (LEVELS[d.dataset.level] || 0) >= min ? "" : "none";
+};
+$("#new-btn").onclick = () => {
+  const form = $("#new-form");
+  if (form.classList.contains("open")) { form.classList.remove("open"); return; }
+  form.innerHTML = formHtml(null, true);
+  form.classList.add("open");
+  wireForm(form, null, true, (saved) => {
+    form.classList.remove("open");
+    if (saved) setTimeout(loadOverview, 600);
+  });
+};
+
+(async function boot() {
+  await loadOverview();
+  try {
+    const h = await (await fetch("/api/history")).json();
+    for (const snap of h.snapshots || []) applySnapshot(snap, false);
+  } catch (e) {}
+  for (const fe of state.fes.values()) {
+    const last = fe.buf[fe.buf.length - 1];
+    if (last) draw(fe);
+  }
+  await loadLogs();
+  connectSSE();
+  setInterval(loadLogs, 2000);
+  setInterval(loadOverview, 10000);
+})();
 </script>
-</body>
-</html>

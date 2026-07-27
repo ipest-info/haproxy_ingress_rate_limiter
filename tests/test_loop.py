@@ -1,265 +1,156 @@
-# tests/test_loop.py —— MonitorLoop 单元测试。
+# tests.test_loop —— 监控主循环的测试（单 HAProxy，单位 = frontend）。
 #
-# 全部依赖用假采集器驱动，验证循环的编排语义：
-#   - 配置先于 tick 生效（队列中的配置在下一拍流水线前被应用）；
-#   - sampler 回调收到每拍的 (now, usages)；
-#   - version 属性跟踪 seed 与队列下发的配置版本；
-#   - 每 60 拍输出一条 "status summary"；
-#   - 持续超限告警状态机：连续超限 OVER_ALERT_AFTER_S 秒才告警、回落
-#     同样持续才解除；degraded / 无限额时判定暂停。
+# 覆盖：配置应用（受管集合/限额基准/叫醒 enforcer）、超限告警的滞回状态机、
+# degraded 时暂停判定、配置队列优先于 tick。
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-import time
 
-from rl_limiter import loop as loop_mod
+import pytest
+
 from rl_limiter import model
-from rl_limiter.loop import MonitorLoop
-
-# ---------------------------------------------------------------------------
-# 假组件
-# ---------------------------------------------------------------------------
+from rl_limiter.loop import OVER_ALERT_AFTER_S, MonitorLoop
 
 
 class FakeCollector:
-    def __init__(self, events: list | None = None):
-        self.events = events if events is not None else []
-        self.mapping: dict | None = None
-        self.usages: list[model.EnvUsage] = []
-        self.degraded: set[str] = set()
+    """假采集器：记录收到的受管集合，按脚本返回用量。"""
+
+    def __init__(self, usages=None):
+        self.managed: set[str] = set()
+        self.degraded = False
+        self._usages = usages or []
         self.ticks = 0
 
-    def set_mapping(self, mapping):
-        self.mapping = mapping
-        self.events.append(("set_mapping", dict(mapping)))
+    def set_managed(self, names):
+        self.managed = set(names)
 
     async def tick(self, now):
         self.ticks += 1
-        self.events.append(("collector.tick", self.ticks))
-        return list(self.usages)
+        return self._usages
 
-    def degraded_nodes(self):
-        return set(self.degraded)
+
+def fe(name="fe_a", quota_bps=8_000_000, port=8080, servers=None):
+    return model.FrontendConfig(
+        name=name, bind_port=port, quota_bits_per_sec=quota_bps,
+        servers=servers or [model.ServerEntry(name="s1", address="10.0.0.1", port=80)])
+
+
+def usage(name="fe_a", mean10=0.0, degraded=False):
+    return model.FrontendUsage(name=name, mean10_bps=mean10, degraded=degraded)
+
+
+def cfg(*frontends, version=1):
+    return model.ControllerConfig(version=version, frontends=list(frontends))
 
 
 # ---------------------------------------------------------------------------
-# 工具
+# 配置应用
 # ---------------------------------------------------------------------------
 
-T1 = model.Target("hap-1", "fe_a")
-T2 = model.Target("hap-2", "fe_a")
-
-
-def make_config(version: int, quota: int = 80_000_000) -> model.ControllerConfig:
-    # 监控单元=节点：env_id 装节点名，这里沿用一个单元挂两个 Target 的
-    # 结构性写法（loop 不关心 Target 落在哪台节点）。
-    return model.ControllerConfig(
-        version=version,
-        envs=[model.EnvQuota(env_id="hap-1", quota_bits_per_sec=quota,
-                             targets=[T1, T2])])
-
-
-async def run_until(ctl: MonitorLoop, queue, cond, interval=0.002, timeout=4.0):
-    """后台跑 ctl.run，直到 cond() 为真（或超时断言失败），随后取消。"""
-    task = asyncio.create_task(ctl.run(queue, tick_interval_s=interval))
-    try:
-        deadline = time.monotonic() + timeout
-        while not cond() and time.monotonic() < deadline:
-            await asyncio.sleep(0.002)
-        assert cond(), "condition not reached before timeout"
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-
-def make_loop(sampler=None):
+def test_apply_config_sets_managed_and_quotas():
     col = FakeCollector()
-    ctl = MonitorLoop(col, sampler=sampler,
-                      log=logging.getLogger("test.loop"))
-    return ctl, col
+    ctl = MonitorLoop(col)
+    ctl.seed(cfg(fe("fe_a", 8_000_000), fe("fe_b", 16_000_000, port=8081)))
+    assert col.managed == {"fe_a", "fe_b"}
+    assert ctl.version == 1
+    # 限额基准换算成 bytes/s（÷8）——单位换算只在 model 一处。
+    assert [f.quota_bits_per_sec for f in ctl.frontends()] == [8_000_000, 16_000_000]
 
 
-# ---------------------------------------------------------------------------
-# 测试
-# ---------------------------------------------------------------------------
-
-
-async def test_seed_applies_config_and_version():
-    ctl, col = make_loop()
-    assert ctl.version == 0
-    ctl.seed(make_config(5))
-    assert ctl.version == 5
-    assert col.mapping == {T1: "hap-1", T2: "hap-1"}
-
-
-async def test_config_applied_before_first_tick():
-    # 配置优先于 tick：启动前排队的配置必须在第一拍流水线之前生效，
-    # 超限判定才不会拿旧限额做基准。
-    ctl, col = make_loop()
-    ctl.seed(make_config(1, quota=100))
-    queue: asyncio.Queue = asyncio.Queue()
-    queue.put_nowait(make_config(2, quota=999))
-
-    await run_until(ctl, queue, lambda: col.ticks >= 1)
-
-    assert ctl.version == 2
-    # 事件顺序：seed 的 set_mapping → 队列配置的 set_mapping → 第一拍采集。
-    kinds = [e[0] for e in col.events]
-    assert kinds[:3] == ["set_mapping", "set_mapping", "collector.tick"]
-
-
-async def test_config_queue_updates_version_mid_run():
-    ctl, col = make_loop()
-    ctl.seed(make_config(3))
-    queue: asyncio.Queue = asyncio.Queue()
-
-    task = asyncio.create_task(ctl.run(queue, tick_interval_s=0.002))
-    try:
-        deadline = time.monotonic() + 4.0
-        while col.ticks < 2 and time.monotonic() < deadline:
-            await asyncio.sleep(0.002)
-        queue.put_nowait(make_config(7, quota=555))
-        while ctl.version != 7 and time.monotonic() < deadline:
-            await asyncio.sleep(0.002)
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-    assert ctl.version == 7
-
-
-async def test_sampler_called_each_tick():
-    samples: list[tuple] = []
-    ctl, col = make_loop(sampler=lambda now, usages: samples.append((now, usages)))
-    ctl.seed(make_config(1))
-    usage = model.EnvUsage(env_id="hap-1", mean10_bps=123.0, conn_cur=4)
-    col.usages = [usage]
-
-    await run_until(ctl, None, lambda: len(samples) >= 2)
-
-    now, usages = samples[0]
-    assert isinstance(now, float)
-    assert usages == [usage]
-
-
-async def test_status_summary_every_60_ticks(caplog):
-    ctl, col = make_loop()
-    ctl.seed(make_config(9))
-    col.degraded = {"hap-2"}
-
-    with caplog.at_level(logging.INFO, logger="test.loop"):
-        # 极小 tick 间隔快速推进 60+ 拍（<0.5s）。
-        await run_until(ctl, None, lambda: col.ticks >= 61, interval=0.001)
-
-    summaries = [r.getMessage() for r in caplog.records
-                 if "运行状态周期汇总" in r.getMessage()]
-    assert summaries, "expected a status summary at tick 60"
-    assert "tick=60" in summaries[0]
-    assert "config_version=9" in summaries[0]
-    assert "degraded_nodes=hap-2" in summaries[0]
-
-
-async def test_over_quota_alert_and_recovery(caplog):
-    """持续超限才告警（滞回）：超限满 OVER_ALERT_AFTER_S 拍打 warning，
-    回落满同样拍数打解除 info；期间不重复刷屏。"""
-    ctl, col = make_loop()
-    # quota 800 bits/s = 100 bytes/s；mean10 = 150 bytes/s 即超限。
-    ctl.seed(make_config(1, quota=800))
-    col.usages = [model.EnvUsage(env_id="hap-1", mean10_bps=150.0)]
-
-    need = loop_mod.OVER_ALERT_AFTER_S
-    with caplog.at_level(logging.INFO, logger="test.loop"):
-        await run_until(ctl, None, lambda: col.ticks >= need + 2,
-                        interval=0.001)
-        warns = [r for r in caplog.records
-                 if r.levelno == logging.WARNING
-                 and "持续高于登记限额" in r.getMessage()]
-        assert len(warns) == 1  # 只在越过阈值那一拍告警一次
-        assert "node=hap-1" in warns[0].getMessage()
-
-        # 回落到限额以内：持续满阈值后解除。
-        col.usages = [model.EnvUsage(env_id="hap-1", mean10_bps=50.0)]
-        base = col.ticks
-        await run_until(ctl, None, lambda: col.ticks >= base + need + 2,
-                        interval=0.001)
-
-    clears = [r for r in caplog.records
-              if "解除持续超限告警" in r.getMessage()]
-    assert len(clears) == 1
-
-
-async def test_over_quota_alert_paused_when_degraded(caplog):
-    """degraded（采样失联，数据陈旧）时超限判定暂停：不触发新告警。"""
-    ctl, col = make_loop()
-    ctl.seed(make_config(1, quota=800))
-    col.usages = [model.EnvUsage(env_id="hap-1", mean10_bps=150.0,
-                                 degraded=True)]
-
-    need = loop_mod.OVER_ALERT_AFTER_S
-    with caplog.at_level(logging.WARNING, logger="test.loop"):
-        await run_until(ctl, None, lambda: col.ticks >= need + 3,
-                        interval=0.001)
-
-    warns = [r for r in caplog.records
-             if "持续高于登记限额" in r.getMessage()]
-    assert not warns
-
-
-# ---------------------------------------------------------------------------
-# frontend_limits：限额自动应用的目标值来源
-# ---------------------------------------------------------------------------
-
-def _unit(env_id, quota_bps, targets):
-    return model.EnvQuota(
-        env_id=env_id, quota_bits_per_sec=quota_bps,
-        targets=[model.Target(n, f) for n, f in targets])
-
-
-def test_frontend_limits_maps_node_quota_to_its_frontend():
-    """单元（节点）的限额落到它那个受控 frontend 上，单位换成 bytes/s
-    ——这正是要写进 haproxy.cfg `limit` 的口径。"""
+def test_frontends_follows_hot_reload():
+    """enforcer 每轮现取，因此配置热更后拿到的必然是新值。"""
     ctl = MonitorLoop(FakeCollector())
-    ctl.seed(model.ControllerConfig(version=1, envs=[
-        _unit("hap-1", 40_000_000, [("hap-1", "fe_env_a")]),
-        _unit("hap-3", 8_000_000, [("hap-3", "fe_env_b")]),
-    ]))
-    assert ctl.frontend_limits() == {"fe_env_a": 5_000_000, "fe_env_b": 1_000_000}
+    ctl.seed(cfg(fe("fe_a", 8_000_000)))
+    assert ctl.frontends()[0].quota_bits_per_sec == 8_000_000
+    ctl.seed(cfg(fe("fe_a", 4_000_000), version=2))
+    assert ctl.frontends()[0].quota_bits_per_sec == 4_000_000
 
 
-def test_frontend_limits_skips_node_with_multiple_frontends():
-    """一个节点挂多个 frontend 时不猜怎么分：原样各写一份会让实际总量
-    翻倍，平均分摊又没有业务依据——跳过并留日志，交人工决定。"""
-    ctl = MonitorLoop(FakeCollector())
-    ctl.seed(model.ControllerConfig(version=1, envs=[
-        _unit("hap-1", 40_000_000, [("hap-1", "fe_a"), ("hap-1", "fe_b")]),
-        _unit("hap-2", 16_000_000, [("hap-2", "fe_c")]),
-    ]))
-    assert ctl.frontend_limits() == {"fe_c": 2_000_000}
-
-
-def test_frontend_limits_follows_hot_reload():
-    """限额热更后目标值立刻跟着变——enforcer 每轮都现算，因此不会拿旧值
-    去写数据面。"""
-    ctl = MonitorLoop(FakeCollector())
-    ctl.seed(model.ControllerConfig(version=1, envs=[
-        _unit("hap-1", 40_000_000, [("hap-1", "fe_env_a")])]))
-    assert ctl.frontend_limits() == {"fe_env_a": 5_000_000}
-    ctl.seed(model.ControllerConfig(version=2, envs=[
-        _unit("hap-1", 20_000_000, [("hap-1", "fe_env_a")])]))
-    assert ctl.frontend_limits() == {"fe_env_a": 2_500_000}
-
-
-def test_config_applied_event_signals_enforcer():
-    """每次应用配置都叫醒 enforcer——"改完立刻生效"靠的就是这个事件，
-    而不是干等下一个周期性 reconcile。"""
+def test_config_applied_event_wakes_enforcer():
+    """每次应用配置都叫醒下发任务——"改完立刻生效"靠的就是这个事件。"""
     ev = asyncio.Event()
     ctl = MonitorLoop(FakeCollector(), config_applied=ev)
     assert not ev.is_set()
-    ctl.seed(model.ControllerConfig(version=1, envs=[
-        _unit("hap-1", 40_000_000, [("hap-1", "fe_env_a")])]))
+    ctl.seed(cfg(fe()))
     assert ev.is_set()
+
+
+def test_removed_frontend_drops_hysteresis_state():
+    """下线的 frontend 其超限滞回状态一并丢弃，避免重新上线时带着旧计数。"""
+    col = FakeCollector()
+    ctl = MonitorLoop(col)
+    ctl.seed(cfg(fe("fe_a"), fe("fe_b", port=8081)))
+    from rl_limiter.loop import _OverState
+    ctl._over["fe_b"] = _OverState()          # 制造一份滞回状态
+    ctl.seed(cfg(fe("fe_a"), version=2))
+    assert "fe_b" not in ctl._over
+    assert col.managed == {"fe_a"}
+
+
+# ---------------------------------------------------------------------------
+# 超限告警的滞回状态机
+# ---------------------------------------------------------------------------
+
+async def drive(ctl, col, usages, ticks):
+    col._usages = usages
+    for i in range(ticks):
+        await ctl._tick(float(i))
+
+
+async def test_over_quota_alert_needs_sustained_excess(caplog):
+    """瞬时冲高不告警：mean10 需连续高于限额 OVER_ALERT_AFTER_S 秒。"""
+    col = FakeCollector()
+    ctl = MonitorLoop(col, log=logging.getLogger("t.over"))
+    ctl.seed(cfg(fe("fe_a", 8_000_000)))          # 限额 = 1_000_000 bytes/s
+    over = [usage("fe_a", mean10=1_500_000)]
+
+    with caplog.at_level(logging.WARNING, logger="t.over"):
+        await drive(ctl, col, over, OVER_ALERT_AFTER_S - 1)
+        assert not [r for r in caplog.records if "持续高于限额" in r.getMessage()]
+        await drive(ctl, col, over, 1)
+        assert [r for r in caplog.records if "持续高于限额" in r.getMessage()]
+
+
+async def test_over_quota_clears_after_sustained_recovery(caplog):
+    col = FakeCollector()
+    ctl = MonitorLoop(col, log=logging.getLogger("t.clear"))
+    ctl.seed(cfg(fe("fe_a", 8_000_000)))
+    with caplog.at_level(logging.INFO, logger="t.clear"):
+        await drive(ctl, col, [usage("fe_a", mean10=1_500_000)], OVER_ALERT_AFTER_S)
+        caplog.clear()
+        await drive(ctl, col, [usage("fe_a", mean10=100_000)], OVER_ALERT_AFTER_S)
+        assert [r for r in caplog.records if "回落到限额以内" in r.getMessage()]
+
+
+async def test_degraded_pauses_over_quota_judgement(caplog):
+    """采样失联时数据是陈旧的：既不该触发新告警，也不该解除已有告警。"""
+    col = FakeCollector()
+    ctl = MonitorLoop(col, log=logging.getLogger("t.deg"))
+    ctl.seed(cfg(fe("fe_a", 8_000_000)))
+    with caplog.at_level(logging.WARNING, logger="t.deg"):
+        await drive(ctl, col,
+                    [usage("fe_a", mean10=9_999_999, degraded=True)],
+                    OVER_ALERT_AFTER_S * 3)
+        assert not [r for r in caplog.records if "持续高于限额" in r.getMessage()]
+
+
+# ---------------------------------------------------------------------------
+# 配置优先于 tick
+# ---------------------------------------------------------------------------
+
+async def test_config_applied_before_tick():
+    """某拍之前送达的配置，一定在该拍之前被应用——超限判定永远基于最新限额。"""
+    col = FakeCollector([usage("fe_a")])
+    ctl = MonitorLoop(col)
+    ctl.seed(cfg(fe("fe_a", 8_000_000)))
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait(cfg(fe("fe_a", 4_000_000), version=7))
+    task = asyncio.create_task(ctl.run(q, tick_interval_s=0.01))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert ctl.version == 7
+    assert ctl.frontends()[0].quota_bits_per_sec == 4_000_000

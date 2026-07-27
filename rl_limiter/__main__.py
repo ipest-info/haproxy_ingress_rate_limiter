@@ -1,20 +1,17 @@
-# rl_limiter.__main__ —— rl-limiter 服务入口（监控单元=节点）。
+# rl_limiter.__main__ —— rl-limiter 服务入口（单 HAProxy 模型）。
 #
-# 限速由各台 HAProxy 自身的 shared bwlim（聚合限速，配置常量 + reload
-# 调整）执行；rl-limiter 每秒采样受控 frontend 的 bytes_out，按节点聚合
-# 出带宽视图（Web 控制台实时展示），并对照配置库中登记的节点限额做持续
-# 超限告警。与配置来源断联时按最后一次加载的配置继续监控（fail-static）。
+# 一个实例管**一台**与它同机的 HAProxy，做两件事：
 #
-# 两种部署形态，由 RL_NODE_NAME 决定：
+#   1. **监控**：每秒经本机 unix stats socket 采样各受管 frontend 的
+#      bytes_out，产出带宽视图（Web 控制台实时展示）并做持续超限告警；
+#   2. **下发**：把配置（监听端口、限额、后端服务器）渲染进本机
+#      haproxy.cfg 的受管区块并 reload，让 Web 界面上的改动立刻生效
+#      （由 RL_APPLY_HAPROXY_CFG 开启，见 enforcer 模块）。
 #
-#   - **同机部署（默认推荐，设 RL_NODE_NAME=<本机节点名>）**：rl-limiter
-#     与 HAProxy 装在同一台服务器上，每台机器一个实例，只采本机那台
-#     HAProxy（走本机 unix stats socket，不占网络端口）。配置库仍是全量
-#     权威、仍做全量校验，只是校验后被裁剪到本机（config.scope_to_node）。
-#     好处：stats socket 不必对内网开放；一台机器的监控故障不外溢；
-#     监控进程与被监控对象同生共死，不存在"跨机网络分区导致误判"。
-#   - **集中监控（不设 RL_NODE_NAME，兼容保留）**：一个实例通过内网 TCP
-#     采样多台 HAProxy，提供跨节点的环境聚合视图。
+# 与配置来源断联时按最后一次加载的配置继续运行（fail-static）。
+#
+# RL_NODE_NAME 指定本实例对应配置库里的哪个 HAProxy 实例——多台机器可以
+# 共用一个配置库，各自只读写属于自己的行。
 
 from __future__ import annotations
 
@@ -43,20 +40,20 @@ try:
 except Exception:  # pragma: no cover - 未安装场景
     SERVICE_VERSION = "dev"
 
-# 同机部署模式开关：设为本机在配置库 haproxy_nodes 里的节点名，该实例
-# 就只采本机那台 HAProxy（配置在全量校验后被裁剪到本机）。不设则退回
-# 集中监控形态（一个实例采多台）。
+# 本实例对应配置库 haproxy_instances 里的哪一行。多台机器共用一个配置库
+# 时靠它区分；数据库模式下必设，本地 YAML 模式忽略（YAML 自带 haproxy 段）。
 ENV_NODE_NAME = "RL_NODE_NAME"
+DEFAULT_INSTANCE = "haproxy"
 # Web 控制台监听地址。默认只绑回环：控制台**没有鉴权**且带写接口（改
-# 限额、改挂载点、删环境），默认对外可达是不可接受的。要让同网段访问，
-# 由运维显式设成内网地址并配合防火墙/安全组限制来源。
+# 监听端口、改限额、改后端服务器、删 frontend），默认对外可达是不可
+# 接受的。要让同网段访问，由运维显式设成内网地址并配合防火墙/安全组
+# 限制来源。
 ENV_CONSOLE_BIND = "RL_CONSOLE_BIND"
 DEFAULT_CONSOLE_BIND = "127.0.0.1"
 
-# 限额自动应用（同机部署才可能做到的事）：设为本机 haproxy.cfg 路径即
-# 启用——配置库里的 quota_bps 一改，本机 rl-limiter 立刻把它写进 cfg 的
-# shared bwlim limit 并 reload，无需人工做第二步。不设则完全不写盘、
-# 不 reload，退化为只读监控 + 漂移告警（原有行为）。
+# 配置自动下发（同机部署才可能做到的事）：设为本机 haproxy.cfg 路径即
+# 启用——配置一改，本机 rl-limiter 立刻把监听端口/限额/后端服务器渲染进
+# cfg 的受管区块并 reload。不设则完全不写盘、不 reload，退化为只读监控。
 #
 # 这两项**只能来自本机环境变量，绝不从配置库读**：若 reload 命令可由库
 # 指定，拿到库写权限就等于在每台 HAProxy 上远程执行任意命令。
@@ -69,25 +66,14 @@ ENV_APPLY_PERIOD_S = "RL_APPLY_PERIOD_S"
 DEFAULT_APPLY_PERIOD_S = 30.0
 
 
-def _summarize_nodes(nodes: list[model.NodeConfig]) -> str:
-    """把受控 HAProxy 节点清单压缩成单个日志字段，格式：
-    "name=hap-1,endpoint=/run/haproxy/admin.sock;..."（同机形态）或
-    "name=hap-1,endpoint=10.0.0.11:9999;..."（跨机 TCP 形态）。"""
+def _summarize_frontends(frontends: list[model.FrontendConfig]) -> str:
+    """把受管 frontend 清单压缩成单个日志字段，格式：
+    "fe_main@:8080,quota_bps=40000000,servers=2;..."。
+    quota_bps 为配置口径的 bits/s。"""
     return ";".join(
-        f"name={n.name},endpoint={n.endpoint()}"
-        for n in nodes
-    )
-
-
-def _summarize_envs(envs: list[model.EnvQuota]) -> str:
-    """把监控单元（节点）清单压缩成单个日志字段，格式：
-    "env_id=hap-1,quota_bps=40000000,targets=hap-1/fe_a;..."。
-    env_id 字段承载节点名（监控单元=节点，见 model.py 顶部说明）；
-    quota_bps 为配置口径的 bits/s；targets 为 节点/前端 二元组。"""
-    return ";".join(
-        "env_id={},quota_bps={},targets={}".format(
-            e.env_id, e.quota_bits_per_sec, "|".join(str(t) for t in e.targets))
-        for e in envs
+        f"{f.name}@{f.bind_spec},quota_bps={f.quota_bits_per_sec},"
+        f"mode={f.mode},servers={len(f.servers)}"
+        for f in frontends
     )
 
 
@@ -95,7 +81,7 @@ async def _amain(cfg, log: logging.Logger,
                  db_opts: dbconfig.MySQLOptions | None = None,
                  console_port: int = 0,
                  logbuf: "webconsole.LogBuffer | None" = None,
-                 scope_node: str | None = None,
+                 instance: str = DEFAULT_INSTANCE,
                  console_bind: str = DEFAULT_CONSOLE_BIND,
                  enforcer: "enforcermod.HAProxyEnforcer | None" = None,
                  apply_period_s: float = DEFAULT_APPLY_PERIOD_S) -> None:
@@ -109,15 +95,10 @@ async def _amain(cfg, log: logging.Logger,
     模块）：sampler 每拍向 StatusHub 发布一帧快照，配置热更经中继队列
     同步给控制台的配置视图。
     """
-    # --- 组装与各台 HAProxy 的 runtime API 客户端（只读采样）。同机形态
-    # 下 cfg.nodes 已被裁剪为本机一条，这里天然只建一个 unix 客户端。
-    # 客户端字典以节点名为键，与 Target.node / NodeConfig.name 对齐。
-    clients = {
-        n.name: haproxy.RuntimeClient.from_node(n, log)
-        for n in cfg.nodes
-    }
-
-    col = Collector(clients, log)
+    # --- 与本机 HAProxy 的 runtime API 客户端（只读采样）。单 HAProxy
+    # 模型下只有一个，同机形态走本机 unix socket。
+    client = haproxy.RuntimeClient.from_node(cfg.haproxy, log)
+    col = Collector(client, log)
 
     # --- Web 控制台（可选）：StatusHub 是监控数据的发布枢纽。
     # version_fn 是延迟求值闭包（ctl 在下方才赋值，闭包只会在运行期被
@@ -128,13 +109,12 @@ async def _amain(cfg, log: logging.Logger,
         hub = webconsole.StatusHub(
             SERVICE_VERSION,
             version_fn=lambda: ctl.version,
-            nodes=cfg.nodes,
-            degraded_fn=col.degraded_nodes,
-            scope_node=scope_node)
+            haproxy=cfg.haproxy,
+            degraded_fn=lambda: col.degraded)
 
     sampler = hub.record if hub is not None else None
-    # 限额自动应用启用时，监控循环每应用一份配置就 set 这个事件，
-    # enforcer 任务据此立刻把新限额落到本机 HAProxy（见 enforcer 模块头）。
+    # 配置下发启用时，监控循环每应用一份配置就 set 这个事件，enforcer
+    # 任务据此立刻把新配置写进本机 haproxy.cfg（见 enforcer 模块头）。
     config_applied = asyncio.Event() if enforcer is not None else None
     ctl = MonitorLoop(col, sampler=sampler, log=log,
                       config_applied=config_applied)
@@ -143,27 +123,17 @@ async def _amain(cfg, log: logging.Logger,
     # 运行期配置直接喂给监控循环。数据库配置模式下引导配置的版本号取
     # 内容校验和，并把它作为轮询任务的变更检测基准——首轮轮询读到同样
     # 内容时不会再触发一次重复应用。
-    env_groups = {
-        k: list(v) for k, v in (getattr(cfg, "env_groups", {}) or {}).items()
-    }
     seed_version = (
-        dbconfig.config_checksum(cfg.envs, env_groups)
-        if db_opts is not None else 0
+        dbconfig.config_checksum(cfg.frontends) if db_opts is not None else 0
     )
-    if cfg.envs:
-        seed_cfg = model.ControllerConfig(
-            version=seed_version, envs=cfg.envs, env_groups=env_groups)
-        ctl.seed(seed_cfg)
-        if hub is not None:
-            hub.update_config(seed_cfg)
-        log.info("已用%s配置完成引导（监控单元=节点） version=%s "
-                 "units=%d units_detail=%s",
-                 "数据库" if db_opts is not None else "本地静态",
-                 seed_version, len(cfg.envs), _summarize_envs(cfg.envs))
-    else:
-        # 配置里没有任何挂载点（数据库尚未录入 env_targets 等）：空转
-        # 启动并等待配置轮询送来首份有效配置。
-        log.warning("引导配置中没有任何挂载点，暂无监控对象，等待配置热更")
+    seed_cfg = cfg.to_controller_config(seed_version)
+    ctl.seed(seed_cfg)
+    if hub is not None:
+        hub.update_config(seed_cfg)
+    log.info("已用%s配置完成引导（监控单位=frontend） version=%s "
+             "frontends=%d detail=%s",
+             "数据库" if db_opts is not None else "本地静态",
+             seed_version, len(cfg.frontends), _summarize_frontends(cfg.frontends))
 
     # --- 信号处理：SIGINT/SIGTERM 触发优雅退出（记录信号名后取消任务）。
     stop = asyncio.Event()
@@ -212,19 +182,18 @@ async def _amain(cfg, log: logging.Logger,
         ctl.run(config_queue, tick_interval_s), name="monitor-loop"))
     if db_opts is not None:
         tasks.append(asyncio.create_task(
-            dbconfig.watch(db_opts, source_queue, cfg, log, scope_node),
+            dbconfig.watch(db_opts, source_queue, cfg, log, instance),
             name="db-config-watch"))
     if hub is not None:
         tasks.append(asyncio.create_task(
             webconsole.run_console(console_port, hub, logbuf, db_opts, log,
-                                   bind=console_bind),
+                                   bind=console_bind, instance=instance),
             name="web-console"))
     if enforcer is not None and config_applied is not None:
-        # 目标限额取自监控循环当前生效的那份配置（单元=节点，挂载点给出
-        # 该节点的 frontend 名）。每次 reconcile 现算，因此配置热更后拿到
-        # 的必然是新值。
-        def _desired() -> dict[str, int]:
-            return ctl.frontend_limits()
+        # 目标配置取自监控循环当前生效的那一份。每次 reconcile 现取，
+        # 因此配置热更后拿到的必然是新值。
+        def _desired() -> list[model.FrontendConfig]:
+            return ctl.frontends()
 
         tasks.append(asyncio.create_task(
             enforcermod.run_enforcer(
@@ -233,11 +202,11 @@ async def _amain(cfg, log: logging.Logger,
                 period_s=apply_period_s),
             name="limit-enforcer"))
 
-    log.info("rl-limiter 服务已启动，监控循环开始运行 mode=%s apply=%s "
-             "nodes=%d version=%s",
-             f"同机（本机节点 {scope_node}）" if scope_node else "集中监控",
+    log.info("rl-limiter 服务已启动，监控循环开始运行 instance=%s "
+             "endpoint=%s apply=%s frontends=%d version=%s",
+             cfg.haproxy.name, cfg.haproxy.endpoint(),
              enforcer.cfg_path if enforcer is not None else "off",
-             len(cfg.nodes), SERVICE_VERSION)
+             len(cfg.frontends), SERVICE_VERSION)
 
     # 等待退出信号；任一常驻任务意外结束（本应永续运行）也触发整体退出，
     # 交由 systemd Restart=always 拉起，比带着半残状态继续跑更安全。
@@ -256,15 +225,16 @@ async def _amain(cfg, log: logging.Logger,
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="rl-limiter",
-        description="HAProxy 入口带宽监控服务：采样 HAProxy 的下行带宽，"
-                    "按节点展示并做持续超限告警"
-                    "（限速由各节点 HAProxy 的 shared bwlim 配置执行）",
-        epilog="部署形态：设置 RL_NODE_NAME=<本机节点名> 进入同机部署模式"
-               "（与 HAProxy 同机，只采本机那台，推荐）；不设则为集中监控"
-               "模式（一个实例采多台）。"
+        description="HAProxy 入口带宽限速与监控：管理本机 HAProxy 的监听"
+                    "端口、限额与后端服务器（写入 cfg 受管区块并 reload），"
+                    "并每秒采样各 frontend 的下行带宽做持续超限告警",
+        epilog="一个实例管一台同机的 HAProxy。RL_NODE_NAME 指定本实例"
+               "对应配置库里的哪个 HAProxy 实例（默认 haproxy）。"
                "配置来源二选一：设置 RL_MYSQL_HOST（及 RL_MYSQL_PORT/USER/"
                "PASSWORD/DB/POLL_S）后从 MySQL 数据库读取配置并轮询热更新；"
                "未设置时回落到 -c 指定的本地 YAML 文件。"
+               "配置下发：设置 RL_APPLY_HAPROXY_CFG=<本机 haproxy.cfg 路径> "
+               "即启用（改配置后自动写入受管区块并 reload）。"
                "Web 控制台：设置 RL_CONSOLE_PORT 启用，RL_CONSOLE_BIND 指定"
                "监听地址（默认 127.0.0.1——控制台无鉴权且带写接口）。")
     parser.add_argument(
@@ -313,23 +283,14 @@ def main() -> None:
     console_bind = (os.environ.get(ENV_CONSOLE_BIND) or "").strip() \
         or DEFAULT_CONSOLE_BIND
 
-    # 部署形态判定：RL_NODE_NAME 已设置 → 同机部署（只采本机那台 HAProxy）；
-    # 未设置 → 集中监控（一个实例采多台）。
-    scope_node = (os.environ.get(ENV_NODE_NAME) or "").strip() or None
+    # 本实例对应配置库里的哪个 HAProxy 实例（数据库模式下用它取行）。
+    instance = (os.environ.get(ENV_NODE_NAME) or "").strip() or DEFAULT_INSTANCE
 
-    # 限额自动应用：设了本机 haproxy.cfg 路径即启用。
+    # 配置自动下发：设了本机 haproxy.cfg 路径即启用。
     apply_cfg = (os.environ.get(ENV_APPLY_CFG) or "").strip()
     enforcer = None
     apply_period_s = DEFAULT_APPLY_PERIOD_S
     if apply_cfg:
-        if scope_node is None:
-            # 集中监控形态下本进程根本不在 HAProxy 机器上，改的是"自己这台"
-            # 的文件——几乎必然是误配，拦下比写坏别处强。
-            print(f"rl-limiter: 设置了 {ENV_APPLY_CFG} 但未设置 {ENV_NODE_NAME}；"
-                  f"限额自动应用只在同机部署模式下有意义"
-                  f"（本进程要能改到被它监控的那台 HAProxy 的配置）",
-                  file=sys.stderr)
-            raise SystemExit(1)
         if not os.path.isfile(apply_cfg):
             print(f"rl-limiter: {ENV_APPLY_CFG} 指向的文件不存在: {apply_cfg}",
                   file=sys.stderr)
@@ -364,9 +325,9 @@ def main() -> None:
             # 启动加载单独跑一个事件循环：加载内含"等待数据库就绪"的重试，
             # 与主循环生命周期无关，分开跑让失败路径干净退出。
             cfg = asyncio.run(
-                dbconfig.load_service_config(db_opts, log, scope_node))
+                dbconfig.load_service_config(db_opts, log, instance))
         else:
-            cfg = configmod.load(args.config, scope_node)
+            cfg = configmod.load(args.config)
     except KeyboardInterrupt:
         # 等待数据库就绪的重试窗口（最长两分钟）里按 Ctrl-C 是常规操作，
         # 必须干净退出；KeyboardInterrupt 是 BaseException，不加这条会
@@ -401,21 +362,19 @@ def main() -> None:
     # 受控节点清单、限额基准与配置来源。
     log.info(
         "服务配置加载完成，以下为完整配置摘要（排障第一条要看的日志） "
-        "config_source=%s deploy_mode=%s scope_node=%s log_level=%s "
-        "tick_interval_s=%s nodes=%d nodes_detail=%s units=%d units_detail=%s",
+        "config_source=%s instance=%s endpoint=%s log_level=%s "
+        "tick_interval_s=%s frontends=%d detail=%s",
         config_source,
-        "colocated" if scope_node else "central",
-        scope_node or "-",
+        cfg.haproxy.name, cfg.haproxy.endpoint(),
         cfg.log_level,
         getattr(cfg, "tick_interval_s", 1.0),
-        len(cfg.nodes), _summarize_nodes(cfg.nodes),
-        len(cfg.envs), _summarize_envs(cfg.envs),
+        len(cfg.frontends), _summarize_frontends(cfg.frontends),
     )
 
     try:
         asyncio.run(_amain(cfg, log, db_opts,
                            console_port=console_port, logbuf=logbuf,
-                           scope_node=scope_node, console_bind=console_bind,
+                           instance=instance, console_bind=console_bind,
                            enforcer=enforcer, apply_period_s=apply_period_s))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass

@@ -21,10 +21,10 @@
 #
 # 用法示例（见 docs/03-限速服务运行指南.md）：
 #   同机形态：
-#     python3 tools/fake_haproxy.py --unix-path /tmp/hap1.sock --frontends fe_env_a:2000000
+#     python3 tools/fake_haproxy.py --unix-path /tmp/hap1.sock --frontends fe_main:2000000
 #   跨机形态：
-#     python3 tools/fake_haproxy.py --port 19991 --frontends fe_env_a:2000000,fe_env_b:500000
-#     python3 tools/fake_haproxy.py --port 19992 --frontends fe_env_a:1500000
+#     python3 tools/fake_haproxy.py --port 19991 --frontends fe_main:2000000
+#     python3 tools/fake_haproxy.py --port 19992 --frontends fe_api:1500000
 
 from __future__ import annotations
 
@@ -197,7 +197,7 @@ def main() -> None:
         help="unix socket 路径（模拟同机部署形态的本机 stats socket；"
              "与 --port 二选一）")
     parser.add_argument(
-        "--frontends", default="fe_env_a:2000000",
+        "--frontends", default="fe_main:2000000",
         help="frontend 清单：name:每秒增长字节数，逗号分隔（默认 %(default)s）")
     parser.add_argument(
         "--jitter", type=float, default=0.2,
