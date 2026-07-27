@@ -141,7 +141,29 @@ async def test_write_endpoints_require_db_mode(client):
         assert "MySQL" in (await r.json())["error"]
 
 
-async def test_index_is_served(client):
+async def test_index_declares_utf8(client):
+    """页面全是中文：Content-Type 不带 charset 时浏览器只能猜编码，
+    中文 Windows 上会猜成 GBK，整页变乱码。两道声明都要在。"""
     r = await client.get("/")
     assert r.status == 200
-    assert b"rl-limiter" in await r.read()
+    assert r.charset == "utf-8", "HTTP 头必须声明 charset"
+    body = await r.read()
+    # <meta charset> 必须落在前 1024 字节内，否则浏览器已经开始按猜测
+    # 的编码解析了。
+    assert b'<meta charset="utf-8">' in body[:1024]
+    # 中文能按 UTF-8 正确解回来（内容本身没被写坏）。
+    assert "控制台" in body.decode("utf-8")
+
+
+async def test_sse_declares_utf8(client):
+    r = await client.get("/api/stream")
+    assert r.headers["Content-Type"].startswith("text/event-stream")
+    assert "charset=utf-8" in r.headers["Content-Type"]
+    r.close()
+
+
+async def test_json_endpoints_declare_utf8(client):
+    """日志接口会带中文消息，同样不能让浏览器猜。"""
+    for path in ("/api/overview", "/api/logs", "/api/history"):
+        r = await client.get(path)
+        assert r.charset == "utf-8", path

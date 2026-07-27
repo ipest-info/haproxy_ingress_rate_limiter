@@ -234,7 +234,12 @@ def build_app(
     index_html = (_STATIC_DIR / "index.html").read_bytes()
 
     async def handle_index(_request: web.Request) -> web.Response:
-        return web.Response(body=index_html, content_type="text/html")
+        # charset 必须显式给：不带它浏览器只能猜编码，中文 Windows 上会
+        # 猜成 GBK，整个页面变成乱码。页面里也有 <meta charset>，两处都
+        # 写是有意的——HTTP 头对浏览器优先级更高，meta 让文件单独打开
+        # （或被别的方式分发）时同样正确。
+        return web.Response(body=index_html, content_type="text/html",
+                            charset="utf-8")
 
     async def handle_overview(_request: web.Request) -> web.Response:
         return web.json_response(hub.overview())
@@ -252,7 +257,9 @@ def build_app(
     async def handle_stream(request: web.Request) -> web.StreamResponse:
         """SSE：每拍推一帧快照。断开由写失败/取消自然结束。"""
         resp = web.StreamResponse(headers={
-            "Content-Type": "text/event-stream",
+            # SSE 规范强制 UTF-8，浏览器不会去猜；显式写出来是为了让中间
+            # 的反向代理/抓包工具也不必猜。
+            "Content-Type": "text/event-stream; charset=utf-8",
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         })
