@@ -68,6 +68,19 @@ docker compose logs -f loadgen      # 看各入口吞吐被压在 40 Mbps 的过
 docker compose logs -f node1        # 看 node1 里 haproxy + rl-limiter 的日志
 ```
 
+> **`--build` 不能省**。node 镜像里打包了入口脚本与 rl-limiter 代码，
+> 拉了新版本后若只 `docker compose up -d`，跑的仍是旧镜像 —— 而 compose
+> 里的挂载点/环境变量已经是新的，两边对不上。典型症状是 node 容器无限
+> 重启并刷：
+>
+> ```
+> [ALERT] config : Cannot open configuration file/directory
+>                  /usr/local/etc/haproxy/haproxy.cfg : No such file or directory
+> ```
+>
+> 这是旧镜像在找已经不再挂载的旧路径。新版入口脚本会直接给出"镜像与
+> compose 版本不匹配，请 docker compose up -d --build"的提示。
+
 确认每台节点确实是"HAProxy + 同机 rl-limiter"：
 
 ```bash

@@ -29,9 +29,33 @@ SOCK_WAIT_S=${SOCK_WAIT_S:-30}
 log() { echo "$(date -Is) ENTRYPOINT $*" >&2; }
 
 mkdir -p "$(dirname "$HAPROXY_SOCK")" "$(dirname "$HAPROXY_CFG")"
+
+# 旧版（v3.1 首版）把 cfg 直接挂在这里。留一条兼容路径：升级过程中
+# "新镜像 + 旧 compose" 的组合不至于起不来。
+LEGACY_CFG=/usr/local/etc/haproxy/haproxy.cfg
+
+# 配置来源判定必须发生在启动 HAProxy **之前**：让 haproxy 自己去撞
+# "文件不存在"再退出，暴露给运维的是一条含糊的"HAProxy 提前退出了"，
+# 真正原因（挂载点对不上）被埋在上一行 ALERT 里，且整个容器会无限
+# 重启刷屏。这里提前判定并直接说清楚。
 if [ -f "$HAPROXY_TEMPLATE" ]; then
     cp "$HAPROXY_TEMPLATE" "$HAPROXY_CFG"
     log "已从模板生成可写配置 template=$HAPROXY_TEMPLATE cfg=$HAPROXY_CFG"
+elif [ -f "$LEGACY_CFG" ] && [ "$LEGACY_CFG" != "$HAPROXY_CFG" ]; then
+    cp "$LEGACY_CFG" "$HAPROXY_CFG"
+    log "警告：用的是旧版挂载点 $LEGACY_CFG。请把 compose 里的挂载改成" \
+        "$HAPROXY_TEMPLATE（限额自动应用要求 cfg 可写，只读单文件 bind" \
+        "mount 无法被原子替换）"
+elif [ -f "$HAPROXY_CFG" ]; then
+    log "未挂载模板，沿用镜像内已有的配置 cfg=$HAPROXY_CFG"
+else
+    log "致命：找不到 HAProxy 配置。已依次查找："
+    log "  模板（compose 应挂在这里）: $HAPROXY_TEMPLATE"
+    log "  旧版挂载点               : $LEGACY_CFG"
+    log "  容器内配置               : $HAPROXY_CFG"
+    log "最常见的原因是**镜像与 compose 版本不匹配**（compose 已更新、" \
+        "镜像还是旧的）。请重建镜像：docker compose up -d --build"
+    exit 1
 fi
 
 # -W: master-worker（与生产的 systemd 形态一致，reload 走 SIGUSR2）
