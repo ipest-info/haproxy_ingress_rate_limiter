@@ -8,6 +8,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import pytest
 
 from rl_limiter import model
@@ -284,6 +287,63 @@ async def test_instance_new_conns_exclude_our_own_runtime_api_traffic():
     assert c.instance.conn_new_ps == 3
 
 
+async def test_runtime_commands_are_issued_concurrently():
+    """两条 runtime 命令必须并发发，不能串行。
+
+    runtime socket 一次连接只服务一条命令，串行的唯一效果是把最坏延迟
+    翻倍：单条超时 0.5s，串行下最坏 1.0s，正好吃满一个 1 秒的 tick。主
+    循环发现本拍超过一个周期就重新对齐（loop.run），实际节拍变成 2 秒，
+    而差分代码按"1 拍 = 1 秒"算速率——**所有速率读数会翻倍**，连超限告警
+    的判据一起失真。
+
+    这里让两条命令各自阻塞在一个事件上：串行实现会卡死在第一条上（第二
+    条永远等不到放行），只有并发实现才能两条同时在途。
+    """
+    entered = asyncio.Event()
+    both_in_flight = asyncio.Event()
+    release = asyncio.Event()
+    in_flight = 0
+
+    class BlockingClient:
+        async def _both(self, result):
+            nonlocal in_flight
+            in_flight += 1
+            entered.set()
+            if in_flight == 2:
+                both_in_flight.set()
+            await release.wait()
+            return result
+
+        async def show_stat(self):
+            return await self._both([st("fe_a", 0)])
+
+        async def show_info(self):
+            return await self._both(model.InstanceStat(curr_conns=1))
+
+    c = Collector(BlockingClient())
+    c.set_managed({"fe_a"})
+    task = asyncio.create_task(c.tick(0.0))
+    await asyncio.wait_for(both_in_flight.wait(), timeout=1.0)
+    release.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+async def test_cancellation_is_not_swallowed():
+    """停机靠取消任务完成。gather(return_exceptions=True) 会把子任务自己
+    抛的 CancelledError 当结果收走，吞掉它服务就停不下来了。"""
+    class CancellingClient:
+        async def show_stat(self):
+            raise asyncio.CancelledError()
+
+        async def show_info(self):
+            return model.InstanceStat(curr_conns=1)
+
+    c = Collector(CancellingClient())
+    c.set_managed({"fe_a"})
+    with pytest.raises(asyncio.CancelledError):
+        await c.tick(0.0)
+
+
 async def test_show_info_failure_does_not_break_frontend_sampling():
     """副链路失败必须被隔离：show info 每拍都抛，frontend 的速率照常产出。"""
     c = collector(
@@ -359,8 +419,6 @@ async def test_nic_disabled_leaves_packet_curves_empty():
 
 async def test_nic_read_failure_is_logged_once(caplog):
     """网卡读不到每秒都会重试，不去重会把日志刷没。"""
-    import logging
-
     c = Collector(FakeClient([[st("fe_a", 0)]] * 5),
                   logging.getLogger("t.nic"), nic="does-not-exist-0")
     c.set_managed({"fe_a"})

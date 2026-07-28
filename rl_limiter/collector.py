@@ -36,6 +36,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from . import model, netdev
@@ -225,16 +226,33 @@ class Collector:
         实例视图（instance 属性）在同一拍内一并刷新，但走独立的容错路径：
         它失败不影响这里的返回值，因此限速判定的可靠性不会被"多画几条
         曲线"拖累。
+
+        **两条 runtime 命令必须并发发，不能串行**。runtime socket 一次连接
+        只服务一条命令，两条命令本就是两条独立连接，串行的唯一效果是把最坏
+        延迟翻倍：单条超时 0.5s，串行下最坏 1.0s，正好吃满一个 1 秒的 tick。
+        而主循环发现本拍耗时超过一个周期时会重新对齐到"当前时刻 + 周期"
+        （见 loop.run），实际节拍就变成 2 秒——差分代码却按"1 拍 = 1 秒"
+        算速率，于是**所有速率读数翻倍**，连超限告警的判据一起失真。
+        并发发之后最坏延迟回到 0.5s，节拍不会被挤掉。
         """
         _ = now
-        try:
-            stats = await self._client.show_stat()
-        except Exception as e:
-            usages = self._on_failure(e)
+        stat_res, info_res = await asyncio.gather(
+            self._client.show_stat(), self._client.show_info(),
+            return_exceptions=True)
+        # gather(return_exceptions=True) 会把子任务自己抛出的 CancelledError
+        # 也当成结果收走。停机时主循环靠取消任务退出，吞掉它会让服务停不下来，
+        # 因此原样重抛。（外层被取消时 gather 自身就会抛，不走这里。）
+        for r in (stat_res, info_res):
+            if isinstance(r, asyncio.CancelledError):
+                raise r
+
+        if isinstance(stat_res, BaseException):
+            usages = self._on_failure(stat_res)
             stats = None
         else:
+            stats = stat_res
             usages = self._on_success(stats)
-        await self._tick_instance(stats)
+        self._tick_instance(stats, info_res)
         return usages
 
     # ------------------------------------------------------------------
@@ -470,8 +488,12 @@ class Collector:
     # 实例视图（监控专用副链路，失败不影响限速判定）
     # ------------------------------------------------------------------
 
-    async def _tick_instance(self, stats: "list[model.FrontendStat] | None") -> None:
+    def _tick_instance(self, stats: "list[model.FrontendStat] | None",
+                       info_res: "model.InstanceStat | BaseException") -> None:
         """刷新整机用量视图。
+
+        两个入参都是 tick 已经取好的结果（含异常对象），本方法只做归并——
+        采样本身在 tick 里并发发出，理由见那里。
 
         stats 为 None 表示本拍 `show stat` 失败——此时按 fail-static 保留
         上一拍的 HAProxy 口径数值，只把 degraded 打上；网卡计数与 HAProxy
@@ -485,12 +507,12 @@ class Collector:
         # --- 1) show info：整机连接数。show stat 的行按 proxy 拆，加总会
         # 把同一条连接重复计，因此并发连接数只能从这里取。
         info: model.InstanceStat | None = None
-        try:
-            info = await self._client.show_info()
-        except Exception as e:
-            self._log_once("info", e,
+        if isinstance(info_res, BaseException):
+            self._log_once("info", info_res,
                            "show info 采样失败，实例视图的连接数沿用上一拍的值"
                            "（限速与 frontend 视图不受影响）")
+        else:
+            info = info_res
         if info is not None:
             self._logged_info_error = ""
             inst.conn_cur = info.curr_conns

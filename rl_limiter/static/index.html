@@ -1023,10 +1023,12 @@ function applySnapshot(snap, live) {
   }
   for (const [name, u] of Object.entries(snap.units || {})) {
     const fe = ensureCard(name);
+    // rout 就是限速那条链路的 rate_bytes_per_s（bwlim 只整形下行），
+    // 这里统一叫 rout 是为了和 rin 成对，图表按同一套键名取值。
     fe.buf.push({
       ts: snap.ts,
-      rate: u.rate_bytes_per_s, mean: u.mean10_bytes_per_s,
       rout: u.rate_bytes_per_s, rin: u.rate_in_bytes_per_s,
+      mean: u.mean10_bytes_per_s,
       conn_new: u.conn_new_ps, conn_denied: u.conn_denied_ps,
       conn: u.conn, active: u.active_conns, idle: u.idle_conns,
     });
