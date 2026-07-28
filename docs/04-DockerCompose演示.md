@@ -45,9 +45,16 @@ reload，同时对照限额做持续超限告警，各自带一个 Web 控制台
 | `web` | 模拟业务后端，每次请求返回 256 KiB～2 MiB 随机大小响应；`/big` 为大文件下载端点（默认 512 MiB，`WEB_BIG_BYTES` 可调）（`tools/random_web.py`） | 无 |
 | `loadgen` | 压测服务，打散到全部入口，并发数可在线调节；默认每入口另挂 1 条**长连接大文件下载**（`tools/loadgen.py`） | `8084`（控制口） |
 
-每个 node 容器的进程编排见 `deploy/docker/node-entrypoint.sh`：先起
-HAProxy 并等 unix socket 就绪，再起 rl-limiter；任一进程退出即整体退出
-（对齐生产上 systemd `Restart=always` 的语义），由 compose 拉起。
+每个 node 容器的进程编排见 `deploy/docker/node-entrypoint.sh`：先做三项
+启动前准备（tc 限速自检 → 内核参数调优 → FD 预检），再起 HAProxy 并等
+unix socket 就绪，最后起 rl-limiter；任一进程退出即整体退出（对齐生产上
+systemd `Restart=always` 的语义），由 compose 拉起。
+
+准备工作必须在 HAProxy **之前**做完：内核参数改晚了对已经建好的监听套接字
+不生效（backlog 在 `listen()` 那一刻就定死），FD 不够则 HAProxy 根本起不来。
+`docker compose logs node1` 里能看到逐项结果，其中"调不动"的那几项是容器
+里改不了、需要在**宿主机**上设的，日志会直接给出命令。详见
+[08-内核参数调优.md](08-内核参数调优.md)。
 
 演示种子：hap-1 / hap-2 / hap-3 各有一个 `fe_main`，监听 8080、限额
 **40 Mbps**、后端指向 `web:9000`。这些行由各自机器上的 rl-limiter 渲染成

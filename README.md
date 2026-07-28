@@ -39,6 +39,7 @@
 | [docs/04-DockerCompose演示.md](docs/04-DockerCompose演示.md) | docker compose 一键演示（MySQL + 三台 Ubuntu 24.04 节点 + Web 控制台 + 可调并发压测） |
 | [docs/05-监控视图.md](docs/05-监控视图.md) | 监控视图：每条曲线的数据来源与口径 |
 | [docs/06-tc限速方案.md](docs/06-tc限速方案.md) | **限速为什么从 HAProxy bwlim 换成内核 tc**：实测依据、映射方式、行为差异，以及尚未验证的部分 |
+| [docs/08-内核参数调优.md](docs/08-内核参数调优.md) | **让瓶颈落在 maxconn 而不是内核默认值上**：初始化阶段的 sysctl 调优与 FD 预检、哪些容器里改不动、怎么验证真的生效 |
 
 ## 系统组成
 
@@ -57,10 +58,12 @@ rl_limiter/       # Python 3.11 + asyncio 服务（与 HAProxy 同机）
 tools/            # fake_haproxy.py（联调假节点，支持 unix / TCP）
                   # random_web.py（随机大小响应的模拟后端）、loadgen.py（可调并发压测）
                   # tc_check.py（限速检查：plan 干跑 / doctor 体检 / verify 核对）
-deploy/           # systemd（同机形态）、haproxy 骨架配置示例、tc 兜底脚本、
+deploy/           # systemd（同机形态）、haproxy 骨架配置示例、
                   # YAML 示例配置、mysql/init.sql（配置库建表+种子）
-  docker/         #   node-entrypoint.sh（节点入口：haproxy + 同机 rl-limiter）、
+  docker/         #   node-entrypoint.sh（节点入口：环境预检 + haproxy + rl-limiter）、
                   #   haproxy-base.cfg（compose 用的 global/defaults 骨架）
+  sysctl/         #   tune-kernel.sh（内核参数调优表：apply 调优 / check 体检 /
+                  #   dump 出 sysctl.d 配置。初始化阶段自动跑）
 docker-compose.yml # 一键演示：MySQL + 三台 Ubuntu 24.04 节点 + 模拟后端 + 压测
 ```
 
@@ -101,6 +104,14 @@ make demo-down  # 收场（含 MySQL 数据卷）
 自动拉回——**配置漂移从"被动告警"变成"自动修复"**。不设则完全不写盘、
 不 reload，退化为只读监控。所需授权（cfg 目录可写、polkit/sudoers 授权
 reload）见 `deploy/systemd/rl-limiter.service` 文件头。
+
+**内核参数**：节点初始化阶段（启动 HAProxy 之前）自动跑
+`deploy/sysctl/tune-kernel.sh`，把高并发/高带宽相关的 sysctl 抬到位，
+逐项**读回校验**，容器里改不动的明确列出并给出宿主机命令。不做这一步的话
+内核默认值会在 HAProxy 下面先成为瓶颈——例如 cfg 里写着 `backlog 65536`，
+`net.core.somaxconn` 默认 4096 会把它**静默削到 4096**（实测）。体检用
+`tune-kernel.sh check`，宿主机持久化用 `dump`；详见
+[docs/08-内核参数调优.md](docs/08-内核参数调优.md)。
 
 **Web 控制台**：`RL_CONSOLE_PORT` 启用，`RL_CONSOLE_BIND` 指定监听地址
 （默认 `127.0.0.1`）。控制台**无鉴权且带写接口**，放到内网必须配合

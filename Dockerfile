@@ -71,7 +71,12 @@ ENV PATH=/opt/rl-limiter/bin:$PATH
 RUN mkdir -p /run/haproxy /etc/rl-limiter /etc/haproxy
 
 COPY deploy/docker/node-entrypoint.sh /usr/local/bin/node-entrypoint.sh
-RUN chmod +x /usr/local/bin/node-entrypoint.sh
+# 内核参数调优表。入口脚本在启动 HAProxy 之前跑它——发行版的默认值
+# （somaxconn 4096、tcp_max_syn_backlog 1024、netdev_max_backlog 1000…）
+# 会在 HAProxy 的 maxconn/backlog 下面先一步成为瓶颈，且不会有任何告警。
+# 单独放一份可执行的，运维在宿主机上也能直接跑 check / dump。
+COPY deploy/sysctl/tune-kernel.sh /usr/local/bin/tune-kernel.sh
+RUN chmod +x /usr/local/bin/node-entrypoint.sh /usr/local/bin/tune-kernel.sh
 
 # 不带参数 = HAProxy 节点角色；带参数（compose 的 command:）= 直接执行
 # 那条命令，见入口脚本开头的 exec "$@" 分支。

@@ -75,10 +75,13 @@ services:
       - NET_ADMIN
     # haproxy-base.cfg 里 maxconn 100000 + maxpipes 100000。FD 需求 =
     # maxconn × 2 + maxpipes × 2 + 34 = 400034（实测逐项核对过；管道那一项
-    # 是 splice 用的，本项目开着 splice）。给不够它**拒绝启动**：
-    #   [ALERT] Cannot raise FD limit to 400034, limit is 4096.
-    # 容器默认的 nofile 往往只有 1024/4096，所以必须在这里放开。
-    # 改 maxconn 或 maxpipes 时记得同步改这里。
+    # 是 splice 用的，本项目开着 splice）。容器默认的 nofile 往往只有
+    # 1024/4096，给不够 HAProxy **拒绝启动**，改 maxconn/maxpipes 时记得
+    # 同步改这里。入口脚本会在启动前按 cfg 里的实际值预检一遍并直接报出
+    # 该改成多少，不必再去 haproxy 的 ALERT 里翻。
+    #
+    # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
+    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
     ulimits:
       nofile:
         soft: 524288
@@ -124,10 +127,13 @@ services:
       - NET_ADMIN
     # haproxy-base.cfg 里 maxconn 100000 + maxpipes 100000。FD 需求 =
     # maxconn × 2 + maxpipes × 2 + 34 = 400034（实测逐项核对过；管道那一项
-    # 是 splice 用的，本项目开着 splice）。给不够它**拒绝启动**：
-    #   [ALERT] Cannot raise FD limit to 400034, limit is 4096.
-    # 容器默认的 nofile 往往只有 1024/4096，所以必须在这里放开。
-    # 改 maxconn 或 maxpipes 时记得同步改这里。
+    # 是 splice 用的，本项目开着 splice）。容器默认的 nofile 往往只有
+    # 1024/4096，给不够 HAProxy **拒绝启动**，改 maxconn/maxpipes 时记得
+    # 同步改这里。入口脚本会在启动前按 cfg 里的实际值预检一遍并直接报出
+    # 该改成多少，不必再去 haproxy 的 ALERT 里翻。
+    #
+    # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
+    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
     ulimits:
       nofile:
         soft: 524288
@@ -169,10 +175,13 @@ services:
       - NET_ADMIN
     # haproxy-base.cfg 里 maxconn 100000 + maxpipes 100000。FD 需求 =
     # maxconn × 2 + maxpipes × 2 + 34 = 400034（实测逐项核对过；管道那一项
-    # 是 splice 用的，本项目开着 splice）。给不够它**拒绝启动**：
-    #   [ALERT] Cannot raise FD limit to 400034, limit is 4096.
-    # 容器默认的 nofile 往往只有 1024/4096，所以必须在这里放开。
-    # 改 maxconn 或 maxpipes 时记得同步改这里。
+    # 是 splice 用的，本项目开着 splice）。容器默认的 nofile 往往只有
+    # 1024/4096，给不够 HAProxy **拒绝启动**，改 maxconn/maxpipes 时记得
+    # 同步改这里。入口脚本会在启动前按 cfg 里的实际值预检一遍并直接报出
+    # 该改成多少，不必再去 haproxy 的 ALERT 里翻。
+    #
+    # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
+    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
     ulimits:
       nofile:
         soft: 524288

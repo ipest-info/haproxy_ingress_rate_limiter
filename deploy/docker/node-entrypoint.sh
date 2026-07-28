@@ -6,12 +6,16 @@
 # rl-limiter.service，后者 After=haproxy.service，见
 # deploy/systemd/rl-limiter.service）。容器里没有 systemd，用这个脚本
 # 承担同样的职责：
-#   1. 先起 HAProxy，等它把 unix stats socket 建出来——rl-limiter 启动
+#   1. 备好运行环境再启动：tc 限速自检 → 内核参数调优 → FD 预检。
+#      这三项都必须在 HAProxy 起来**之前**做完——内核参数改晚了对已经
+#      建好的监听套接字不生效（backlog 在 listen() 那一刻就定死了），
+#      FD 不够则 HAProxy 根本起不来；
+#   2. 起 HAProxy，等它把 unix stats socket 建出来——rl-limiter 启动
 #      即采样，socket 还没出现会白白刷一轮采样失败告警；
-#   2. 再起 rl-limiter（RL_NODE_NAME 指定本机节点名，只采本机）；
-#   3. 任一进程退出就整体退出（对齐 systemd Restart=always 的语义：
+#   3. 再起 rl-limiter（RL_NODE_NAME 指定本机节点名，只采本机）；
+#   4. 任一进程退出就整体退出（对齐 systemd Restart=always 的语义：
 #      带着半残状态继续跑比重启更危险），由 compose 的 restart 策略拉起；
-#   4. 转发 SIGTERM/SIGINT 给两个子进程，docker stop 能干净收场。
+#   5. 转发 SIGTERM/SIGINT 给两个子进程，docker stop 能干净收场。
 set -euo pipefail
 
 # 带参数时直接执行参数，不走 HAProxy 节点那套。
@@ -115,6 +119,51 @@ if [ "${RL_TC_IFACE:-}" = "-" ]; then
 elif ! tc_selfcheck; then
     exit 1
 fi
+
+# 内核参数调优：HAProxy 的 maxconn/backlog 配得再大，也会被内核默认值在
+# 下面削掉——最典型的是 net.core.somaxconn（默认 4096）给 cfg 里的
+# `backlog 65536` 封顶，配置写着 65536、实际生效 4096，没有任何告警。
+# 这一步在启动 HAProxy **之前**做，逐项读回校验；容器里设不了的会明确
+# 列出来并给出宿主机命令。设不全不阻断启动——它影响的是性能上限，
+# 不像 tc 那样关系到"限速有没有生效"。详见 docs/08-内核参数调优.md。
+TUNE_KERNEL=${TUNE_KERNEL:-/usr/local/bin/tune-kernel.sh}
+if [ "${RL_TUNE_KERNEL:-1}" = "0" ]; then
+    log "已跳过内核参数调优（RL_TUNE_KERNEL=0）"
+elif [ -x "$TUNE_KERNEL" ]; then
+    "$TUNE_KERNEL" apply || true
+else
+    log "警告：找不到 $TUNE_KERNEL，跳过内核参数调优（镜像多半是旧的）"
+fi
+
+# FD 预检：HAProxy 需要 maxconn×2 + maxpipes×2 + 34 个 fd（管道那两个是
+# splice 用的），给不够它**拒绝启动**并留下
+#   [ALERT] Cannot raise FD limit to 400034, limit is 4096.
+# 然后容器进入重启循环刷屏。这里提前把账算给运维看。
+#
+# 比的是**硬上限**：HAProxy 自己会把软上限抬到硬上限，所以软上限低不要紧。
+fd_preflight() {
+    local maxconn maxpipes need hard
+    maxconn=$(awk '$1=="maxconn" && $2 ~ /^[0-9]+$/ {print $2; exit}' "$HAPROXY_CFG")
+    # 没写 maxconn 时 haproxy 自己按 ulimit 反推，没有可核对的目标值。
+    [ -n "${maxconn:-}" ] || return 0
+    maxpipes=$(awk '$1=="maxpipes" && $2 ~ /^[0-9]+$/ {print $2; exit}' "$HAPROXY_CFG")
+    # 不写 maxpipes 时的默认值就是 maxconn/4。
+    [ -n "${maxpipes:-}" ] || maxpipes=$((maxconn / 4))
+    need=$((maxconn * 2 + maxpipes * 2 + 34))
+    hard=$(ulimit -Hn)
+    [ "$hard" = unlimited ] && return 0
+    if [ "$hard" -lt "$need" ]; then
+        log "致命：文件描述符上限不够 maxconn=$maxconn maxpipes=$maxpipes"
+        log "致命：需要 $need 个 fd（maxconn×2 + maxpipes×2 + 34），当前硬上限只有 $hard，"
+        log "致命：HAProxy 会直接拒绝启动。compose 里给本服务加："
+        log "致命：    ulimits:"
+        log "致命：      nofile: {soft: $need, hard: $need}"
+        log "致命：裸机 systemd 则在 **haproxy 自己的** unit 里设 LimitNOFILE=$need。"
+        return 1
+    fi
+    log "FD 预检通过 need=$need hard=$hard maxconn=$maxconn maxpipes=$maxpipes"
+}
+fd_preflight || exit 1
 
 # -W: master-worker（与生产的 systemd 形态一致，reload 走 SIGUSR2）
 # -db: 不后台化，让 master 进程留在前台受本脚本管理
