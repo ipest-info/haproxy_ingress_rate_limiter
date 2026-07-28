@@ -15,6 +15,9 @@
 > bwlim 滤镜，HAProxy 就会完全关闭内核 splice（零拷贝转发）**，同吞吐下
 > HAProxy 的 CPU 要多花一倍（0.59 → 0.33 CPU 秒/GB）。原委、行为差异与
 > **尚未验证的部分**见 [docs/06-tc限速方案.md](docs/06-tc限速方案.md)。
+>
+> 检查限速有没有真的生效：`python3 tools/tc_check.py doctor`（体检环境）、
+> `plan`（干跑看命令）、`verify`（核对网卡实况与配置是否一致）。
 
 > **同机部署的首要理由就是"改完立刻生效"**：只有在同一台机器上，服务
 > 才有可能直接改本机配置并 reload；跨机的集中服务做不到（要么开 SSH，
@@ -46,11 +49,13 @@ rl_limiter/       # Python 3.11 + asyncio 服务（与 HAProxy 同机）
   collector.py    #   每秒采样，按 frontend 产出用量；fail-static 与降级
   dbconfig.py     #   MySQL 配置源（启动加载 + 轮询热更新 + 控制台写回，RL_MYSQL_* 接线）
   enforcer.py     #   配置下发：渲染受管区块 → haproxy -c 校验 → 原子替换 → reload
+  tcshaper.py     #   限速下发：把限额落到本机网卡的 tc（HTB），按源端口分类
   config.py       #   配置解析与校验（YAML 与数据库共用同一管线）
   webconsole.py   #   内置 Web 控制台（带宽曲线 + 端口/限额/后端服务器管理）
   loop.py         #   1s 监控主循环（采集 → 超限判定 → 发布）
 tools/            # fake_haproxy.py（联调假节点，支持 unix / TCP）
                   # random_web.py（随机大小响应的模拟后端）、loadgen.py（可调并发压测）
+                  # tc_check.py（限速检查：plan 干跑 / doctor 体检 / verify 核对）
 deploy/           # systemd（同机形态）、haproxy 骨架配置示例、tc 兜底脚本、
                   # YAML 示例配置、mysql/init.sql（配置库建表+种子）
   docker/         #   node-entrypoint.sh（节点入口：haproxy + 同机 rl-limiter）、
