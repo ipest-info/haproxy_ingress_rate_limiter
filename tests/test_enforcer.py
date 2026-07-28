@@ -46,22 +46,37 @@ def write(tmp_path, text=BASE):
 # 渲染（纯函数）
 # ---------------------------------------------------------------------------
 
-def test_render_contains_listen_bwlim_and_servers():
+def test_render_contains_listen_and_servers():
     block = E.render_block([fe(servers=[
         model.ServerEntry(name="web1", address="10.0.0.21", port=9000),
         model.ServerEntry(name="web2", address="10.0.0.22", port=9000,
                           weight=50, check=False)])])
     assert "listen fe_main" in block
     assert "bind :8080" in block
-    # 限额换算：40 Mbps ÷ 8 = 5_000_000 bytes/s
-    # 40 Mbps ÷ 8 = 5_000_000 bytes/s；min-size 按限额比例取（5_000_000/1000）
-    assert "filter bwlim-out rl-limit limit 5000000 key fe_name min-size 5000" in block
-    assert "tcp-request content set-bandwidth-limit rl-limit" in block
     # 不开 contstats，TCP 长连接的 bytes_out 只在会话结束时跳变，监控不可用。
     assert "option contstats" in block
     assert "server web1 10.0.0.21:9000 weight 100 check inter 2000ms" in block
     assert "server web2 10.0.0.22:9000 weight 50" in block
     assert "check" not in block.split("server web2")[1]
+
+
+def test_render_has_no_rate_limiting_directives():
+    """限速已下沉到内核 tc，受管区块里**不能再出现任何 bwlim 相关指令**。
+
+    留着它们不只是冗余：只要 frontend 上挂着 bwlim 滤镜，HAProxy 就会
+    完全关掉 splice（实测限速下走 splice 的字节数为 0），整个迁移的收益
+    （HAProxy 侧 CPU 减半）会被一行残留配置抵消掉。
+    """
+    block = E.render_block([fe()])
+    for bad in ("bwlim", "set-bandwidth-limit", "stick-table", "min-size"):
+        assert bad not in block, f"受管区块里不该再有 {bad}"
+
+
+def test_render_enables_splice():
+    """限速搬走之后才能开的零拷贝转发——这是本次迁移的直接收益。"""
+    block = E.render_block([fe()])
+    assert "option splice-auto" in block
+    assert "option splice-response" in block
 
 
 def test_render_is_deterministic():
@@ -105,10 +120,10 @@ def test_splice_appends_when_no_marker():
 
 
 def test_splice_replaces_existing_block_and_preserves_outside():
-    once = E.splice_block(BASE, E.render_block([fe(quota=40_000_000)]))
-    twice = E.splice_block(once, E.render_block([fe(quota=8_000_000)]))
+    once = E.splice_block(BASE, E.render_block([fe(port=8080)]))
+    twice = E.splice_block(once, E.render_block([fe(port=9090)]))
     assert twice.count(E.BEGIN_MARKER) == 1, "区块不应重复追加"
-    assert "limit 1000000" in twice and "limit 5000000" not in twice
+    assert "bind :9090" in twice and "bind :8080" not in twice
     # 标记之外的手写内容一字未动。
     assert "backend hand_written" in twice
     assert twice.split(E.BEGIN_MARKER)[0] == once.split(E.BEGIN_MARKER)[0]
@@ -202,27 +217,3 @@ async def test_current_block_reads_from_disk(tmp_path):
     assert en.current_block() is None
     await en.reconcile([fe()])
     assert "listen fe_main" in (en.current_block() or "")
-
-
-# ---------------------------------------------------------------------------
-# min-size：整形的 CPU 开销主要由它决定（见 enforcer 模块的实测数据）
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("limit_bytes,expect", [
-    (125_000,       1460),    # 1 Mbps：按比例算只有 125，夹到下限
-    (1_000_000,     1460),    # 8 Mbps：1000 < 下限
-    (5_000_000,     5000),    # 40 Mbps
-    (20_000_000,   20000),    # 160 Mbps
-    (100_000_000,  65536),    # 800 Mbps：100000 > 上限，夹到上限
-    (10_000_000_000, 65536),  # 极大限额也不超过上限
-])
-def test_min_size_scales_with_limit(limit_bytes, expect):
-    """min-size 太小 → 放行次数多、CPU 高（实测 1460 比 65536 贵 3 倍）；
-    太大 → 相对每秒配额过大，放不满额度（实测 1MB/s 配 64KB 只跑到 74%）。
-    因此按限额比例取值并夹在 [1460, 65536]。"""
-    assert E.bwlim_min_size(limit_bytes) == expect
-
-
-def test_min_size_appears_in_rendered_block():
-    block = E.render_block([fe(quota=160_000_000)])   # 160 Mbps = 20 MB/s
-    assert "min-size 20000" in block

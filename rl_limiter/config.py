@@ -288,7 +288,7 @@ def _validate(cfg: ServiceConfig) -> None:
         if f.quota_bits_per_sec <= 0:
             raise ValueError(
                 f"{where} ({f.name}): quota_bps 必须为正数（当前值 "
-                f"{f.quota_bits_per_sec!r}）——它既是写进 shared bwlim 的 "
+                f"{f.quota_bits_per_sec!r}）——它既是下发给内核 tc 的 "
                 f"limit，也是超限告警基准；HAProxy 也不接受 limit 0")
         if f.quota_bytes_per_sec < 1:
             raise ValueError(

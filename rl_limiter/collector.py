@@ -2,7 +2,7 @@
 # 差分出各受管 frontend 的下行速率，产出带 10s 均值与 60s EWMA 的用量样本。
 #
 # 单 HAProxy 模型（v0.4 起）：**监控单位 = frontend**。一个 frontend 就是
-# 一个监听端口 + 一个 shared bwlim 速率桶，与 HAProxy 的限速机制一一对应，
+# 一个监听端口 + 一个 tc 速率类（tc 按源端口分类），与限速机制一一对应，
 # 因此不存在跨 frontend 的聚合——每个 frontend 自己算自己的速率与均值。
 # （v0.3 及以前是"多节点 + 按节点聚合其全部 frontend"，见 tag
 # v0.3.0-colocated；改为同机单实例后那层聚合失去意义，已移除。）

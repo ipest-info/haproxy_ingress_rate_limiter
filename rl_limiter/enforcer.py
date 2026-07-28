@@ -21,31 +21,29 @@
 # 首次运行时若文件里没有标记，区块会被**追加到文件末尾**——这让"给一台
 # 已有的 HAProxy 接上 rl-limiter"不需要先手工改配置。
 #
-# ## 为什么限速必须走"改配置 + reload"，而不是 runtime API
+# ## 本模块**不再负责限速**
 #
-# 实测 HAProxy 2.8.16（Ubuntu 24.04 自带版本）：
+# 限速已下沉到内核 tc（见 rl_limiter.tcshaper）。本模块只管"监听端口 +
+# 后端服务器"这一半，受管区块里不再出现任何 bwlim/stick-table 指令。
 #
-#   - **shared bwlim 的 limit 是配置常量，运行期改不了**。给
-#     `set-bandwidth-limit` 带上动态 limit 表达式会在配置解析阶段就被
-#     拒绝：`set-bandwidth-limit rule cannot define a limit for a shared
-#     bwlim filter`；runtime API 的命令表里也没有任何 bwlim/bandwidth
-#     相关命令。
-#   - 带动态 limit（map 表 + `set map` 热更）只有 **per-stream** 形态支持
-#     ——而 per-stream 正是设计文档 §3.2 记载的、生产事故后废弃的方案
-#     （限速值建连时定格、按连接数均分、正反馈锁死）。不能为了"免 reload"
-#     退回去。
+# 这么分的直接理由是实测出来的：**只要 frontend 上挂了 bwlim 滤镜，
+# HAProxy 就会完全关闭内核 splice（零拷贝转发）**——限速要按字节计量并
+# 延迟发送，数据必须过用户态。同吞吐 2000 Mbps 下实测，HAProxy 进程的
+# CPU 差一倍（0.56~0.63 → 0.32~0.33 CPU 秒/GB）。把限速搬走之后，受管
+# 区块里就能开 `option splice-*` 了。
 #
-# 何况监听端口、后端服务器这些本来就只能靠改配置 + reload 生效。实测这
-# 条路足够快，"立刻生效"名副其实（同机、400MB 下载、hard-stop-after 6s）：
+# 顺带解决了一个 bwlim 方案固有的别扭之处：**改限额不再需要 reload**。
+# tc 改限额是 `tc class change`，存量连接立刻跟上；bwlim 下改限额必须
+# reload，且存量连接要等 `hard-stop-after` 宽限期结束被断开重连才会用上
+# 新限额。
+#
+# 监听端口与后端服务器的变更仍然只能靠改配置 + reload——这是 HAProxy 的
+# 固有约束，与限速方案无关。实测这条路足够快，"立刻生效"名副其实：
 #
 #   | 观测项 | 实测 |
 #   | ------ | ---- |
 #   | 一次完整应用（校验 + 原子写 + reload） | ~74 ms |
 #   | 新 worker 接管 | ~23 ms |
-#   | reload 后**新建**连接 | 立刻按新限额（1→4 MB/s，实测稳定 4.00 MB/s）|
-#   | **存量**连接 | 保持旧限额，直到 hard-stop-after 宽限期结束被断开重连 |
-#
-# 存量连接的行为由运维自己的 `hard-stop-after` 决定，本模块不碰它。
 #
 # ## 安全边界（本模块是全服务唯一有写权限的地方，逐条都是刻意的）
 #
@@ -74,30 +72,9 @@ from dataclasses import dataclass, field
 
 from . import model
 
-# bwlim 的 min-size：一次最少放行多少字节。它对 CPU 的影响非常大——
-# 整形是把数据拆成小块按节奏放行，块越小、单位时间内的放行次数与任务
-# 唤醒次数就越多。实测（HAProxy 2.8.16，20 条连接，限额 20 MB/s）：
-#
-#   min-size    1460 →  21.4% CPU
-#   min-size    8192 →  12.9% CPU
-#   min-size   65536 →   6.9% CPU     （吞吐都稳定在 19.9 MB/s）
-#
-# 但也不能一味取大：min-size 相对每秒配额太大时会放不满额度。实测限额
-# 1 MB/s 配 min-size 65536 只跑到 0.74 MB/s——少放行了 26%。
-#
-# 于是按限额比例取值：每秒放行约 1000 块。下限 1460（一个以太网 MSS，
-# 再小没有意义）、上限 65536（再大对 CPU 已无明显收益，却开始影响平滑度）。
-# 实测该规则在 1/5/20/100 MB/s 四档的达成率都是 99~100%，而 CPU 相对
-# 固定 1460 在中低档减半。
-MIN_SIZE_DIVISOR = 1000
-MIN_SIZE_FLOOR = 1460
-MIN_SIZE_CEIL = 65536
-
-
-def bwlim_min_size(limit_bytes_per_s: int) -> int:
-    """按限额算出合适的 bwlim min-size（见上方常量注释的实测依据）。"""
-    return max(MIN_SIZE_FLOOR,
-               min(MIN_SIZE_CEIL, limit_bytes_per_s // MIN_SIZE_DIVISOR))
+# 注：限速已从 HAProxy 的 bwlim 迁到内核 tc（见 rl_limiter.tcshaper），
+# 因此这里不再有 min-size 相关的常量与换算——那是 bwlim 特有的调优参数。
+# tc 侧对应的旋钮是 HTB 的 burst，见 tcshaper.burst_bytes。
 
 
 BEGIN_MARKER = "# >>> BEGIN rl-limiter managed >>>"
@@ -167,10 +144,11 @@ def _check_renderable(frontends: list[model.FrontendConfig]) -> None:
 def render_block(frontends: list[model.FrontendConfig]) -> str:
     """把受管 frontend 清单渲染成受管区块文本（含首尾标记）。
 
-    每个 frontend 渲染成一个 `listen` 段：监听端口、模式、超时、
-    shared bwlim 限速、后端服务器。用 listen 而不是 frontend+backend
-    分写，是因为本模型里两者一一对应，合成一段更短、也让 stats 里的
-    pxname 与配置里的段名直接相等（采样按 pxname 匹配）。
+    每个 frontend 渲染成一个 `listen` 段：监听端口、模式、超时、零拷贝
+    转发、后端服务器。**不含任何限速指令**——限速由 tcshaper 落到内核
+    tc 上（理由见模块头）。用 listen 而不是 frontend+backend 分写，是因为
+    本模型里两者一一对应，合成一段更短、也让 stats 里的 pxname 与配置里
+    的段名直接相等（采样按 pxname 匹配）。
 
     输出是**确定性**的（同样的输入永远得到同样的字节），reconcile 的
     幂等性依赖这一点——否则每轮都会认为"有变化"而反复 reload。
@@ -184,7 +162,6 @@ def render_block(frontends: list[model.FrontendConfig]) -> str:
         "# 标记之外的内容 rl-limiter 一个字节都不会碰。",
     ]
     for f in frontends:
-        limit_bytes = int(f.quota_bytes_per_sec)
         lines.append("")
         lines.append(f"listen {f.name}")
         lines.append(f"    bind {f.bind_spec}")
@@ -199,17 +176,17 @@ def render_block(frontends: list[model.FrontendConfig]) -> str:
         # 连续统计：不开的话 TCP 长连接的 bytes_out 只在会话结束时跳变，
         # 逐秒差分出来的速率会是"0 与巨大脉冲交替"，监控完全不可用。
         lines.append("    option contstats")
-        # shared bwlim 的速率桶存在这张 stick-table 里，key 取 frontend 名
-        # ——本段全部连接共用一个桶，于是限的是"该端口的总下行速率"。
-        lines.append(
-            "    stick-table type string len 64 size 1k expire 1h "
-            "store bytes_out_rate(1s)")
-        # min-size 按限额比例取，直接决定整形的 CPU 开销（见文件顶部
-        # MIN_SIZE_* 常量处的实测数据）。
-        lines.append(
-            f"    filter bwlim-out rl-limit limit {limit_bytes} "
-            f"key fe_name min-size {bwlim_min_size(limit_bytes)}")
-        lines.append("    tcp-request content set-bandwidth-limit rl-limit")
+        # 零拷贝转发。**这两行能存在，正是把限速搬去 tc 换来的**：只要
+        # frontend 上挂着 bwlim 滤镜，HAProxy 就会完全关掉 splice（实测
+        # 限速下走 splice 的字节数为 0）。限速下沉到内核后 HAProxy 只做
+        # 纯转发，splice 全程可用，同吞吐下 HAProxy 的 CPU 减半
+        # （实测 0.59 → 0.33 CPU 秒/GB，见 tcshaper 模块头）。
+        lines.append("    option splice-auto")
+        lines.append("    option splice-request")
+        lines.append("    option splice-response")
+        # 这里**不再渲染任何限速指令**。限额由 tcshaper 落到本机网卡的
+        # tc（HTB）上，按源端口分类——HAProxy 发给客户端的包，源端口就是
+        # 这个 frontend 的监听端口。理由与实测数据见 tcshaper 模块头。
         for s in f.servers:
             parts = [f"    server {s.name} {s.address}:{s.port}"]
             parts.append(f"weight {s.weight}")

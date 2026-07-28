@@ -1,0 +1,255 @@
+# tests.test_tcshaper —— 用内核 tc（HTB）做限速。
+#
+# 这是继 enforcer 之后第二个**以 root 权限对生产数据面下命令**的模块，
+# 所以测试的重点同样不是"命令拼对了没有"，而是每条边界都不留烂摊子：
+#   1. 空清单/非法端口/限额过小 → 拒绝执行，不下任何命令；
+#   2. 已经一致 → 一条命令都不发（否则每 30 秒重建一次队列树 = 每 30 秒
+#      抖一次流量）；
+#   3. 只有速率变了 → 走 `tc class change`，**绝不重建**（重建会短暂不整形）；
+#   4. 结构变了 → 重建，且重建序列里每个 frontend 的类/叶子/IPv4+IPv6
+#      分类一个都不少。
+#
+# 用假的 runner 记录 argv，不依赖本机内核有没有 htb（本沙箱内核只内建
+# pfifo，见 docs/06 的"未验证的部分"）。
+
+from __future__ import annotations
+
+import pytest
+
+from rl_limiter import model
+from rl_limiter import tcshaper as T
+
+IFACE = "eth0"
+
+
+def fe(name="fe_main", port=8080, quota=40_000_000):
+    return model.FrontendConfig(
+        name=name, bind_port=port, quota_bits_per_sec=quota,
+        servers=[model.ServerEntry(name="s1", address="10.0.0.1", port=80)])
+
+
+class FakeTc:
+    """假 tc：记录收到的 argv，按预置的 show 输出应答。"""
+
+    def __init__(self, classes="", filters="", fail_on=None):
+        self.calls: list[list[str]] = []
+        self._classes = classes
+        self._filters = filters
+        self._fail_on = fail_on or ()      # 命中该子串的命令返回非零
+
+    async def __call__(self, argv):
+        self.calls.append(list(argv))
+        joined = " ".join(argv)
+        for bad in self._fail_on:
+            if bad in joined:
+                return 1, "", f"fake failure: {bad}"
+        if argv[:3] == ["tc", "class", "show"]:
+            return 0, self._classes, ""
+        if argv[:3] == ["tc", "filter", "show"]:
+            return 0, self._filters, ""
+        return 0, "", ""
+
+    def mutations(self):
+        """只保留会改变内核状态的命令（show 是只读的）。"""
+        return [c for c in self.calls if c[2] != "show"]
+
+
+def shaper(**kw):
+    f = FakeTc(**kw)
+    return T.TcShaper(IFACE, runner=f), f
+
+
+# 一份贴近真实 `tc class show` 输出的样例（htb 会把速率换算成可读单位）。
+CLASSES_OK = """\
+class htb 1:1 root prio 0 rate 100Gbit ceil 100Gbit burst 0b cburst 0b
+class htb 1:8080 root leaf 8080: prio 0 rate 40Mbit ceil 40Mbit burst 50000b cburst 1600b
+"""
+FILTERS_OK = """\
+filter parent 1: protocol ip pref 1 u32 chain 0
+filter parent 1: protocol ip pref 1 u32 chain 0 fh 800: ht divisor 1
+filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:8080 not_in_hw
+  match 00001f90/0000ffff at 20
+"""
+
+
+# ---------------------------------------------------------------------------
+# 纯函数：classid / burst / 解析
+# ---------------------------------------------------------------------------
+
+def test_classid_is_the_listen_port():
+    """classid 次要号直接取监听端口：端口天然唯一，因此 classid 稳定——
+    增删 frontend 不会让别人的 classid 漂移，reconcile 才能只改不重建。"""
+    assert T.classid_for(8080) == "1:8080"
+
+
+@pytest.mark.parametrize("rate_bytes,expect", [
+    (1_000, 3000),              # 极小限额：10ms 额度只有 10 字节，夹到下限 2×MTU
+    (5_000_000, 50_000),        # 40 Mbps：10ms = 50000 字节
+    (125_000_000, 1_250_000),   # 1 Gbps
+    (10_000_000_000, 8 * 1024 * 1024),   # 极大限额夹到上限
+])
+def test_burst_is_ten_milliseconds_clamped(rate_bytes, expect):
+    """burst 太小达不到设定速率，太大则秒级限速失真；取 10ms 额度并夹在
+    [2×MTU, 8MB]。"""
+    assert T.burst_bytes(rate_bytes) == expect
+
+
+@pytest.mark.parametrize("text,expect", [
+    ("40Mbit", 40_000_000),
+    ("1250000bit", 1_250_000),
+    ("100Gbit", 100_000_000_000),
+    ("1Kbit", 1_000),
+])
+def test_parse_rate_handles_tc_units(text, expect):
+    """tc 会按可读性自动换算单位，比较速率必须解析成数值——比字符串会让
+    "40Mbit" 与 "40000000bit" 被当成不同的值而反复重建。"""
+    assert T.parse_rate(text) == expect
+
+
+def test_parse_classes_and_filters():
+    assert T.parse_classes(CLASSES_OK) == {1: 100_000_000_000, 8080: 40_000_000}
+    assert T.parse_filter_minors(FILTERS_OK) == {8080}
+
+
+def test_parse_tolerates_empty_output():
+    """网卡上还没有任何 qdisc 时 tc 输出为空——那是首次运行的正常状态。"""
+    assert T.parse_classes("") == {}
+    assert T.parse_filter_minors("") == set()
+
+
+# ---------------------------------------------------------------------------
+# 拒绝执行的边界
+# ---------------------------------------------------------------------------
+
+async def test_empty_list_refused_without_touching_kernel():
+    """空清单 = 撤掉全部限速。那是事故不是配置操作，且必须**一条命令都不发**。"""
+    sh, fake = shaper()
+    res = await sh.reconcile([])
+    assert not res.ok and "撤掉全部限速" in res.error
+    assert fake.calls == []
+
+
+async def test_port_colliding_with_default_class_refused():
+    """classid 次要号取端口，1 号被兜底类占了——必须报清楚而不是让 tc
+    抛一句难懂的错。"""
+    sh, fake = shaper()
+    res = await sh.reconcile([fe(port=1)])
+    assert not res.ok and "兜底类" in res.error
+    assert fake.calls == []
+
+
+async def test_duplicate_port_refused():
+    sh, _ = shaper()
+    res = await sh.reconcile([fe("a", port=8080), fe("b", port=8080)])
+    assert not res.ok and "被多个 frontend 使用" in res.error
+
+
+async def test_quota_too_small_refused():
+    sh, _ = shaper()
+    res = await sh.reconcile([fe(quota=4)])     # 4 bit/s < 1 byte/s
+    assert not res.ok and "无法整形" in res.error
+
+
+# ---------------------------------------------------------------------------
+# reconcile 的三条路径
+# ---------------------------------------------------------------------------
+
+async def test_no_change_when_already_consistent():
+    """已经一致就一条命令都不发——否则周期兜底会每 30 秒重建一次队列树，
+    每次重建都有一个不整形的窗口。"""
+    sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile([fe(port=8080, quota=40_000_000)])
+    assert res.ok and not res.changed
+    assert fake.mutations() == []
+
+
+async def test_rate_only_change_uses_class_change_not_rebuild():
+    """只改限额时绝不能重建：`tc class change` 不打断任何连接，而且**存量
+    连接立刻按新限额跑**——这正是 tc 方案相对 bwlim 的优势（bwlim 改限额
+    要 reload，存量连接还得等 hard-stop-after 宽限期）。"""
+    sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile([fe(port=8080, quota=80_000_000)])
+    assert res.ok and res.changed and res.action == "rate-change"
+    muts = fake.mutations()
+    assert len(muts) == 1
+    assert muts[0][:3] == ["tc", "class", "change"]
+    assert "80000000bit" in muts[0]
+    assert not any(c[:3] == ["tc", "qdisc", "del"] for c in muts), "不该重建"
+
+
+async def test_new_frontend_triggers_rebuild():
+    """结构变化（新增 frontend）只能重建——tc 没有"插入一个类并保持其余
+    不动"的原子操作。"""
+    sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile([fe("a", port=8080), fe("b", port=9090)])
+    assert res.ok and res.changed and res.action == "rebuild"
+    joined = [" ".join(c) for c in fake.mutations()]
+    assert any("qdisc del" in c for c in joined), "重建要先清旧树"
+    assert any("classid 1:9090" in c for c in joined)
+
+
+async def test_rebuild_covers_every_frontend_completely():
+    """每个 frontend 都要有：HTB 类、叶子队列、IPv4 分类、IPv6 分类。
+    少了 IPv6 那条，客户端走 IPv6 进来时限速会整个失效。"""
+    sh, fake = shaper()          # 空状态 = 首次运行
+    await sh.reconcile([fe("a", port=8080, quota=40_000_000)])
+    joined = [" ".join(c) for c in fake.mutations()]
+    # 单位回环：配置口径 40 Mbps → 内部 5_000_000 bytes/s → tc 口径
+    # 40_000_000 bit/s。这条断言就是在钉这个来回不许错 8 倍。
+    assert any("class add" in c and "classid 1:8080" in c and "rate 40000000bit" in c
+               for c in joined), "配置的 40 Mbps 必须原样落到 tc 上"
+    assert any("qdisc add" in c and "parent 1:8080" in c for c in joined)
+    assert any("filter add" in c and "protocol ip " in c + " " and "sport 8080" in c
+               for c in joined)
+    assert any("filter add" in c and "protocol ipv6" in c and "sport 8080" in c
+               for c in joined)
+
+
+async def test_default_class_is_created_and_unshaped():
+    """没被分类的流量（SSH、监控、后端方向）必须落进一个不整形的兜底类，
+    否则一开限速整台机器的其它流量都被拖下水。"""
+    sh, fake = shaper()
+    await sh.reconcile([fe()])
+    joined = [" ".join(c) for c in fake.mutations()]
+    assert any("htb default 1" in c for c in joined)
+    assert any(f"classid 1:1 htb rate {T.DEFAULT_CLASS_RATE_BPS}bit" in c
+               for c in joined)
+
+
+# ---------------------------------------------------------------------------
+# 失败路径
+# ---------------------------------------------------------------------------
+
+async def test_missing_root_qdisc_on_first_run_is_not_fatal():
+    """首次运行时 `tc qdisc del root` 必然失败（本来就没有），不能因此
+    放弃整次下发。"""
+    sh, _ = shaper(fail_on=["qdisc del"])
+    res = await sh.reconcile([fe()])
+    assert res.ok and res.changed
+
+
+async def test_missing_leaf_qdisc_is_not_fatal():
+    """老内核可能没有 fq_codel。缺了只是失去类内公平性，限速本身照常——
+    不该让整个限速下发失败。"""
+    sh, _ = shaper(fail_on=["fq_codel"])
+    res = await sh.reconcile([fe()])
+    assert res.ok and res.changed
+
+
+async def test_class_add_failure_is_reported_not_swallowed():
+    """真正的限速命令失败必须上报：此时限速没生效，静默等于假装限住了。"""
+    sh, _ = shaper(fail_on=["class add"])
+    res = await sh.reconcile([fe()])
+    assert not res.ok and "tc 命令失败" in res.error
+
+
+async def test_commands_are_argv_never_shell_strings():
+    """本模块以 root/CAP_NET_ADMIN 执行命令，必须逐个参数传递——走 shell
+    等于把配置库里的值暴露给命令行解析。"""
+    sh, fake = shaper()
+    await sh.reconcile([fe()])
+    for argv in fake.calls:
+        assert isinstance(argv, list) and all(isinstance(a, str) for a in argv)
+        assert argv[0] == "tc"
+        # 任何一个参数里都不该混进 shell 元字符（值全是整数/网卡名）
+        assert not any(ch in a for a in argv for ch in ";|&$`\n")

@@ -68,6 +68,11 @@ services:
   node1:
     build:
       context: .
+    # 限速由内核 tc 执行，容器默认没有操作网络设备的权限，必须显式给。
+    # 少了它 rl-limiter 一启动就会因为 tc 权限不足而退出（入口脚本会
+    # 明确报出来，不会静默地"没在限速"）。
+    cap_add:
+      - NET_ADMIN
     # haproxy-base.cfg 里 maxconn 100000 —— HAProxy 需要的文件描述符数
     # 是 maxconn × 2 + 34 = 200034（实测精确值）。给不够它**拒绝启动**：
     #   [ALERT] Cannot raise FD limit to 200034, limit is 4096.
@@ -111,6 +116,11 @@ services:
   node2:
     build:
       context: .
+    # 限速由内核 tc 执行，容器默认没有操作网络设备的权限，必须显式给。
+    # 少了它 rl-limiter 一启动就会因为 tc 权限不足而退出（入口脚本会
+    # 明确报出来，不会静默地"没在限速"）。
+    cap_add:
+      - NET_ADMIN
     # haproxy-base.cfg 里 maxconn 100000 —— HAProxy 需要的文件描述符数
     # 是 maxconn × 2 + 34 = 200034（实测精确值）。给不够它**拒绝启动**：
     #   [ALERT] Cannot raise FD limit to 200034, limit is 4096.
@@ -150,6 +160,11 @@ services:
   node3:
     build:
       context: .
+    # 限速由内核 tc 执行，容器默认没有操作网络设备的权限，必须显式给。
+    # 少了它 rl-limiter 一启动就会因为 tc 权限不足而退出（入口脚本会
+    # 明确报出来，不会静默地"没在限速"）。
+    cap_add:
+      - NET_ADMIN
     # haproxy-base.cfg 里 maxconn 100000 —— HAProxy 需要的文件描述符数
     # 是 maxconn × 2 + 34 = 200034（实测精确值）。给不够它**拒绝启动**：
     #   [ALERT] Cannot raise FD limit to 200034, limit is 4096.

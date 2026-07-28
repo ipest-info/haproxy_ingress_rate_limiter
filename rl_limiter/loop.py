@@ -1,14 +1,17 @@
 # rl_limiter.loop —— 监控主循环（单 HAProxy 模型，监控单位 = frontend）。
 #
 # 每个 tick 按固定流水线执行"采集 → 超限判定 → 发布"。限速本身由本机
-# HAProxy 的 shared bwlim 执行；本循环的职责是每秒产出各受管 frontend 的
+# 内核 tc 执行（见 rl_limiter.tcshaper）；本循环的职责是每秒产出各受管 frontend 的
 # 带宽视图，并对照配置里的限额做**持续超限告警**。
 #
-# 说明：配置下发（把限额与端口写进 haproxy.cfg）不在本循环里，而由
-# enforcer 的独立任务承担——每次配置应用后本循环 set 一个事件叫醒它
-# （见 _apply_config 末尾）。限额与 cfg 同源之后，"实测超过限额"基本
-# 只剩两种可能：cfg 下发失败（enforcer 会另行告警），或流量确实打满了
-# 限额而 bwlim 的整形有正常的过冲余量。
+# 说明：下发不在本循环里，而由两个独立任务承担——enforcer 把监听端口与
+# 后端写进 haproxy.cfg，tcshaper 把限额下发到内核 tc。每次配置应用后本
+# 循环 set 事件叫醒它们（见 _apply_config 末尾）。
+#
+# 限额与数据面同源之后，"实测超过限额"基本只剩三种可能：tc 下发失败
+# （tcshaper 会另行告警）、流量打满限额而 HTB 有正常的 burst 过冲余量、
+# 或者**口径差异**——tc 限的是链路层字节（含 IP/TCP 头），本循环采的是
+# HAProxy 的应用层 bytes_out，后者本就应该略低于前者。
 #
 # 并发模型：整个循环运行在单个 asyncio 任务中，组件间不会并发访问，
 # 因此无需任何锁；配置通过 asyncio.Queue 注入，时间通过 tick_interval_s
@@ -74,7 +77,7 @@ class MonitorLoop:
     """
 
     def __init__(self, collector, sampler=None, log=None,
-                 config_applied: "asyncio.Event | None" = None):
+                 config_applied: "asyncio.Event | list[asyncio.Event] | None" = None):
         self._collector = collector
         self._sampler = sampler
         self._log = log if log is not None else logging.getLogger("rl_limiter.loop")
@@ -88,10 +91,20 @@ class MonitorLoop:
         self._frontends: list[model.FrontendConfig] = []
         # frontend 名 → 超限滞回状态。
         self._over: dict[str, _OverState] = {}
-        # 每次应用配置后被 set 的信号量：配置下发任务（enforcer）靠它做到
-        # "配置一改就立刻写进本机 haproxy.cfg"，而不是干等下一个周期性
-        # reconcile。None = 没人关心（纯监控形态，未启用下发）。
-        self._config_applied = config_applied
+        # 每次应用配置后被 set 的信号量，供各"下发"类任务（写 cfg 的
+        # enforcer、下发限速的 tcshaper）做到"配置一改就立刻生效"，而不是
+        # 干等下一个周期性 reconcile。None = 没人关心（纯监控形态）。
+        #
+        # **每个任务必须各持一个 Event，不能共用**：这些任务在被唤醒后会
+        # clear() 自己的事件，共用一个的话，A 先醒来 clear 掉、B 还没回到
+        # wait，就会漏掉这次变更（要等 30 秒的周期兜底才补上）。
+        # 为兼容只有一个下发任务的调用方，这里也接受单个 Event。
+        if config_applied is None:
+            self._config_applied: list[asyncio.Event] = []
+        elif isinstance(config_applied, asyncio.Event):
+            self._config_applied = [config_applied]
+        else:
+            self._config_applied = list(config_applied)
 
     @property
     def version(self) -> int:
@@ -137,8 +150,8 @@ class MonitorLoop:
         )
         # 叫醒配置下发任务。放在最后：等本循环的基准先更新完，避免
         # enforcer 已经把新配置写进数据面、监控这边还在按旧基准判超限。
-        if self._config_applied is not None:
-            self._config_applied.set()
+        for ev in self._config_applied:
+            ev.set()
 
     async def run(self, config_queue: asyncio.Queue | None,
                   tick_interval_s: float = 1.0) -> None:
@@ -231,9 +244,10 @@ class MonitorLoop:
             st.alerting = True
             st.since_last_remind = 0
             self._log.warning(
-                "frontend 带宽持续高于限额（配置下发正常时这通常只是 bwlim "
-                "整形的正常过冲；若持续偏高很多，请检查配置下发是否失败——"
-                "enforcer 会另行告警） frontend=%s mean10_bytes_per_s=%.0f "
+                "frontend 带宽持续高于限额（下发正常时这通常只是 HTB 的 "
+                "burst 过冲；注意监控是应用层口径、tc 限的是链路层口径，"
+                "前者理应略低于后者。若持续偏高很多，请检查 tc 下发是否失败"
+                "——tcshaper 会另行告警） frontend=%s mean10_bytes_per_s=%.0f "
                 "quota_bytes_per_s=%.0f utilization=%.2f over_secs=%d",
                 u.name, u.mean10_bps, quota, u.mean10_bps / quota,
                 st.over_secs)

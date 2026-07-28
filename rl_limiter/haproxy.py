@@ -5,7 +5,8 @@
 # bytes_out 累计值与当前并发连接数，作为计费口径的原始输入（设计文档
 # §3.1：选用 frontend bytes_out 而非网卡计数，保证口径与"HAProxy 发回
 # 客户端的字节数"精确一致，且天然按 frontend 拆分）。限速本身由 HAProxy
-# 的 shared bwlim 配置执行，rl-limiter 不写入任何运行期状态，因此
+# 内核 tc 执行（见 rl_limiter.tcshaper），rl-limiter 不写入任何 HAProxy 的
+# 运行期状态，因此
 # stats socket 用 level user（只读）即够。
 #
 # 接线有两种形态（见 model.NodeConfig）：同机部署走本机 unix stats

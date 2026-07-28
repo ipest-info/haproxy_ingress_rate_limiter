@@ -77,13 +77,43 @@ else
     exit 1
 fi
 
-# 限速自检：本项目的全部限速能力都来自 shared bwlim 过滤器。配置里一行
-# 都没有，说明这个容器只是个普通反代——限速静默失效是本项目最不能接受的
-# 故障（用户以为限住了，实际没有），所以宁可喊得刺眼一点。
-if ! grep -qE '^\s*filter\s+bwlim-out\s' "$HAPROXY_CFG"; then
-    log "警告：$HAPROXY_CFG 里没有任何 shared bwlim 配置（filter bwlim-out），"
-    log "警告：本节点将**不做任何限速**。多半是 cfg 模板没挂载、用成了"
-    log "警告：发行版自带的默认配置。参照 deploy/docker/haproxy-env-a.cfg。"
+# 限速自检：限速由内核 tc（HTB）执行，不再走 HAProxy 的 bwlim。
+# 限速静默失效是本项目最不能接受的故障（用户以为限住了，实际没有），
+# 所以这里在真正启动之前就把三个前提逐个验掉，缺哪个说哪个。
+#
+# 之所以要在**运行期**验而不是只在构建镜像时验：前两项取决于宿主机内核
+# 与容器的 capability，构建时根本看不到。
+tc_selfcheck() {
+    if ! command -v tc >/dev/null 2>&1; then
+        log "致命：找不到 tc（iproute2）。限速由内核 tc 执行，没有它本节点"
+        log "致命：**完全不会限速**。镜像多半是旧的，请重建：docker compose up -d --build"
+        return 1
+    fi
+    # CAP_NET_ADMIN：容器默认不带，compose 里要写 cap_add: [NET_ADMIN]。
+    # 用 lo 上加一个再删掉来实测，比解析 capsh 输出可靠。
+    if ! tc qdisc add dev lo root handle 9999: pfifo >/dev/null 2>&1; then
+        log "致命：没有 CAP_NET_ADMIN，无法操作 tc（本节点将不会限速）。"
+        log "致命：请在 compose 的本服务下加：cap_add: [\"NET_ADMIN\"]"
+        return 1
+    fi
+    tc qdisc del dev lo root >/dev/null 2>&1 || true
+    # 内核有没有 HTB 调度器。iproute2 装了不代表内核带 sch_htb——精简内核
+    # （容器优化型发行版、部分云厂商镜像）经常把它裁掉，届时 tc 会报
+    # "Specified qdisc kind is unknown"，限速一样是静默失效。
+    if ! tc qdisc add dev lo root handle 9999: htb >/dev/null 2>&1; then
+        log "致命：内核不支持 HTB 调度器（sch_htb），限速无法工作。"
+        log "致命：宿主机上执行 modprobe sch_htb；若内核根本没编译该模块，"
+        log "致命：需要换一个带完整 net/sched 的内核。"
+        return 1
+    fi
+    tc qdisc del dev lo root >/dev/null 2>&1 || true
+    log "限速自检通过：tc 可用、有 CAP_NET_ADMIN、内核支持 HTB"
+    return 0
+}
+if [ "${RL_TC_IFACE:-}" = "-" ]; then
+    log "警告：已显式关闭 tc 限速（RL_TC_IFACE=-），本节点只做监控与配置下发"
+elif ! tc_selfcheck; then
+    exit 1
 fi
 
 # -W: master-worker（与生产的 systemd 形态一致，reload 走 SIGUSR2）

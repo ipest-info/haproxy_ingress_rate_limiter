@@ -29,7 +29,9 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # haproxy：数据面；python3-venv：装 rl-limiter；ca-certificates：pip 走
-# HTTPS 取 wheel；procps：入口脚本用 pkill 给 haproxy 发 reload 信号。
+# HTTPS 取 wheel；procps：入口脚本用 pkill 给 haproxy 发 reload 信号；
+# iproute2：**限速本体**——限额由内核 tc（HTB）执行，没有它 rl-limiter
+# 一启动就会因为找不到 tc 而下发失败（见 rl_limiter/tcshaper.py）。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         haproxy \
@@ -37,11 +39,17 @@ RUN apt-get update \
         python3-venv \
         ca-certificates \
         procps \
+        iproute2 \
     && rm -rf /var/lib/apt/lists/* \
     && haproxy -v \
-    # 版本闸门：shared bwlim 需要 >= 2.8，低于此值限速会静默失效。
+    # 版本闸门：本项目的受管区块用到 option splice-*（2.8 起稳定可用），
+    # 且监控依赖 h1_open_* 等 2.8 才有的 stats 列。
     && haproxy -v | head -1 | grep -Eq 'version 2\.(8|9)|version [3-9]\.' \
-    && echo "haproxy 版本满足 shared bwlim 要求 (>=2.8)"
+    && echo "haproxy 版本满足要求 (>=2.8)" \
+    # 限速闸门：tc 必须在，且必须能解析 HTB——只装 iproute2 是不够的，
+    # 内核还得有 sch_htb。这里只能验证用户态工具，内核侧的检查在
+    # 入口脚本里做（那时才拿得到真实网卡）。
+    && tc -V
 
 WORKDIR /app
 

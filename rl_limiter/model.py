@@ -1,16 +1,16 @@
 # rl_limiter.model —— 全服务共享的领域类型（"词汇表"层）。
 #
 # 架构背景（v0.4 起的单 HAProxy 模型）：一个 rl-limiter 实例管**一台**
-# 与它同机的 HAProxy。限速由该 HAProxy 自身的 shared bwlim（聚合限速）
-# 执行；rl-limiter 负责两件事：
+# 与它同机的 HAProxy。限速由**内核 tc（HTB）**执行（见 rl_limiter.tcshaper）；
+# rl-limiter 负责两件事：
 #   1. 监控——每秒经本机 unix stats socket 采样各受管 frontend 的
 #      bytes_out，对照限额做持续超限告警；
 #   2. 下发——把配置（监听端口、限额、后端服务器）渲染进 haproxy.cfg 的
 #      受管区块并 reload，让改动即时生效。
 #
 # **监控与限速的单位都是 frontend**：一个 frontend = 一个监听端口 +
-# 一个 shared bwlim 速率桶 + 一组后端服务器。这与 HAProxy 的实际机制
-# 一一对应——shared bwlim 的速率桶本就按 frontend 建，不存在"跨 frontend
+# 一个 tc 速率类 + 一组后端服务器。tc 按**源端口**分类，而源端口就是该
+# frontend 的监听端口，因此这个对应关系是天然的，也不存在"跨 frontend
 # 的总限额"这种东西。
 #
 # 历史包袱说明：v0.3 及以前有"节点 / 业务环境（env）"两层分组，用于一个
@@ -86,9 +86,9 @@ class FrontendConfig:
     frontend+backend 分写，是因为本项目里两者一一对应，合成一段能让
     生成的配置更短、也更贴近 stats 里的 pxname）。
 
-    quota_bits_per_sec 同时是两件事的依据：写进 cfg 的 shared bwlim
-    `limit`（真实限速），以及监控侧的超限告警基准。两者同源，因此
-    v0.3 那种"库里改了、cfg 忘了改"的配置漂移在本模型下不可能发生。
+    quota_bits_per_sec 同时是两件事的依据：下发到内核 tc 的类速率
+    （真实限速），以及监控侧的超限告警基准。两者同源，因此 v0.3 那种
+    "库里改了、数据面忘了改"的配置漂移在本模型下不可能发生。
     """
 
     name: str                       # frontend 名（= stats 里的 pxname，全局唯一）
@@ -107,8 +107,8 @@ class FrontendConfig:
     def quota_bytes_per_sec(self) -> float:
         """bits/s → bytes/s 的唯一换算边界（除以 8）。
 
-        写进 haproxy.cfg 的 bwlim `limit` 与监控侧的判定基准都取这个值，
-        单位换算全服务只此一处。
+        下发给 tc 的类速率（tcshaper 会再 ×8 换回 bit/s，因为 tc 的 rate
+        参数用 bit）与监控侧的判定基准都取这个值，单位换算全服务只此一处。
         """
         return self.quota_bits_per_sec / 8.0
 

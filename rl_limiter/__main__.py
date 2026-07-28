@@ -26,6 +26,7 @@ from . import config as configmod
 from . import dbconfig
 from . import enforcer as enforcermod
 from . import haproxy, model
+from . import tcshaper as tcmod
 from . import webconsole
 from .collector import Collector
 from .loop import MonitorLoop
@@ -65,6 +66,15 @@ DEFAULT_RELOAD_CMD = "systemctl reload haproxy"
 ENV_APPLY_PERIOD_S = "RL_APPLY_PERIOD_S"
 DEFAULT_APPLY_PERIOD_S = 30.0
 
+# 限速网卡。限速由内核 tc 执行（见 tcshaper 模块），作用在这张网卡的
+# **出方向**上，按源端口把流量分到各 frontend 自己的 HTB 类里。
+# 不设则自动取默认路由的出口网卡；多网卡机器必须显式指定。
+# 设为 "-" 表示**关闭限速**（只保留监控与配置下发），此时不做任何 tc 操作。
+#
+# 与 RL_APPLY_RELOAD_CMD 同理，这一项只能来自本机环境变量、绝不从配置库
+# 读——它决定了以 root 权限操作哪张网卡。
+ENV_TC_IFACE = "RL_TC_IFACE"
+
 
 def _summarize_frontends(frontends: list[model.FrontendConfig]) -> str:
     """把受管 frontend 清单压缩成单个日志字段，格式：
@@ -84,7 +94,8 @@ async def _amain(cfg, log: logging.Logger,
                  instance: str = DEFAULT_INSTANCE,
                  console_bind: str = DEFAULT_CONSOLE_BIND,
                  enforcer: "enforcermod.HAProxyEnforcer | None" = None,
-                 apply_period_s: float = DEFAULT_APPLY_PERIOD_S) -> None:
+                 apply_period_s: float = DEFAULT_APPLY_PERIOD_S,
+                 shaper: "tcmod.TcShaper | None" = None) -> None:
     """事件循环内的主体：组装组件、引导配置、并发运行监控循环与配置源。
 
     db_opts 非 None 表示配置来自 MySQL（数据库配置模式，生产权威）：
@@ -115,7 +126,12 @@ async def _amain(cfg, log: logging.Logger,
     sampler = hub.record if hub is not None else None
     # 配置下发启用时，监控循环每应用一份配置就 set 这个事件，enforcer
     # 任务据此立刻把新配置写进本机 haproxy.cfg（见 enforcer 模块头）。
-    config_applied = asyncio.Event() if enforcer is not None else None
+    # 配置一变就叫醒"下发"类任务（写 cfg 的 enforcer、下发限速的 tcshaper）。
+    # **各持一个 Event**：任务醒来后会 clear 自己的事件，共用会让其中一个
+    # 漏掉变更（见 MonitorLoop.__init__ 的说明）。
+    cfg_applied = asyncio.Event() if enforcer is not None else None
+    tc_applied = asyncio.Event() if shaper is not None else None
+    config_applied = [e for e in (cfg_applied, tc_applied) if e is not None]
     ctl = MonitorLoop(col, sampler=sampler, log=log,
                       config_applied=config_applied)
 
@@ -189,7 +205,7 @@ async def _amain(cfg, log: logging.Logger,
             webconsole.run_console(console_port, hub, logbuf, db_opts, log,
                                    bind=console_bind, instance=instance),
             name="web-console"))
-    if enforcer is not None and config_applied is not None:
+    if enforcer is not None and cfg_applied is not None:
         # 目标配置取自监控循环当前生效的那一份。每次 reconcile 现取，
         # 因此配置热更后拿到的必然是新值。
         def _desired() -> list[model.FrontendConfig]:
@@ -197,10 +213,19 @@ async def _amain(cfg, log: logging.Logger,
 
         tasks.append(asyncio.create_task(
             enforcermod.run_enforcer(
-                enforcer, _desired, config_applied, log,
+                enforcer, _desired, cfg_applied, log,
                 on_result=(hub.record_enforce if hub is not None else None),
                 period_s=apply_period_s),
-            name="limit-enforcer"))
+            name="cfg-enforcer"))
+
+    if shaper is not None and tc_applied is not None:
+        # 限速任务与 cfg 下发任务各自独立 reconcile：一个失败不牵连另一个。
+        # 两者共享同一个"配置已更新"事件——asyncio.Event 是电平触发，
+        # 一次 set 能同时唤醒多个等待者。
+        tasks.append(asyncio.create_task(
+            tcmod.run_shaper(shaper, lambda: ctl.frontends(), tc_applied,
+                             log, period_s=apply_period_s),
+            name="tc-shaper"))
 
     log.info("rl-limiter 服务已启动，监控循环开始运行 instance=%s "
              "endpoint=%s apply=%s frontends=%d version=%s",
@@ -313,6 +338,26 @@ def main() -> None:
             or DEFAULT_RELOAD_CMD,
             log)
 
+    # 限速：内核 tc（见 tcshaper 模块）。默认启用——限速是本服务的核心
+    # 职责，"静悄悄地没在限"是最不该出现的状态。显式设 RL_TC_IFACE=- 才
+    # 关闭；网卡探测不出来直接启动失败，而不是装作在限速。
+    shaper = None
+    raw_iface = (os.environ.get(ENV_TC_IFACE) or "").strip()
+    if raw_iface == "-":
+        print("rl-limiter: 已显式关闭 tc 限速（RL_TC_IFACE=-），本实例只做"
+              "监控与配置下发", file=sys.stderr)
+    else:
+        iface = tcmod.resolve_iface(raw_iface, log)
+        if not iface:
+            print("rl-limiter: 无法确定要在哪张网卡上限速——/proc/net/route 里"
+                  "没有默认路由。\n"
+                  f"  请用 {ENV_TC_IFACE}=<网卡名> 显式指定（多网卡机器本来"
+                  "就该显式指定）；\n"
+                  f"  确实不需要限速时设 {ENV_TC_IFACE}=- 明确关闭。",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        shaper = tcmod.TcShaper(iface, log)
+
     # 配置来源判定：RL_MYSQL_HOST 已设置 → 数据库配置模式；否则本地 YAML。
     try:
         db_opts = dbconfig.from_env()
@@ -375,7 +420,8 @@ def main() -> None:
         asyncio.run(_amain(cfg, log, db_opts,
                            console_port=console_port, logbuf=logbuf,
                            instance=instance, console_bind=console_bind,
-                           enforcer=enforcer, apply_period_s=apply_period_s))
+                           enforcer=enforcer, apply_period_s=apply_period_s,
+                           shaper=shaper))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
     log.info("rl-limiter 服务已停止")

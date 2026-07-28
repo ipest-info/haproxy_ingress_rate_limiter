@@ -5,10 +5,16 @@
 写库，随后由本机 rl-limiter 渲染进 haproxy.cfg 的受管区块并 reload——
 **改完立刻生效**（实测一次下发 ~74 ms）。
 
-限速由 HAProxy 自身的 **shared bwlim** 执行：受管 frontend 全部连接
-（含存量长连接）的总速率被硬性压在限额内，与连接数、单连接快慢无关。
-rl-limiter 同时每秒经**本机 unix stats socket** 采样各 frontend 的下行
-带宽做持续超限告警。
+限速由**内核 tc（HTB）**执行：按源端口把每个 frontend 的出向流量分到
+自己的速率类里，该端口全部连接（含存量长连接）的总速率被硬性压在限额内，
+与连接数、单连接快慢无关。改限额走 `tc class change`，**连 reload 都不需要，
+存量连接立刻跟上**。rl-limiter 同时每秒经**本机 unix stats socket** 采样
+各 frontend 的下行带宽做持续超限告警。
+
+> 之前用的是 HAProxy 的 shared bwlim。换掉是因为实测发现：**只要挂着
+> bwlim 滤镜，HAProxy 就会完全关闭内核 splice（零拷贝转发）**，同吞吐下
+> HAProxy 的 CPU 要多花一倍（0.59 → 0.33 CPU 秒/GB）。原委、行为差异与
+> **尚未验证的部分**见 [docs/06-tc限速方案.md](docs/06-tc限速方案.md)。
 
 > **同机部署的首要理由就是"改完立刻生效"**：只有在同一台机器上，服务
 > 才有可能直接改本机配置并 reload；跨机的集中服务做不到（要么开 SSH，
@@ -24,10 +30,11 @@ rl-limiter 同时每秒经**本机 unix stats socket** 采样各 frontend 的下
 | 文档 | 说明 |
 | ---- | ---- |
 | [docs/00-需求说明.md](docs/00-需求说明.md) | 原始需求（名词定义、架构图、核心诉求） |
-| [docs/01-方案设计.md](docs/01-方案设计.md) | 方案设计（shared bwlim 聚合限速、限额调整流程、监控与超限告警、MySQL 配置模型、容错） |
+| [docs/01-方案设计.md](docs/01-方案设计.md) | 方案设计（聚合限速、限额调整流程、监控与超限告警、MySQL 配置模型、容错） |
 | [docs/02-建议与讨论点.md](docs/02-建议与讨论点.md) | 需求改进建议与决策清单 |
 | [docs/03-限速服务运行指南.md](docs/03-限速服务运行指南.md) | 安装、配置来源（MySQL/YAML）、限额调整 SOP、HAProxy 侧接线 |
 | [docs/04-DockerCompose演示.md](docs/04-DockerCompose演示.md) | docker compose 一键演示（MySQL + 三台 Ubuntu 24.04 节点 + Web 控制台 + 可调并发压测） |
+| [docs/06-tc限速方案.md](docs/06-tc限速方案.md) | **限速为什么从 HAProxy bwlim 换成内核 tc**：实测依据、映射方式、行为差异，以及尚未验证的部分 |
 
 ## 系统组成
 
@@ -53,11 +60,12 @@ docker-compose.yml # 一键演示：MySQL + 三台 Ubuntu 24.04 节点 + 模拟�
 
 ## 核心思路一句话
 
-配置库是唯一数据源：一个 frontend = 一个监听端口 + 一个 shared bwlim
-速率桶 + 一组后端服务器。rl-limiter 把它渲染进本机 haproxy.cfg 的受管
-区块并 reload，同一份限额同时作为超限告警基准——同源，因此不存在"库改了、
-cfg 忘了改"的漂移。shared bwlim 把该端口全部连接的**总**下行速率硬限在
-限额内，存量长连接持续受控；上游流量靠 TCP 背压自然收敛，tc 作硬兜底。
+配置库是唯一数据源：一个 frontend = 一个监听端口 + 一个 tc 速率类 +
+一组后端服务器。rl-limiter 把监听端口与后端渲染进本机 haproxy.cfg 的受管
+区块并 reload，把限额下发到本机网卡的 tc 上，同一份限额同时作为超限告警
+基准——同源，因此不存在"库改了、数据面忘了改"的漂移。tc 把该端口全部连接
+的**总**下行速率硬限在限额内，存量长连接持续受控；上游流量靠 TCP 背压
+自然收敛。
 监控每秒采 `bytes_out`（前提 `option contstats`）算 10 秒滑动均值；
 rl-limiter 宕机不影响已下发的限速。
 
@@ -69,7 +77,7 @@ make test       # 全量单元测试
 # 本地最小演示（假 HAProxy unix socket + standalone YAML）见 docs/03
 
 make demo-up    # docker compose 一键演示：MySQL 配置 + 三台 Ubuntu 24.04
-                # 节点（每台 = HAProxy TCP L4 shared bwlim + 同机 rl-limiter）
+                # 节点（每台 = HAProxy TCP L4 转发 + 内核 tc 限速 + 同机 rl-limiter）
                 # + 随机大小响应后端 + 可调并发压测
                 # 每台节点各一个控制台：http://localhost:8090 / :8092 / :8093
 make demo-logs  # 观察各节点监控与 loadgen 分入口吞吐表格
