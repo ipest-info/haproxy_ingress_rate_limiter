@@ -44,6 +44,46 @@ def test_snapshot_merges_usage_and_quota():
     assert u["over"] is False
 
 
+def test_snapshot_carries_frontend_monitoring_fields():
+    """监听端口视图的那几条曲线（新建/丢失连接、活跃/空闲、上行）随快照
+    一起下发——页面不该为了画图再去发第二种请求。"""
+    h = hub()
+    h.record(1.0, [model.FrontendUsage(
+        name="fe_a", rate_in_bps=88.0, conn_new_ps=12.0, conn_denied_ps=3.0,
+        active_conns=4, idle_conns=5)])
+    u = h.history()[-1]["units"]["fe_a"]
+    assert u["rate_in_bytes_per_s"] == 88.0
+    assert (u["conn_new_ps"], u["conn_denied_ps"]) == (12.0, 3.0)
+    assert (u["active_conns"], u["idle_conns"]) == (4, 5)
+
+
+def test_snapshot_carries_instance_view():
+    """实例视图与 frontend 视图出自同一拍，装在同一帧里下发，页面切 tab
+    时两条时间轴才对得齐。"""
+    h = hub()
+    h.record(1.0, [usage()], model.InstanceUsage(
+        conn_new_ps=33.0, conn_denied_ps=2.0, conn_cur=17, active_conns=9,
+        idle_conns=8, max_conn=4000, rate_in_bps=1000.0, rate_out_bps=5000.0,
+        nic="eth0", pkts_in_ps=40.0, pkts_out_ps=60.0,
+        drop_in_ps=1.0, drop_out_ps=0.0, idle_pct=87))
+    i = h.history()[-1]["instance"]
+    assert (i["conn"], i["active_conns"], i["idle_conns"]) == (17, 9, 8)
+    assert (i["conn_new_ps"], i["conn_denied_ps"]) == (33.0, 2.0)
+    assert (i["rate_in_bytes_per_s"], i["rate_out_bytes_per_s"]) == (1000.0, 5000.0)
+    # 网卡口径的字段名带 nic_/pkts_/drop_ 前缀，与 HAProxy 口径分得开。
+    assert i["nic"] == "eth0"
+    assert (i["pkts_in_ps"], i["pkts_out_ps"]) == (40.0, 60.0)
+    assert (i["drop_in_ps"], i["drop_out_ps"]) == (1.0, 0.0)
+    assert i["idle_pct"] == 87
+
+
+def test_snapshot_without_instance_view_is_still_valid():
+    """未提供实例视图（纯 frontend 采样的老接线）时快照照常成立。"""
+    h = hub()
+    h.record(1.0, [usage()])
+    assert h.history()[-1]["instance"] == {}
+
+
 def test_snapshot_over_flag():
     h = hub()
     h.record(1.0, [usage(mean10=2_000_000)])       # 限额 1_000_000 bytes/s

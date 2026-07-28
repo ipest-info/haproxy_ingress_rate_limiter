@@ -28,6 +28,7 @@ rl-limiter 同时每秒经**本机 unix stats socket** 采样各 frontend 的下
 | [docs/02-建议与讨论点.md](docs/02-建议与讨论点.md) | 需求改进建议与决策清单 |
 | [docs/03-限速服务运行指南.md](docs/03-限速服务运行指南.md) | 安装、配置来源（MySQL/YAML）、限额调整 SOP、HAProxy 侧接线 |
 | [docs/04-DockerCompose演示.md](docs/04-DockerCompose演示.md) | docker compose 一键演示（MySQL + 三台 Ubuntu 24.04 节点 + Web 控制台 + 可调并发压测） |
+| [docs/05-监控视图.md](docs/05-监控视图.md) | 监控视图的可行性分析：每条曲线的数据来源与口径，以及**哪几条 HAProxy 确实给不出来、为什么** |
 
 ## 系统组成
 
@@ -90,4 +91,8 @@ reload）见 `deploy/systemd/rl-limiter.service` 文件头。
 
 **Web 控制台**：`RL_CONSOLE_PORT` 启用，`RL_CONSOLE_BIND` 指定监听地址
 （默认 `127.0.0.1`）。控制台**无鉴权且带写接口**，放到内网必须配合
-防火墙/安全组限制来源。
+防火墙/安全组限制来源。三个 tab：**实例**（整台 HAProxy 的连接/带宽/
+数据包视图）、**监听端口**（每个 frontend 的监控曲线 + 配置编辑）、
+**日志**。数据包与丢包取自本机网卡 `/proc/net/dev`（`RL_NIC` 指定网卡）
+——HAProxy 完全不统计数据包，因此它们是**整机口径**且无法按 frontend
+拆分；每条曲线的来源与口径见 [docs/05-监控视图.md](docs/05-监控视图.md)。

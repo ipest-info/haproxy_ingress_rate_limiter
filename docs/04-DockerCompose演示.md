@@ -275,7 +275,11 @@ docker compose exec node1 grep -o 'limit [0-9]*' /etc/haproxy/haproxy.cfg
   演示里 reload 命令是 `kill -USR2 $(cat /run/haproxy/master.pid)`
   （容器里没有 systemd）；生产上默认 `systemctl reload haproxy`。
   reload 命令只从本机环境变量读、绝不从配置库读——否则拿到库写权限
-  就等于在每台 HAProxy 上远程执行任意命令。
+  就等于在每台 HAProxy 上远程执行任意命令；
+- `RL_NIC`：实例监控视图的数据包统计要采样的网卡。不设即自动选默认路由
+  的出口网卡（容器里通常是 `eth0`）。注意容器网络下这份计数是**该容器
+  网络命名空间**的整机口径，含 compose 内部的东西向流量。口径说明见
+  [05-监控视图.md](05-监控视图.md)。
 
 ## 验证"监控与限速互不牵连"
 

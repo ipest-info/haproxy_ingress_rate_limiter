@@ -68,9 +68,10 @@ class MonitorLoop:
 
     组件契约：
       - collector.set_managed(set[str])；async collector.tick(now)
-        -> list[FrontendUsage]；collector.degraded -> bool
-      - sampler 可选回调：sampler(now, usages)，供控制台 StatusHub 记录
-        每拍快照。
+        -> list[FrontendUsage]；collector.degraded -> bool；
+        collector.instance -> InstanceUsage（整机监控视图，tick 后刷新）
+      - sampler 可选回调：sampler(now, usages, instance)，供控制台
+        StatusHub 记录每拍快照。
     """
 
     def __init__(self, collector, sampler=None, log=None,
@@ -188,8 +189,10 @@ class MonitorLoop:
             self._check_over(u)
 
         # 采样发布：把本 tick 的完整结果交给可选的 sampler 回调（控制台）。
+        # 实例视图与 frontend 用量出自同一拍，一并交出去——否则页面上
+        # 两个 tab 的曲线会差半秒，看起来像是数据对不上。
         if self._sampler is not None:
-            self._sampler(now, usages)
+            self._sampler(now, usages, self._collector.instance)
 
         # 周期状态汇总：每 STATUS_SUMMARY_EVERY_TICKS 个 tick 输出一次，
         # 正常运行时以约 1 条/分钟的成本留下可核对的运行痕迹。

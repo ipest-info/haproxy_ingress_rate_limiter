@@ -1,6 +1,16 @@
 # rl_limiter.collector —— 采样层：每秒从本机 HAProxy 取一次 `show stat`，
 # 差分出各受管 frontend 的下行速率，产出带 10s 均值与 60s EWMA 的用量样本。
 #
+# 三条采样链路（每拍各取一次，彼此独立容错）：
+#   1. `show stat`  —— 各 frontend 的字节/连接/拒绝计数。**主链路**：限速
+#      与超限告警只依赖它，它失败即整拍 fail-static；
+#   2. `show info`  —— 整台 HAProxy 的并发/累计连接数、空闲率。只喂实例
+#      视图，失败时沿用上一拍的值，绝不影响限速判定；
+#   3. /proc/net/dev —— 网卡包计数（HAProxy 根本不统计数据包，见 netdev
+#      模块）。同样只喂实例视图，失败即静默沿用。
+# 分开容错的理由很实际：监控视图是"看"的，限速是"管"的，不能因为多画了
+# 几条曲线就让限速的判定链路多几种失败方式。
+#
 # 单 HAProxy 模型（v0.4 起）：**监控单位 = frontend**。一个 frontend 就是
 # 一个监听端口 + 一个 shared bwlim 速率桶，与 HAProxy 的限速机制一一对应，
 # 因此不存在跨 frontend 的聚合——每个 frontend 自己算自己的速率与均值。
@@ -28,7 +38,7 @@ from __future__ import annotations
 
 import logging
 
-from . import model
+from . import model, netdev
 from .haproxy import RuntimeClient
 from .window import Ewma, SlidingWindow
 
@@ -51,6 +61,42 @@ DEGRADED_FAILURE_THRESHOLD = 10
 ABSENT_TICK_LIMIT = 60
 
 
+class _DiffCounter:
+    """单调累计计数器的"差分成每秒速率"的最小状态机。
+
+    只服务于**监控视图**字段（上行字节、新建连接数、拒绝数、网卡计数）。
+    计费口径的 bytes_out 没有用它——那条路径要额外记 has_rate、要在回绕时
+    打日志、要参与滑动窗口，语义比这里复杂得多，硬套一个抽象只会把两边
+    都讲不清楚。
+
+    回绕（HAProxy reload 后计数从零重来）的处理与 bytes_out 一致：本次
+    沿用上一次的速率，并用新值重建基线。
+    """
+
+    __slots__ = ("last", "rate", "primed")
+
+    def __init__(self, value: int = 0, primed: bool = False):
+        self.last = value
+        self.rate = 0.0
+        # 是否已有基线。无基线时首次 push 只建基线，速率保持 0（"未知"在
+        # 监控视图里按 0 展示即可，它不参与任何判定）。构造时给了初值的
+        # （frontend 首次采样那一拍）直接算已建基线，下一拍就有速率——与
+        # bytes_out 主链路的时序保持一致。
+        self.primed = primed
+
+    def push(self, value: int) -> float:
+        if self.primed and value >= self.last:
+            self.rate = float(value - self.last)
+        # value < last：回绕，沿用上次速率，下面照常重建基线。
+        self.last = value
+        self.primed = True
+        return self.rate
+
+    def reset_rate(self) -> None:
+        """把速率归零（对应"该 frontend 本拍确实不存在"）。"""
+        self.rate = 0.0
+
+
 class _FrontendState:
     """按 frontend 维护的计数差分基线 + 平滑状态。
 
@@ -60,25 +106,74 @@ class _FrontendState:
     """
 
     __slots__ = ("last_bytes_out", "last_rate", "last_conn", "has_rate",
-                 "absent_ticks", "window", "ewma")
+                 "absent_ticks", "window", "ewma",
+                 "c_in", "c_conn_new", "c_denied", "last_active", "last_idle")
 
-    def __init__(self, bytes_out: int, conn_cur: int):
-        self.last_bytes_out = bytes_out
+    def __init__(self, stat: model.FrontendStat):
+        self.last_bytes_out = stat.bytes_out
         self.last_rate = 0.0
-        self.last_conn = conn_cur
+        self.last_conn = stat.conn_cur
         # 是否已产出过至少一次基于差分的速率。刚建基线的 frontend 速率是
         # "未知"而非 0，两者对窗口的影响完全不同。
         self.has_rate = False
         self.absent_ticks = 0
         self.window = SlidingWindow(WINDOW10_SIZE)
         self.ewma = Ewma(EWMA60_ALPHA)
+        # --- 监控视图字段的差分基线与瞬时值 ---
+        self.c_in = _DiffCounter(stat.bytes_in, primed=True)
+        self.c_conn_new = _DiffCounter(stat.conn_tot, primed=True)
+        self.c_denied = _DiffCounter(stat.denied_total, primed=True)
+        self.last_active = stat.active_conns
+        self.last_idle = stat.idle_conns
+
+    def observe(self, stat: model.FrontendStat) -> None:
+        """刷新监控视图字段（与 bytes_out 的主链路各走各的）。"""
+        self.c_in.push(stat.bytes_in)
+        self.c_conn_new.push(stat.conn_tot)
+        self.c_denied.push(stat.denied_total)
+        self.last_active = stat.active_conns
+        self.last_idle = stat.idle_conns
+
+    def blank(self) -> None:
+        """该 frontend 本拍在 stats 里不存在：监控视图字段全部归零。
+
+        与 fail-static 的区别很关键——"采不到"要沿用旧值，"确实没有"是
+        真实的零。这个方法只在采样**成功**的拍上被调用。
+        """
+        self.c_in.reset_rate()
+        self.c_conn_new.reset_rate()
+        self.c_denied.reset_rate()
+        self.last_active = 0
+        self.last_idle = 0
+
+
+class _InstanceState:
+    """实例视图的差分基线（show info + 全体 frontend 汇总 + 网卡）。"""
+
+    __slots__ = ("c_conn_new", "c_denied", "c_in", "c_out",
+                 "c_pkt_in", "c_pkt_out", "c_drop_in", "c_drop_out",
+                 "c_nic_in", "c_nic_out")
+
+    def __init__(self):
+        self.c_conn_new = _DiffCounter()   # Σ frontend conn_tot（不是 CumConns，
+                                           # 理由见 _tick_instance 的注释）
+        self.c_denied = _DiffCounter()     # Σ frontend denied_total
+        self.c_in = _DiffCounter()         # Σ frontend bytes_in
+        self.c_out = _DiffCounter()        # Σ frontend bytes_out
+        self.c_pkt_in = _DiffCounter()     # 网卡 rx_packets
+        self.c_pkt_out = _DiffCounter()
+        self.c_drop_in = _DiffCounter()    # 网卡 rx_dropped
+        self.c_drop_out = _DiffCounter()
+        self.c_nic_in = _DiffCounter()     # 网卡 rx_bytes（与 HAProxy 口径对照）
+        self.c_nic_out = _DiffCounter()
 
 
 class Collector:
     """从本机 HAProxy 采样并产出各受管 frontend 的用量样本。"""
 
     def __init__(self, client: RuntimeClient,
-                 log: logging.Logger | None = None):
+                 log: logging.Logger | None = None,
+                 nic: str = ""):
         self._client = client
         self._log = log if log is not None else logging.getLogger("rl_limiter.collector")
         # 受管 frontend 名集合，由配置层下发；决定哪些 frontend 产出用量。
@@ -90,6 +185,16 @@ class Collector:
         self._degraded = False
         # 只提示一次的日志去重集合。
         self._logged_unmanaged: set[str] = set()
+        # --- 实例视图（监控用，不参与限速判定）---
+        # 要采样的网卡；空串 = 不采（探测失败或运维禁用），包统计整体缺席。
+        self._nic = nic
+        self._inst_state = _InstanceState()
+        # 最近一拍的实例用量。采不到时原样留着上一拍的值（fail-static），
+        # 因此这里从构造起就必须是一个可用对象而不是 None。
+        self._instance = model.InstanceUsage(nic=nic)
+        # show info / 网卡这两条副链路的失败只记一次日志，避免每秒刷屏。
+        self._logged_info_error = ""
+        self._logged_nic_error = ""
 
     def set_managed(self, names: set[str]) -> None:
         """整体替换受管 frontend 集合（配置下发时调用）。"""
@@ -103,18 +208,34 @@ class Collector:
         """采样通道是否处于降级（连续失败达阈值）。"""
         return self._degraded
 
+    @property
+    def instance(self) -> model.InstanceUsage:
+        """最近一拍的整机用量视图（实例监控视图的数据源）。
+
+        每次 tick 后被整体替换；采不到时沿用上一拍并打上 degraded。
+        """
+        return self._instance
+
     async def tick(self, now: float) -> list[model.FrontendUsage]:
         """采样一次，返回按名字排序的各受管 frontend 用量。
 
         now 由调用方注入以便测试确定性；速率计算依赖固定 1s 节奏而非墙钟
         差值，now 仅为将来扩展保留。
+
+        实例视图（instance 属性）在同一拍内一并刷新，但走独立的容错路径：
+        它失败不影响这里的返回值，因此限速判定的可靠性不会被"多画几条
+        曲线"拖累。
         """
         _ = now
         try:
             stats = await self._client.show_stat()
         except Exception as e:
-            return self._on_failure(e)
-        return self._on_success(stats)
+            usages = self._on_failure(e)
+            stats = None
+        else:
+            usages = self._on_success(stats)
+        await self._tick_instance(stats)
+        return usages
 
     # ------------------------------------------------------------------
     # 采样成功 / 失败两条路径
@@ -162,7 +283,7 @@ class Collector:
                     continue
                 # 首次采样：只有一个累计值、没有前值可差分，速率未知，本
                 # tick 仅记录基线。连接数是瞬时值不依赖差分，可直接计入。
-                self._states[fs.name] = _FrontendState(fs.bytes_out, fs.conn_cur)
+                self._states[fs.name] = _FrontendState(fs)
                 rates[fs.name] = None
                 conns[fs.name] = fs.conn_cur
                 self._log.info(
@@ -189,6 +310,10 @@ class Collector:
             st.last_rate = rate
             st.last_conn = fs.conn_cur
             st.has_rate = True
+            # 监控视图字段：与计费口径的 bytes_out 各走各的差分（见
+            # _DiffCounter 的说明）。未纳管的 frontend 也照常刷新，理由
+            # 与基线相同——将来纳管时第一秒就有正确数值。
+            st.observe(fs)
             # 已知但当前未纳管的 frontend 也在上面刷新了基线：将来被纳管
             # 时差分从第一秒起就连续，不必重走"首采样丢一秒"。
             if managed:
@@ -202,6 +327,10 @@ class Collector:
             if name not in rates:
                 rates[name] = 0.0
                 conns.setdefault(name, 0)
+                # 监控视图字段同样归零：这是"确实没有"而不是"采不到"。
+                st = self._states.get(name)
+                if st is not None:
+                    st.blank()
 
         self._evict_absent(present)
         self._reset_unmanaged_smoothing()
@@ -315,6 +444,13 @@ class Collector:
                 mean10_bps=st.window.mean(),
                 ewma60_bps=st.ewma.value,
                 conn_cur=conns.get(name, 0),
+                # 监控视图字段直接取自状态：采样失败时它们没被刷新，
+                # 于是天然沿用上一拍的值（fail-static），与主链路一致。
+                rate_in_bps=st.c_in.rate,
+                conn_new_ps=st.c_conn_new.rate,
+                conn_denied_ps=st.c_denied.rate,
+                active_conns=st.last_active,
+                idle_conns=st.last_idle,
                 degraded=degraded,
             ))
 
@@ -323,7 +459,115 @@ class Collector:
                 self._log.debug(
                     "本秒采样完成，输出该 frontend 的用量样本 "
                     "frontend=%s rate_bps=%.1f mean10_bps=%.1f ewma60_bps=%.1f "
-                    "conn_cur=%d degraded=%s",
+                    "conn_cur=%d conn_new_ps=%.1f conn_denied_ps=%.1f "
+                    "active_conns=%d idle_conns=%d degraded=%s",
                     u.name, u.rate_bps, u.mean10_bps, u.ewma60_bps,
-                    u.conn_cur, u.degraded)
+                    u.conn_cur, u.conn_new_ps, u.conn_denied_ps,
+                    u.active_conns, u.idle_conns, u.degraded)
         return usages
+
+    # ------------------------------------------------------------------
+    # 实例视图（监控专用副链路，失败不影响限速判定）
+    # ------------------------------------------------------------------
+
+    async def _tick_instance(self, stats: "list[model.FrontendStat] | None") -> None:
+        """刷新整机用量视图。
+
+        stats 为 None 表示本拍 `show stat` 失败——此时按 fail-static 保留
+        上一拍的 HAProxy 口径数值，只把 degraded 打上；网卡计数与 HAProxy
+        无关，仍照常采（它往往正是"HAProxy 挂了但机器还在收包"的证据）。
+
+        本方法**不抛异常**：任何一条副链路失败都只记日志并沿用旧值。
+        """
+        prev = self._instance
+        inst = model.InstanceUsage(nic=self._nic, degraded=self._degraded)
+
+        # --- 1) show info：整机连接数。show stat 的行按 proxy 拆，加总会
+        # 把同一条连接重复计，因此并发连接数只能从这里取。
+        info: model.InstanceStat | None = None
+        try:
+            info = await self._client.show_info()
+        except Exception as e:
+            self._log_once("info", e,
+                           "show info 采样失败，实例视图的连接数沿用上一拍的值"
+                           "（限速与 frontend 视图不受影响）")
+        if info is not None:
+            self._logged_info_error = ""
+            inst.conn_cur = info.curr_conns
+            inst.max_conn = info.max_conn
+            inst.idle_pct = info.idle_pct
+        else:
+            inst.conn_cur = prev.conn_cur
+            inst.max_conn = prev.max_conn
+            inst.idle_pct = prev.idle_pct
+
+        # --- 2) 全体 frontend 汇总：新建连接数、带宽与拒绝数。刻意**不**
+        # 限于受管 frontend——"整个实例的视图"就该覆盖这台 HAProxy 上的全部
+        # 监听端口，哪怕它们是运维手写、不归 rl-limiter 管的。
+        #
+        # 新建连接数为什么不用 show info 的 CumConns：**它把 rl-limiter 自己
+        # 对 runtime API 的连接也算进去了**。runtime socket 一次连接只服务
+        # 一条命令，本采集器每秒建两条（show stat + show info），于是
+        # CumConns 的差分恒有 +2 的底噪，空载时曲线会稳稳停在 2/秒。实测
+        # 佐证：同一时刻 CumConns=256，而各 frontend 的 conn_tot 之和只有
+        # 28——差额全是采集器自己。Σ conn_tot 只统计真正经监听端口进来的
+        # 连接，与"丢失连接数"同源，两条曲线也才可比。
+        if stats is not None:
+            s = self._inst_state
+            inst.conn_new_ps = s.c_conn_new.push(sum(x.conn_tot for x in stats))
+            inst.rate_in_bps = s.c_in.push(sum(x.bytes_in for x in stats))
+            inst.rate_out_bps = s.c_out.push(sum(x.bytes_out for x in stats))
+            inst.conn_denied_ps = s.c_denied.push(
+                sum(x.denied_total for x in stats))
+            inst.active_conns = sum(x.active_conns for x in stats)
+            inst.idle_conns = sum(x.idle_conns for x in stats)
+        else:
+            inst.conn_new_ps = prev.conn_new_ps
+            inst.rate_in_bps = prev.rate_in_bps
+            inst.rate_out_bps = prev.rate_out_bps
+            inst.conn_denied_ps = prev.conn_denied_ps
+            inst.active_conns = prev.active_conns
+            inst.idle_conns = prev.idle_conns
+
+        # --- 3) 网卡：数据包与丢包。HAProxy 完全不统计包，只此一途
+        # （见 netdev 模块）。整机口径，无法按 frontend 拆。
+        nic: model.NicStat | None = None
+        if self._nic:
+            try:
+                nic = netdev.read_nic_stat(self._nic)
+            except Exception as e:
+                self._log_once("nic", e,
+                               "网卡计数器读取失败，实例视图的数据包/丢包曲线"
+                               "沿用上一拍的值（其余监控不受影响）")
+        if nic is not None:
+            self._logged_nic_error = ""
+            s = self._inst_state
+            inst.pkts_in_ps = s.c_pkt_in.push(nic.rx_packets)
+            inst.pkts_out_ps = s.c_pkt_out.push(nic.tx_packets)
+            inst.drop_in_ps = s.c_drop_in.push(nic.rx_dropped)
+            inst.drop_out_ps = s.c_drop_out.push(nic.tx_dropped)
+            inst.nic_rate_in_bps = s.c_nic_in.push(nic.rx_bytes)
+            inst.nic_rate_out_bps = s.c_nic_out.push(nic.tx_bytes)
+        else:
+            inst.pkts_in_ps = prev.pkts_in_ps
+            inst.pkts_out_ps = prev.pkts_out_ps
+            inst.drop_in_ps = prev.drop_in_ps
+            inst.drop_out_ps = prev.drop_out_ps
+            inst.nic_rate_in_bps = prev.nic_rate_in_bps
+            inst.nic_rate_out_bps = prev.nic_rate_out_bps
+
+        self._instance = inst
+
+    def _log_once(self, kind: str, err: BaseException, msg: str) -> None:
+        """副链路的失败日志去重：同一种错误只在首次出现时记一条 warning。
+
+        这两条链路每秒都会重试，一直失败（比如网卡被改名）时不去重就会
+        每秒一条 warning 把日志刷没。错误措辞变化时会再记一条，因此故障
+        转移不会被静默吃掉。
+        """
+        key = f"{type(err).__name__}: {err}"
+        attr = "_logged_info_error" if kind == "info" else "_logged_nic_error"
+        if getattr(self, attr) == key:
+            return
+        setattr(self, attr, key)
+        self._log.warning("%s err=%s", msg, key)

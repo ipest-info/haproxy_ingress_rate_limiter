@@ -26,6 +26,7 @@ from . import config as configmod
 from . import dbconfig
 from . import enforcer as enforcermod
 from . import haproxy, model
+from . import netdev
 from . import webconsole
 from .collector import Collector
 from .loop import MonitorLoop
@@ -65,6 +66,12 @@ DEFAULT_RELOAD_CMD = "systemctl reload haproxy"
 ENV_APPLY_PERIOD_S = "RL_APPLY_PERIOD_S"
 DEFAULT_APPLY_PERIOD_S = 30.0
 
+# 实例监控视图里"每秒收发包数/丢包数"要采样的网卡。HAProxy 完全不统计
+# 数据包（见 netdev 模块），这几条曲线只能从 /proc/net/dev 取。不设则自动
+# 选默认路由的出口网卡；多网卡机器上建议显式指定。设为 "-" 表示明确禁用
+# 包统计（此时实例视图的包/丢包曲线为空，其余监控照常）。
+ENV_NIC = "RL_NIC"
+
 
 def _summarize_frontends(frontends: list[model.FrontendConfig]) -> str:
     """把受管 frontend 清单压缩成单个日志字段，格式：
@@ -84,7 +91,8 @@ async def _amain(cfg, log: logging.Logger,
                  instance: str = DEFAULT_INSTANCE,
                  console_bind: str = DEFAULT_CONSOLE_BIND,
                  enforcer: "enforcermod.HAProxyEnforcer | None" = None,
-                 apply_period_s: float = DEFAULT_APPLY_PERIOD_S) -> None:
+                 apply_period_s: float = DEFAULT_APPLY_PERIOD_S,
+                 nic: str = "") -> None:
     """事件循环内的主体：组装组件、引导配置、并发运行监控循环与配置源。
 
     db_opts 非 None 表示配置来自 MySQL（数据库配置模式，生产权威）：
@@ -98,7 +106,7 @@ async def _amain(cfg, log: logging.Logger,
     # --- 与本机 HAProxy 的 runtime API 客户端（只读采样）。单 HAProxy
     # 模型下只有一个，同机形态走本机 unix socket。
     client = haproxy.RuntimeClient.from_node(cfg.haproxy, log)
-    col = Collector(client, log)
+    col = Collector(client, log, nic=nic)
 
     # --- Web 控制台（可选）：StatusHub 是监控数据的发布枢纽。
     # version_fn 是延迟求值闭包（ctl 在下方才赋值，闭包只会在运行期被
@@ -236,7 +244,9 @@ def main() -> None:
                "配置下发：设置 RL_APPLY_HAPROXY_CFG=<本机 haproxy.cfg 路径> "
                "即启用（改配置后自动写入受管区块并 reload）。"
                "Web 控制台：设置 RL_CONSOLE_PORT 启用，RL_CONSOLE_BIND 指定"
-               "监听地址（默认 127.0.0.1——控制台无鉴权且带写接口）。")
+               "监听地址（默认 127.0.0.1——控制台无鉴权且带写接口）。"
+               "实例监控视图的数据包统计取自 /proc/net/dev，RL_NIC 指定网卡"
+               "（默认自动选默认路由的出口网卡，设 - 则禁用）。")
     parser.add_argument(
         "-c", "--config", default="/etc/rl-limiter/config.yaml",
         help="YAML 配置文件路径（默认 %(default)s；设置 RL_MYSQL_HOST 时忽略）")
@@ -358,6 +368,10 @@ def main() -> None:
 
     config_source = db_opts.describe() if db_opts is not None else f"文件 {args.config}"
 
+    # 实例视图的数据包统计要采哪张网卡（"-" = 显式禁用）。
+    raw_nic = (os.environ.get(ENV_NIC) or "").strip()
+    nic = "" if raw_nic == "-" else netdev.resolve_iface(raw_nic, log)
+
     # 启动即输出完整配置摘要：现场排障时第一条要看的日志，可直接核对
     # 受控节点清单、限额基准与配置来源。
     log.info(
@@ -375,7 +389,8 @@ def main() -> None:
         asyncio.run(_amain(cfg, log, db_opts,
                            console_port=console_port, logbuf=logbuf,
                            instance=instance, console_bind=console_bind,
-                           enforcer=enforcer, apply_period_s=apply_period_s))
+                           enforcer=enforcer, apply_period_s=apply_period_s,
+                           nic=nic))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
     log.info("rl-limiter 服务已停止")

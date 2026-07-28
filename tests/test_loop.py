@@ -17,10 +17,12 @@ from rl_limiter.loop import OVER_ALERT_AFTER_S, MonitorLoop
 class FakeCollector:
     """假采集器：记录收到的受管集合，按脚本返回用量。"""
 
-    def __init__(self, usages=None):
+    def __init__(self, usages=None, instance=None):
         self.managed: set[str] = set()
         self.degraded = False
         self._usages = usages or []
+        # 采集器契约的一部分：tick 之后 instance 是本拍的整机视图。
+        self.instance = instance or model.InstanceUsage()
         self.ticks = 0
 
     def set_managed(self, names):
@@ -134,6 +136,25 @@ async def test_degraded_pauses_over_quota_judgement(caplog):
                     [usage("fe_a", mean10=9_999_999, degraded=True)],
                     OVER_ALERT_AFTER_S * 3)
         assert not [r for r in caplog.records if "持续高于限额" in r.getMessage()]
+
+
+# ---------------------------------------------------------------------------
+# 采样发布
+# ---------------------------------------------------------------------------
+
+async def test_sampler_receives_frontend_and_instance_from_same_tick():
+    """两级视图必须同拍交出：分两次发布会让页面上两个 tab 的曲线差半秒，
+    看起来像是数据对不上。"""
+    inst = model.InstanceUsage(conn_cur=17)
+    col = FakeCollector([usage("fe_a", mean10=5.0)], instance=inst)
+    seen = []
+    ctl = MonitorLoop(col, sampler=lambda now, us, i: seen.append((now, us, i)))
+    ctl.seed(cfg(fe("fe_a")))
+    await ctl._tick(42.0)
+    (now, usages, got) = seen[-1]
+    assert now == 42.0
+    assert [u.name for u in usages] == ["fe_a"]
+    assert got is inst
 
 
 # ---------------------------------------------------------------------------
