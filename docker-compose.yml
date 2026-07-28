@@ -211,12 +211,12 @@ services:
     # 本机 tc 压在自己的限额内、互不影响。
     command: >-
       python3 tools/loadgen.py
-      --target http://node1:8080/,http://node2:8080/,http://node3:8080/
+      --target http://node1:8080/
       --control-port 8081
     environment:
       # 初始并发：LOADGEN_CONCURRENCY=32 docker compose up -d 即可改；
       # 运行中用控制端口在线调节（见文件头速查）。
-      LOADGEN_CONCURRENCY: ${LOADGEN_CONCURRENCY:-12}
+      LOADGEN_CONCURRENCY: ${LOADGEN_CONCURRENCY:-1000}
       # 长连接大文件下载场景：每个入口 N 条长连接循环下载 /big（默认
       # 每入口 1 条）。验证 tc 对存量长连接的持续限速与限额
       # 调整（reload + hard-stop）对在途下载的影响。
