@@ -68,6 +68,15 @@ services:
   node1:
     build:
       context: .
+    # haproxy-base.cfg 里 maxconn 100000 —— HAProxy 需要的文件描述符数
+    # 是 maxconn × 2 + 34 = 200034（实测精确值）。给不够它**拒绝启动**：
+    #   [ALERT] Cannot raise FD limit to 200034, limit is 4096.
+    # 容器默认的 nofile 往往只有 1024/4096，所以必须在这里放开。
+    # 改 maxconn 时记得同步改这里。
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
     volumes:
       - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
@@ -102,6 +111,15 @@ services:
   node2:
     build:
       context: .
+    # haproxy-base.cfg 里 maxconn 100000 —— HAProxy 需要的文件描述符数
+    # 是 maxconn × 2 + 34 = 200034（实测精确值）。给不够它**拒绝启动**：
+    #   [ALERT] Cannot raise FD limit to 200034, limit is 4096.
+    # 容器默认的 nofile 往往只有 1024/4096，所以必须在这里放开。
+    # 改 maxconn 时记得同步改这里。
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
     volumes:
       - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
@@ -132,6 +150,15 @@ services:
   node3:
     build:
       context: .
+    # haproxy-base.cfg 里 maxconn 100000 —— HAProxy 需要的文件描述符数
+    # 是 maxconn × 2 + 34 = 200034（实测精确值）。给不够它**拒绝启动**：
+    #   [ALERT] Cannot raise FD limit to 200034, limit is 4096.
+    # 容器默认的 nofile 往往只有 1024/4096，所以必须在这里放开。
+    # 改 maxconn 时记得同步改这里。
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
     volumes:
       - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:

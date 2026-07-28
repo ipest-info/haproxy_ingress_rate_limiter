@@ -277,6 +277,19 @@ docker compose exec node1 grep -o 'limit [0-9]*' /etc/haproxy/haproxy.cfg
   reload 命令只从本机环境变量读、绝不从配置库读——否则拿到库写权限
   就等于在每台 HAProxy 上远程执行任意命令。
 
+三台节点还各设了 `ulimits.nofile: 262144`。这不是随手写的余量：
+`haproxy-base.cfg` 里 `maxconn 100000`，而 HAProxy 需要的文件描述符数
+= `maxconn × 2 + 34` = 200034（实测精确值）。容器默认的 nofile 常常只有
+1024/4096，给不够 HAProxy 会**拒绝启动**并打
+
+```
+[ALERT] Cannot raise FD limit to 200034, limit is 4096.
+```
+
+改 `maxconn` 时务必同步改这里。调优基线的完整说明见
+[03-限速服务运行指南.md §5.1](03-限速服务运行指南.md) 与
+`deploy/docker/haproxy-base.cfg` 本身的注释（每项都带实测数字）。
+
 ## 验证"监控与限速互不牵连"
 
 同机形态下故障域完全按节点隔离，可以直接演示：
