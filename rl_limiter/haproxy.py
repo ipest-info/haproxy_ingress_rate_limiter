@@ -33,6 +33,11 @@ from . import model
 # server_id = -1 表示全部 server（对 frontend 行无实际筛选作用，按惯例传 -1）。
 SHOW_STAT_CMD = "show stat -1 1 -1"
 
+# 进程级指标（并发/累计连接数、连接速率、空闲率…）。回包是 "Key: value"
+# 的逐行文本，不是 CSV。它与 show stat 互补：show stat 给不出"整台 HAProxy
+# 当前有多少连接"，show stat 的行是按 proxy 拆的。
+SHOW_INFO_CMD = "show info"
+
 # 列举"回包首行以此开头即可断定命令失败"的前缀。runtime socket 的失败回包
 # 没有统一格式，只能靠已知前缀识别：命令不存在（"Unknown command"）、socket
 # 权限级别不足（"Permission denied"）、以及 "[ALERT]"/"[CFGERR]" 这类方括号
@@ -60,6 +65,10 @@ class CommandError(RuntimeAPIError):
 
 class StatParseError(RuntimeAPIError):
     """show stat 回包不是可用的 CSV（缺表头/缺必需列/数值非法）。"""
+
+
+class InfoParseError(RuntimeAPIError):
+    """show info 回包不是可用的 "Key: value" 文本（缺必需键）。"""
 
 
 class RuntimeClient:
@@ -150,14 +159,35 @@ class RuntimeClient:
         out = await self.exec_cmd(SHOW_STAT_CMD)
         return parse_show_stat(out)
 
+    async def show_info(self) -> model.InstanceStat:
+        """执行一次 "show info" 采样并返回进程级指标。
+
+        用途见 model.InstanceUsage：整台 HAProxy 的并发/新建连接数只有
+        这里给得出（show stat 的行按 proxy 拆，加总会把同一条连接在多个
+        proxy 上重复计）。
+        """
+        return parse_show_info(await self.exec_cmd(SHOW_INFO_CMD))
+
+
+# show stat 的**必需列**：缺任何一列都拿不到计费口径，必须整体失败。
+# 其余列（监控视图用的那些）一律可选——HAProxy 各版本列集合有增删，
+# 少一列只该让对应曲线为空，不该让整次采样连同限速判定一起垮掉。
+_REQUIRED_STAT_COLS = ("pxname", "svname", "scur", "bytes_out|bout")
+
+
 def parse_show_stat(out: str) -> list[model.FrontendStat]:
     """解析 "show stat" 的 CSV 回包。
 
-    为什么按列名而不是列下标解析：HAProxy 的 stat 列集合随版本增删（2.x 各
-    小版本都有变化），列的绝对位置完全不可依赖；唯一稳定的契约是表头行
-    （以 "# " 开头）中的列名。因此先从表头建立 名字→下标 索引，再取行内
-    字段。"bytes_out" 被接受为 HAProxy 原生列名 "bout" 的别名，以兼容测试
-    桩及可能的代理层改写。
+    为什么按列名而不是列下标解析：HAProxy 的 stat 列集合随版本增删（2.8
+    的表头有 205 列，2.x 各小版本都不一样），列的绝对位置完全不可依赖；
+    唯一稳定的契约是表头行（以 "# " 开头）中的列名。因此先从表头建立
+    名字→下标 索引，再取行内字段。"bytes_out"/"bytes_in" 被接受为 HAProxy
+    原生列名 "bout"/"bin" 的别名，以兼容测试桩及可能的代理层改写。
+
+    **必需列与可选列**：pxname/svname/scur/bout 缺失即抛 StatParseError
+    （见 _REQUIRED_STAT_COLS）；监控视图用的那些列缺失时按 0 处理，只让
+    对应曲线为空——不能因为某个版本少了一列 h1_open_streams 就让限速
+    监控整个停摆。
 
     只保留 svname == "FRONTEND" 的汇总行：type 掩码虽已请求"仅 frontend"，
     但按行再校验一次可以防御掩码语义变化或桩数据混入其他行。内建 "stats"
@@ -188,7 +218,7 @@ def parse_show_stat(out: str) -> list[model.FrontendStat]:
                 # 数据继续——collector 的容错逻辑（§3.7）会兜住这次失败。
                 raise StatParseError(
                     "haproxy: show stat header missing required columns "
-                    f"(pxname/svname/scur/bytes_out|bout): {line}")
+                    f"({'/'.join(_REQUIRED_STAT_COLS)}): {line}")
             continue
         if col_idx is None:
             # 数据行先于表头出现：回包不是合法的 show stat CSV。
@@ -211,12 +241,73 @@ def parse_show_stat(out: str) -> list[model.FrontendStat]:
             scur = _parse_int_field(_field_at(fields, i_scur))
         except ValueError as e:
             raise StatParseError(f"haproxy: frontend {pxname}: bad scur: {e}") from e
-        stats.append(model.FrontendStat(name=pxname, bytes_out=bytes_out, conn_cur=scur))
+
+        def opt(*names: str, _f=fields, _c=col_idx) -> int:
+            return _optional_int(_f, _c, *names)
+
+        stats.append(model.FrontendStat(
+            name=pxname,
+            bytes_out=bytes_out,
+            conn_cur=scur,
+            bytes_in=opt("bytes_in", "bin"),
+            conn_tot=opt("conn_tot"),
+            sess_tot=opt("stot"),
+            denied_conn=opt("dcon"),
+            denied_sess=opt("dses"),
+            denied_req=opt("dreq"),
+            denied_resp=opt("dresp"),
+            err_req=opt("ereq"),
+            # 只取 h1：h2/h3 没有 frontend 方向的 open_streams 列，
+            # 理由见 model.FrontendStat 的字段注释。
+            open_conns=opt("h1_open_connections"),
+            open_streams=opt("h1_open_streams"),
+            mode=_field_at(fields, col_idx.get("mode", -1)),
+        ))
 
     if col_idx is None:
         # 连表头都没有：空回包或完全非预期的输出，按失败处理。
         raise StatParseError("haproxy: empty show stat output")
     return stats
+
+
+def parse_show_info(out: str) -> model.InstanceStat:
+    """解析 "show info" 的 "Key: value" 逐行文本。
+
+    与 parse_show_stat 同样的取舍：CurrConns 是必需键（缺了就说明这根本
+    不是 show info 的回包），其余按 0/缺省处理。键名大小写与 HAProxy 输出
+    一致；未知键直接忽略——show info 的键集合同样随版本增删。
+    """
+    kv: dict[str, str] = {}
+    for line in out.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        k, sep, v = line.partition(":")
+        if sep:
+            kv[k.strip()] = v.strip()
+
+    if "CurrConns" not in kv:
+        raise InfoParseError(
+            f"haproxy: show info output missing CurrConns: {_first_line(out)}")
+
+    def num(key: str, default: int = 0) -> int:
+        raw = kv.get(key, "")
+        try:
+            return _parse_int_field(raw) if raw else default
+        except ValueError:
+            return default
+
+    return model.InstanceStat(
+        curr_conns=num("CurrConns"),
+        cum_conns=num("CumConns"),
+        cum_req=num("CumReq"),
+        conn_rate=num("ConnRate"),
+        sess_rate=num("SessRate"),
+        max_conn=num("Maxconn"),
+        run_queue=num("Run_queue"),
+        idle_pct=num("Idle_pct", 100),
+        uptime_s=num("Uptime_sec"),
+    )
 
 
 def _is_error_reply(out: str) -> bool:
@@ -241,6 +332,23 @@ def _field_at(fields: list[str], i: int) -> str:
     if i < 0 or i >= len(fields):
         return ""
     return fields[i].strip()
+
+
+def _optional_int(fields: list[str], col_idx: dict[str, int], *names: str) -> int:
+    """取一个**可选**数值列：按 names 的先后顺序找第一个存在的列名。
+
+    缺列、空值、非法值一律返回 0。这与必需列的处理刻意相反：监控视图的
+    列少一个只该让对应曲线为空，不该让整次采样（连同限速超限判定）失败。
+    """
+    for n in names:
+        i = col_idx.get(n, -1)
+        if i < 0:
+            continue
+        try:
+            return _parse_int_field(_field_at(fields, i))
+        except ValueError:
+            return 0
+    return 0
 
 
 def _parse_int_field(s: str) -> int:

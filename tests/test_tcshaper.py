@@ -253,3 +253,43 @@ async def test_commands_are_argv_never_shell_strings():
         assert argv[0] == "tc"
         # 任何一个参数里都不该混进 shell 元字符（值全是整数/网卡名）
         assert not any(ch in a for a in argv for ch in ";|&$`\n")
+
+
+# ---------------------------------------------------------------------------
+# 类统计（监控用）
+#
+# 这是限速迁到 tc 之后白捡的能力：tc 的每个类正好对应一个 frontend，
+# 于是"按监听端口统计数据包与丢包"第一次成立（HAProxy 完全不统计包，
+# 网卡计数又无法按 frontend 拆）。
+# ---------------------------------------------------------------------------
+
+# `tc -s -j class show` 的真实输出形态（字段名取自本机 iproute2 6.1 实测）。
+CLASS_STATS_JSON = """[
+ {"class":"htb","handle":"1:1","bytes":10,"packets":1,"drops":0,
+  "overlimits":0,"backlog":0,"qlen":0},
+ {"class":"htb","handle":"1:8080","bytes":123456,"packets":100,"drops":7,
+  "overlimits":42,"backlog":2048,"qlen":3}
+]"""
+
+
+def test_parse_class_stats_maps_port_to_counters():
+    st = T.parse_class_stats(CLASS_STATS_JSON)
+    assert set(st) == {8080}, "兜底类 1:1 不是任何 frontend，必须跳过"
+    s = st[8080]
+    assert (s.packets, s.drops, s.overlimits) == (100, 7, 42)
+    assert (s.bytes, s.backlog, s.qlen) == (123456, 2048, 3)
+
+
+def test_parse_class_stats_tolerates_empty_and_garbage():
+    """网卡上还没建树时输出为空——那是首次运行的正常状态，不该抛。"""
+    assert T.parse_class_stats("") == {}
+    assert T.parse_class_stats("   ") == {}
+    with pytest.raises(T.TcError):
+        T.parse_class_stats("not json at all")
+
+
+async def test_class_stats_failure_returns_empty_not_raise():
+    """统计是监控用的副链路：读不到就当没有，绝不能把异常抛给采集器——
+    限速判定不该被"多画几条曲线"拖累。"""
+    sh, _ = shaper(fail_on=["class show"])
+    assert await sh.class_stats() == {}

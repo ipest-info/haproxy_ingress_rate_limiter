@@ -8,6 +8,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import pytest
 
 from rl_limiter import model
@@ -15,11 +18,17 @@ from rl_limiter.collector import DEGRADED_FAILURE_THRESHOLD, Collector
 
 
 class FakeClient:
-    """假 RuntimeClient：按脚本逐次返回 stats 或抛异常。"""
+    """假 RuntimeClient：按脚本逐次返回 stats 或抛异常。
 
-    def __init__(self, script):
+    show_info 走独立的 info_script（默认每拍返回一份固定的 InstanceStat）
+    ——这正是被测的分链路容错：show info 挂掉不该影响 frontend 采样。
+    """
+
+    def __init__(self, script, info_script=None):
         self._script = list(script)
+        self._info_script = list(info_script or [])
         self.calls = 0
+        self.info_calls = 0
 
     async def show_stat(self):
         self.calls += 1
@@ -28,13 +37,21 @@ class FakeClient:
             raise item
         return item
 
+    async def show_info(self):
+        self.info_calls += 1
+        item = self._info_script.pop(0) if self._info_script else \
+            model.InstanceStat(curr_conns=0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
-def st(name, bytes_out, conn=0):
-    return model.FrontendStat(name=name, bytes_out=bytes_out, conn_cur=conn)
+
+def st(name, bytes_out, conn=0, **kw):
+    return model.FrontendStat(name=name, bytes_out=bytes_out, conn_cur=conn, **kw)
 
 
-def collector(script, managed=("fe_a",)):
-    c = Collector(FakeClient(script))
+def collector(script, managed=("fe_a",), info_script=None, nic=""):
+    c = Collector(FakeClient(script, info_script), nic=nic)
     c.set_managed(set(managed))
     return c
 
@@ -141,3 +158,272 @@ async def test_output_is_sorted_and_stable():
     c = collector([[st("fe_b", 0), st("fe_a", 0)]], managed=("fe_a", "fe_b"))
     usages = await c.tick(0.0)
     assert [u.name for u in usages] == ["fe_a", "fe_b"]
+
+
+# ---------------------------------------------------------------------------
+# 监控视图字段（docs/05-监控视图.md）
+#
+# 这一组的主张：新加的监控字段与限速链路**共享时序规则**（首拍建基线、
+# 回绕沿用、fail-static、缺席归零），但**不共享失败**——show info 或网卡
+# 采不到时，限速那条链路必须毫发无损。
+# ---------------------------------------------------------------------------
+
+async def test_frontend_monitoring_fields_are_differences():
+    """上行字节、新建连接数、拒绝数都是相邻两拍的差分，与下行同一时序。"""
+    c = collector([
+        [st("fe_a", 0, bytes_in=0, conn_tot=0, denied_conn=0)],
+        [st("fe_a", 100, bytes_in=500, conn_tot=12, denied_conn=1, denied_req=2)],
+    ])
+    await c.tick(0.0)
+    (u,) = await c.tick(1.0)
+    assert u.rate_in_bps == 500
+    assert u.conn_new_ps == 12
+    assert u.conn_denied_ps == 3          # dcon + dreq
+
+
+async def test_frontend_monitoring_fields_ready_on_second_tick():
+    """首拍建基线的那一拍也把监控字段的基线一起建了——否则监控曲线会
+    比限速曲线晚一秒起步，看起来像是数据对不齐。"""
+    c = collector([
+        [st("fe_a", 0, conn_tot=100)],
+        [st("fe_a", 10, conn_tot=105)],
+    ])
+    await c.tick(0.0)
+    (u,) = await c.tick(1.0)
+    assert u.conn_new_ps == 5, "第二拍就该有速率，而不是又丢一拍"
+
+
+async def test_active_idle_conns_passed_through():
+    """活跃/空闲是瞬时值，不差分；http 按在途流拆，tcp 全算活跃。"""
+    c = collector(
+        [[st("fe_a", 0, conn=8, mode="http", open_conns=8, open_streams=3),
+          st("fe_b", 0, conn=5, mode="tcp")]],
+        managed=("fe_a", "fe_b"))
+    a, b = await c.tick(0.0)
+    assert (a.active_conns, a.idle_conns) == (3, 5)
+    assert (b.active_conns, b.idle_conns) == (5, 0)
+
+
+async def test_monitoring_fields_are_fail_static():
+    """采样失败时监控字段与速率一样沿用上一拍——骤降为零会在图上画出
+    一个并不存在的低谷。"""
+    c = collector([
+        [st("fe_a", 0, conn_tot=0)],
+        [st("fe_a", 10, conn_tot=7)],
+        ConnectionError("socket 没了"),
+    ])
+    await c.tick(0.0)
+    await c.tick(1.0)
+    (u,) = await c.tick(2.0)
+    assert u.conn_new_ps == 7
+
+
+async def test_monitoring_fields_zero_when_frontend_absent():
+    """受管却不在 stats 里 = 确实没有，监控字段必须归零（区别于采不到）。"""
+    c = collector([
+        [st("fe_a", 0, conn_tot=0)],
+        [st("fe_a", 10, conn_tot=7)],
+        [],
+    ])
+    await c.tick(0.0)
+    await c.tick(1.0)
+    (u,) = await c.tick(2.0)
+    assert u.conn_new_ps == 0.0 and u.active_conns == 0
+
+
+# ---- 实例视图 ----
+
+async def test_instance_view_aggregates_all_frontends():
+    """实例带宽/拒绝数汇总**全部** frontend，包括不受管的那些——
+    "整个实例的视图"就该是整个实例。"""
+    c = collector([
+        [st("fe_a", 0, bytes_in=0, denied_conn=0),
+         st("unmanaged", 0, bytes_in=0, denied_req=0)],
+        [st("fe_a", 100, bytes_in=10, denied_conn=1),
+         st("unmanaged", 900, bytes_in=90, denied_req=4)],
+    ], managed=("fe_a",))
+    await c.tick(0.0)
+    await c.tick(1.0)
+    inst = c.instance
+    assert inst.rate_out_bps == 1000    # 100 + 900
+    assert inst.rate_in_bps == 100      # 10 + 90
+    assert inst.conn_denied_ps == 5     # 1 + 4
+
+
+async def test_instance_concurrent_conns_come_from_show_info():
+    """并发连接数只能取 show info：show stat 的行按 proxy 拆，加总会把
+    同一条连接重复计。"""
+    c = collector(
+        [[st("fe_a", 0)], [st("fe_a", 0)]],
+        info_script=[
+            model.InstanceStat(curr_conns=17, max_conn=400, idle_pct=90),
+            model.InstanceStat(curr_conns=19, max_conn=400, idle_pct=88),
+        ])
+    await c.tick(0.0)
+    await c.tick(1.0)
+    assert c.instance.conn_cur == 19
+    assert c.instance.max_conn == 400
+    assert c.instance.idle_pct == 88
+
+
+async def test_instance_new_conns_exclude_our_own_runtime_api_traffic():
+    """实例的"每秒新建连接数"必须取 Σ frontend conn_tot，而不是 show info
+    的 CumConns。
+
+    CumConns 是进程范围的，把采集器自己每秒两条 runtime API 连接
+    （show stat + show info）也算了进去——用它做差分，空载时曲线会稳稳
+    停在 2/秒。实测佐证：同一时刻 CumConns=256，各 frontend 的 conn_tot
+    之和只有 28，差额全是采集器自己。
+
+    这里用"CumConns 每拍 +5、frontend conn_tot 每拍 +3"的脚本把两个来源
+    分开：结果必须是 3。
+    """
+    c = collector(
+        [[st("fe_a", 0, conn_tot=0)], [st("fe_a", 0, conn_tot=3)]],
+        info_script=[model.InstanceStat(curr_conns=1, cum_conns=100),
+                     model.InstanceStat(curr_conns=1, cum_conns=105)])
+    await c.tick(0.0)
+    await c.tick(1.0)
+    assert c.instance.conn_new_ps == 3
+
+
+async def test_runtime_commands_are_issued_concurrently():
+    """两条 runtime 命令必须并发发，不能串行。
+
+    runtime socket 一次连接只服务一条命令，串行的唯一效果是把最坏延迟
+    翻倍：单条超时 0.5s，串行下最坏 1.0s，正好吃满一个 1 秒的 tick。主
+    循环发现本拍超过一个周期就重新对齐（loop.run），实际节拍变成 2 秒，
+    而差分代码按"1 拍 = 1 秒"算速率——**所有速率读数会翻倍**，连超限告警
+    的判据一起失真。
+
+    这里让两条命令各自阻塞在一个事件上：串行实现会卡死在第一条上（第二
+    条永远等不到放行），只有并发实现才能两条同时在途。
+    """
+    entered = asyncio.Event()
+    both_in_flight = asyncio.Event()
+    release = asyncio.Event()
+    in_flight = 0
+
+    class BlockingClient:
+        async def _both(self, result):
+            nonlocal in_flight
+            in_flight += 1
+            entered.set()
+            if in_flight == 2:
+                both_in_flight.set()
+            await release.wait()
+            return result
+
+        async def show_stat(self):
+            return await self._both([st("fe_a", 0)])
+
+        async def show_info(self):
+            return await self._both(model.InstanceStat(curr_conns=1))
+
+    c = Collector(BlockingClient())
+    c.set_managed({"fe_a"})
+    task = asyncio.create_task(c.tick(0.0))
+    await asyncio.wait_for(both_in_flight.wait(), timeout=1.0)
+    release.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+async def test_cancellation_is_not_swallowed():
+    """停机靠取消任务完成。gather(return_exceptions=True) 会把子任务自己
+    抛的 CancelledError 当结果收走，吞掉它服务就停不下来了。"""
+    class CancellingClient:
+        async def show_stat(self):
+            raise asyncio.CancelledError()
+
+        async def show_info(self):
+            return model.InstanceStat(curr_conns=1)
+
+    c = Collector(CancellingClient())
+    c.set_managed({"fe_a"})
+    with pytest.raises(asyncio.CancelledError):
+        await c.tick(0.0)
+
+
+async def test_show_info_failure_does_not_break_frontend_sampling():
+    """副链路失败必须被隔离：show info 每拍都抛，frontend 的速率照常产出。"""
+    c = collector(
+        [[st("fe_a", 0)], [st("fe_a", 2500)]],
+        info_script=[ConnectionError("info 挂了")] * 2)
+    await c.tick(0.0)
+    (u,) = await c.tick(1.0)
+    assert u.rate_bps == 2500, "show info 挂掉不该动到限速链路"
+    assert u.degraded is False
+
+
+async def test_show_info_failure_holds_previous_instance_values():
+    c = collector(
+        [[st("fe_a", 0)], [st("fe_a", 0)]],
+        info_script=[model.InstanceStat(curr_conns=17),
+                     ConnectionError("info 挂了")])
+    await c.tick(0.0)
+    await c.tick(1.0)
+    assert c.instance.conn_cur == 17, "采不到时沿用上一拍，而不是掉到 0"
+
+
+async def test_stat_failure_holds_instance_bandwidth_but_still_reads_nic(
+        monkeypatch):
+    """show stat 挂了：HAProxy 口径的实例带宽沿用旧值，网卡照常采——
+    "HAProxy 挂了但机器还在收包"正是要靠这个看出来的。"""
+    pkts = iter([100, 250, 400])
+
+    def fake_read(iface, *_a, **_kw):
+        return model.NicStat(iface=iface, rx_packets=next(pkts))
+
+    monkeypatch.setattr("rl_limiter.collector.netdev.read_nic_stat", fake_read)
+    c = collector([
+        [st("fe_a", 0, bytes_in=0)],
+        [st("fe_a", 800, bytes_in=200)],
+        ConnectionError("stat 挂了"),
+    ], nic="eth0")
+    await c.tick(0.0)
+    await c.tick(1.0)
+    assert c.instance.rate_out_bps == 800
+    await c.tick(2.0)
+    assert c.instance.rate_out_bps == 800, "HAProxy 口径沿用上一拍"
+    assert c.instance.pkts_in_ps == 150, "网卡与 HAProxy 无关，照常采"
+
+
+async def test_nic_counters_are_differenced(monkeypatch):
+    script = [
+        model.NicStat(iface="eth0", rx_bytes=0, rx_packets=0, rx_dropped=0,
+                      tx_bytes=0, tx_packets=0, tx_dropped=0),
+        model.NicStat(iface="eth0", rx_bytes=5000, rx_packets=40, rx_dropped=2,
+                      tx_bytes=9000, tx_packets=60, tx_dropped=1),
+    ]
+    it = iter(script)
+    monkeypatch.setattr("rl_limiter.collector.netdev.read_nic_stat",
+                        lambda *_a, **_kw: next(it))
+    c = collector([[st("fe_a", 0)], [st("fe_a", 0)]], nic="eth0")
+    await c.tick(0.0)
+    await c.tick(1.0)
+    inst = c.instance
+    assert (inst.pkts_in_ps, inst.pkts_out_ps) == (40, 60)
+    assert (inst.drop_in_ps, inst.drop_out_ps) == (2, 1)
+    assert (inst.nic_rate_in_bps, inst.nic_rate_out_bps) == (5000, 9000)
+    assert inst.nic == "eth0"
+
+
+async def test_nic_disabled_leaves_packet_curves_empty():
+    """未配置网卡（探测失败或显式禁用）：包统计缺席，其余照常。"""
+    c = collector([[st("fe_a", 0)], [st("fe_a", 500)]], nic="")
+    await c.tick(0.0)
+    (u,) = await c.tick(1.0)
+    assert u.rate_bps == 500
+    assert c.instance.nic == "" and c.instance.pkts_in_ps == 0.0
+
+
+async def test_nic_read_failure_is_logged_once(caplog):
+    """网卡读不到每秒都会重试，不去重会把日志刷没。"""
+    c = Collector(FakeClient([[st("fe_a", 0)]] * 5),
+                  logging.getLogger("t.nic"), nic="does-not-exist-0")
+    c.set_managed({"fe_a"})
+    with caplog.at_level(logging.WARNING, logger="t.nic"):
+        for i in range(5):
+            await c.tick(float(i))
+    hits = [r for r in caplog.records if "网卡计数器读取失败" in r.getMessage()]
+    assert len(hits) == 1, f"同一错误只该记一条，实得 {len(hits)}"

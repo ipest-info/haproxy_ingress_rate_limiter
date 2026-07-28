@@ -82,6 +82,37 @@ class LogBuffer(logging.Handler):
         return [e for e in self._buf if e["seq"] > after][:LOGS_PAGE_LIMIT]
 
 
+def _instance_view(inst) -> dict[str, Any]:
+    """把 InstanceUsage 摊成快照里的 instance 段。
+
+    字段名带上口径后缀是有意的：nic_* 与 pkts_/drop_ 全部来自网卡（整机
+    范围、链路层字节、无法按 frontend 拆），rate_in/out 来自 HAProxy 的
+    frontend 汇总（应用层字节）。两者数值本就不该相等，名字上就区分开，
+    免得页面或后来的人把它们当同一回事。
+    """
+    if inst is None:
+        return {}
+    return {
+        "conn_new_ps": inst.conn_new_ps,
+        "conn_denied_ps": inst.conn_denied_ps,
+        "conn": inst.conn_cur,
+        "active_conns": inst.active_conns,
+        "idle_conns": inst.idle_conns,
+        "max_conn": inst.max_conn,
+        "rate_in_bytes_per_s": inst.rate_in_bps,
+        "rate_out_bytes_per_s": inst.rate_out_bps,
+        "nic": inst.nic,
+        "pkts_in_ps": inst.pkts_in_ps,
+        "pkts_out_ps": inst.pkts_out_ps,
+        "drop_in_ps": inst.drop_in_ps,
+        "drop_out_ps": inst.drop_out_ps,
+        "nic_rate_in_bytes_per_s": inst.nic_rate_in_bps,
+        "nic_rate_out_bytes_per_s": inst.nic_rate_out_bps,
+        "idle_pct": inst.idle_pct,
+        "degraded": inst.degraded,
+    }
+
+
 class StatusHub:
     """监控实时数据的发布枢纽（单事件循环内使用，无锁）。
 
@@ -152,11 +183,15 @@ class StatusHub:
             "degraded": bool(self._degraded_fn()),
         }
 
-    def record(self, now: float, usages) -> None:
+    def record(self, now: float, usages, instance=None) -> None:
         """监控循环 sampler 回调：把一拍的采集结果合成快照并发布。
 
-        监控单位 = frontend，快照按 frontend 名发布。over 为瞬时超限标记
-        （mean10 > 限额），持续超限的判定与告警在监控循环里。
+        快照有两级：units 按 frontend 名发布（监听端口视图），instance 是
+        整台 HAProxy（实例视图）。两级出自同一拍，页面切 tab 时曲线的时间
+        轴完全对齐。
+
+        over 为瞬时超限标记（mean10 > 限额），持续超限的判定与告警在监控
+        循环里。
         """
         units: dict[str, Any] = {}
         for u in usages:
@@ -167,6 +202,17 @@ class StatusHub:
                 "mean10_bytes_per_s": u.mean10_bps,
                 "ewma60_bytes_per_s": u.ewma60_bps,
                 "conn": u.conn_cur,
+                # --- 监控视图字段（见 docs/05-监控视图.md）---
+                "rate_in_bytes_per_s": u.rate_in_bps,
+                "conn_new_ps": u.conn_new_ps,
+                "conn_denied_ps": u.conn_denied_ps,
+                "active_conns": u.active_conns,
+                "idle_conns": u.idle_conns,
+                # 来自内核 tc 的该 frontend 队列（出方向、链路层口径）
+                "pkts_out_ps": u.pkts_out_ps,
+                "drop_out_ps": u.drop_out_ps,
+                "overlimit_ps": u.overlimit_ps,
+                "backlog_bytes": u.backlog_bytes,
                 "degraded": u.degraded,
                 "quota_bytes_per_s": quota,
                 "over": bool(quota and not u.degraded and u.mean10_bps > quota),
@@ -175,6 +221,7 @@ class StatusHub:
             "ts": now,
             "config_version": self._version_fn(),
             "units": units,
+            "instance": _instance_view(instance),
             "haproxy": self._haproxy_view(),
         }
         self._history.append(snap)

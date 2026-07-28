@@ -26,6 +26,7 @@ from . import config as configmod
 from . import dbconfig
 from . import enforcer as enforcermod
 from . import haproxy, model
+from . import netdev
 from . import tcshaper as tcmod
 from . import webconsole
 from .collector import Collector
@@ -75,6 +76,12 @@ DEFAULT_APPLY_PERIOD_S = 30.0
 # 读——它决定了以 root 权限操作哪张网卡。
 ENV_TC_IFACE = "RL_TC_IFACE"
 
+# 实例监控视图里**入向**数据包统计要采样的网卡（/proc/net/dev）。
+# 出向的包数/丢包数已由 tc 按 frontend 精确统计（见 tcshaper），不需要
+# 网卡口径；入向 tc 的出方向队列看不到，只能从这里取。
+# 不设则跟随 RL_TC_IFACE；设为 "-" 表示禁用入向包统计。
+ENV_NIC = "RL_NIC"
+
 
 def _summarize_frontends(frontends: list[model.FrontendConfig]) -> str:
     """把受管 frontend 清单压缩成单个日志字段，格式：
@@ -95,7 +102,8 @@ async def _amain(cfg, log: logging.Logger,
                  console_bind: str = DEFAULT_CONSOLE_BIND,
                  enforcer: "enforcermod.HAProxyEnforcer | None" = None,
                  apply_period_s: float = DEFAULT_APPLY_PERIOD_S,
-                 shaper: "tcmod.TcShaper | None" = None) -> None:
+                 shaper: "tcmod.TcShaper | None" = None,
+                 nic: str = "") -> None:
     """事件循环内的主体：组装组件、引导配置、并发运行监控循环与配置源。
 
     db_opts 非 None 表示配置来自 MySQL（数据库配置模式，生产权威）：
@@ -109,7 +117,17 @@ async def _amain(cfg, log: logging.Logger,
     # --- 与本机 HAProxy 的 runtime API 客户端（只读采样）。单 HAProxy
     # 模型下只有一个，同机形态走本机 unix socket。
     client = haproxy.RuntimeClient.from_node(cfg.haproxy, log)
-    col = Collector(client, log)
+
+    # tc 队列统计 → 监控。tc 按 classid（= 监听端口）索引，这里换成
+    # frontend 名再交给采集器——采集器只认名字，不必知道端口这回事。
+    tc_stats_fn = None
+    if shaper is not None:
+        async def tc_stats_fn():                     # noqa: F811
+            by_port = await shaper.class_stats()
+            return {f.name: by_port[f.bind_port]
+                    for f in ctl.frontends() if f.bind_port in by_port}
+
+    col = Collector(client, log, nic=nic, tc_stats=tc_stats_fn)
 
     # --- Web 控制台（可选）：StatusHub 是监控数据的发布枢纽。
     # version_fn 是延迟求值闭包（ctl 在下方才赋值，闭包只会在运行期被
@@ -261,7 +279,9 @@ def main() -> None:
                "配置下发：设置 RL_APPLY_HAPROXY_CFG=<本机 haproxy.cfg 路径> "
                "即启用（改配置后自动写入受管区块并 reload）。"
                "Web 控制台：设置 RL_CONSOLE_PORT 启用，RL_CONSOLE_BIND 指定"
-               "监听地址（默认 127.0.0.1——控制台无鉴权且带写接口）。")
+               "监听地址（默认 127.0.0.1——控制台无鉴权且带写接口）。"
+               "实例监控视图的数据包统计取自 /proc/net/dev，RL_NIC 指定网卡"
+               "（默认自动选默认路由的出口网卡，设 - 则禁用）。")
     parser.add_argument(
         "-c", "--config", default="/etc/rl-limiter/config.yaml",
         help="YAML 配置文件路径（默认 %(default)s；设置 RL_MYSQL_HOST 时忽略）")
@@ -342,6 +362,7 @@ def main() -> None:
     # 职责，"静悄悄地没在限"是最不该出现的状态。显式设 RL_TC_IFACE=- 才
     # 关闭；网卡探测不出来直接启动失败，而不是装作在限速。
     shaper = None
+    tc_iface = ""
     raw_iface = (os.environ.get(ENV_TC_IFACE) or "").strip()
     if raw_iface == "-":
         print("rl-limiter: 已显式关闭 tc 限速（RL_TC_IFACE=-），本实例只做"
@@ -356,6 +377,7 @@ def main() -> None:
                   f"  确实不需要限速时设 {ENV_TC_IFACE}=- 明确关闭。",
                   file=sys.stderr)
             raise SystemExit(1)
+        tc_iface = iface
         shaper = tcmod.TcShaper(iface, log)
 
     # 配置来源判定：RL_MYSQL_HOST 已设置 → 数据库配置模式；否则本地 YAML。
@@ -403,6 +425,17 @@ def main() -> None:
 
     config_source = db_opts.describe() if db_opts is not None else f"文件 {args.config}"
 
+    # 实例视图的**入向**包统计要采哪张网卡（"-" = 显式禁用）。出向的包/
+    # 丢包由 tc 按 frontend 统计，不走这里。默认跟随限速网卡——两者本来
+    # 就该是同一张（客户端流量进出的那张），分开设只会给人配错的机会。
+    raw_nic = (os.environ.get(ENV_NIC) or "").strip()
+    if raw_nic == "-":
+        nic = ""
+    elif raw_nic:
+        nic = netdev.resolve_iface(raw_nic, log)
+    else:
+        nic = tc_iface or netdev.resolve_iface("", log)
+
     # 启动即输出完整配置摘要：现场排障时第一条要看的日志，可直接核对
     # 受控节点清单、限额基准与配置来源。
     log.info(
@@ -421,7 +454,7 @@ def main() -> None:
                            console_port=console_port, logbuf=logbuf,
                            instance=instance, console_bind=console_bind,
                            enforcer=enforcer, apply_period_s=apply_period_s,
-                           shaper=shaper))
+                           shaper=shaper, nic=nic))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
     log.info("rl-limiter 服务已停止")

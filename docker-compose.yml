@@ -20,7 +20,7 @@
 #                          └──> web:9000（随机大小响应）
 #   node{1,2,3} 内的 rl-limiter ──轮询──> mysql（实例/frontend/后端服务器）
 #   node{1,2,3} 内的 rl-limiter ──show stat──> 本机 unix socket（不出容器）
-# 限速由各台 HAProxy 的 shared bwlim（各 40 Mbps）在本机执行。每个控制台
+# 限速由各台机器的内核 tc（各 40 Mbps）在本机执行。每个控制台
 # 只管本机那台 HAProxy：可在页面上增删改监听端口、限额与后端服务器，
 # 保存即写库、随后自动写进 cfg 并 reload。
 
@@ -208,7 +208,7 @@ services:
   loadgen:
     build: .
     # 三个入口各是一台独立节点：worker 轮转绑定入口，每台节点各自被
-    # 本机 shared bwlim 压在自己的限额内、互不影响。
+    # 本机 tc 压在自己的限额内、互不影响。
     command: >-
       python3 tools/loadgen.py
       --target http://node1:8080/,http://node2:8080/,http://node3:8080/
@@ -218,7 +218,7 @@ services:
       # 运行中用控制端口在线调节（见文件头速查）。
       LOADGEN_CONCURRENCY: ${LOADGEN_CONCURRENCY:-12}
       # 长连接大文件下载场景：每个入口 N 条长连接循环下载 /big（默认
-      # 每入口 1 条）。验证 shared bwlim 对存量长连接的持续限速与限额
+      # 每入口 1 条）。验证 tc 对存量长连接的持续限速与限额
       # 调整（reload + hard-stop）对在途下载的影响。
       LOADGEN_BIG_PER_TARGET: ${LOADGEN_BIG_PER_TARGET:-1}
     ports:

@@ -4,7 +4,7 @@
 # 角色：docker compose 演示环境里的"客户端群"替身。维持 N 个并发 worker
 # 持续请求目标 URL（经 HAProxy 入口，可给多个、逗号分隔，每请求随机挑一），
 # 把响应体完整读完并累计字节数——制造出可控强度的下行带宽压力，供观察
-# 各入口 shared bwlim 聚合限速的效果（总速率贴限额、连接间动态分享）。
+# 各入口聚合限速的效果（总速率贴限额、连接间动态分享）。限速在内核 tc 上。
 #
 # 并发数可两种方式调节：
 #   - 启动参数 --concurrency / 环境变量 LOADGEN_CONCURRENCY：初始并发；
@@ -14,7 +14,7 @@
 #       curl -X PUT http://localhost:8081/concurrency -d '32'      # 裸数字也行
 #     并发调到 0 即暂停打流（worker 全部收回，随时可再调起）。
 #
-# 长连接大文件下载场景（验证 shared bwlim 对长连接的持续限速）：
+# 长连接大文件下载场景（验证限速对长连接的持续作用）：
 #   每目标 N 个"大文件 worker"——同一条 TCP 长连接上循环请求 /big
 #   （单个响应数百 MB，限速下要下载数分钟），连接**永不主动轮转**。
 #   限额调整（reload + hard-stop-after）会把在途下载掐断：worker 记一次
@@ -59,7 +59,7 @@ DEFAULT_REPORT_S = 2.0
 # 每条 TCP 连接复用的请求数，之后由**客户端侧**优雅关闭并重建。
 # 两头兼顾：TCP L4 整形的每连接限速在建连时定格，周期轮转连接让
 # 限额调整后新连接尽快进入新额度；同时绝不能用 Connection: close
-# 让服务端先关（server 提前 FIN 会与 HAProxy bwlim 过滤器尚未放完的
+# 让服务端先关（server 提前 FIN 会与整形器尚未放完的
 # 整形数据竞争，导致 client 侧响应截断——实测短连接全部报
 # ContentLengthError，keep-alive 由客户端关则完全正常）。
 REQUESTS_PER_CONNECTION = 8
@@ -260,7 +260,7 @@ class LoadGen:
 
         与普通 worker 的关键区别：
         - **连接永不主动轮转**——一条连接可以挂着下载几十分钟，专门检验
-          shared bwlim 对存量长连接的持续限速；
+          限速对存量长连接的持续作用；
         - 单个响应就是一次长下载（默认 512 MiB，40 Mbps 限速下约 100s），
           分块读、逐块计入吞吐；
         - 下载半途被断开（HAProxy reload 的 hard-stop、后端重启）时记一次

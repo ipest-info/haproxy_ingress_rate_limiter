@@ -66,6 +66,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -92,6 +93,28 @@ MAX_BURST_BYTES = 8 * 1024 * 1024
 # 占满导致同 frontend 的其它连接饿死。fq_codel 还能压低排队时延。
 # 老内核可能没有这个 qdisc，因此它的失败**不致命**（见 _rebuild_cmds）。
 LEAF_QDISC = "fq_codel"
+
+
+@dataclass(slots=True)
+class TcClassStat:
+    """单个 HTB 类的统计（= 单个 frontend 的出方向实况）。
+
+    **这是限速迁到 tc 之后白捡的监控能力**：tc 的每个 class 天然带
+    发送字节/包数、丢包数、超限次数，而每个 class 正好对应一个
+    frontend——于是"按监听端口统计数据包/丢包"这件事第一次成立了
+    （HAProxy 自己完全不统计数据包，网卡计数又无法按 frontend 拆）。
+
+    口径：链路层字节（含以太网/IP/TCP 头），只有**出方向**（tc 挂在
+    出向队列上，入向看不到）。
+    """
+
+    port: int              # = classid 次要号 = frontend 的监听端口
+    bytes: int = 0         # 已发送字节（链路层口径）
+    packets: int = 0       # 已发送包数
+    drops: int = 0         # 被丢弃的包数——限速丢包就统计在这里
+    overlimits: int = 0    # 触发限速被延迟的次数（限额是否吃紧的直接信号）
+    backlog: int = 0       # 当前排队字节数
+    qlen: int = 0          # 当前排队包数
 
 
 class TcError(RuntimeError):
@@ -305,6 +328,22 @@ class TcShaper:
             ["tc", "filter", "show", "dev", self.iface], fatal=False))
         return classes, minors
 
+    async def class_stats(self) -> dict[int, TcClassStat]:
+        """读回各 HTB 类的统计，按监听端口索引（监控用，只读）。
+
+        用 `tc -s -j` 取 JSON 而不是解析人类可读文本：文本格式在不同
+        iproute2 版本间会变（换行、单位、字段顺序），JSON 的键名稳定得多。
+        取不到就返回空字典——监控缺一拍不该影响限速。
+        """
+        try:
+            out = await self._tc(
+                ["tc", "-s", "-j", "class", "show", "dev", self.iface],
+                fatal=False)
+            return parse_class_stats(out)
+        except Exception as e:
+            self._log.debug("读取 tc 类统计失败，本拍跳过 err=%s", e)
+            return {}
+
     async def reconcile(self, frontends: list[model.FrontendConfig]) -> TcResult:
         """把网卡上的限速状态收敛到配置描述的样子。
 
@@ -369,6 +408,41 @@ class TcShaper:
         """撤掉本模块建立的整棵树（停机/切回 bwlim 方案时用）。"""
         await self._tc(["tc", "qdisc", "del", "dev", self.iface, "root"],
                        fatal=False)
+
+
+def parse_class_stats(out: str) -> dict[int, TcClassStat]:
+    """解析 `tc -s -j class show` 的 JSON，返回 端口 → TcClassStat。
+
+    只保留 HTB 叶子类里 classid 次要号能对上监听端口的那些；兜底类
+    （次要号 1）不是任何 frontend，跳过。
+    """
+    if not out.strip():
+        return {}
+    try:
+        rows = json.loads(out)
+    except ValueError as e:
+        raise TcError(f"tc 类统计不是合法 JSON: {e}") from None
+    res: dict[int, TcClassStat] = {}
+    for r in rows if isinstance(rows, list) else []:
+        handle = str(r.get("handle") or "")
+        if ":" not in handle:
+            continue
+        try:
+            minor = int(handle.split(":", 1)[1])
+        except ValueError:
+            continue
+        if minor == DEFAULT_CLASS_MINOR:
+            continue
+        res[minor] = TcClassStat(
+            port=minor,
+            bytes=int(r.get("bytes") or 0),
+            packets=int(r.get("packets") or 0),
+            drops=int(r.get("drops") or 0),
+            overlimits=int(r.get("overlimits") or 0),
+            backlog=int(r.get("backlog") or 0),
+            qlen=int(r.get("qlen") or 0),
+        )
+    return res
 
 
 async def _run_argv(argv: list[str]) -> tuple[int, str, str]:
