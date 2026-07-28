@@ -293,3 +293,38 @@ async def test_class_stats_failure_returns_empty_not_raise():
     限速判定不该被"多画几条曲线"拖累。"""
     sh, _ = shaper(fail_on=["class show"])
     assert await sh.class_stats() == {}
+
+
+# ---------------------------------------------------------------------------
+# 临时端口冲突（单网卡部署的一个真实隐患）
+# ---------------------------------------------------------------------------
+
+def test_ephemeral_conflict_detected():
+    """分类规则只匹配源端口。单网卡时 HAProxy 连后端的包也从同一张网卡出去，
+    其源端口是内核分配的临时端口——一旦撞上某个 frontend 的监听端口，那条
+    连接的出向流量就会被误判进该 frontend 的限速类。这是**随机偶发**的，
+    必须在启动时就喊出来而不是等人去排查。"""
+    rng = (32768, 60999)
+    assert T.ephemeral_conflicts([fe("ok", port=8080)], rng) == []
+    assert T.ephemeral_conflicts([fe("ok", port=443)], rng) == []
+    assert T.ephemeral_conflicts([fe("bad", port=40000)], rng) == ["bad"]
+    # 边界包含在内
+    assert T.ephemeral_conflicts([fe("lo", port=32768)], rng) == ["lo"]
+    assert T.ephemeral_conflicts([fe("hi", port=60999)], rng) == ["hi"]
+
+
+def test_ephemeral_range_falls_back_when_unreadable():
+    """读不到 procfs（非 Linux、容器裁剪）时用常见默认值，不能抛。"""
+    assert T.ephemeral_range("/nonexistent/path") == (32768, 60999)
+
+
+async def test_ephemeral_conflict_warns_but_does_not_block(caplog):
+    """只告警不拒绝：两网卡部署下监听端口落在临时范围内是完全安全的，
+    因为后端流量根本不经过被限速的那张网卡——不该一刀切拦住。"""
+    import logging
+    sh, _ = shaper()
+    sh._log = logging.getLogger("t.eph")
+    with caplog.at_level(logging.WARNING, logger="t.eph"):
+        res = await sh.reconcile([fe("bad", port=40000)])
+    assert res.ok, "只告警，不阻断"
+    assert any("临时端口范围" in r.getMessage() for r in caplog.records)

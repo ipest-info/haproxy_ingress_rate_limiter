@@ -94,6 +94,9 @@ MAX_BURST_BYTES = 8 * 1024 * 1024
 # 老内核可能没有这个 qdisc，因此它的失败**不致命**（见 _rebuild_cmds）。
 LEAF_QDISC = "fq_codel"
 
+# 本机临时端口范围（内核给出向连接分配源端口的区间）。
+PROC_EPHEMERAL_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
+
 
 @dataclass(slots=True)
 class TcClassStat:
@@ -133,6 +136,38 @@ class TcResult:
     # "rate-change"（只改速率，不动结构、不打断流量）。
     action: str = ""
     error: str = ""
+
+
+def ephemeral_range(path: str = PROC_EPHEMERAL_RANGE) -> tuple[int, int]:
+    """读本机的临时端口范围。读不到就返回 Linux 的常见默认值。"""
+    try:
+        with open(path, encoding="ascii") as f:
+            lo, hi = f.read().split()[:2]
+        return int(lo), int(hi)
+    except (OSError, ValueError):
+        return 32768, 60999
+
+
+def ephemeral_conflicts(frontends: list[model.FrontendConfig],
+                        rng: tuple[int, int] | None = None) -> list[str]:
+    """挑出**监听端口落在临时端口范围内**的 frontend 名。
+
+    为什么这是个真问题（**单网卡部署时**）：本模块的分类规则只匹配源端口
+    ——`match ip sport <监听端口>`。HAProxy 发给客户端的包源端口确实是监听
+    端口，但**HAProxy 连后端的包，源端口是内核分配的临时端口**，而单网卡
+    时它们从同一张网卡出去。一旦某次连后端抽到的临时端口正好等于某个
+    frontend 的监听端口，那条连接的出向流量就会被误判进该 frontend 的限速
+    类，吃掉本该给客户端的配额——而且是**随机偶发**的，极难排查。
+
+    两条出路（见 docs/06 的"单网卡还是两网卡"）：
+      1. 把监听端口挪到临时端口范围之外（<32768，也就是 80/443/8080 这类
+         正常的入口端口）——推荐，零成本；
+      2. 用两张网卡，只在客户端侧那张上限速，后端流量根本不经过限速树。
+
+    返回空列表表示没有这个风险。
+    """
+    lo, hi = rng if rng is not None else ephemeral_range()
+    return [f.name for f in frontends if lo <= f.bind_port <= hi]
 
 
 def burst_bytes(rate_bytes_per_s: float) -> int:
@@ -307,6 +342,8 @@ class TcShaper:
                  runner=None):
         self.iface = iface
         self._log = log if log is not None else logging.getLogger("rl_limiter.tc")
+        # 临时端口冲突告警的去重键（同一组 frontend 只说一次）。
+        self._logged_ephemeral: str | None = None
         # 注入点：测试用假 runner 验证命令序列，生产用真 tc。
         self._run = runner if runner is not None else _run_argv
 
@@ -327,6 +364,25 @@ class TcShaper:
         minors = parse_filter_minors(await self._tc(
             ["tc", "filter", "show", "dev", self.iface], fatal=False))
         return classes, minors
+
+    def _warn_ephemeral(self, frontends: list[model.FrontendConfig]) -> None:
+        """监听端口撞进临时端口范围时告警（同一组只说一次）。"""
+        bad = ephemeral_conflicts(frontends)
+        key = ",".join(sorted(bad))
+        if key == self._logged_ephemeral:
+            return
+        self._logged_ephemeral = key
+        if not bad:
+            return
+        lo, hi = ephemeral_range()
+        self._log.warning(
+            "以下 frontend 的监听端口落在本机临时端口范围内，**单网卡部署时"
+            "限速可能偶发失准**：HAProxy 连后端用的临时源端口可能撞上监听"
+            "端口，那条连接的出向流量会被误判进该 frontend 的限速类。"
+            "两条出路：把监听端口挪到 %d 以下，或用两张网卡、只在客户端侧"
+            "那张上限速（见 docs/06-tc限速方案.md） frontends=%s "
+            "ephemeral_range=%d-%d",
+            lo, key, lo, hi)
 
     async def class_stats(self) -> dict[int, TcClassStat]:
         """读回各 HTB 类的统计，按监听端口索引（监控用，只读）。
@@ -359,6 +415,7 @@ class TcShaper:
             return TcResult(ok=False, changed=False, error=str(e))
 
         names = sorted(f.name for f in frontends)
+        self._warn_ephemeral(frontends)
         want = desired_rates(frontends)
         try:
             classes, filtered = await self.observe()
