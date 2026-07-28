@@ -271,6 +271,7 @@ def build_app(
     db_opts: dbconfig.MySQLOptions | None,
     log: logging.Logger,
     instance: str = "haproxy",
+    store=None,
 ) -> web.Application:
     """组装控制台的 aiohttp 应用（静态页 + 只读 API + 配置管理 API）。
 
@@ -293,6 +294,34 @@ def build_app(
 
     async def handle_history(_request: web.Request) -> web.Response:
         return web.json_response({"snapshots": hub.history()})
+
+    async def handle_metrics(request: web.Request) -> web.Response:
+        """历史回查：/api/metrics?scope=&from=&to=[&bucket_s=]
+
+        与 /api/history 的分工：那个读**内存**里最近 10 分钟的 1 秒粒度，
+        这个读**库**里的分级聚合（1 分钟 × 7 天 / 5 分钟 × 90 天）。
+        不给 bucket_s 时按区间自动选层，见 metricstore.pick_tier。
+        """
+        if store is None:
+            return _json_error(
+                409, "未启用监控数据落库（需要数据库配置模式，见 "
+                     "docs/07-监控数据回查.md）；实时曲线请用 /api/history")
+        q = request.query
+        try:
+            now = int(time.time())
+            start = int(q.get("from") or (now - 3600))
+            end = int(q.get("to") or now)
+            bucket = int(q["bucket_s"]) if q.get("bucket_s") else None
+        except ValueError:
+            return _json_error(400, "from/to/bucket_s 必须是整数（unix 秒）")
+        if end <= start:
+            return _json_error(400, "to 必须大于 from")
+        try:
+            return web.json_response(
+                await store.query(q.get("scope", ""), start, end, bucket))
+        except Exception as e:
+            log.warning("监控数据回查失败 err=%s", e)
+            return _json_error(502, f"查询失败：{e}")
 
     async def handle_logs(request: web.Request) -> web.Response:
         try:
@@ -398,6 +427,9 @@ def build_app(
     app.router.add_get("/api/overview", handle_overview)
     app.router.add_get("/api/history", handle_history)
     app.router.add_get("/api/logs", handle_logs)
+    # 历史回查（落库的分级聚合）。/api/history 是内存里的实时曲线，两者
+    # 路径与语义都分开，免得有人拿 history 去查昨天。
+    app.router.add_get("/api/metrics", handle_metrics)
     app.router.add_get("/api/stream", handle_stream)
     # 受管 frontend 的增删改：监听端口、模式、限额、超时、后端服务器。
     # PUT 用同一个 upsert 语义（存在即整体更新，不存在即新建），界面上
@@ -416,6 +448,7 @@ async def run_console(
     log: logging.Logger,
     bind: str = "127.0.0.1",
     instance: str = "haproxy",
+    store=None,
 ) -> None:
     """常驻任务：启动控制台 HTTP 服务并挂起到被取消，取消时干净回收。
 
@@ -424,7 +457,7 @@ async def run_console(
     warning，让"我以为它只在本机"的误配在日志里留痕。
     """
     runner = web.AppRunner(
-        build_app(hub, logbuf, db_opts, log, instance), access_log=None)
+        build_app(hub, logbuf, db_opts, log, instance, store), access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, bind, port)
     await site.start()

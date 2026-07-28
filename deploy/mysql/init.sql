@@ -12,7 +12,10 @@
 -- （或 Web 控制台上）改完即真正生效，不存在"库改了、cfg 忘了改"的漂移。
 --
 -- 单位约定：quota_bps 一律为 bit/s（运维口径，40000000 = 40 Mbps）；
--- 写进 haproxy.cfg 的 shared bwlim limit 是它 ÷ 8 的 bytes/s。
+-- 下发给内核 tc 的类速率同样是 bit/s（原样，不换算）。
+--
+-- 本库除配置外还存**监控数据**（metric_rollup 表，分级保留支持 90 天
+-- 回查）——见该表上方的说明。
 --
 -- 从 v0.3（多节点 + 环境分组）升级：模型不兼容，envs / env_targets /
 -- haproxy_nodes 三张表已被下面的新表取代。旧版本见 tag v0.3.0-colocated。
@@ -107,6 +110,62 @@ CREATE TABLE IF NOT EXISTS haproxy_servers (
     CONSTRAINT fk_srv_frontend FOREIGN KEY (instance, frontend)
         REFERENCES haproxy_frontends (instance, name) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------------------------------------------------------------------
+-- 监控数据（分级保留，支持 90 天回查）
+-- ---------------------------------------------------------------------------
+--
+-- 为什么不是每秒一行：90 天 = 7,776,000 秒，10 个 frontend 按 1 秒粒度就是
+-- 7778 万行 / 约 14.5 GB，写不动也查不动。因此按**分级保留**存：
+--
+--   bucket_s=60   保留 7 天    细查最近一周（"昨天下午三点前后怎么了"）
+--   bucket_s=300  保留 90 天   回查 + 计费（约 49 MB）
+--
+-- 5 分钟这一层刻意对齐**带宽 95 计费**的采样粒度：回查与对账用同一份
+-- 数据，不会出现"运维看的数和账单上的数对不上"。
+--
+-- 三类量三种聚合（详见 rl_limiter/metricstore.py 的模块头）：
+--   速率类   存 avg + max —— 只存 avg 会把尖峰抹平，峰值就永远查不出来
+--   计数类   存 sum       —— 问题形如"那天一共丢了多少包"
+--   瞬时类   存 avg + max
+--
+-- quota 记的是**当时的限额**：限额会被人改，事后从配置里查到的是现在的
+-- 值而不是当时的值，没有它就读不出"那条曲线有没有打满"。
+--
+-- samples/degraded 记该桶实际采到几拍、其中几拍是失联时沿用的陈旧值。
+-- 没有这两个数，"半空的桶"和"真的很闲的桶"在图上长得一模一样。
+CREATE TABLE IF NOT EXISTS metric_rollup (
+    instance        VARCHAR(64)       NOT NULL,   -- 哪台 HAProxy
+    scope           VARCHAR(64)       NOT NULL,   -- frontend 名；'' = 实例级
+    bucket_s        SMALLINT UNSIGNED NOT NULL,   -- 粒度：60 或 300
+    ts              BIGINT UNSIGNED   NOT NULL,   -- 桶起点（unix 秒，已按绝对边界对齐）
+    samples         SMALLINT UNSIGNED NOT NULL,   -- 该桶实际采到几拍
+    degraded        SMALLINT UNSIGNED NOT NULL,   -- 其中几拍是采样失联沿用的陈旧值
+    -- 带宽（bytes/s；应用层口径，与 HAProxy bytes_out 同源）
+    out_avg         BIGINT UNSIGNED   NOT NULL DEFAULT 0,
+    out_max         BIGINT UNSIGNED   NOT NULL DEFAULT 0,
+    in_avg          BIGINT UNSIGNED   NOT NULL DEFAULT 0,
+    in_max          BIGINT UNSIGNED   NOT NULL DEFAULT 0,
+    -- 连接
+    conn_avg        INT UNSIGNED      NOT NULL DEFAULT 0,
+    conn_max        INT UNSIGNED      NOT NULL DEFAULT 0,
+    active_avg      INT UNSIGNED      NOT NULL DEFAULT 0,
+    idle_avg        INT UNSIGNED      NOT NULL DEFAULT 0,
+    conn_new_sum    BIGINT UNSIGNED   NOT NULL DEFAULT 0,
+    conn_denied_sum BIGINT UNSIGNED   NOT NULL DEFAULT 0,
+    -- 数据包（frontend 级来自 tc 队列、出方向；实例级来自网卡、整机口径）
+    pkts_out_sum    BIGINT UNSIGNED   NOT NULL DEFAULT 0,
+    drop_out_sum    BIGINT UNSIGNED   NOT NULL DEFAULT 0,
+    overlimit_sum   BIGINT UNSIGNED   NOT NULL DEFAULT 0,
+    -- 该桶生效的限额（bytes/s），回查曲线时的参照线
+    quota           BIGINT UNSIGNED   NOT NULL DEFAULT 0,
+    -- 主键顺序 = 最常见的查询形状："某台机器的某个 frontend、某个粒度、
+    -- 某段时间"，四个条件正好构成一次连续的范围扫描。
+    PRIMARY KEY (instance, scope, bucket_s, ts),
+    -- 剪枝专用：按 (粒度, 时间) 删过期行，不必扫主键。
+    KEY idx_prune (bucket_s, ts)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 
 -- ===========================================================================
 -- 演示种子数据（docker compose 环境）

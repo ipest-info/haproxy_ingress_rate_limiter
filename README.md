@@ -39,6 +39,7 @@
 | [docs/04-DockerCompose演示.md](docs/04-DockerCompose演示.md) | docker compose 一键演示（MySQL + 三台 Ubuntu 24.04 节点 + Web 控制台 + 可调并发压测） |
 | [docs/05-监控视图.md](docs/05-监控视图.md) | 监控视图：每条曲线的数据来源与口径 |
 | [docs/06-tc限速方案.md](docs/06-tc限速方案.md) | **限速为什么从 HAProxy bwlim 换成内核 tc**：实测依据、映射方式、行为差异，以及尚未验证的部分 |
+| [docs/07-监控数据回查.md](docs/07-监控数据回查.md) | **90 天回查怎么存怎么查**：分级保留、聚合语义、真实 MariaDB 上的容量与耗时实测 |
 
 ## 系统组成
 
@@ -52,6 +53,7 @@ rl_limiter/       # Python 3.11 + asyncio 服务（与 HAProxy 同机）
   enforcer.py     #   配置下发：渲染受管区块 → haproxy -c 校验 → 原子替换 → reload
   tcshaper.py     #   限速下发：把限额落到本机网卡的 tc（HTB），按源端口分类
   config.py       #   配置解析与校验（YAML 与数据库共用同一管线）
+  metricstore.py  #   监控数据分级落库与回查（1min×7天 / 5min×90天）
   webconsole.py   #   内置 Web 控制台（带宽曲线 + 端口/限额/后端服务器管理）
   loop.py         #   1s 监控主循环（采集 → 超限判定 → 发布）
 tools/            # fake_haproxy.py（联调假节点，支持 unix / TCP）
