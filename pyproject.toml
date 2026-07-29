@@ -4,18 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rl-limiter"
-version = "0.2.0"
+version = "0.3.0"
 description = "集中式 HAProxy 入口带宽限速服务：远程控制多台 HAProxy，保证各环境下行带宽不超约定配额"
 requires-python = ">=3.11"
 dependencies = [
     "PyYAML>=6.0",
     "aiohttp>=3.9",
+    "aiomysql>=0.2",
+    # MySQL 8+ 默认 caching_sha2_password 认证，aiomysql/PyMySQL 依赖它完成握手
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]
-# MySQL 配置源（v3.0）：PyMySQL 为纯 Python 驱动，docker 镜像内零编译
-# 依赖。搭配 MySQL 用户使用 mysql_native_password 认证时无需 cryptography。
-mysql = ["PyMySQL>=1.1"]
 test = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.scripts]
@@ -23,6 +23,10 @@ rl-limiter = "rl_limiter.__main__:main"
 
 [tool.setuptools]
 packages = ["rl_limiter"]
+
+[tool.setuptools.package-data]
+# Web 控制台的静态页面随包分发（webconsole 按包内相对路径读取）。
+rl_limiter = ["static/*.html"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

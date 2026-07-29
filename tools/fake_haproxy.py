@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 # tools/fake_haproxy.py —— 本地演示/联调用的"假 HAProxy stats socket"。
 #
-# 用途：在没有真实 HAProxy 的开发机上模拟 v2.0 架构里的一台受控节点——
-# 一个监听内网 TCP 的 stats socket（真实部署中对应 haproxy.cfg 的
-# `stats socket ipv4@<内网IP>:9999 level admin`）。rl-limiter 连上来后：
+# 用途：在没有真实 HAProxy 的开发机上模拟一台受控节点的 stats socket。
+# 两种形态与真实部署一一对应：
+#   --unix-path /run/haproxy/admin.sock  → 同机部署（haproxy.cfg 的
+#       `stats socket /run/haproxy/admin.sock mode 660 level user`）
+#   --port 19991                         → 跨机集中监控（haproxy.cfg 的
+#       `stats socket ipv4@<内网IP>:9999 level user`）
+# rl-limiter 连上来后：
 #   - "show stat -1 1 -1"：返回带 "# " 列头的 CSV，其中各 frontend 的
-#     bytes_out 计数器按 --frontends 指定的下行速率(Mbps) × 真实流逝时间持续增长
+#     bytes_out 计数器按 --frontends 指定的速率 × 真实流逝时间持续增长
 #     （附带 --jitter 抖动），scur 在 5~50 之间随机游走，模拟真实流量；
 #   - "set map <path> <key> <value>" / "add map ..."：记录到内存 map 并在
-#     值变化时打 info 日志（这就是观察 enforce 模式下发效果的窗口），
+#     值变化时打 info 日志（保留自旧的 runtime map 方案，聚合限速架构
+#     下 rl-limiter 不再调用，仅供手工联调 runtime API），
 #     回包为空（与真实 HAProxy 成功时的行为一致）。
 #
 # 协议要点（与真实 runtime socket 一致）：非交互模式下一次连接只服务
 # 一条命令，应答完即由服务端关闭连接——客户端每条命令都要重新拨号。
 #
-# 用法示例（模拟两台 HAProxy，见 docs/03-限速服务运行指南.md）：
-#   python3 tools/fake_haproxy.py --port 19991 --frontends fe_env_a:16,fe_env_b:4
-#   python3 tools/fake_haproxy.py --port 19992 --frontends fe_env_a:12
+# 用法示例（见 docs/03-限速服务运行指南.md）：
+#   同机形态：
+#     python3 tools/fake_haproxy.py --unix-path /tmp/hap1.sock --frontends fe_main:2000000
+#   跨机形态：
+#     python3 tools/fake_haproxy.py --port 19991 --frontends fe_main:2000000
+#     python3 tools/fake_haproxy.py --port 19992 --frontends fe_api:1500000
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import logging
+import pathlib
 import random
 import time
 
@@ -89,7 +98,7 @@ class FakeHAProxy:
         self.maps[(map_path, key)] = value
         if old != value:
             # 值发生变化才打日志：这是观察限速值真实下发的主要窗口。
-            log.info("收到 map 更新，本节点限速值已改写（enforce 下发的观察窗口） "
+            log.info("收到 map 更新（当前架构下 rl-limiter 不会调用，多半来自手工联调） "
                      "peer=%s map=%s key=%s old=%s new=%s",
                      peer, map_path, key, old if old is not None else "-", value)
         return "\n"
@@ -128,24 +137,18 @@ class FakeHAProxy:
                 pass
 
 
-# 1 Mbps = 1_000_000 bit/s = 125_000 byte/s（十进制兆，网络带宽惯例）。
-_BYTES_PER_MBIT = 125_000
-
-
 def parse_frontends(spec: str, jitter: float) -> list[FakeFrontend]:
-    """解析 --frontends 参数："fe_a:16,fe_b:4" → 每个 frontend 一个模拟器。
-
-    冒号后的数值是**下行速率 Mbps**（人类可读口径，如 16 表示 16 Mbps），
-    内部换算成 bytes/s 驱动 bytes_out 计数器增长。"""
+    """解析 --frontends 参数："fe_a:2000000,fe_b:500000" →
+    每个 frontend 一个 (名称, 每秒增长字节数) 的模拟器。"""
     frontends: list[FakeFrontend] = []
     for item in spec.split(","):
         item = item.strip()
         if not item:
             continue
-        name, _, mbps = item.partition(":")
-        if not name or not mbps:
-            raise ValueError(f"bad frontend spec: {item!r} (expected name:mbps)")
-        frontends.append(FakeFrontend(name, float(mbps) * _BYTES_PER_MBIT, jitter))
+        name, _, rate = item.partition(":")
+        if not name or not rate:
+            raise ValueError(f"bad frontend spec: {item!r} (expected name:bytes_per_sec)")
+        frontends.append(FakeFrontend(name, float(rate), jitter))
     if not frontends:
         raise ValueError("no frontends specified")
     return frontends
@@ -153,29 +156,55 @@ def parse_frontends(spec: str, jitter: float) -> list[FakeFrontend]:
 
 async def amain(args: argparse.Namespace) -> None:
     fake = FakeHAProxy(parse_frontends(args.frontends, args.jitter))
-    server = await asyncio.start_server(fake.handle, host=args.host, port=args.port)
+    frontends = ",".join(
+        f"{f.name}:{f.rate_bps:.0f}" for f in fake.frontends.values())
+    if args.unix_path:
+        # 同机部署形态：模拟 haproxy.cfg 的
+        # `stats socket /run/haproxy/admin.sock mode 660 level user`。
+        # 残留的旧 socket 文件会让 bind 直接失败（"Address already in
+        # use"），先清掉——演示工具，不必为此要求手工 rm。
+        path = pathlib.Path(args.unix_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_socket():
+            path.unlink()
+        server = await asyncio.start_unix_server(fake.handle, path=str(path))
+        endpoint = str(path)
+    else:
+        server = await asyncio.start_server(
+            fake.handle, host=args.host, port=args.port)
+        endpoint = f"{args.host}:{args.port}"
     log.info("假 HAProxy stats socket 已开始监听，等待 rl-limiter 接入 "
-             "addr=%s:%d frontends=%s jitter=%.2f",
-             args.host, args.port,
-             ",".join(f"{f.name}:{f.rate_bps / _BYTES_PER_MBIT:.2f}Mbps"
-                      for f in fake.frontends.values()),
-             args.jitter)
-    async with server:
-        await server.serve_forever()
+             "endpoint=%s frontends=%s jitter=%.2f",
+             endpoint, frontends, args.jitter)
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        if args.unix_path:
+            pathlib.Path(args.unix_path).unlink(missing_ok=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="假 HAProxy stats socket（TCP），本地演示/联调 rl-limiter 用")
+        description="假 HAProxy stats socket（unix 或 TCP），"
+                    "本地演示/联调 rl-limiter 用")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 %(default)s）")
-    parser.add_argument("--port", type=int, required=True, help="监听端口（模拟内网 TCP stats socket）")
     parser.add_argument(
-        "--frontends", default="fe_env_a:16",
-        help="frontend 清单：name:下行速率Mbps，逗号分隔（如 fe_a:16,fe_b:4；默认 %(default)s）")
+        "--port", type=int,
+        help="TCP 监听端口（模拟内网 TCP stats socket；与 --unix-path 二选一）")
+    parser.add_argument(
+        "--unix-path", default="",
+        help="unix socket 路径（模拟同机部署形态的本机 stats socket；"
+             "与 --port 二选一）")
+    parser.add_argument(
+        "--frontends", default="fe_main:2000000",
+        help="frontend 清单：name:每秒增长字节数，逗号分隔（默认 %(default)s）")
     parser.add_argument(
         "--jitter", type=float, default=0.2,
         help="流量抖动幅度，0.2 表示 ±20%%（默认 %(default)s）")
     args = parser.parse_args()
+    if bool(args.port) == bool(args.unix_path):
+        parser.error("--port 与 --unix-path 必须且只能指定一个")
 
     logging.basicConfig(
         level=logging.INFO,

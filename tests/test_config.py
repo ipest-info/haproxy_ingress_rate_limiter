@@ -1,10 +1,8 @@
-# tests.test_config —— rl_limiter.config 的加载/默认值/校验测试。
+# tests.test_config —— 配置解析/默认值/校验（单 HAProxy 模型）。
 #
-# 覆盖面：
-#   - 全量字段的正常解析（含 timeout_ms → timeout_s 的单位换算）；
-#   - 最小配置下的全部默认值；
-#   - 每一条校验分支的拒绝路径（错误信息必须点名问题字段，让运维可以
-#     直接按报错修配置，这里用 match 断言把这一契约固定下来）。
+# 校验的严格程度是刻意的：这些值会被渲染进 haproxy.cfg 并 reload，
+# 一个坏值就能让整台机器的入口挂掉。每条拒绝路径都用 match 断言把
+# "错误信息要点名字段"这一契约固定下来——运维应当不必翻代码就能改对。
 
 from __future__ import annotations
 
@@ -14,303 +12,184 @@ import pytest
 
 from rl_limiter import config, model
 
+VALID = """\
+log_level: debug
+tick_interval_s: 1.0
+haproxy:
+  name: haproxy
+  socket_path: /run/haproxy/admin.sock
+  timeout_ms: 250
+frontends:
+  - name: fe_main
+    bind_port: 8080
+    quota_bps: 40000000
+    maxconn: 2000
+    servers:
+      - {name: web1, address: 10.0.0.21, port: 9000}
+      - {name: web2, address: 10.0.0.22, port: 9000, weight: 50, check: false}
+  - name: fe_api
+    bind_address: 127.0.0.1
+    bind_port: 8081
+    mode: http
+    quota_bps: 8000000
+    balance: leastconn
+    servers:
+      - {name: api1, address: 10.0.0.31, port: 8000}
+"""
 
-def load_from(tmp_path, text: str) -> config.ServiceConfig:
-    """把 YAML 文本写入临时文件后走真实的 load 路径（读文件 + safe_load）。"""
+
+def load_from(tmp_path, text=VALID):
     p = tmp_path / "config.yaml"
     p.write_text(textwrap.dedent(text), encoding="utf-8")
     return config.load(str(p))
 
 
-# 后续错误用例在这份合法配置的基础上做最小改动，保证报错确实来自
-# 被改动的字段而不是别处。
-VALID_YAML = """\
-node_id: svc-1
-mode: enforce
-log_level: debug
-tick_interval_s: 0.5
-haproxy_nodes:
-  - name: lb-1
-    host: 10.0.0.1
-    port: 9999
-    bwlim_map_path: /etc/haproxy/maps/custom.map
-    timeout_ms: 250
-  - name: lb-2
-    host: 10.0.0.2
-    port: 9999
-envs:
-  - env_id: env-a
-    quota_mbps: 200
-    targets:
-      - {node: lb-1, frontend: fe_a}
-      - {node: lb-2, frontend: fe_a}
-    params:
-      md_factor: 0.8
-  - env_id: env-b
-    quota_mbps: 100
-    targets:
-      - {node: lb-1, frontend: fe_b}
-backend:
-  base_url: https://backend:9090/
-  cache_path: /tmp/cache.json
-  tls:
-    ca_file: /x/ca.pem
-    cert_file: /x/cert.pem
-    key_file: /x/key.pem
-"""
+def one_fe(**over):
+    """构造只含一个 frontend 的最小 YAML，便于逐字段做拒绝路径测试。"""
+    f = {"name": "fe_a", "bind_port": 8080, "quota_bps": 8000000}
+    f.update(over)
+    body = "\n".join(f"    {k}: {v!r}" for k, v in f.items() if k != "servers")
+    srv = over.get("servers", "\n      - {name: s1, address: 1.2.3.4, port: 80}")
+    return ("haproxy:\n  socket_path: /run/haproxy/admin.sock\n"
+            "frontends:\n  -\n" + body + "\n    servers:" + srv + "\n")
 
 
 def test_load_full_config(tmp_path):
-    cfg = load_from(tmp_path, VALID_YAML)
-    assert cfg.node_id == "svc-1"
-    assert cfg.mode == model.MODE_ENFORCE
+    cfg = load_from(tmp_path)
     assert cfg.log_level == "debug"
-    assert cfg.tick_interval_s == 0.5
+    assert cfg.haproxy.socket_path == "/run/haproxy/admin.sock"
+    assert cfg.haproxy.timeout_s == 0.25          # ms → s
+    assert [f.name for f in cfg.frontends] == ["fe_main", "fe_api"]
 
-    assert [n.name for n in cfg.nodes] == ["lb-1", "lb-2"]
-    n1, n2 = cfg.nodes
-    assert n1.host == "10.0.0.1"
-    assert n1.port == 9999
-    assert n1.bwlim_map_path == "/etc/haproxy/maps/custom.map"
-    # timeout_ms（毫秒，运维口径）在加载时一次性换算为内部口径的秒。
-    assert n1.timeout_s == pytest.approx(0.25)
-    # lb-2 未写 bwlim_map_path/timeout_ms → 各自取默认。
-    assert n2.bwlim_map_path == config.DEFAULT_BWLIM_MAP_PATH
-    assert n2.timeout_s == pytest.approx(config.DEFAULT_TIMEOUT_MS / 1000.0)
-
-    assert [e.env_id for e in cfg.envs] == ["env-a", "env-b"]
-    ea = cfg.envs[0]
-    assert ea.quota_mbps == 200
-    # 配额单位是 Mbps，quota_bytes_per_sec 是唯一的换算边界（×125000）。
-    assert ea.quota_bytes_per_sec == pytest.approx(25_000_000.0)
-    assert ea.targets == [
-        model.Target("lb-1", "fe_a"),
-        model.Target("lb-2", "fe_a"),
+    main = cfg.frontends[0]
+    assert main.bind_spec == ":8080" and main.mode == "tcp"
+    assert main.quota_bytes_per_sec == 5_000_000  # 40 Mbps ÷ 8
+    assert main.maxconn == 2000
+    assert [(s.name, s.address, s.port, s.weight, s.check) for s in main.servers] == [
+        ("web1", "10.0.0.21", 9000, 100, True),
+        ("web2", "10.0.0.22", 9000, 50, False),
     ]
-    assert ea.params is not None and ea.params.md_factor == pytest.approx(0.8)
-    # params 局部覆盖经 normalize 补齐其余字段（零值回填默认）。
-    assert ea.params.elastic_ceiling == pytest.approx(1.10)
-    assert cfg.envs[1].params is None
-
-    assert cfg.backend.base_url == "https://backend:9090/"
-    assert cfg.backend.cache_path == "/tmp/cache.json"
-    assert cfg.backend.ca_file == "/x/ca.pem"
-    assert cfg.backend.cert_file == "/x/cert.pem"
-    assert cfg.backend.key_file == "/x/key.pem"
+    api = cfg.frontends[1]
+    assert api.bind_spec == "127.0.0.1:8081" and api.mode == "http"
+    assert api.balance == "leastconn"
 
 
-def test_load_minimal_config_defaults(tmp_path):
-    """只写 node_id 时其余字段全部取安全默认：dry-run（误部署不产生数据
-    面影响）、info 级日志、1s tick、空节点/环境、standalone 后台。"""
-    cfg = load_from(tmp_path, "node_id: svc-1\n")
-    assert cfg.node_id == "svc-1"
-    assert cfg.mode == model.MODE_DRY_RUN
-    assert cfg.log_level == "info"
-    assert cfg.tick_interval_s == 1.0
-    assert cfg.nodes == []
-    assert cfg.envs == []
-    assert cfg.backend.base_url == ""  # 空 = standalone
-    assert cfg.backend.cache_path == config.DEFAULT_CACHE_PATH
-    assert cfg.backend.ca_file == ""
-    assert cfg.backend.cert_file == ""
-    assert cfg.backend.key_file == ""
+def test_defaults_filled(tmp_path):
+    cfg = load_from(tmp_path, one_fe())
+    f = cfg.frontends[0]
+    assert (f.mode, f.balance, f.maxconn) == ("tcp", "roundrobin", 0)
+    assert (f.timeout_connect_ms, f.timeout_client_ms, f.timeout_server_ms) == \
+        (5000, 50000, 50000)
+    assert cfg.log_level == config.DEFAULT_LOG_LEVEL
+    assert cfg.haproxy.timeout_s == config.DEFAULT_TIMEOUT_MS / 1000.0
 
 
-def test_load_missing_file():
-    with pytest.raises(FileNotFoundError):
-        config.load("/nonexistent/rl-limiter/config.yaml")
+def test_controller_config_roundtrip(tmp_path):
+    cfg = load_from(tmp_path)
+    ctl = cfg.to_controller_config(version=7)
+    assert ctl.version == 7
+    assert ctl.names() == {"fe_main", "fe_api"}
+    assert ctl.quotas()["fe_main"] == 5_000_000
+    # to_dict/from_dict 往返不丢字段（控制台写接口依赖它）。
+    back = model.ControllerConfig.from_dict(ctl.to_dict())
+    assert back.to_dict() == ctl.to_dict()
 
 
-def test_load_invalid_yaml(tmp_path):
-    with pytest.raises(ValueError, match="解析失败"):
-        load_from(tmp_path, "node_id: [unclosed\n")
+# ---------------------------------------------------------------------------
+# 拒绝路径
+# ---------------------------------------------------------------------------
 
-
-def test_load_non_mapping_root(tmp_path):
-    with pytest.raises(ValueError, match="顶层必须是键值映射"):
-        load_from(tmp_path, "- just\n- a\n- list\n")
-
-
-# ---- 校验分支：每条一个最小化的坏配置，match 锁定错误信息点名的字段 ----
-
-# 大部分坏配置在这个骨架上改动：一个节点 + 一个引用它的环境。
-BASE = """\
-node_id: svc-1
-haproxy_nodes:
-  - {name: lb-1, host: 10.0.0.1, port: 9999}
-envs:
-  - env_id: env-a
-    quota_mbps: 200
-    targets:
-      - {node: lb-1, frontend: fe_a}
-"""
-
-
-@pytest.mark.parametrize(
-    ("yaml_text", "match"),
-    [
-        # node_id 非空：缺失与显式空串都要拒绝。
-        pytest.param("mode: dry-run\n", "node_id 不能为空", id="node-id-missing"),
-        pytest.param('node_id: ""\n', "node_id 不能为空", id="node-id-empty"),
-        # mode 只能是 dry-run / enforce，不做静默回落。
-        pytest.param(
-            "node_id: svc-1\nmode: observe\n",
-            "mode 值非法.*observe",
-            id="mode-invalid",
-        ),
-        # log_level 枚举。
-        pytest.param(
-            "node_id: svc-1\nlog_level: verbose\n",
-            "log_level 值非法.*verbose",
-            id="log-level-invalid",
-        ),
-        # tick_interval_s 必须 > 0（显式写 0/负数是配置错误，不回落默认）。
-        pytest.param(
-            "node_id: svc-1\ntick_interval_s: 0\n",
-            "tick_interval_s 必须 > 0",
-            id="tick-zero",
-        ),
-        pytest.param(
-            "node_id: svc-1\ntick_interval_s: -1.5\n",
-            "tick_interval_s 必须 > 0",
-            id="tick-negative",
-        ),
-        # 节点：name 非空且唯一，host 非空，port 1-65535。
-        pytest.param(
-            "node_id: svc-1\nhaproxy_nodes:\n"
-            "  - {host: 10.0.0.1, port: 9999}\n",
-            r"haproxy_nodes\[0\].*name 不能为空",
-            id="node-name-empty",
-        ),
-        pytest.param(
-            "node_id: svc-1\nhaproxy_nodes:\n"
-            "  - {name: lb-1, host: 10.0.0.1, port: 9999}\n"
-            "  - {name: lb-1, host: 10.0.0.2, port: 9999}\n",
-            r"haproxy_nodes\[1\].*'lb-1'.*重复",
-            id="node-name-duplicate",
-        ),
-        pytest.param(
-            "node_id: svc-1\nhaproxy_nodes:\n  - {name: lb-1, port: 9999}\n",
-            r"haproxy_nodes\[0\].*host 不能为空",
-            id="node-host-empty",
-        ),
-        pytest.param(
-            "node_id: svc-1\nhaproxy_nodes:\n"
-            "  - {name: lb-1, host: 10.0.0.1}\n",
-            r"port 必须在 1-65535",
-            id="node-port-missing",
-        ),
-        pytest.param(
-            "node_id: svc-1\nhaproxy_nodes:\n"
-            "  - {name: lb-1, host: 10.0.0.1, port: 0}\n",
-            r"port 必须在 1-65535.*0",
-            id="node-port-zero",
-        ),
-        pytest.param(
-            "node_id: svc-1\nhaproxy_nodes:\n"
-            "  - {name: lb-1, host: 10.0.0.1, port: 70000}\n",
-            r"port 必须在 1-65535.*70000",
-            id="node-port-too-big",
-        ),
-        # 环境：env_id 非空且唯一。
-        pytest.param(
-            BASE.replace("env_id: env-a", 'env_id: ""'),
-            r"envs\[0\].*env_id 不能为空",
-            id="env-id-empty",
-        ),
-        pytest.param(
-            BASE
-            + "  - env_id: env-a\n"
-            "    quota_mbps: 100\n"
-            "    targets:\n"
-            "      - {node: lb-1, frontend: fe_b}\n",
-            r"envs\[1\].*'env-a'.*重复",
-            id="env-id-duplicate",
-        ),
-        # 配额必须为正（0 与负数都会把环境限死或让计算失去基准）。
-        pytest.param(
-            BASE.replace("quota_mbps: 200", "quota_mbps: 0"),
-            r"env-a.*quota_mbps 必须 > 0",
-            id="quota-zero",
-        ),
-        pytest.param(
-            BASE.replace("quota_mbps: 200", "quota_mbps: -5"),
-            r"env-a.*quota_mbps 必须 > 0.*-5",
-            id="quota-negative",
-        ),
-        # targets 非空。
-        pytest.param(
-            "node_id: svc-1\nhaproxy_nodes:\n"
-            "  - {name: lb-1, host: 10.0.0.1, port: 9999}\n"
-            "envs:\n  - {env_id: env-a, quota_mbps: 200}\n",
-            r"env-a.*至少需要一个 target",
-            id="targets-missing",
-        ),
-        pytest.param(
-            "node_id: svc-1\nhaproxy_nodes:\n"
-            "  - {name: lb-1, host: 10.0.0.1, port: 9999}\n"
-            "envs:\n"
-            "  - {env_id: env-a, quota_mbps: 200, targets: []}\n",
-            r"env-a.*至少需要一个 target",
-            id="targets-empty",
-        ),
-        # target.frontend 非空。
-        pytest.param(
-            BASE.replace("frontend: fe_a", 'frontend: ""'),
-            r"env-a.*frontend 不能为空",
-            id="target-frontend-empty",
-        ),
-        # target.node 必须已在 haproxy_nodes 中声明。
-        pytest.param(
-            BASE.replace("node: lb-1, frontend: fe_a", "node: lb-9, frontend: fe_a"),
-            r"env-a.*'lb-9' 未在 haproxy_nodes 中声明",
-            id="target-node-undeclared",
-        ),
-        # 同一 Target 不得映射到两个环境（用量重复计入、限速值互相覆盖）。
-        pytest.param(
-            BASE
-            + "  - env_id: env-b\n"
-            "    quota_mbps: 100\n"
-            "    targets:\n"
-            "      - {node: lb-1, frontend: fe_a}\n",
-            r"lb-1/fe_a 同时映射到环境 'env-a' 与 'env-b'",
-            id="target-duplicate-across-envs",
-        ),
-        # 同一环境内重复书写同一 Target 同样拒绝。
-        pytest.param(
-            BASE + "      - {node: lb-1, frontend: fe_a}\n",
-            r"lb-1/fe_a 同时映射到环境 'env-a' 与 'env-a'",
-            id="target-duplicate-same-env",
-        ),
-        # target 结构残缺（缺 frontend 键）→ 报环境下标与结构提示。
-        pytest.param(
-            BASE.replace("- {node: lb-1, frontend: fe_a}", "- {node: lb-1}"),
-            r"envs\[0\].*结构错误",
-            id="target-malformed",
-        ),
-    ],
-)
-def test_validation_errors(tmp_path, yaml_text, match):
+@pytest.mark.parametrize("text,match", [
+    ("haproxy: {socket_path: /run/h.sock}\nfrontends: []\n",
+     r"frontends 不能为空"),
+    (one_fe(name="fe bad"), r"name 非法"),
+    (one_fe(bind_port=0), r"bind_port 必须在 1-65535"),
+    (one_fe(quota_bps=0), r"quota_bps 必须为正数"),
+    (one_fe(quota_bps=4), r"太小"),
+    (one_fe(mode="udp"), r"mode 取值非法"),
+    (one_fe(balance="magic"), r"balance 取值非法"),
+    (one_fe(maxconn=-1), r"maxconn 不能为负"),
+    (one_fe(timeout_client_ms=0), r"timeout_client_ms 必须为正数"),
+    (one_fe(servers=" []"), r"servers 不能为空"),
+    (one_fe(servers="\n      - {name: s1, address: 'a b', port: 80}"),
+     r"address 非法"),
+    (one_fe(servers="\n      - {name: s1, address: 1.2.3.4, port: 70000}"),
+     r"port 必须在 1-65535"),
+    (one_fe(servers="\n      - {name: s1, address: 1.2.3.4, port: 80, weight: 999}"),
+     r"weight 必须在 0-256"),
+])
+def test_validation_rejects(tmp_path, text, match):
     with pytest.raises(ValueError, match=match):
-        load_from(tmp_path, yaml_text)
+        load_from(tmp_path, text)
+
+
+def test_duplicate_frontend_name_rejected(tmp_path):
+    """重名会让采样数据张冠李戴（名字要与 stats 的 pxname 一一对应）。"""
+    text = ("haproxy: {socket_path: /run/h.sock}\nfrontends:\n"
+            "  - {name: fe_a, bind_port: 1, quota_bps: 8000, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n"
+            "  - {name: fe_a, bind_port: 2, quota_bps: 8000, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n")
+    with pytest.raises(ValueError, match="重复"):
+        load_from(tmp_path, text)
+
+
+def test_duplicate_bind_port_rejected(tmp_path):
+    """两个 frontend 绑同一端口会让 HAProxy 起不来——启动时就拦下。"""
+    text = ("haproxy: {socket_path: /run/h.sock}\nfrontends:\n"
+            "  - {name: fe_a, bind_port: 8080, quota_bps: 8000, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n"
+            "  - {name: fe_b, bind_port: 8080, quota_bps: 8000, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n")
+    with pytest.raises(ValueError, match="冲突"):
+        load_from(tmp_path, text)
+
+
+def test_duplicate_server_name_within_frontend_rejected(tmp_path):
+    text = one_fe(servers="\n      - {name: s1, address: 1.1.1.1, port: 1}"
+                          "\n      - {name: s1, address: 2.2.2.2, port: 2}")
+    with pytest.raises(ValueError, match="重复"):
+        load_from(tmp_path, text)
+
+
+def test_tick_interval_locked_to_one_second(tmp_path):
+    """速率差分与 10 秒窗口都以「1 拍 = 1 秒」为前提，改这个值会让速率
+    口径与告警阈值整体失真。"""
+    with pytest.raises(ValueError, match="只支持 1.0"):
+        load_from(tmp_path, "tick_interval_s: 0.5\n" + one_fe())
 
 
 def test_error_message_contains_path(tmp_path):
     """所有校验错误都要带上配置文件路径，方便多配置文件部署时定位。"""
     p = tmp_path / "config.yaml"
-    p.write_text("mode: dry-run\n", encoding="utf-8")
+    p.write_text("frontends: []\n", encoding="utf-8")
     with pytest.raises(ValueError, match=str(p)):
         config.load(str(p))
 
 
-def test_timeout_ms_nonpositive_falls_back_to_default(tmp_path):
-    """timeout_ms 显式写 0/负数按"缺失"处理回落默认（对非正超时兜底，
-    避免 0/负超时穿透到网络层）。"""
-    cfg = load_from(
-        tmp_path,
-        "node_id: svc-1\nhaproxy_nodes:\n"
-        "  - {name: lb-1, host: 10.0.0.1, port: 9999, timeout_ms: -100}\n",
-    )
-    assert cfg.nodes[0].timeout_s == pytest.approx(
-        config.DEFAULT_TIMEOUT_MS / 1000.0
-    )
+# ---------------------------------------------------------------------------
+# HAProxy 接线段（采样通道二选一）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("hap,match", [
+    ("{socket_path: /run/h.sock, host: 10.0.0.1, port: 9999}", r"只能二选一"),
+    ("{}", r"host 不能为空"),
+    ("{socket_path: run/h.sock}", r"必须是绝对路径"),
+    ("{socket_path: /" + "x" * 120 + "}", r"过长"),
+])
+def test_haproxy_wiring_validation(tmp_path, hap, match):
+    text = ("haproxy: " + hap + "\nfrontends:\n"
+            "  - {name: fe_a, bind_port: 1, quota_bps: 8000, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n")
+    with pytest.raises(ValueError, match=match):
+        load_from(tmp_path, text)
+
+
+def test_tcp_wiring_accepted(tmp_path):
+    """远程只读观测形态：填 host/port 走内网 TCP。"""
+    text = ("haproxy: {host: 10.0.0.11, port: 9999}\nfrontends:\n"
+            "  - {name: fe_a, bind_port: 1, quota_bps: 8000, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n")
+    cfg = load_from(tmp_path, text)
+    assert cfg.haproxy.is_unix is False
+    assert cfg.haproxy.endpoint() == "10.0.0.11:9999"
+
+
+def test_shipped_example_config_is_valid():
+    """随仓库发布的示例配置必须能被真实加载——它是运维的起点。"""
+    cfg = config.load("deploy/config/limiter.example.yaml")
+    assert [f.name for f in cfg.frontends] == ["fe_main", "fe_api"]

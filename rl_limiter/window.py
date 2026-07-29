@@ -34,6 +34,12 @@ class SlidingWindow:
         if self._count < len(self._buf):
             self._count += 1
 
+    @property
+    def count(self) -> int:
+        """当前持有的有效样本数。调用方据此判断窗口是否还是"空的"
+        （空窗口的 mean() 返回 0，与"样本恰好都是 0"无法区分）。"""
+        return self._count
+
     def mean(self) -> float:
         """返回当前持有样本的算术平均（空窗口返回 0）。
 

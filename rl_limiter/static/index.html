@@ -1,0 +1,1490 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rl-limiter 控制台</title>
+<!-- 空 favicon：不写这行浏览器会去请求 /favicon.ico，控制台没这个路由，
+     于是每次打开页面都在控制台留一条 404 —— 排障时那条无关的红字很干扰。 -->
+<link rel="icon" href="data:,">
+<style>
+/* 单 HAProxy 模型的控制台。三个 tab：
+     实例   —— 整台 HAProxy 的连接/带宽视图；
+     监听端口 —— 每个 frontend 一张卡片：监控曲线 + 配置编辑；
+     日志   —— 进程内环形缓冲的最近若干条。
+
+   监控视图的分组照 docs/05-监控视图.md 落地，并且**只画有真实数据源的
+   曲线**。拿不到的指标既不画空图、也不在页面上长篇解释为什么没有——
+   那些取舍属于文档，页面只呈现真有数据的东西。
+
+   每张图都标数据来源，因为口径确实不同、数值本就不该相等：
+     HAProxy  应用层字节，按 frontend 精确拆分（带宽、连接）
+     tc 队列  链路层字节 + 包数/丢包，按 frontend 拆分，仅出方向
+     网卡     链路层，整机范围，用于入方向的包统计
+
+   编辑表单的布局按**操作频率**分层，而不是按字段清单平铺：
+     监听（端口/地址/模式）→ 限速（限额）→ 后端服务器 → 折叠的高级项。 */
+:root {
+  --surface-0: #f5f5f4;
+  --surface-1: #ffffff;
+  --surface-2: #f0efed;
+  --surface-3: #e8e7e4;
+  --border:    #dedcd8;
+  --border-strong: #c8c6c1;
+  --text-primary:   #16150f;
+  --text-secondary: #5c5b55;
+  --text-muted:     #8d8c85;
+  /* 曲线配色：同一张图里的两三条线要一眼分得开，跨图又要语义一致
+     （出向永远是蓝，入向永远是青，"坏事"永远是红）。 */
+  --s-out:   #2a78d6;
+  --s-in:    #0a9396;
+  --s-mean:  #008300;
+  --s-bad:   #cf3a3a;
+  --s-idle:  #b8790a;
+  --s-total: #7a4fd6;
+  --ref-quota:     #77766f;
+  --ok:       #0f9d3a;
+  --warn:     #b8790a;
+  --critical: #cf3a3a;
+  --accent:   #2a78d6;
+  --accent-weak: rgba(42,120,214,.10);
+  --grid: rgba(0,0,0,.06);
+  --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 12px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-0: #131316; --surface-1: #1c1c20; --surface-2: #24242a;
+    --surface-3: #2d2d34;
+    --border: #33333b; --border-strong: #45454f;
+    --text-primary: #f0efec; --text-secondary: #b4b3ae; --text-muted: #85847e;
+    --ref-quota: #b4b3ae;
+    --s-in: #2ab7ba; --s-mean: #3fbb5a; --s-total: #9b78e8;
+    --grid: rgba(255,255,255,.07);
+    --accent-weak: rgba(42,120,214,.16);
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 12px rgba(0,0,0,.25);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--surface-0); color: var(--text-primary);
+  font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC",
+        "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+/* 内容限宽并居中：2000px 宽屏上铺满会让每行的视线行程长得离谱，
+   表单字段也会被拉成荒唐的宽度。 */
+.wrap { max-width: 1240px; margin: 0 auto; padding: 0 20px; }
+
+header {
+  background: var(--surface-1); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 30;
+}
+header .wrap {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding-top: 12px; padding-bottom: 12px;
+}
+h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .01em; }
+.meta { color: var(--text-secondary); font-size: 12.5px; white-space: nowrap; }
+.meta b { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+.grow { flex: 1 1 auto; }
+.badge {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+  padding: 3px 10px; border-radius: 999px; background: var(--surface-2);
+  color: var(--text-secondary); white-space: nowrap;
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+
+/* ---- tab 条 ---- */
+.tabs {
+  display: flex; gap: 2px; border-bottom: 1px solid var(--border);
+  background: var(--surface-1); position: sticky; top: 53px; z-index: 29;
+}
+.tabs .wrap { display: flex; gap: 4px; padding-top: 0; padding-bottom: 0; }
+.tabs button {
+  border: 0; background: transparent; border-radius: 0; padding: 10px 16px;
+  font-size: 13.5px; color: var(--text-secondary); cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.tabs button:hover { background: var(--surface-2); }
+.tabs button[aria-selected=true] {
+  color: var(--accent); border-bottom-color: var(--accent); font-weight: 600;
+}
+
+main { padding: 20px 0 64px; }
+main > .wrap > * + * { margin-top: 16px; }
+.tabpage { display: none; }
+.tabpage.on { display: block; }
+.tabpage > * + * { margin-top: 16px; }
+
+.banner {
+  padding: 11px 15px; border-radius: 9px; font-size: 13px; line-height: 1.65;
+  border: 1px solid transparent; border-left-width: 3px;
+  background: rgba(184,121,10,.09); border-left-color: var(--warn);
+}
+.banner.ok  { background: rgba(15,157,58,.09); border-left-color: var(--ok); }
+.banner.err { background: rgba(207,58,58,.10); border-left-color: var(--critical); }
+.banner.info{ background: var(--surface-2); border-left-color: var(--border-strong); }
+.banner pre {
+  margin: 7px 0 0; white-space: pre-wrap; word-break: break-all;
+  font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  background: rgba(0,0,0,.05); padding: 8px 10px; border-radius: 6px;
+}
+.banner ul { margin: 6px 0 0; padding-left: 20px; }
+.banner li { margin: 3px 0; }
+
+.card {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 11px; box-shadow: var(--shadow); overflow: hidden;
+}
+.card + .card { margin-top: 16px; }
+.card-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 13px 16px; border-bottom: 1px solid var(--border);
+}
+.card-title { font-size: 14.5px; font-weight: 650; }
+.card-body { padding: 14px 16px; }
+
+.tag {
+  font: 11.5px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  padding: 2px 7px; border-radius: 5px;
+  background: var(--surface-2); color: var(--text-secondary);
+}
+.tag.alert { background: rgba(207,58,58,.14); color: var(--critical); font-weight: 600; }
+.tag.warn  { background: rgba(184,121,10,.16); color: var(--warn); font-weight: 600; }
+
+/* 指标条：等宽数字 + 标签在上、数值在下，扫一眼就能对齐比较。 */
+.stats { display: flex; gap: 24px; flex-wrap: wrap; }
+.card-body > .stats + .chart-grid { margin-top: 14px; }
+.stat-l { font-size: 11.5px; color: var(--text-muted); }
+.stat-v {
+  font-size: 15px; font-weight: 620; font-variant-numeric: tabular-nums;
+  margin-top: 1px;
+}
+.stat-v small { font-size: 11.5px; font-weight: 400; color: var(--text-muted); margin-left: 3px; }
+
+/* ---- 图表分组 ----
+   一行两张：再窄就看不出曲线形状了，再宽则一屏放不下一个分组。 */
+.chart-grid {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+}
+.chart {
+  border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px 8px;
+  background: var(--surface-1); min-width: 0;
+}
+.chart-h { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.chart-t { font-size: 13px; font-weight: 600; }
+.chart-src { font-size: 11px; color: var(--text-muted); margin-left: auto; }
+canvas { width: 100%; height: 128px; display: block; margin-top: 6px; }
+.legend {
+  display: flex; gap: 14px; flex-wrap: wrap; margin-top: 6px;
+  font-size: 11.5px; color: var(--text-secondary);
+}
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.legend i { width: 10px; height: 2.5px; border-radius: 2px; flex: none; }
+.legend b { font-variant-numeric: tabular-nums; color: var(--text-primary); font-weight: 600; }
+
+button {
+  font: inherit; font-size: 13px; padding: 6px 13px; border-radius: 7px;
+  border: 1px solid var(--border-strong); background: var(--surface-1);
+  color: var(--text-primary); cursor: pointer; white-space: nowrap;
+  transition: background .12s, border-color .12s;
+}
+button:hover:not(:disabled) { background: var(--surface-2); }
+button.primary {
+  background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 550;
+}
+button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+button.ghost { border-color: transparent; background: transparent; color: var(--text-secondary); }
+button.ghost:hover:not(:disabled) { background: var(--surface-2); }
+button.danger { color: var(--critical); border-color: transparent; background: transparent; }
+button.danger:hover:not(:disabled) { background: rgba(207,58,58,.10); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button.sm { padding: 3px 9px; font-size: 12px; }
+
+/* ---- 编辑面板 ---- */
+.editor {
+  display: none; background: var(--surface-2);
+  border-top: 1px solid var(--border);
+}
+.editor.open { display: block; }
+.sec { padding: 15px 16px; border-bottom: 1px solid var(--border); }
+.sec:last-of-type { border-bottom: 0; }
+.sec-h {
+  font-size: 12px; font-weight: 650; color: var(--text-secondary);
+  letter-spacing: .04em; margin-bottom: 10px;
+  display: flex; align-items: center; gap: 8px;
+}
+.sec-h .hint { font-weight: 400; letter-spacing: 0; }
+/* 字段宽度按内容需要给，不平均分——端口只要 8 个字符宽，没必要和地址一样宽。 */
+.fields { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: flex-start; }
+.f { display: flex; flex-direction: column; }
+.f-name  { width: 190px; } .f-addr { width: 230px; }
+.f-port  { width: 110px; } .f-mode { width: 120px; }
+.f-quota { width: 190px; } .f-num  { width: 130px; }
+.f-bal   { width: 150px; }
+label { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+label .req { color: var(--critical); }
+input, select {
+  font: inherit; font-size: 13px; padding: 6px 9px; border-radius: 7px;
+  border: 1px solid var(--border-strong); background: var(--surface-1);
+  color: var(--text-primary); width: 100%; min-width: 0;
+}
+input:focus, select:focus {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak);
+}
+input:disabled { background: var(--surface-3); color: var(--text-muted); }
+input.bad { border-color: var(--critical); }
+input.bad:focus { box-shadow: 0 0 0 3px rgba(207,58,58,.15); }
+.suffix { position: relative; }
+.suffix input { padding-right: 46px; }
+.suffix span {
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  font-size: 12px; color: var(--text-muted); pointer-events: none;
+}
+/* 限额输入框 + 单位下拉：50 Gbps 写成 50000 Mbps 谁都看不出是多少。 */
+.unit-in { display: flex; gap: 6px; }
+.unit-in input { flex: 1 1 auto; min-width: 0; }
+.unit-in select { width: auto; flex: 0 0 auto; padding-right: 6px; }
+.err { font-size: 11.5px; color: var(--critical); margin-top: 4px; }
+.hint { font-size: 11.5px; color: var(--text-muted); }
+.hint code {
+  font: 11px/1 ui-monospace, Menlo, Consolas, monospace;
+  background: var(--surface-3); padding: 1px 4px; border-radius: 4px;
+}
+
+/* ---- 批量填充 ---- */
+textarea {
+  font: inherit; font-size: 13px; line-height: 1.5; padding: 6px 9px;
+  border-radius: 7px; border: 1px solid var(--border-strong);
+  background: var(--surface-1); color: var(--text-primary);
+  width: 100%; min-width: 0; resize: vertical;
+}
+textarea:focus {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak);
+}
+details.bulk {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface-1); margin-bottom: 12px; max-width: 880px;
+}
+details.bulk > summary {
+  padding: 8px 12px; cursor: pointer; font-size: 12.5px;
+  color: var(--text-secondary); user-select: none; list-style: none;
+  display: flex; align-items: center; gap: 8px;
+}
+details.bulk > summary::-webkit-details-marker { display: none; }
+details.bulk > summary::before { content: "▸ "; color: var(--text-muted); }
+details.bulk[open] > summary::before { content: "▾ "; }
+details.bulk > summary:hover { background: var(--surface-2); }
+.bulk-body { padding: 4px 12px 12px; border-top: 1px solid var(--border); }
+.f-pfx { width: 120px; } .f-bad { width: 260px; }
+.f-bpt { width: 150px; } .f-bac { width: 96px; }
+.f-bac button { width: 100%; }
+.srv-btns { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+/* 限额换算提示：Mbps ↔ bytes/s 的 8 倍混淆是本项目最贵的错误来源，
+   把最终写进 cfg 的数值直接显示出来，让人在保存前就能发现。 */
+.conv {
+  font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums;
+  align-self: center; padding-top: 14px; line-height: 1.5;
+}
+.conv b { color: var(--text-primary); font-weight: 600; }
+
+table { width: 100%; max-width: 880px; border-collapse: collapse;
+         table-layout: fixed; font-size: 13px; }
+th {
+  text-align: left; font-size: 11.5px; font-weight: 600; color: var(--text-muted);
+  padding: 0 8px 6px 0; white-space: nowrap;
+}
+td { padding: 3px 8px 3px 0; vertical-align: top; }
+/* 操作列紧跟最后一个输入框，别被推到表格最右端——那样"移除"看着不像
+   属于这一行。 */
+.col-ac { width: 72px; }
+td:last-child, th:last-child { padding-right: 0; padding-left: 10px; }
+th.c, td.c { text-align: center; }
+/* 列宽按内容需要给：端口是 5 位数字，没必要和地址一样宽。 */
+.col-nm { width: 150px; } .col-ad { width: 220px; } .col-pt { width: 96px; }
+.col-wt { width: 84px; }  .col-ck { width: 76px; }  .col-in { width: 108px; }
+input[type=checkbox] { width: auto; }
+.empty { color: var(--text-muted); font-size: 12.5px; padding: 8px 0; }
+
+details.adv { border-top: 1px solid var(--border); }
+details.adv > summary {
+  padding: 11px 16px; cursor: pointer; font-size: 12.5px;
+  color: var(--text-secondary); user-select: none; list-style: none;
+}
+details.adv > summary::-webkit-details-marker { display: none; }
+details.adv > summary::before { content: "▸ "; color: var(--text-muted); }
+details.adv[open] > summary::before { content: "▾ "; }
+details.adv > summary:hover { background: var(--surface-3); }
+
+.actions {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 12px 16px; background: var(--surface-3);
+  border-top: 1px solid var(--border);
+}
+.dirty { font-size: 12px; color: var(--warn); }
+
+#logs {
+  max-height: 460px; overflow-y: auto;
+  font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace;
+}
+#logs div { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
+.lv-WARNING { color: var(--warn); }
+.lv-ERROR, .lv-CRITICAL { color: var(--critical); }
+.lv-DEBUG { color: var(--text-muted); }
+
+#toasts { position: fixed; right: 18px; bottom: 18px; display: grid; gap: 8px; z-index: 60; }
+.toast {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-left: 3px solid var(--ok); border-radius: 9px;
+  padding: 11px 15px; max-width: 440px; box-shadow: var(--shadow);
+  font-size: 13px; line-height: 1.55;
+}
+.toast.err { border-left-color: var(--critical); }
+@media (max-width: 720px) {
+  .f-name, .f-addr, .f-quota, .f-bal, .f-mode, .f-num, .f-port,
+  .f-pfx, .f-bad, .f-bpt, .f-bac { width: 100%; }
+  .tabs { top: 0; position: static; }
+}
+</style>
+
+<header><div class="wrap">
+  <h1>rl-limiter</h1>
+  <span class="badge"><span class="dot" id="sse-dot" style="background:var(--critical)"></span><span id="sse-text">连接中…</span></span>
+  <span class="meta">HAProxy <b id="hap-name">–</b></span>
+  <span class="meta" id="hap-endpoint-wrap">端点 <b id="hap-endpoint">–</b></span>
+  <span class="grow"></span>
+  <span class="meta">配置版本 <b id="cfg-version">–</b></span>
+  <span class="meta">运行 <b id="uptime">–</b></span>
+  <span class="meta">v<b id="svc-version">–</b></span>
+  <span class="meta">窗口
+    <select id="window-sel" style="width:auto;display:inline-block;padding:3px 6px">
+      <option value="60">1 分钟</option>
+      <option value="300" selected>5 分钟</option>
+      <option value="600">10 分钟</option>
+    </select>
+  </span>
+</div></header>
+
+<nav class="tabs"><div class="wrap">
+  <button data-tab="instance" aria-selected="true">实例</button>
+  <button data-tab="frontend" aria-selected="false">监听端口</button>
+  <button data-tab="logs" aria-selected="false">日志</button>
+</div></nav>
+
+<main><div class="wrap">
+  <div id="apply-banner" class="banner" style="display:none"></div>
+
+  <!-- ============ 实例视图 ============ -->
+  <section class="tabpage on" id="page-instance">
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">总览</span>
+        <span class="tag warn" id="inst-degraded" hidden>采样失联</span>
+        <span class="grow"></span>
+        <span class="hint" id="inst-nic-note"></span>
+      </div>
+      <div class="card-body">
+        <div class="stats">
+          <div><div class="stat-l">并发连接数</div><div class="stat-v" id="i-conn">–</div></div>
+          <div><div class="stat-l">活跃 / 非活跃</div><div class="stat-v" id="i-actidle">–</div></div>
+          <div><div class="stat-l">每秒新建</div><div class="stat-v" id="i-new">–</div></div>
+          <div><div class="stat-l">每秒丢失</div><div class="stat-v" id="i-denied">–</div></div>
+          <div><div class="stat-l">流入带宽</div><div class="stat-v" id="i-rin">–<small>Mbps</small></div></div>
+          <div><div class="stat-l">流出带宽</div><div class="stat-v" id="i-rout">–<small>Mbps</small></div></div>
+          <div><div class="stat-l">连接上限</div><div class="stat-v" id="i-maxconn">–</div></div>
+          <div><div class="stat-l">HAProxy 空闲率</div><div class="stat-v" id="i-idle">–<small>%</small></div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><span class="card-title">连接视图</span>
+        <span class="hint">来源：HAProxy <code>show info</code> + 全部 frontend 汇总</span></div>
+      <div class="card-body"><div class="chart-grid" id="i-conn-charts"></div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><span class="card-title">带宽视图</span>
+        <span class="hint">带宽为 HAProxy 应用层口径；数据包为网卡口径</span></div>
+      <div class="card-body"><div class="chart-grid" id="i-bw-charts"></div></div>
+    </div>
+
+  </section>
+
+  <!-- ============ 监听端口视图 ============ -->
+  <section class="tabpage" id="page-frontend">
+    <div id="frontends"></div>
+
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">新增监听端口</span>
+        <span class="hint">一个 frontend = 一个监听端口 + 一个限速桶 + 一组后端</span>
+        <span class="grow"></span>
+        <button id="new-btn" class="primary">+ 新增</button>
+      </div>
+      <div class="editor" id="new-editor"></div>
+    </div>
+
+  </section>
+
+  <!-- ============ 日志 ============ -->
+  <section class="tabpage" id="page-logs">
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">运行日志</span>
+        <span class="grow"></span>
+        <select id="log-level" style="width:auto;padding:4px 8px">
+          <option value="DEBUG">全部</option>
+          <option value="INFO" selected>INFO 及以上</option>
+          <option value="WARNING">WARNING 及以上</option>
+          <option value="ERROR">仅 ERROR</option>
+        </select>
+      </div>
+      <div class="card-body"><div id="logs"></div></div>
+    </div>
+  </section>
+</div></main>
+<div id="toasts"></div>
+
+<script>
+const $ = (s, el) => (el || document).querySelector(s);
+const $$ = (s, el) => [...(el || document).querySelectorAll(s)];
+// 往 innerHTML 里塞任何非本页写死的文本前都要过这一道：配置名、下发失败
+// 时 `haproxy -c` 的原始 stderr 等都来自外部，直接拼进 HTML 就是注入面。
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+// 速率一律以 bytes/s 在内部流转，只在显示时换算成 Mbps（×8÷1e6），
+// 与配置里的 quota_bps（bit/s）口径对齐。
+const fmtMbps = (bps) => (bps * 8 / 1e6).toFixed(2);
+// 每秒计数类（连接数、包数）：小数值给一位小数，大数值取整——差分出来的
+// 每秒值经常在个位数，全部取整会让曲线看着一跳一跳的。
+const fmtRate = (v) => (v >= 100 ? Math.round(v).toString()
+                      : v >= 10 ? v.toFixed(1) : v.toFixed(2));
+const fmtInt = (v) => Math.round(v || 0).toString();
+
+const state = {
+  fes: new Map(),            // frontend 名 → {buf, conf, card, charts…}
+  instBuf: [],               // 实例视图的样本环形缓冲
+  instCharts: [],
+  windowS: 300, logAfter: 0, logLevel: "INFO", tab: "instance",
+};
+const LEVELS = {DEBUG:10, INFO:20, WARNING:30, ERROR:40, CRITICAL:50};
+// 缓冲上限：1 秒一拍，服务端只留 10 分钟历史，客户端留够 20 分钟即可。
+const BUF_MAX = 1200;
+
+function toast(msg, isErr) {
+  const el = document.createElement("div");
+  el.className = "toast" + (isErr ? " err" : "");
+  el.textContent = msg;
+  $("#toasts").appendChild(el);
+  setTimeout(() => el.remove(), isErr ? 10000 : 4500);
+}
+
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name);
+
+// ============================================================ 图表
+// 一个通用的多序列时间序列图：所有监控视图（实例的、frontend 的）都用它，
+// 差别只在"取哪个缓冲、画哪几个字段、怎么格式化数值"。
+//
+// spec = {
+//   title, source,                  标题与数据来源标注（来源必须标：
+//                                   HAProxy 口径与网卡口径不是一回事）
+//   fmt, unit,                      数值格式化与单位文本
+//   series: [{key, label, color}],  要画的字段
+//   points: () => [{ts, …}],        数据源（每次重绘现取）
+//   ref: () => ({value,label})|null 参考线（限额）
+// }
+function makeChart(parent, spec) {
+  const el = document.createElement("div");
+  el.className = "chart";
+  el.innerHTML = `
+    <div class="chart-h">
+      <span class="chart-t">${esc(spec.title)}</span>
+      <span class="chart-src">${esc(spec.source || "")}</span>
+    </div>
+    <canvas></canvas>
+    <div class="legend">${spec.series.map(s =>
+      `<span><i style="background:${esc(s.color)}"></i>${esc(s.label)} <b data-k="${esc(s.key)}">–</b></span>`
+    ).join("")}</div>`;
+  parent.appendChild(el);
+  const ch = Object.assign({el, canvas: $("canvas", el), tooltipX: null}, spec);
+  ch.canvas.addEventListener("mousemove", (e) => { ch.tooltipX = e.offsetX; drawChart(ch); });
+  ch.canvas.addEventListener("mouseleave", () => { ch.tooltipX = null; drawChart(ch); });
+  new ResizeObserver(() => drawChart(ch)).observe(ch.canvas);
+  return ch;
+}
+
+function drawChart(ch) {
+  const cv = ch.canvas, dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;                     // tab 未激活时画布尺寸为 0
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+
+  const now = Date.now() / 1000;
+  const pts = ch.points().filter(p => now - p.ts <= state.windowS);
+  const ref = ch.ref ? ch.ref() : null;
+  // 纵轴上界取 max(参考线, 实测峰值) 的 1.15 倍：限额线永远在视野内，
+  // 超限时的溢出部分也看得见。
+  let peak = ref ? ref.value : 0;
+  for (const p of pts) for (const s of ch.series) peak = Math.max(peak, p[s.key] || 0);
+  const top = (peak || 1) * 1.15;
+  const x = (ts) => w - (now - ts) / state.windowS * w;
+  const y = (v) => h - ((v || 0) / top) * (h - 4) - 2;
+
+  g.strokeStyle = css("--grid"); g.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const yy = Math.round(h * i / 4) + .5;
+    g.beginPath(); g.moveTo(0, yy); g.lineTo(w, yy); g.stroke();
+  }
+  g.font = "10.5px sans-serif";
+  g.fillStyle = css("--text-muted");
+  // 纵轴上界的数值：没有它就看不出曲线的绝对高度，只能看出形状。
+  g.fillText(ch.fmt(top) + " " + ch.unit, 4, 12);
+
+  if (ref && ref.value > 0) {
+    g.strokeStyle = css("--ref-quota");
+    g.setLineDash([5, 4]); g.beginPath();
+    g.moveTo(0, y(ref.value)); g.lineTo(w, y(ref.value)); g.stroke();
+    g.setLineDash([]);
+  }
+  for (const s of ch.series) {
+    g.strokeStyle = css(s.color) || s.color;
+    g.lineWidth = 1.6; g.beginPath();
+    pts.forEach((p, i) => i ? g.lineTo(x(p.ts), y(p[s.key]))
+                            : g.moveTo(x(p.ts), y(p[s.key])));
+    g.stroke();
+  }
+  if (ref && ref.value > 0) {
+    // 限额标签画在曲线**之后**并衬一层底色：限速生效时曲线本来就贴着
+    // 限额线跑，先画标签会被曲线盖掉，正好在最需要读它的时候读不到。
+    const lbl = ref.label, lw = g.measureText(lbl).width;
+    const lx = w - lw - 5, ly = Math.max(10, y(ref.value) - 4);
+    g.fillStyle = css("--surface-1");
+    g.fillRect(lx - 2, ly - 9, lw + 4, 12);
+    g.fillStyle = css("--ref-quota");
+    g.fillText(lbl, lx, ly);
+  }
+
+  // 图例上的数值：默认跟最新一拍，鼠标悬停时跟悬停处那一拍——图例既是
+  // legend 又是读数器，省掉一整行重复的指标条。
+  let cur = pts.length ? pts[pts.length - 1] : null;
+  if (ch.tooltipX != null && pts.length) {
+    let bd = Infinity;
+    for (const p of pts) { const d = Math.abs(x(p.ts) - ch.tooltipX); if (d < bd) { bd = d; cur = p; } }
+    const px = x(cur.ts);
+    g.strokeStyle = css("--text-muted");
+    g.beginPath(); g.moveTo(px, 0); g.lineTo(px, h); g.stroke();
+  }
+  for (const b of $$(".legend b", ch.el))
+    b.textContent = cur ? ch.fmt(cur[b.dataset.k] || 0) : "–";
+}
+
+function redrawAll() {
+  for (const ch of state.instCharts) drawChart(ch);
+  for (const fe of state.fes.values()) for (const ch of fe.charts) drawChart(ch);
+}
+
+// ============================================================ 实例视图
+// 分组严格照 docs/05-监控视图.md：连接视图 = 新建 + 总连接；带宽视图 =
+// 带宽 + 数据包 + 丢弃数据包。文档里的"每秒丢弃 bit 数"没有任何数据源，
+// 不画（原因见页面底部的说明块）。
+function buildInstanceCharts() {
+  const pts = () => state.instBuf;
+  const conn = $("#i-conn-charts"), bw = $("#i-bw-charts");
+  state.instCharts = [
+    makeChart(conn, {
+      title: "实例新建连接数", source: "show info / frontend 汇总",
+      fmt: fmtRate, unit: "个/秒", points: pts,
+      series: [
+        {key: "conn_new", label: "每秒新建连接数", color: "--s-out"},
+        {key: "conn_denied", label: "每秒丢失连接数", color: "--s-bad"},
+      ],
+    }),
+    makeChart(conn, {
+      title: "实例总连接数", source: "show info / frontend 汇总",
+      fmt: fmtInt, unit: "个", points: pts,
+      series: [
+        {key: "conn", label: "并发连接数", color: "--s-total"},
+        {key: "active", label: "活跃连接数", color: "--s-out"},
+        {key: "idle", label: "非活跃连接数", color: "--s-idle"},
+      ],
+    }),
+    makeChart(bw, {
+      title: "实例带宽统计", source: "HAProxy 应用层口径",
+      fmt: fmtMbps, unit: "Mbps", points: pts,
+      series: [
+        {key: "rin", label: "流入带宽", color: "--s-in"},
+        {key: "rout", label: "流出带宽", color: "--s-out"},
+      ],
+    }),
+    makeChart(bw, {
+      title: "实例数据包统计", source: "网卡口径（整机）",
+      fmt: fmtRate, unit: "包/秒", points: pts,
+      series: [
+        {key: "pin", label: "每秒流入数据包数", color: "--s-in"},
+        {key: "pout", label: "每秒流出数据包数", color: "--s-out"},
+      ],
+    }),
+    makeChart(bw, {
+      title: "实例丢弃数据包统计", source: "网卡口径（整机）",
+      fmt: fmtRate, unit: "包/秒", points: pts,
+      series: [
+        {key: "din", label: "每秒丢失入包数", color: "--s-bad"},
+        {key: "dout", label: "每秒丢失出包数", color: "--s-idle"},
+      ],
+    }),
+  ];
+}
+
+function updateInstance(i) {
+  if (!i) return;
+  const set = (id, v, unit) =>
+    $(id).innerHTML = esc(v) + (unit ? `<small>${unit}</small>` : "");
+  set("#i-conn", fmtInt(i.conn));
+  set("#i-actidle", fmtInt(i.active_conns) + " / " + fmtInt(i.idle_conns));
+  set("#i-new", fmtRate(i.conn_new_ps), "个/秒");
+  set("#i-denied", fmtRate(i.conn_denied_ps), "个/秒");
+  set("#i-rin", fmtMbps(i.rate_in_bytes_per_s), "Mbps");
+  set("#i-rout", fmtMbps(i.rate_out_bytes_per_s), "Mbps");
+  set("#i-maxconn", i.max_conn ? fmtInt(i.max_conn) : "–");
+  set("#i-idle", fmtInt(i.idle_pct), "%");
+  $("#inst-degraded").hidden = !i.degraded;
+  $("#inst-nic-note").textContent = i.nic
+    ? `数据包统计取自网卡 ${i.nic}（整机口径，含 HAProxy 之外的流量）`
+    : "未采集网卡数据：数据包/丢包曲线为空（可用 RL_NIC 指定网卡）";
+}
+
+// ============================================================ 表单
+// 分组顺序 = 操作频率：监听 → 限速 → 后端 → （折叠）高级。
+// 冷门参数（maxconn/balance/三个 timeout）默认收起，改的人自然会去展开，
+// 不改的人不必每次都从五个 timeout 里找那个限额输入框。
+function editorHtml(fe, isNew) {
+  const f = fe || {};
+  const opt = (v, cur, label) =>
+    `<option value="${esc(v)}"${v === (cur || "") ? " selected" : ""}>${esc(label || v)}</option>`;
+  // 限额的显示单位跟着数量级走：50 Gbps 写成 50000 Mbps 谁都看不出是多少。
+  // 新建时给 DEFAULT_QUOTA_BPS（50 Gbps）——默认值不该成为限制。
+  const qbps = f.quota_bps || DEFAULT_QUOTA_BPS;
+  const qUnit = qbps >= 1e9 ? 1e9 : 1e6;
+  // 去掉 5e10/1e9 这类除法带出来的浮点尾巴（50.000000000000004）。
+  const qVal = parseFloat((qbps / qUnit).toPrecision(12));
+  return `
+  <div class="sec">
+    <div class="sec-h">监听</div>
+    <div class="fields">
+      <div class="f f-name">
+        <label>frontend 名 ${isNew ? '<span class="req">*</span>' : ""}</label>
+        <input class="i-name" value="${esc(f.name || "")}" ${isNew ? "" : "disabled"}
+               placeholder="fe_main" autocomplete="off">
+        ${isNew ? '<div class="hint">字母数字 . _ -</div>'
+                : '<div class="hint">改名请新建后删除旧的</div>'}
+        <div class="err" hidden></div>
+      </div>
+      <div class="f f-addr">
+        <label>监听地址</label>
+        <input class="i-addr" value="${esc(f.bind_address || "")}"
+               placeholder="留空 = 所有地址" autocomplete="off">
+        <div class="err" hidden></div>
+      </div>
+      <div class="f f-port">
+        <label>端口 <span class="req">*</span></label>
+        <input class="i-port" type="number" min="1" max="65535"
+               value="${esc(f.bind_port ?? "")}" placeholder="8080">
+        <div class="err" hidden></div>
+      </div>
+      <div class="f f-mode">
+        <label>模式</label>
+        <select class="i-mode">${opt("tcp", f.mode || "tcp")}${opt("http", f.mode)}</select>
+      </div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-h">限速</div>
+    <div class="fields">
+      <div class="f f-quota">
+        <label>带宽限额 <span class="req">*</span></label>
+        <div class="unit-in">
+          <input class="i-quota" type="number" min="0" step="any"
+                 value="${esc(qVal)}" placeholder="50">
+          <select class="i-qunit">
+            <option value="1000000"${qUnit === 1e6 ? " selected" : ""}>Mbps</option>
+            <option value="1000000000"${qUnit === 1e9 ? " selected" : ""}>Gbps</option>
+          </select>
+        </div>
+        <div class="hint">${isNew
+          ? "默认 <b>50 Gbps</b>：默认值不设限，真要收着了再往下调"
+          : "改限额不需要 reload，存量连接立刻跟上"}</div>
+        <div class="err" hidden></div>
+      </div>
+      <div class="conv"></div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-h">后端服务器 <span class="hint">至少一台，否则请求会返回 503</span></div>
+
+    <!-- 批量填充：一台一台点着加是这个界面上最费时间的操作。地址、端口
+         都支持整段粘贴，名称按前缀自动编号——运维手边的清单往往就是一列
+         IP，直接贴进来即可。 -->
+    <details class="bulk" ${isNew ? "open" : ""}>
+      <summary>批量填充 <span class="hint">粘贴一列地址即可，名称自动编号</span></summary>
+      <div class="bulk-body">
+        <div class="fields">
+          <div class="f f-pfx">
+            <label>名称前缀</label>
+            <input class="b-prefix" value="srv" placeholder="srv" autocomplete="off">
+            <div class="hint">自动编号 srv1、srv2…</div>
+          </div>
+          <div class="f f-bad">
+            <label>地址（每行一个）</label>
+            <textarea class="b-addr" rows="4" spellcheck="false"
+              placeholder="10.0.0.11&#10;10.0.0.12:9000&#10;10.0.0.20-24&#10;web-a.internal"></textarea>
+            <div class="hint">逗号/空格/换行都算分隔；支持 <code>地址:端口</code>
+              与末段区间 <code>10.0.0.20-24</code></div>
+          </div>
+          <div class="f f-bpt">
+            <label>端口</label>
+            <input class="b-port" placeholder="9000" autocomplete="off">
+            <div class="hint">只填一个 = 所有地址都用它<br>
+              也可写 <code>9000-9003</code></div>
+          </div>
+          <div class="f f-bac">
+            <label>&nbsp;</label>
+            <button class="b-append sm primary">追加</button>
+            <button class="b-replace sm" style="margin-top:6px">替换全部</button>
+          </div>
+        </div>
+        <div class="err err-bulk" hidden></div>
+      </div>
+    </details>
+
+    <table>
+      <thead><tr>
+        <th class="col-nm">名称</th><th class="col-ad">地址</th><th class="col-pt">端口</th>
+        <th class="col-wt">权重</th><th class="col-ck c">健康检查</th>
+        <th class="col-in">检查间隔</th><th class="col-ac"></th>
+      </tr></thead>
+      <tbody class="i-servers"></tbody>
+    </table>
+    <div class="empty" hidden>还没有后端服务器</div>
+    <div class="srv-btns">
+      <button class="i-addsrv sm">+ 添加服务器</button>
+      <button class="i-renum sm ghost">按前缀重新编号</button>
+      <span class="hint">往「地址」或「端口」格子里直接粘贴多行也会自动展开成多行</span>
+    </div>
+    <div class="err err-srv" hidden style="margin-top:6px"></div>
+  </div>
+
+  <details class="adv">
+    <summary>高级参数（并发上限、负载均衡、超时）</summary>
+    <div class="sec" style="border-bottom:0">
+      <div class="fields">
+        <div class="f f-num">
+          <label>maxconn</label>
+          <input class="i-maxconn" type="number" min="0" value="${esc(f.maxconn ?? 0)}">
+          <div class="hint">0 = 不限制</div>
+        </div>
+        <div class="f f-bal">
+          <label>负载均衡</label>
+          <select class="i-balance">${
+            ["roundrobin","static-rr","leastconn","first","source","random"]
+              .map(v => opt(v, f.balance || "roundrobin")).join("")}</select>
+        </div>
+        <div class="f f-num">
+          <label>timeout connect</label>
+          <div class="suffix"><input class="i-tc" type="number" min="1"
+            value="${esc(f.timeout_connect_ms ?? 5000)}"><span>ms</span></div>
+        </div>
+        <div class="f f-num">
+          <label>timeout client</label>
+          <div class="suffix"><input class="i-tcl" type="number" min="1"
+            value="${esc(f.timeout_client_ms ?? 50000)}"><span>ms</span></div>
+        </div>
+        <div class="f f-num">
+          <label>timeout server</label>
+          <div class="suffix"><input class="i-ts" type="number" min="1"
+            value="${esc(f.timeout_server_ms ?? 50000)}"><span>ms</span></div>
+        </div>
+      </div>
+    </div>
+  </details>
+
+  <div class="actions">
+    ${isNew ? "" : '<button class="i-del danger">删除此监听端口</button>'}
+    <span class="grow"></span>
+    <span class="dirty" hidden>● 有未保存的修改</span>
+    <button class="i-cancel ghost">取消</button>
+    <button class="i-save primary" disabled>${isNew ? "创建并下发" : "保存并下发"}</button>
+  </div>`;
+}
+
+// ============================================================ 批量填充解析
+// 这一段是**纯函数**，不碰 DOM：tests/test_bulkfill.py 会把 BULKFILL 标记
+// 之间的代码抽出来用 node 跑。改动请连带看那边——粘贴解析错了不会报错，
+// 只会把地址悄悄拼歪，等下发到 haproxy.cfg 才发现。
+// >>> BULKFILL >>>
+
+/** 切分粘贴来的一坨文本：换行、逗号、分号、空白都算分隔符。 */
+function splitTokens(text) {
+  return String(text == null ? "" : text)
+    .split(/[\s,;]+/).map(s => s.trim()).filter(Boolean);
+}
+
+/** 展开末段区间：10.0.0.20-24 → 10.0.0.20 … 10.0.0.24。
+ *  只在前三段全是数字时才认，否则 web-1.internal 这种主机名会被切坏。 */
+function expandIpRange(token) {
+  const m = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.)(\d{1,3})-(\d{1,3})$/.exec(token);
+  if (!m) return null;
+  const from = +m[2], to = +m[3];
+  if (from > to || to > 255) return null;
+  const out = [];
+  for (let i = from; i <= to; i++) out.push(m[1] + i);
+  return out;
+}
+
+/** 拆 host:port。裸 IPv6 本身就一堆冒号，所以只认两种明确写法：
+ *  [::1]:9000（方括号）和**恰好一个冒号**的 host:port。其余原样当地址，
+ *  宁可让人自己补端口，也不要把 fd00::5 猜成 "fd00:" + 端口 5。 */
+function splitHostPort(token) {
+  const br = /^\[(.+)\]:(\d+)$/.exec(token);
+  if (br) return {address: br[1], port: +br[2]};
+  if (/^\[(.+)\]$/.test(token)) return {address: token.slice(1, -1), port: null};
+  const parts = token.split(":");
+  if (parts.length === 2 && parts[0] && /^\d+$/.test(parts[1]))
+    return {address: parts[0], port: +parts[1]};
+  return {address: token, port: null};
+}
+
+/** 地址栏 → [{address, port|null}, …] */
+function parseAddresses(text) {
+  const out = [];
+  for (const tok of splitTokens(text)) {
+    const hp = splitHostPort(tok);
+    const range = expandIpRange(hp.address);
+    if (range) range.forEach(a => out.push({address: a, port: hp.port}));
+    else out.push(hp);
+  }
+  return out;
+}
+
+/** 端口栏 → {ports:[…]} 或 {error}。支持 9000 / 9000-9003 / 混写。 */
+function parsePorts(text) {
+  const out = [];
+  for (const tok of splitTokens(text)) {
+    const m = /^(\d+)-(\d+)$/.exec(tok);
+    if (m) {
+      const from = +m[1], to = +m[2];
+      if (from > to) return {error: `端口区间「${tok}」起点比终点大`};
+      if (to - from > 1024) return {error: `端口区间「${tok}」展开超过 1024 个，多半是写错了`};
+      for (let p = from; p <= to; p++) out.push(p);
+    } else if (/^\d+$/.test(tok)) {
+      out.push(+tok);
+    } else {
+      return {error: `端口「${tok}」不是数字`};
+    }
+  }
+  return {ports: out};
+}
+
+/** 前缀 + 序号自动命名，跳过已占用的名字（追加时不会撞上已有的行）。 */
+function genNames(prefix, count, taken) {
+  const used = new Set(taken || []);
+  const out = [];
+  let n = 1;
+  for (let i = 0; i < count; i++) {
+    let name;
+    do { name = `${prefix}${n++}`; } while (used.has(name));
+    used.add(name); out.push(name);
+  }
+  return out;
+}
+
+/** 地址 × 端口 → 后端服务器列表。整个批量填充的规则都在这里：
+ *   - 地址自带端口（10.0.0.5:9000）时**以自带的为准**；
+ *   - 端口只给一个 → 所有地址都用它（最常见：一个后端端口打天下）；
+ *   - 端口给多个 → 必须与地址一一对应，对不上**宁可报错也不猜**：
+ *     猜错的后果是流量打到错误的端口，而界面上看着一切正常。 */
+function combineServers(addrText, portText, prefix, taken) {
+  const addrs = parseAddresses(addrText);
+  if (!addrs.length) return {error: "请先粘贴后端地址"};
+  const pp = parsePorts(portText);
+  if (pp.error) return pp;
+  const ports = pp.ports;
+  if (ports.length > 1 && ports.length !== addrs.length)
+    return {error: `端口给了 ${ports.length} 个、地址有 ${addrs.length} 个，对不上`};
+
+  const rows = [];
+  for (const a of addrs) {
+    const port = a.port != null ? a.port
+      : ports.length === 1 ? ports[0]
+      : ports.length ? ports[rows.length] : null;
+    if (port == null)
+      return {error: `「${a.address}」没有端口：请在端口栏填一个，或用 地址:端口 写法`};
+    if (!(port >= 1 && port <= 65535))
+      return {error: `端口 ${port} 不在 1–65535`};
+    rows.push({address: a.address, port});
+  }
+  const names = genNames(prefix, rows.length, taken);
+  rows.forEach((r, i) => { r.name = names[i]; });
+  return {rows};
+}
+// <<< BULKFILL <<<
+
+function serverRow(s) {
+  s = s || {};
+  const tr = document.createElement("tr");
+  tr.innerHTML = `
+    <td><input class="s-name" value="${esc(s.name || "")}" placeholder="web1" autocomplete="off"></td>
+    <td><input class="s-addr" value="${esc(s.address || "")}" placeholder="10.0.0.21" autocomplete="off"></td>
+    <td><input class="s-port" type="number" min="1" max="65535" value="${esc(s.port ?? "")}" placeholder="9000"></td>
+    <td><input class="s-weight" type="number" min="0" max="256" value="${esc(s.weight ?? 100)}"></td>
+    <td class="c"><input class="s-check" type="checkbox" ${s.check === false ? "" : "checked"}></td>
+    <td><input class="s-inter" type="number" min="1" value="${esc(s.check_inter_ms ?? 2000)}"></td>
+    <td><button class="s-del danger sm">移除</button></td>`;
+  tr.querySelector(".s-del").onclick = () => { tr.remove(); tr.dispatchEvent(new Event("x")); };
+  return tr;
+}
+
+function readEditor(root, fallbackName) {
+  const q = parseFloat($(".i-quota", root).value);
+  const qUnit = parseFloat($(".i-qunit", root).value) || 1e6;
+  return {
+    name: ($(".i-name", root).value || fallbackName || "").trim(),
+    bind_address: $(".i-addr", root).value.trim(),
+    bind_port: parseInt($(".i-port", root).value, 10),
+    // 界面按运维习惯用 Mbps/Gbps，接口用 bit/s——换算只在这一处。
+    quota_bps: Math.round((isFinite(q) ? q : 0) * qUnit),
+    mode: $(".i-mode", root).value,
+    balance: $(".i-balance", root).value,
+    maxconn: parseInt($(".i-maxconn", root).value, 10) || 0,
+    timeout_connect_ms: parseInt($(".i-tc", root).value, 10),
+    timeout_client_ms: parseInt($(".i-tcl", root).value, 10),
+    timeout_server_ms: parseInt($(".i-ts", root).value, 10),
+    servers: $$(".i-servers tr", root).map(tr => ({
+      name: $(".s-name", tr).value.trim(),
+      address: $(".s-addr", tr).value.trim(),
+      port: parseInt($(".s-port", tr).value, 10),
+      weight: parseInt($(".s-weight", tr).value, 10),
+      check: $(".s-check", tr).checked,
+      check_inter_ms: parseInt($(".s-inter", tr).value, 10),
+    })),
+  };
+}
+
+// 新建 frontend 的默认限额：50 Gbps。**默认值不该成为限制**——不填限额
+// 建出来的入口应该是"能跑多快跑多快"，等真要收着了再显式往下调。反过来
+// （默认给个小值）会让人在排查慢的时候满世界找原因，最后发现是默认值。
+// 与 deploy/mysql/init.sql 里 quota_bps 列的 DEFAULT 保持一致。
+const DEFAULT_QUOTA_BPS = 50e9;
+
+const NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const ADDR_RE = /^[A-Za-z0-9._:-]{1,255}$/;
+
+/** 前端校验只为**尽早**给出人话反馈；服务端有同一套规则的权威校验，
+ *  两边不一致时以服务端为准（它的错误会通过 toast 显示出来）。 */
+function validate(root, p, isNew) {
+  const errs = new Map();
+  if (isNew && !NAME_RE.test(p.name))
+    errs.set(".i-name", "只能用字母、数字、点、下划线、连字符");
+  if (!(p.bind_port >= 1 && p.bind_port <= 65535))
+    errs.set(".i-port", "端口需在 1–65535");
+  if (p.bind_address && !ADDR_RE.test(p.bind_address))
+    errs.set(".i-addr", "地址含非法字符");
+  if (!(p.quota_bps > 0)) errs.set(".i-quota", "限额必须大于 0");
+  else if (p.quota_bps < 8) errs.set(".i-quota", "限额太小（不足 1 byte/s）");
+
+  let srvErr = "";
+  if (!p.servers.length) srvErr = "至少要有一台后端服务器";
+  const seen = new Set();
+  for (const s of p.servers) {
+    if (!s.name) { srvErr = "请填写服务器名"; break; }
+    if (!NAME_RE.test(s.name)) {
+      srvErr = `服务器名「${s.name}」非法：只能用字母、数字、点、下划线、连字符`; break;
+    }
+    if (seen.has(s.name)) { srvErr = `服务器名「${s.name}」重复`; break; }
+    seen.add(s.name);
+    if (!s.address) { srvErr = `请填写「${s.name}」的后端地址`; break; }
+    if (!ADDR_RE.test(s.address)) { srvErr = `「${s.name}」的地址含非法字符`; break; }
+    if (!(s.port >= 1 && s.port <= 65535)) {
+      srvErr = `「${s.name}」的端口需在 1–65535`; break;
+    }
+    if (!(s.weight >= 0 && s.weight <= 256)) { srvErr = `「${s.name}」的权重需在 0–256`; break; }
+  }
+
+  // 渲染内联错误：错在哪个字段就标哪个字段，不弹一个笼统的失败提示。
+  for (const sel of [".i-name", ".i-port", ".i-addr", ".i-quota"]) {
+    const input = $(sel, root); if (!input) continue;
+    const box = input.closest(".f").querySelector(".err");
+    const msg = errs.get(sel);
+    input.classList.toggle("bad", !!msg);
+    box.hidden = !msg; box.textContent = msg || "";
+  }
+  const sbox = $(".err-srv", root);
+  if (sbox) { sbox.hidden = !srvErr; sbox.textContent = srvErr; }
+  return errs.size === 0 && !srvErr;
+}
+
+function wireEditor(root, fe, isNew, onDone) {
+  const tbody = $(".i-servers", root);
+  const emptyHint = $(".empty", root);
+  ((fe && fe.servers) || []).forEach(s => tbody.appendChild(serverRow(s)));
+
+  const rows = () => $$(".i-servers tr", root);
+  const nameOf = tr => $(".s-name", tr).value.trim();
+  // 前缀非法时静默退回 srv：这里不是要教育用户，是不要让自动命名反过来
+  // 生成一堆过不了校验的名字。
+  const prefix = () => {
+    const p = ($(".b-prefix", root).value || "").trim();
+    return NAME_RE.test(p + "1") ? p : "srv";
+  };
+  /** 给名字空着的行补上自动名。手填的名字一概不动。 */
+  const autoName = () => {
+    const blanks = rows().filter(tr => !nameOf(tr));
+    if (!blanks.length) return;
+    const names = genNames(prefix(), blanks.length, rows().map(nameOf).filter(Boolean));
+    blanks.forEach((tr, i) => { $(".s-name", tr).value = names[i]; });
+  };
+  const addRow = (s) => { const tr = serverRow(s); tbody.appendChild(tr); return tr; };
+
+  if (isNew && !tbody.children.length) addRow();
+  autoName();
+
+  const initial = JSON.stringify(readEditor(root, fe && fe.name));
+  const refresh = () => {
+    const p = readEditor(root, fe && fe.name);
+    // 限额换算提示。Mbps ↔ bytes/s 的 8 倍混淆是本项目最贵的错误来源，
+    // 把最终写进 cfg 的数值直接显示出来，保存前就能发现填错了一位。
+    const conv = $(".conv", root);
+    conv.innerHTML = p.quota_bps > 0
+      ? `↔ <b>${(p.quota_bps / 8 / 1e6).toFixed(2)} MB/s</b>　`
+        + `写入 haproxy.cfg 的 <code>limit</code> = <b>${Math.floor(p.quota_bps / 8)}</b> bytes/s`
+      : "";
+    emptyHint.hidden = tbody.children.length > 0;
+    const dirty = JSON.stringify(p) !== initial;
+    $(".dirty", root).hidden = !dirty;
+    const valid = validate(root, p, isNew);
+    // 没改动就不给保存：避免"手滑点一下"触发一次真实的 reload。
+    $(".i-save", root).disabled = !(dirty && valid);
+  };
+  root.addEventListener("input", refresh);
+  root.addEventListener("change", refresh);
+  root.addEventListener("x", refresh);          // 移除服务器行
+  $(".i-addsrv", root).onclick = (e) => {
+    e.preventDefault(); addRow(); autoName(); refresh();
+  };
+  $(".i-renum", root).onclick = (e) => {
+    e.preventDefault();
+    // 与 autoName 不同：这个按钮**会覆盖手填的名字**，所以只在显式点击时做。
+    const all = rows();
+    const names = genNames(prefix(), all.length, []);
+    all.forEach((tr, i) => { $(".s-name", tr).value = names[i]; });
+    refresh();
+    toast(`已按前缀「${prefix()}」重新编号 ${all.length} 台`);
+  };
+
+  // ---- 批量填充 ----------------------------------------------------------
+  const bulkErr = $(".err-bulk", root);
+  const bulkFill = (replace) => {
+    const addrText = $(".b-addr", root).value, portText = $(".b-port", root).value;
+    // 先干跑一遍只为验错——报错时表格必须一个字都没动过。
+    const probe = combineServers(addrText, portText, "srv", []);
+    if (probe.error) {
+      bulkErr.hidden = false; bulkErr.textContent = probe.error;
+      return;
+    }
+    bulkErr.hidden = true;
+    if (replace) tbody.innerHTML = "";
+    // 追加时先清掉没填地址的空行。新建表单默认就带一行空的，不清的话
+    // 批量填完还剩一行填不动的残行卡着保存——正是这个界面最烦人的地方。
+    // 没地址的行本来也过不了校验，删掉不会丢任何已填的内容。
+    else rows().filter(tr => !$(".s-addr", tr).value.trim()).forEach(tr => tr.remove());
+    // taken 必须在删完空行之后取，否则被删掉的 srv1 还占着号，新行从 srv2 起。
+    const r = combineServers(addrText, portText, prefix(),
+                             rows().map(nameOf).filter(Boolean));
+    r.rows.forEach(addRow);
+    // 填完清空输入框：不清的话再点一下就又追加一遍，而且看不出来。
+    $(".b-addr", root).value = ""; $(".b-port", root).value = "";
+    refresh();
+    toast(`已${replace ? "替换为" : "追加"} ${r.rows.length} 台后端服务器`);
+  };
+  $(".b-append", root).onclick = (e) => { e.preventDefault(); bulkFill(false); };
+  $(".b-replace", root).onclick = (e) => { e.preventDefault(); bulkFill(true); };
+
+  // 往表格里的「地址」「端口」格子直接粘贴多行时自动展开成多行。
+  // 运维手边的清单往往就在剪贴板里，这一步省掉了"先数几台、再点几次添加"。
+  tbody.addEventListener("paste", (ev) => {
+    const input = ev.target;
+    if (!input.classList) return;
+    const isAddr = input.classList.contains("s-addr");
+    const isPort = input.classList.contains("s-port");
+    if (!isAddr && !isPort) return;
+    const text = (ev.clipboardData || window.clipboardData).getData("text");
+    const items = isAddr ? parseAddresses(text) : (parsePorts(text).ports || []);
+    if (items.length <= 1) return;              // 单个值走浏览器默认行为
+    ev.preventDefault();
+
+    const tr = input.closest("tr");
+    const all = rows();
+    let idx = all.indexOf(tr);
+    if (isAddr) {
+      // 第一条填进当前行，其余在它后面依次插入——不覆盖后面已有的行。
+      items.forEach((it, i) => {
+        const target = i === 0 ? tr : tbody.insertBefore(serverRow(), all[idx + 1] || null);
+        $(".s-addr", target).value = it.address;
+        if (it.port != null) $(".s-port", target).value = it.port;
+        if (i > 0) idx++;
+      });
+    } else {
+      // 端口是"一列值"，按顺序往下填已有的行，不凭空造行——真造出来的是
+      // 一批没有地址的空行，保存时才报错。多出来的明说丢了几个。
+      const targets = rows().slice(idx);
+      items.slice(0, targets.length).forEach((p, i) => {
+        $(".s-port", targets[i]).value = p;
+      });
+      if (items.length > targets.length)
+        toast(`粘贴了 ${items.length} 个端口，但从这一行往下只有 `
+              + `${targets.length} 行，多出来的已忽略`, true);
+    }
+    autoName();
+    refresh();
+  });
+  refresh();
+
+  $(".i-cancel", root).onclick = () => {
+    if (!$(".dirty", root).hidden && !confirm("有未保存的修改，确定放弃？")) return;
+    onDone(false);
+  };
+  if (!isNew) $(".i-del", root).onclick = () => delFrontend(fe.name);
+  $(".i-save", root).onclick = async (ev) => {
+    const btn = ev.target, p = readEditor(root, fe && fe.name);
+    if (!validate(root, p, isNew)) return;
+    btn.disabled = true; btn.textContent = "下发中…";
+    try {
+      const r = await fetch("/api/frontends/" + encodeURIComponent(p.name),
+        {method: "PUT", body: JSON.stringify(p)});
+      const j = await r.json();
+      if (!r.ok) {
+        toast(j.error || "保存失败", true);
+        btn.disabled = false; btn.textContent = isNew ? "创建并下发" : "保存并下发";
+        return;
+      }
+      toast(j.note || "已保存");
+      onDone(true);
+    } catch (e) {
+      toast("请求失败: " + e, true);
+      btn.disabled = false; btn.textContent = isNew ? "创建并下发" : "保存并下发";
+    }
+  };
+}
+
+// ============================================================ frontend 卡片
+// 每个 frontend 一张卡片：概要指标条 + 三张监控图 + 折叠的编辑面板。
+// 三张图对应文档里 frontend 视图能落地的三组：新建连接、总连接、带宽。
+function ensureCard(name) {
+  let fe = state.fes.get(name);
+  if (fe) return fe;
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `
+    <div class="card-head">
+      <span class="card-title fe-name"></span>
+      <span class="tag fe-bind"></span>
+      <span class="tag fe-mode"></span>
+      <span class="tag alert fe-over" hidden>超限</span>
+      <span class="tag warn fe-degraded" hidden>采样失联</span>
+      <span class="grow"></span>
+      <button class="fe-edit">编辑</button>
+    </div>
+    <div class="card-body">
+      <div class="stats">
+        <div><div class="stat-l">实时下行</div><div class="stat-v st-rate">–<small>Mbps</small></div></div>
+        <div><div class="stat-l">10s 均值</div><div class="stat-v st-mean">–<small>Mbps</small></div></div>
+        <div><div class="stat-l">限额</div><div class="stat-v st-quota">–<small>Mbps</small></div></div>
+        <div><div class="stat-l">利用率</div><div class="stat-v st-util">–</div></div>
+        <div><div class="stat-l">并发连接</div><div class="stat-v st-conn">–</div></div>
+        <div><div class="stat-l">活跃 / 非活跃</div><div class="stat-v st-actidle">–</div></div>
+        <div><div class="stat-l">后端</div><div class="stat-v st-srv">–<small>台</small></div></div>
+      </div>
+      <div class="chart-grid fe-charts"></div>
+    </div>
+    <div class="editor"></div>`;
+  $("#frontends").appendChild(card);
+  fe = {name, buf: [], conf: null, card, charts: []};
+  const grid = $(".fe-charts", card), pts = () => fe.buf;
+  fe.charts = [
+    makeChart(grid, {
+      title: "新建连接数", source: "conn_tot / dcon+dses+dreq 差分",
+      fmt: fmtRate, unit: "个/秒", points: pts,
+      series: [
+        {key: "conn_new", label: "每秒新建连接数", color: "--s-out"},
+        {key: "conn_denied", label: "每秒丢失连接数", color: "--s-bad"},
+      ],
+    }),
+    makeChart(grid, {
+      title: "总连接数", source: "scur / h1_open_connections",
+      fmt: fmtInt, unit: "个", points: pts,
+      series: [
+        {key: "conn", label: "并发连接数", color: "--s-total"},
+        {key: "active", label: "活跃连接数", color: "--s-out"},
+        {key: "idle", label: "非活跃连接数", color: "--s-idle"},
+      ],
+    }),
+    makeChart(grid, {
+      title: "带宽统计", source: "bin / bout 差分（应用层）",
+      fmt: fmtMbps, unit: "Mbps", points: pts,
+      series: [
+        {key: "rin", label: "流入带宽", color: "--s-in"},
+        {key: "rout", label: "流出带宽", color: "--s-out"},
+        {key: "mean", label: "流出 10s 均值", color: "--s-mean"},
+      ],
+      // 限额参考线只对流出方向有意义——tc 只整形出方向。
+      ref: () => fe.conf && fe.conf.quota_bytes_per_s
+        ? {value: fe.conf.quota_bytes_per_s,
+           label: "限额 " + fmtMbps(fe.conf.quota_bytes_per_s)}
+        : null,
+    }),
+    makeChart(grid, {
+      // 这张图是限速迁到内核 tc 之后才有的：tc 的每个队列正好对应一个
+      // frontend，于是"按监听端口统计包与丢包"第一次成立。丢包就是被
+      // 限速丢掉的包，overlimit 是被限速延迟的次数——限额吃不吃紧看它。
+      title: "数据包与丢包", source: "tc 队列（出方向）",
+      fmt: fmtRate, unit: "个/秒", points: pts,
+      series: [
+        {key: "pkts_out", label: "每秒流出数据包数", color: "--s-out"},
+        {key: "drop_out", label: "每秒丢弃包数", color: "--s-bad"},
+        {key: "overlimit", label: "每秒触发限速次数", color: "--s-idle"},
+      ],
+    }),
+  ];
+  $(".fe-edit", card).onclick = () => toggleEdit(fe);
+  state.fes.set(name, fe);
+  return fe;
+}
+
+function toggleEdit(fe) {
+  const ed = $(".editor", fe.card), btn = $(".fe-edit", fe.card);
+  if (ed.classList.contains("open")) {
+    ed.classList.remove("open"); btn.textContent = "编辑"; return;
+  }
+  ed.innerHTML = editorHtml(fe.conf, false);
+  ed.classList.add("open"); btn.textContent = "收起";
+  wireEditor(ed, fe.conf, false, (saved) => {
+    ed.classList.remove("open"); btn.textContent = "编辑";
+    if (saved) setTimeout(loadOverview, 700);
+  });
+}
+
+async function delFrontend(name) {
+  if (!confirm(`删除监听端口「${name}」？\n\n该端口会在下一次 reload 后停止服务，`
+             + `经它转发的连接会被断开。`)) return;
+  try {
+    const r = await fetch("/api/frontends/" + encodeURIComponent(name), {method: "DELETE"});
+    const j = await r.json();
+    if (!r.ok) { toast(j.error || "删除失败", true); return; }
+    toast(j.note || "已删除");
+    const fe = state.fes.get(name);
+    if (fe) { fe.card.remove(); state.fes.delete(name); }
+    setTimeout(loadOverview, 700);
+  } catch (e) { toast("请求失败: " + e, true); }
+}
+
+function updateCard(fe, u) {
+  const c = fe.card, conf = fe.conf || {};
+  $(".fe-name", c).textContent = fe.name;
+  $(".fe-bind", c).textContent = (conf.bind_address || "*") + ":" + (conf.bind_port ?? "?");
+  $(".fe-mode", c).textContent = conf.mode || "tcp";
+  $(".st-srv", c).innerHTML = (conf.servers || []).length + "<small>台</small>";
+  if (!u) return;
+  const set = (sel, v, unit) =>
+    $(sel, c).innerHTML = esc(v) + (unit ? `<small>${unit}</small>` : "");
+  set(".st-rate", fmtMbps(u.rate_bytes_per_s), "Mbps");
+  set(".st-mean", fmtMbps(u.mean10_bytes_per_s), "Mbps");
+  set(".st-quota", u.quota_bytes_per_s ? fmtMbps(u.quota_bytes_per_s) : "–",
+      u.quota_bytes_per_s ? "Mbps" : "");
+  set(".st-util", u.quota_bytes_per_s
+    ? (u.mean10_bytes_per_s / u.quota_bytes_per_s * 100).toFixed(0) + "%" : "–");
+  set(".st-conn", fmtInt(u.conn));
+  set(".st-actidle", fmtInt(u.active_conns) + " / " + fmtInt(u.idle_conns));
+  $(".fe-over", c).hidden = !u.over;
+  $(".fe-degraded", c).hidden = !u.degraded;
+}
+
+// ============================================================ 数据
+function applySnapshot(snap, live) {
+  $("#cfg-version").textContent = snap.config_version ?? "–";
+  if (snap.haproxy) {
+    $("#hap-name").textContent = snap.haproxy.name || "–";
+    $("#hap-endpoint").textContent = snap.haproxy.endpoint || "";
+  }
+  const i = snap.instance;
+  if (i && Object.keys(i).length) {
+    state.instBuf.push({
+      ts: snap.ts,
+      conn_new: i.conn_new_ps, conn_denied: i.conn_denied_ps,
+      conn: i.conn, active: i.active_conns, idle: i.idle_conns,
+      rin: i.rate_in_bytes_per_s, rout: i.rate_out_bytes_per_s,
+      pin: i.pkts_in_ps, pout: i.pkts_out_ps,
+      din: i.drop_in_ps, dout: i.drop_out_ps,
+    });
+    if (state.instBuf.length > BUF_MAX) state.instBuf.shift();
+    if (live) {
+      updateInstance(i);
+      if (state.tab === "instance") for (const ch of state.instCharts) drawChart(ch);
+    }
+  }
+  for (const [name, u] of Object.entries(snap.units || {})) {
+    const fe = ensureCard(name);
+    // rout 就是限速那条链路的 rate_bytes_per_s（bwlim 只整形下行），
+    // 这里统一叫 rout 是为了和 rin 成对，图表按同一套键名取值。
+    fe.buf.push({
+      ts: snap.ts,
+      rout: u.rate_bytes_per_s, rin: u.rate_in_bytes_per_s,
+      mean: u.mean10_bytes_per_s,
+      conn_new: u.conn_new_ps, conn_denied: u.conn_denied_ps,
+      conn: u.conn, active: u.active_conns, idle: u.idle_conns,
+      pkts_out: u.pkts_out_ps || 0, drop_out: u.drop_out_ps || 0,
+      overlimit: u.overlimit_ps || 0,
+    });
+    if (fe.buf.length > BUF_MAX) fe.buf.shift();
+    if (live) {
+      updateCard(fe, u);
+      if (state.tab === "frontend") for (const ch of fe.charts) drawChart(ch);
+    }
+  }
+}
+
+function renderApplyBanner(en) {
+  const el = $("#apply-banner");
+  el.style.display = "";
+  if (!en || !en.enabled) {
+    // 未启用下发时必须说清楚：否则用户会以为在界面上保存就已经生效了。
+    el.className = "banner";
+    el.innerHTML = "<b>配置自动下发未启用</b>：这里保存的改动只会写入配置库，"
+      + "<b>不会</b>自动写进 haproxy.cfg。要让改动真正生效，请设置 "
+      + "<code>RL_APPLY_HAPROXY_CFG=&lt;本机 haproxy.cfg 路径&gt;</code> 后重启本服务。";
+    return;
+  }
+  if (en.ok) {
+    el.className = "banner ok";
+    const t = en.last_change_ts ? new Date(en.last_change_ts * 1000).toLocaleTimeString() : null;
+    el.innerHTML = "<b>配置自动下发已启用</b>：保存后会写入本机 haproxy.cfg 并 reload，"
+      + "数据面即时生效（新建连接立即按新配置；存量连接在 hard-stop-after 宽限期后跟上）。"
+      + (t ? ` 最近一次下发 ${esc(t)}。` : " 当前与配置库一致。");
+  } else {
+    el.className = "banner err";
+    el.innerHTML = "<b>配置下发失败——数据面仍在按<u>调整前</u>的配置运行</b>："
+      + "配置库已改，但没能写进本机 haproxy.cfg / reload 未成功（会自动重试）。"
+      + `<pre>${esc(en.error || "")}</pre>`;
+  }
+}
+
+async function loadOverview() {
+  const o = await (await fetch("/api/overview")).json();
+  $("#svc-version").textContent = o.service_version || "–";
+  $("#cfg-version").textContent = o.config_version ?? "–";
+  if (o.haproxy) {
+    $("#hap-name").textContent = o.haproxy.name || "–";
+    $("#hap-endpoint").textContent = o.haproxy.endpoint || "";
+  }
+  const up = Math.floor(o.uptime_s || 0);
+  $("#uptime").textContent = up >= 3600
+    ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
+  renderApplyBanner(o.enforce);
+  if (o.latest && o.latest.instance) updateInstance(o.latest.instance);
+
+  const names = Object.keys(o.frontends || {}).sort();
+  for (const name of names) {
+    const fe = ensureCard(name);
+    // 编辑面板开着时不覆盖 conf：否则轮询会把用户正在填的表单初值换掉。
+    if (!$(".editor", fe.card).classList.contains("open")) fe.conf = o.frontends[name];
+    updateCard(fe, (o.latest && o.latest.units) ? o.latest.units[name] : null);
+  }
+  for (const [name, fe] of [...state.fes]) {
+    if (!names.includes(name)) { fe.card.remove(); state.fes.delete(name); }
+  }
+}
+
+async function loadLogs() {
+  const j = await (await fetch("/api/logs?after=" + state.logAfter)).json();
+  const box = $("#logs");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  for (const e of j.logs || []) {
+    state.logAfter = Math.max(state.logAfter, e.seq);
+    const d = document.createElement("div");
+    d.className = "lv-" + e.level;
+    d.dataset.level = e.level;
+    d.textContent = `${new Date(e.ts * 1000).toLocaleTimeString()} ${e.level} ${e.msg}`;
+    d.style.display = (LEVELS[e.level] || 0) >= (LEVELS[state.logLevel] || 0) ? "" : "none";
+    box.appendChild(d);
+  }
+  while (box.children.length > 1000) box.removeChild(box.firstChild);
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function connectSSE() {
+  const es = new EventSource("/api/stream");
+  es.onopen = () => {
+    $("#sse-dot").style.background = "var(--ok)";
+    $("#sse-text").textContent = "实时连接正常";
+  };
+  es.onerror = () => {
+    $("#sse-dot").style.background = "var(--critical)";
+    $("#sse-text").textContent = "连接断开，重试中…";
+  };
+  es.onmessage = (ev) => { try { applySnapshot(JSON.parse(ev.data), true); } catch (e) {} };
+}
+
+// ============================================================ 启动
+function switchTab(name) {
+  state.tab = name;
+  for (const b of $$(".tabs button")) b.setAttribute("aria-selected", String(b.dataset.tab === name));
+  for (const p of $$(".tabpage")) p.classList.toggle("on", p.id === "page-" + name);
+  // 刚显示出来的画布此前 clientWidth 为 0，必须重绘一次才有内容。
+  redrawAll();
+}
+for (const b of $$(".tabs button")) b.onclick = () => switchTab(b.dataset.tab);
+
+$("#window-sel").onchange = (e) => {
+  state.windowS = parseInt(e.target.value, 10);
+  redrawAll();
+};
+$("#log-level").onchange = (e) => {
+  state.logLevel = e.target.value;
+  const min = LEVELS[state.logLevel] || 0;
+  for (const d of $("#logs").children)
+    d.style.display = (LEVELS[d.dataset.level] || 0) >= min ? "" : "none";
+};
+$("#new-btn").onclick = () => {
+  const ed = $("#new-editor"), btn = $("#new-btn");
+  if (ed.classList.contains("open")) {
+    ed.classList.remove("open"); btn.textContent = "+ 新增"; return;
+  }
+  ed.innerHTML = editorHtml(null, true);
+  ed.classList.add("open"); btn.textContent = "收起";
+  wireEditor(ed, null, true, (saved) => {
+    ed.classList.remove("open"); btn.textContent = "+ 新增";
+    if (saved) setTimeout(loadOverview, 700);
+  });
+};
+// 有未保存修改时离开页面要拦一下——这里的每次保存都是真实的配置变更。
+window.addEventListener("beforeunload", (e) => {
+  if ($$(".editor.open .dirty").some(d => !d.hidden)) { e.preventDefault(); e.returnValue = ""; }
+});
+
+(async function boot() {
+  buildInstanceCharts();
+  await loadOverview();
+  try {
+    const h = await (await fetch("/api/history")).json();
+    for (const snap of h.snapshots || []) applySnapshot(snap, false);
+  } catch (e) {}
+  redrawAll();
+  await loadLogs();
+  connectSSE();
+  setInterval(loadLogs, 2000);
+  setInterval(loadOverview, 10000);
+})();
+</script>

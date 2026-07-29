@@ -1,80 +1,262 @@
-# docker-compose.yml —— rl-limiter v3.0 一键部署（MySQL 配置源 + 假 HAProxy）。
+# docker compose 一键演示环境：MySQL 配置源 + 三台 **Ubuntu 24.04 节点**
+# （每台 = HAProxy + 同机 rl-limiter）+ 模拟业务后端 + 可调并发压测服务。
+# 详细玩法见 docs/04-DockerCompose演示.md。
 #
-# 一句话：`docker compose up --build` 即拉起 MySQL + 两台假 HAProxy + 限速服务
-# 三件套，无需任何本地 YAML。
-#   - 改配置就改库：UPDATE envs/env_targets/settings 表，rl-limiter 每 5s 轮询
-#     配置版本（= 这三张表 updated_at 的最大值），发现变化即热重载，秒级生效、
-#     无需重启服务；
-#   - 用量落库：每秒用量样本批量写入 usage_samples 表，心跳写入 heartbeats 表，
-#     供后台展示/对账；
-#   - schema.sql 挂到 MySQL 初始化目录，首次启动自动建表并写入种子（两台节点、
-#     env-a 200Mbps / env-b 50Mbps、mode=dry-run）。
+#   启动：docker compose up -d --build
+#   控制台：http://localhost:8090 / :8092 / :8093（每台节点各一个）
+#   观察：docker compose logs -f node1 loadgen
+#   调并发：curl -X PUT http://localhost:8084/concurrency -d '{"concurrency": 32}'
+#   长连接大文件下载：curl -X PUT http://localhost:8084/big -d '{"per_target": 2}'
+#   收场：docker compose down -v
+#
+# 部署形态：**rl-limiter 与 HAProxy 同机**。每个 node 容器 = 生产上的
+# 一台 ECS：容器内同时跑 haproxy 与 rl-limiter，rl-limiter 通过本机
+# unix socket（/run/haproxy/admin.sock）只采本机那台 HAProxy——stats
+# socket 不占任何网络端口，容器之间也无需互相可达。
+#
+# 拓扑（三台 TCP L4 节点，各自独立；监听端口/限额/后端服务器都由各自的
+# rl-limiter 从配置库渲染进本机 haproxy.cfg 的受管区块）：
+#   loadgen ==打散==> node1:8080、node2:8080、node3:8080（各自 fe_main）
+#                          └──> web:9000（随机大小响应）
+#   node{1,2,3} 内的 rl-limiter ──轮询──> mysql（实例/frontend/后端服务器）
+#   node{1,2,3} 内的 rl-limiter ──show stat──> 本机 unix socket（不出容器）
+# 限速由各台机器的内核 tc（各 40 Mbps）在本机执行。每个控制台
+# 只管本机那台 HAProxy：可在页面上增删改监听端口、限额与后端服务器，
+# 保存即写库、随后自动写进 cfg 并 reload。
 
 services:
-  # MySQL 8.0：配置权威 + 用量库。schema.sql 首次启动自动执行。
+  # ---- 配置源：MySQL（表结构与演示种子数据见 deploy/mysql/init.sql）----
   mysql:
-    image: mysql:8.0
-    # 用 mysql_native_password 认证，PyMySQL 无需 cryptography 即可连接。
-    command: --default-authentication-plugin=mysql_native_password
+    image: mysql:8.4
     environment:
-      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_ROOT_PASSWORD: root_pass
       MYSQL_DATABASE: rl_limiter
       MYSQL_USER: rl
-      MYSQL_PASSWORD: rlpass
+      MYSQL_PASSWORD: rl_pass
     volumes:
-      # 初始化脚本：仅在数据卷为空的首次启动时执行。
-      - ./deploy/mysql/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
-      # 数据持久化：删除卷（docker compose down -v）即回到全新初始化状态。
+      - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       - mysql-data:/var/lib/mysql
+    # 只在本机回环暴露 3306，方便宿主机直接用 mysql 客户端改配置。
+    ports:
+      - "127.0.0.1:3306:3306"
     healthcheck:
-      # rl-limiter 用 depends_on service_healthy 等这里就绪后再启动。
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-prootpass"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-      start_period: 30s
-
-  # 假 HAProxy 节点 1：提供 fe_env_a(16Mbps) 与 fe_env_b(4Mbps) 两个 frontend。
-  # 服务名 hap-1 即容器主机名，与 haproxy_nodes 表的 host 一致。
-  hap-1:
-    build:
-      context: ./
-      dockerfile: deploy/docker/Dockerfile
-    command: >-
-      python tools/fake_haproxy.py --host 0.0.0.0 --port 9999
-      --frontends fe_env_a:16,fe_env_b:4
+      # TCP ping：初始化阶段的临时实例只监听 unix socket，ping 通 TCP
+      # 即表示真实实例（含 init.sql 灌数）已就绪。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
     restart: unless-stopped
 
-  # 假 HAProxy 节点 2：仅提供 fe_env_a(12Mbps)，与 hap-1 的 fe_env_a 同属 env-a。
-  hap-2:
-    build:
-      context: ./
-      dockerfile: deploy/docker/Dockerfile
-    command: >-
-      python tools/fake_haproxy.py --host 0.0.0.0 --port 9999
-      --frontends fe_env_a:12
+  # ---- HAProxy 后端：模拟业务 web 服务（每次请求返回随机大小响应）----
+  web:
+    build: .
+    command: python3 tools/random_web.py --port 9000
+    environment:
+      # 响应体大小区间（字节）：默认 256 KiB ~ 2 MiB，可按需覆盖。
+      WEB_MIN_BYTES: ${WEB_MIN_BYTES:-262144}
+      WEB_MAX_BYTES: ${WEB_MAX_BYTES:-2097152}
+      # /big 大文件下载端点的默认大小：512 MiB（40 Mbps 限速下约 100s
+      # 下完），供长连接大文件场景（loadgen 的 big worker）使用。
+      WEB_BIG_BYTES: ${WEB_BIG_BYTES:-536870912}
     restart: unless-stopped
 
-  # rl-limiter 限速服务：MySQL 模式（RL_MYSQL_HOST 触发）。
-  rl-limiter:
+  # ---- 三台节点：Ubuntu 24.04 + HAProxy 2.8(发行版自带) + 同机 rl-limiter。
+  # 每个容器 = 生产上的一台 ECS，各管各的。挂进去的 haproxy-base.cfg 只是
+  # global/defaults 骨架，监听端口与后端由各自的 rl-limiter 从配置库渲染
+  # 进受管区块。stats socket 是容器内的 unix socket，不映射也无需互通。
+  node1:
     build:
-      context: ./
-      dockerfile: deploy/docker/Dockerfile
+      context: .
+    # 限速由内核 tc 执行，容器默认没有操作网络设备的权限，必须显式给。
+    # 少了它 rl-limiter 一启动就会因为 tc 权限不足而退出（入口脚本会
+    # 明确报出来，不会静默地"没在限速"）。
+    cap_add:
+      - NET_ADMIN
+    # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
+    # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
+    # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
+    #
+    # 这里用的是**演示量级**：haproxy-base.cfg 的默认值是 100 万连接
+    # （= 400 万 fd），而宿主机 `fs.nr_open` 默认只有 1048576、且**容器里
+    # 改不动**，开发机上直接起不来。所以演示用下面的 HAPROXY_MAXCONN /
+    # HAPROXY_MAXPIPES 降到 10 万（= 400034 fd）——降的是演示，模板本身
+    # 仍然是那份可以直接抄去生产的骨架。生产机器请按 docs/08 把
+    # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
+    #
+    # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
+    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
+    volumes:
+      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
+    environment:
+      # 本实例对应配置库 haproxy_instances 里的哪一行（读写都只碰自己
+      # 那些行）。值必须与库中登记的实例名一致。
+      RL_NODE_NAME: hap-1
+      # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
+      HAPROXY_MAXCONN: "100000"
+      HAPROXY_MAXPIPES: "100000"
+      RL_MYSQL_HOST: mysql
+      RL_MYSQL_PORT: "3306"
+      RL_MYSQL_USER: rl
+      RL_MYSQL_PASSWORD: rl_pass
+      RL_MYSQL_DB: rl_limiter
+      RL_MYSQL_POLL_S: "3"
+      RL_CONSOLE_PORT: "8090"
+      # 演示需要从宿主机打开控制台，故绑 0.0.0.0；宿主机侧只映射到回环
+      # （下方 ports）。生产默认是 127.0.0.1，控制台无鉴权，切勿裸奔。
+      RL_CONSOLE_BIND: 0.0.0.0
+      # 配置自动下发：库里改监听端口/限额/后端服务器 → 本机 rl-limiter
+      # 立刻把它们渲染进这份 cfg 的受管区块并 reload（容器里没有
+      # systemctl，用入口脚本落的 master pid 发 SIGUSR2）。
+      RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
+      RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
+    ports:
+      - "8080:8080"              # hap-1 / fe_main（宿主机可 curl 体验限速）
+      - "127.0.0.1:8090:8090"    # hap-1 的控制台
     depends_on:
       mysql:
         condition: service_healthy
-      hap-1:
+      web:
         condition: service_started
-      hap-2:
-        condition: service_started
+    restart: unless-stopped
+
+  node2:
+    build:
+      context: .
+    # 限速由内核 tc 执行，容器默认没有操作网络设备的权限，必须显式给。
+    # 少了它 rl-limiter 一启动就会因为 tc 权限不足而退出（入口脚本会
+    # 明确报出来，不会静默地"没在限速"）。
+    cap_add:
+      - NET_ADMIN
+    # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
+    # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
+    # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
+    #
+    # 这里用的是**演示量级**：haproxy-base.cfg 的默认值是 100 万连接
+    # （= 400 万 fd），而宿主机 `fs.nr_open` 默认只有 1048576、且**容器里
+    # 改不动**，开发机上直接起不来。所以演示用下面的 HAPROXY_MAXCONN /
+    # HAPROXY_MAXPIPES 降到 10 万（= 400034 fd）——降的是演示，模板本身
+    # 仍然是那份可以直接抄去生产的骨架。生产机器请按 docs/08 把
+    # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
+    #
+    # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
+    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
+    volumes:
+      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
+      RL_NODE_NAME: hap-2
+      # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
+      HAPROXY_MAXCONN: "100000"
+      HAPROXY_MAXPIPES: "100000"
       RL_MYSQL_HOST: mysql
+      RL_MYSQL_PORT: "3306"
       RL_MYSQL_USER: rl
-      RL_MYSQL_PASSWORD: rlpass
+      RL_MYSQL_PASSWORD: rl_pass
       RL_MYSQL_DB: rl_limiter
-      RL_MYSQL_POLL_INTERVAL_S: "5"
-      RL_NODE_ID: rl-limiter-01
-      RL_LOG_LEVEL: info
+      RL_MYSQL_POLL_S: "3"
+      RL_CONSOLE_PORT: "8090"
+      RL_CONSOLE_BIND: 0.0.0.0
+      # 配置自动下发：库里改监听端口/限额/后端服务器 → 本机 rl-limiter
+      # 立刻把它们渲染进这份 cfg 的受管区块并 reload（容器里没有
+      # systemctl，用入口脚本落的 master pid 发 SIGUSR2）。
+      RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
+      RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
+    ports:
+      - "8082:8080"              # hap-2 / fe_main
+      - "127.0.0.1:8092:8090"    # hap-2 的控制台
+    depends_on:
+      mysql:
+        condition: service_healthy
+      web:
+        condition: service_started
+    restart: unless-stopped
+
+  node3:
+    build:
+      context: .
+    # 限速由内核 tc 执行，容器默认没有操作网络设备的权限，必须显式给。
+    # 少了它 rl-limiter 一启动就会因为 tc 权限不足而退出（入口脚本会
+    # 明确报出来，不会静默地"没在限速"）。
+    cap_add:
+      - NET_ADMIN
+    # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
+    # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
+    # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
+    #
+    # 这里用的是**演示量级**：haproxy-base.cfg 的默认值是 100 万连接
+    # （= 400 万 fd），而宿主机 `fs.nr_open` 默认只有 1048576、且**容器里
+    # 改不动**，开发机上直接起不来。所以演示用下面的 HAPROXY_MAXCONN /
+    # HAPROXY_MAXPIPES 降到 10 万（= 400034 fd）——降的是演示，模板本身
+    # 仍然是那份可以直接抄去生产的骨架。生产机器请按 docs/08 把
+    # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
+    #
+    # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
+    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
+    volumes:
+      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
+    environment:
+      RL_NODE_NAME: hap-3
+      # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
+      HAPROXY_MAXCONN: "100000"
+      HAPROXY_MAXPIPES: "100000"
+      RL_MYSQL_HOST: mysql
+      RL_MYSQL_PORT: "3306"
+      RL_MYSQL_USER: rl
+      RL_MYSQL_PASSWORD: rl_pass
+      RL_MYSQL_DB: rl_limiter
+      RL_MYSQL_POLL_S: "3"
+      RL_CONSOLE_PORT: "8090"
+      RL_CONSOLE_BIND: 0.0.0.0
+      # 配置自动下发：库里改监听端口/限额/后端服务器 → 本机 rl-limiter
+      # 立刻把它们渲染进这份 cfg 的受管区块并 reload（容器里没有
+      # systemctl，用入口脚本落的 master pid 发 SIGUSR2）。
+      RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
+      RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
+    ports:
+      - "8083:8080"              # hap-3 / fe_main
+      - "127.0.0.1:8093:8090"    # hap-3 的控制台
+    depends_on:
+      mysql:
+        condition: service_healthy
+      web:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---- 客户端群：可在线调节并发数的压测服务（模拟并发带宽）----
+  loadgen:
+    build: .
+    # 三个入口各是一台独立节点：worker 轮转绑定入口，每台节点各自被
+    # 本机 tc 压在自己的限额内、互不影响。
+    command: >-
+      python3 tools/loadgen.py
+      --target http://node1:8080/
+      --control-port 8081
+    environment:
+      # 初始并发：LOADGEN_CONCURRENCY=32 docker compose up -d 即可改；
+      # 运行中用控制端口在线调节（见文件头速查）。
+      LOADGEN_CONCURRENCY: ${LOADGEN_CONCURRENCY:-1000}
+      # 长连接大文件下载场景：每个入口 N 条长连接循环下载 /big（默认
+      # 每入口 1 条）。验证 tc 对存量长连接的持续限速与限额
+      # 调整（reload + hard-stop）对在途下载的影响。
+      LOADGEN_BIG_PER_TARGET: ${LOADGEN_BIG_PER_TARGET:-1}
+    ports:
+      - "8084:8081"   # 控制端口（宿主机 8084）：GET /status、PUT /concurrency
+    depends_on:
+      - node1
+      - node2
+      - node3
     restart: unless-stopped
 
 volumes:

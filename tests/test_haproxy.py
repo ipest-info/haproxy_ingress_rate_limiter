@@ -9,11 +9,13 @@ import pytest
 
 from rl_limiter import model
 from rl_limiter.haproxy import (
+    SHOW_INFO_CMD,
     SHOW_STAT_CMD,
     CommandError,
-    RuntimeAPIError,
+    InfoParseError,
     RuntimeClient,
     StatParseError,
+    parse_show_info,
     parse_show_stat,
 )
 
@@ -130,7 +132,8 @@ async def test_show_stat_parses_frontend_rows():
         assert srv.commands == [SHOW_STAT_CMD]
         # 只留 FRONTEND 行；剔除内建 stats；空字段按 0。
         assert stats == [
-            model.FrontendStat(name="fe_env1", bytes_out=12345, conn_cur=3),
+            model.FrontendStat(name="fe_env1", bytes_out=12345, conn_cur=3,
+                               bytes_in=100),
             model.FrontendStat(name="fe_idle", bytes_out=0, conn_cur=0),
         ]
 
@@ -183,67 +186,163 @@ def test_parse_show_stat_bad_number_raises():
 
 
 # ---------------------------------------------------------------------------
-# set_map_entry
+# 监控视图用的那些列（docs/05-监控视图.md）
+#
+# 这一组的共同主张：监控列是**可选**的。HAProxy 各版本的 stat 列集合有增删，
+# 少一列只该让对应曲线为空，不该让限速的采样链路跟着垮掉。
 # ---------------------------------------------------------------------------
 
-async def test_set_map_success_empty_reply():
-    async with fake_haproxy(lambda cmd: "\n") as srv:
-        c = RuntimeClient("127.0.0.1", srv.port)
-        await c.set_map_entry("/etc/haproxy/maps/bwlim.map", "env1", "125000000")
-        assert srv.commands == ["set map /etc/haproxy/maps/bwlim.map env1 125000000"]
+# 摘自真实 HAProxy 2.8.16 的列名（原表头 205 列，这里只留用得上的），
+# 列序也刻意打乱，确认解析确实按列名而非位置。
+MONITOR_CSV = (
+    "# pxname,svname,scur,bout,bin,dcon,dses,dreq,dresp,ereq,"
+    "conn_tot,stot,mode,h1_open_connections,h1_open_streams\n"
+    "fe_http,FRONTEND,8,900,700,1,2,3,4,5,50,60,http,8,4\n"
+    "fe_tcp,FRONTEND,5,100,200,0,0,0,0,0,7,7,tcp,0,0\n"
+)
 
 
-async def test_set_map_falls_back_to_add_map():
-    # "set map" 回 "not found" → 透明回退 "add map"（首次写入的正常路径）。
-    def reply(cmd):
-        if cmd.startswith("set map"):
-            return "entry not found.\n"
-        return "\n"
-
-    async with fake_haproxy(reply) as srv:
-        c = RuntimeClient("127.0.0.1", srv.port)
-        await c.set_map_entry("/m.map", "env1", "42")
-        assert srv.commands == ["set map /m.map env1 42", "add map /m.map env1 42"]
+def test_parse_show_stat_reads_monitoring_columns():
+    a, b = parse_show_stat(MONITOR_CSV)
+    assert (a.bytes_in, a.conn_tot, a.sess_tot) == (700, 50, 60)
+    assert (a.denied_conn, a.denied_sess, a.denied_req, a.denied_resp) == (1, 2, 3, 4)
+    assert a.err_req == 5
+    assert (a.mode, a.open_conns, a.open_streams) == ("http", 8, 4)
+    # 丢失连接数的口径：连接级 + 会话级 + 请求级，不含响应级。
+    assert a.denied_total == 1 + 2 + 3
+    assert b.mode == "tcp"
 
 
-async def test_set_map_fallback_on_unable_to_find_variant():
-    # 另一种版本措辞 "unable to find ..." 同样触发回退。
-    def reply(cmd):
-        if cmd.startswith("set map"):
-            return "unable to find entry for key.\n"
-        return "\n"
-
-    async with fake_haproxy(reply) as srv:
-        c = RuntimeClient("127.0.0.1", srv.port)
-        await c.set_map_entry("/m.map", "k", "v")
-        assert [cmd.split()[0:2] for cmd in srv.commands] == [["set", "map"], ["add", "map"]]
+def test_active_idle_split_http_vs_tcp():
+    """http 下按"有无在途流"拆活跃/空闲；tcp 没有流的概念，全算活跃。"""
+    a, b = parse_show_stat(MONITOR_CSV)
+    assert (a.active_conns, a.idle_conns) == (4, 4)   # 8 条连接，4 条有在途流
+    assert (b.active_conns, b.idle_conns) == (5, 0)   # tcp：scur 全算活跃
 
 
-async def test_set_map_fallback_add_map_unexpected_reply_raises():
-    # 回退只做一次："add map" 也回非空包时必须上抛，绝不假装写入成功。
-    def reply(cmd):
-        if cmd.startswith("set map"):
-            return "entry not found.\n"
-        return "something odd happened\n"
-
-    async with fake_haproxy(reply) as srv:
-        c = RuntimeClient("127.0.0.1", srv.port)
-        with pytest.raises(RuntimeAPIError):
-            await c.set_map_entry("/m.map", "k", "v")
+def test_monitoring_columns_are_optional():
+    """老版本 HAProxy 少几列监控字段：按 0 处理，采样照常成功。"""
+    (s,) = parse_show_stat("# pxname,svname,scur,bout\nfe,FRONTEND,2,10\n")
+    assert s.bytes_in == 0 and s.conn_tot == 0 and s.denied_total == 0
+    assert s.mode == "" and s.active_conns == 2  # mode 未知 → 按 tcp 口径
 
 
-async def test_set_map_unexpected_reply_raises():
-    # 非空、又不是"条目不存在"的回包：未知情况，报错。
-    async with fake_haproxy(lambda cmd: "weird reply\n") as srv:
-        c = RuntimeClient("127.0.0.1", srv.port)
-        with pytest.raises(RuntimeAPIError):
-            await c.set_map_entry("/m.map", "k", "v")
+def test_bad_monitoring_value_does_not_fail_sampling():
+    """可选列的值非法只让该项为 0——绝不能连累限速判定所依赖的必需列。"""
+    (s,) = parse_show_stat(
+        "# pxname,svname,scur,bout,bin\nfe,FRONTEND,2,10,notanumber\n")
+    assert s.bytes_out == 10 and s.bytes_in == 0
 
 
-async def test_set_map_error_reply_propagates():
-    # 命中错误前缀且不含"not found"措辞：直接上抛，不触发回退。
-    async with fake_haproxy(lambda cmd: "Permission denied\n") as srv:
-        c = RuntimeClient("127.0.0.1", srv.port)
-        with pytest.raises(CommandError):
-            await c.set_map_entry("/m.map", "k", "v")
-        assert srv.commands == ["set map /m.map k v"]  # 未发出 add map
+# ---------------------------------------------------------------------------
+# show info
+# ---------------------------------------------------------------------------
+
+# 摘自真实 HAProxy 2.8.16 的 show info 回包（截取用得上的键）。
+CANNED_INFO = (
+    "Name: HAProxy\n"
+    "Version: 2.8.16-0ubuntu0.24.04.3\n"
+    "Uptime: 0d 0h00m22s\n"
+    "Uptime_sec: 22\n"
+    "Maxconn: 400\n"
+    "CurrConns: 17\n"
+    "CumConns: 4210\n"
+    "CumReq: 5000\n"
+    "ConnRate: 33\n"
+    "SessRate: 31\n"
+    "Run_queue: 2\n"
+    "Idle_pct: 87\n"
+    "node: vm\n"
+)
+
+
+async def test_show_info_roundtrip():
+    async with fake_haproxy(lambda cmd: CANNED_INFO) as srv:
+        info = await RuntimeClient("127.0.0.1", srv.port).show_info()
+        assert srv.commands == [SHOW_INFO_CMD]
+        assert info == model.InstanceStat(
+            curr_conns=17, cum_conns=4210, cum_req=5000, conn_rate=33,
+            sess_rate=31, max_conn=400, run_queue=2, idle_pct=87, uptime_s=22)
+
+
+def test_parse_show_info_ignores_unknown_keys_and_defaults():
+    """键集合随版本增删：未知键忽略，缺的键取缺省（Idle_pct 缺省 100）。"""
+    info = parse_show_info("CurrConns: 3\nSomeNewKeyIn3x: 9\n")
+    assert info.curr_conns == 3 and info.idle_pct == 100 and info.cum_conns == 0
+
+
+def test_parse_show_info_missing_currconns_raises():
+    """连 CurrConns 都没有：这根本不是 show info 的回包，按失败处理。"""
+    with pytest.raises(InfoParseError):
+        parse_show_info("Name: HAProxy\nVersion: 2.8\n")
+
+
+def test_parse_show_info_bad_number_falls_back():
+    """单个值非法不该让整次采样失败——实例视图缺一项好过整条链路断掉。"""
+    info = parse_show_info("CurrConns: 3\nCumConns: x\nIdle_pct: y\n")
+    assert info.cum_conns == 0 and info.idle_pct == 100
+
+
+# ---------------------------------------------------------------------------
+# 同机部署形态：本机 unix stats socket
+# ---------------------------------------------------------------------------
+
+class FakeUnixHAProxy(FakeHAProxy):
+    """同 FakeHAProxy，但监听 unix socket——复刻同机部署下 haproxy.cfg 的
+    `stats socket /run/haproxy/admin.sock mode 660 level user`。"""
+
+    def __init__(self, reply_fn, path):
+        super().__init__(reply_fn)
+        self.path = str(path)
+
+    async def start(self):
+        self._server = await asyncio.start_unix_server(self._handle, self.path)
+
+
+@contextlib.asynccontextmanager
+async def fake_unix_haproxy(reply_fn, path):
+    srv = FakeUnixHAProxy(reply_fn, path)
+    await srv.start()
+    try:
+        yield srv
+    finally:
+        await srv.stop()
+
+
+async def test_show_stat_over_unix_socket(tmp_path):
+    """unix socket 形态下命令语义与回包解析与 TCP 完全一致——两种接线
+    只有"怎么建连"一步不同。"""
+    sock = tmp_path / "admin.sock"
+    async with fake_unix_haproxy(lambda cmd: CANNED_CSV, sock) as srv:
+        c = RuntimeClient(socket_path=str(sock))
+        stats = await c.show_stat()
+        assert srv.commands == [SHOW_STAT_CMD]
+        assert stats == [
+            model.FrontendStat(name="fe_env1", bytes_out=12345, conn_cur=3,
+                               bytes_in=100),
+            model.FrontendStat(name="fe_idle", bytes_out=0, conn_cur=0),
+        ]
+        assert c.endpoint() == str(sock)
+
+
+async def test_from_node_picks_wiring(tmp_path):
+    """from_node 是"该走 unix 还是 TCP"的唯一判断点，接线装配不必重复分支。"""
+    sock = tmp_path / "admin.sock"
+    async with fake_unix_haproxy(lambda cmd: CANNED_CSV, sock) as srv:
+        node = model.NodeConfig(name="hap-1", socket_path=str(sock))
+        stats = await RuntimeClient.from_node(node).show_stat()
+        assert [s.name for s in stats] == ["fe_env1", "fe_idle"]
+        assert srv.commands == [SHOW_STAT_CMD]
+
+    async with fake_haproxy(lambda cmd: CANNED_CSV) as srv:
+        node = model.NodeConfig(name="hap-2", host="127.0.0.1", port=srv.port)
+        stats = await RuntimeClient.from_node(node).show_stat()
+        assert [s.name for s in stats] == ["fe_env1", "fe_idle"]
+
+
+async def test_unix_socket_missing_raises(tmp_path):
+    """socket 文件不存在（HAProxy 未起/路径写错）按普通采样失败上抛，
+    由 collector 的单节点容错兜住（fail-static + degraded）。"""
+    c = RuntimeClient(socket_path=str(tmp_path / "nope.sock"), timeout_s=1.0)
+    with pytest.raises((FileNotFoundError, ConnectionError, OSError)):
+        await c.show_stat()

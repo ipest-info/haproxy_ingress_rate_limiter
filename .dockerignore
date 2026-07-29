@@ -1,16 +1,18 @@
-# .dockerignore —— 缩小 docker build 上下文，加快构建、避免无关文件入镜像。
-# 构建上下文为仓库根（docker-compose.yml 中 build: ./）。
 .git
 .gitignore
-__pycache__/
-**/__pycache__/
-*.pyc
-.pytest_cache/
-*.egg-info/
-.venv/
-tests/
-docs/
-deploy/config/
-deploy/systemd/
-deploy/tc/
-deploy/haproxy/
+docs
+tests
+# 注意：deploy/ 不可整体排除——deploy/docker/Dockerfile.node 需要
+# COPY deploy/docker/node-entrypoint.sh。只排掉与镜像构建无关的子目录。
+deploy/config
+deploy/mysql
+deploy/systemd
+deploy/tc
+deploy/haproxy
+Makefile
+README.md
+docker-compose.yml
+Dockerfile
+**/__pycache__
+*.egg-info
+Dockerfilebak

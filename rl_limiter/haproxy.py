@@ -1,19 +1,23 @@
 # rl_limiter.haproxy —— HAProxy runtime API（TCP stats socket）异步客户端。
 #
-# 这是 rl-limiter 服务与数据面（各台 HAProxy 进程）之间唯一的交互通道：
+# 这是 rl-limiter 服务与数据面（各台 HAProxy 进程）之间唯一的交互通道，
+# 且是**只读**的：collector 每秒通过 show_stat 拉取各 frontend 的
+# bytes_out 累计值与当前并发连接数，作为计费口径的原始输入（设计文档
+# §3.1：选用 frontend bytes_out 而非网卡计数，保证口径与"HAProxy 发回
+# 客户端的字节数"精确一致，且天然按 frontend 拆分）。限速本身由 HAProxy
+# 内核 tc 执行（见 rl_limiter.tcshaper），rl-limiter 不写入任何 HAProxy 的
+# 运行期状态，因此
+# stats socket 用 level user（只读）即够。
 #
-#   - 采集侧：collector 每秒通过 show_stat 拉取各 frontend 的 bytes_out 累计值
-#     与当前并发连接数，作为计费口径的原始输入（设计文档 §3.1：选用 frontend
-#     bytes_out 而非网卡计数，保证口径与"HAProxy 发回客户端的字节数"精确一致，
-#     且天然按 frontend 拆分以支持一台 HAProxy 服务多个环境）；
-#   - 执行侧：executor 通过 set_map_entry 把快环算出的整形值写入 runtime map，
-#     驱动 bwlim-out 过滤器动态调整聚合限速（设计文档 §3.2/§3.3）。
+# 接线有两种形态（见 model.NodeConfig）：同机部署走本机 unix stats
+# socket（`stats socket /run/haproxy/admin.sock mode 660 level user`，
+# 不占网络端口、按文件权限授权，推荐）；跨机监控走内网 TCP stats socket
+# （`stats socket ipv4@<内网IP>:9999 level user`）。两者只有"怎么建连"
+# 一步不同，命令语义与回包解析完全一致。
 #
-# v2.0 变化：runtime API 不再是本机 unix socket，而是 HAProxy 在内网监听的
-# TCP stats socket（haproxy.cfg：`stats socket ipv4@<内网IP>:9999 level admin`）。
-# 协议本身不变——HAProxy runtime socket 在非交互模式下"一次连接只服务一条
-# 命令"，命令执行完即由服务端关闭连接。因此 exec_cmd 每次调用都重新建连，
-# 而不是复用长连接——这不是性能疏忽，而是协议要求。
+# HAProxy runtime socket 在非交互模式下"一次连接只服务一条命令"，命令
+# 执行完即由服务端关闭连接。因此 exec_cmd 每次调用都重新建连，而不是
+# 复用长连接——这不是性能疏忽，而是协议要求。
 
 from __future__ import annotations
 
@@ -29,11 +33,16 @@ from . import model
 # server_id = -1 表示全部 server（对 frontend 行无实际筛选作用，按惯例传 -1）。
 SHOW_STAT_CMD = "show stat -1 1 -1"
 
+# 进程级指标（并发/累计连接数、连接速率、空闲率…）。回包是 "Key: value"
+# 的逐行文本，不是 CSV。它与 show stat 互补：show stat 给不出"整台 HAProxy
+# 当前有多少连接"，show stat 的行是按 proxy 拆的。
+SHOW_INFO_CMD = "show info"
+
 # 列举"回包首行以此开头即可断定命令失败"的前缀。runtime socket 的失败回包
 # 没有统一格式，只能靠已知前缀识别：命令不存在（"Unknown command"）、socket
 # 权限级别不足（"Permission denied"）、以及 "[ALERT]"/"[CFGERR]" 这类方括号
 # 包裹的诊断信息。不在此列的回包一律原样返回，由调用方按各自命令的语义
-# 解释——例如 "show stat" 的正常回包是 CSV，"set map" 成功时回包为空。
+# 解释——例如 "show stat" 的正常回包是 CSV。
 _ERROR_REPLY_PREFIXES = ("Unknown command", "Permission denied", "[")
 
 
@@ -44,8 +53,8 @@ class RuntimeAPIError(RuntimeError):
 class CommandError(RuntimeAPIError):
     """命令被 HAProxy 明确拒绝（回包命中已知错误前缀）。
 
-    保留 cmd 与完整回包原文（reply），便于上层记录与 set_map_entry 的
-    回退判断——回退逻辑需要检查回包的具体措辞，仅有异常消息不够用。
+    保留 cmd 与完整回包原文（reply），便于上层记录与按回包措辞做
+    针对性处理。
     """
 
     def __init__(self, cmd: str, reply: str, detail: str | None = None):
@@ -58,26 +67,52 @@ class StatParseError(RuntimeAPIError):
     """show stat 回包不是可用的 CSV（缺表头/缺必需列/数值非法）。"""
 
 
+class InfoParseError(RuntimeAPIError):
+    """show info 回包不是可用的 "Key: value" 文本（缺必需键）。"""
+
+
 class RuntimeClient:
-    """与单台 HAProxy 的 TCP stats socket 通信的客户端。
+    """与单台 HAProxy 的 stats socket 通信的客户端（unix 或 TCP）。
 
     自身无状态（不缓存连接），可被多个协程并发使用；timeout_s 约束每条
     命令的端到端耗时（连接 + 写入 + 读取全过程）；timeout_s <= 0 表示关闭
     客户端侧预算，完全交由调用方控制（测试场景常用）。
+
+    socket_path 非空时走本机 unix socket（同机部署形态），host/port 被
+    忽略；否则走 TCP。两种形态的差异被完全收敛在 _open 一个方法里。
     """
 
-    def __init__(self, host: str, port: int, timeout_s: float = 0.5,
-                 log: logging.Logger | None = None):
+    def __init__(self, host: str = "", port: int = 0, timeout_s: float = 0.5,
+                 log: logging.Logger | None = None, socket_path: str = ""):
         self._host = host
         self._port = port
+        self._socket_path = socket_path
         self._timeout_s = timeout_s
         # 日志仅用于调试观测（命令、耗时、回退事件），不参与控制逻辑。
         self._log = log if log is not None else logging.getLogger(__name__)
 
+    @classmethod
+    def from_node(cls, node: model.NodeConfig,
+                  log: logging.Logger | None = None) -> "RuntimeClient":
+        """按节点配置构造客户端——把"该用 unix 还是 TCP"的判断收在一处，
+        调用方（__main__ 的接线装配）不必重复分支。"""
+        return cls(node.host, node.port, node.timeout_s, log,
+                   socket_path=node.socket_path)
+
+    def endpoint(self) -> str:
+        """人类可读的端点描述，用于日志。"""
+        return self._socket_path if self._socket_path else f"{self._host}:{self._port}"
+
+    async def _open(self):
+        """建立到 stats socket 的连接，返回 (reader, writer)。"""
+        if self._socket_path:
+            return await asyncio.open_unix_connection(self._socket_path)
+        return await asyncio.open_connection(self._host, self._port)
+
     async def exec_cmd(self, cmd: str) -> str:
         """发送一条命令并返回去除首尾空白后的回包。
 
-        每次调用都新建 TCP 连接：HAProxy 在非交互模式下执行完一条命令就会
+        每次调用都新建连接：HAProxy 在非交互模式下执行完一条命令就会
         关闭 runtime socket，长连接复用在协议上不可行。读到 EOF 即为"回包
         结束"的信号，无需（也无法）依赖长度前缀或分隔符。回包若命中已知
         错误前缀则抛 CommandError（回包原文在异常属性上，便于上层记录）；
@@ -91,7 +126,7 @@ class RuntimeClient:
         # timeout <= 0 时传 None：asyncio.timeout(None) 即"无超时"。
         budget = self._timeout_s if self._timeout_s > 0 else None
         async with asyncio.timeout(budget):
-            reader, writer = await asyncio.open_connection(self._host, self._port)
+            reader, writer = await self._open()
             try:
                 writer.write((cmd + "\n").encode())
                 await writer.drain()
@@ -107,8 +142,9 @@ class RuntimeClient:
 
         out = raw.decode("utf-8", errors="replace").strip()
         self._log.debug(
-            "已执行 HAProxy runtime API 命令并完整读取回包 cmd=%r duration_ms=%d reply_bytes=%d",
-            cmd, int((time.monotonic() - start) * 1000), len(raw))
+            "已执行 HAProxy runtime API 命令并完整读取回包 "
+            "endpoint=%s cmd=%r duration_ms=%d reply_bytes=%d",
+            self.endpoint(), cmd, int((time.monotonic() - start) * 1000), len(raw))
         if _is_error_reply(out):
             raise CommandError(cmd, out)
         return out
@@ -123,56 +159,35 @@ class RuntimeClient:
         out = await self.exec_cmd(SHOW_STAT_CMD)
         return parse_show_stat(out)
 
-    async def set_map_entry(self, map_path: str, key: str, value: str) -> None:
-        """更新 runtime map 中 key 对应的条目。
+    async def show_info(self) -> model.InstanceStat:
+        """执行一次 "show info" 采样并返回进程级指标。
 
-        HAProxy 对 "set map" 成功时回包为空；若 key 尚不存在（例如 map 文件
-        初始为空、或 HAProxy reload 后 map 被重建），"set map" 会返回 "not
-        found" 类回包。此时自动回退一次 "add map"，让首次出现的 key 被透明
-        创建——调用方（executor）因此无需关心"该 key 是否已存在"，两条路径
-        对外语义一致。回退只做一次：若 "add map" 仍失败，说明是 map 路径
-        错误等真实故障，直接上抛。
+        用途见 model.InstanceUsage：整台 HAProxy 的并发/新建连接数只有
+        这里给得出（show stat 的行按 proxy 拆，加总会把同一条连接在多个
+        proxy 上重复计）。
         """
-        cmd = f"set map {map_path} {key} {value}"
-        err: CommandError | None = None
-        try:
-            out = await self.exec_cmd(cmd)
-        except CommandError as e:
-            # 即使回包命中错误前缀，也先检查是否属于"条目不存在"的
-            # 措辞变体，再决定是回退还是上抛。
-            out, err = e.reply, e
+        return parse_show_info(await self.exec_cmd(SHOW_INFO_CMD))
 
-        if _is_missing_entry_reply(out):
-            # key 不存在不算错误，是"首次写入"的正常路径；记 info 便于确认
-            # map 冷启动/重建后的首次填充时点。
-            self._log.info(
-                "map 条目不存在（多为 map 冷启动或 HAProxy reload 后重建），回退为新增条目（add map）"
-                "，对调用方语义等同写入成功 map_path=%s key=%s value=%s",
-                map_path, key, value)
-            add_cmd = f"add map {map_path} {key} {value}"
-            out = await self.exec_cmd(add_cmd)  # CommandError 直接上抛（回退只做一次）
-            if out:
-                # "add map" 成功时同样应回空包；任何非空回包都是未知情况，
-                # 宁可报错也不能假装写入成功（限速值未生效属于危险方向）。
-                raise RuntimeAPIError(
-                    f"haproxy: add map {map_path} {key}: unexpected reply: {_first_line(out)}")
-            return
 
-        if err is not None:
-            raise err
-        if out:
-            raise RuntimeAPIError(
-                f"haproxy: set map {map_path} {key}: unexpected reply: {_first_line(out)}")
+# show stat 的**必需列**：缺任何一列都拿不到计费口径，必须整体失败。
+# 其余列（监控视图用的那些）一律可选——HAProxy 各版本列集合有增删，
+# 少一列只该让对应曲线为空，不该让整次采样连同限速判定一起垮掉。
+_REQUIRED_STAT_COLS = ("pxname", "svname", "scur", "bytes_out|bout")
 
 
 def parse_show_stat(out: str) -> list[model.FrontendStat]:
     """解析 "show stat" 的 CSV 回包。
 
-    为什么按列名而不是列下标解析：HAProxy 的 stat 列集合随版本增删（2.x 各
-    小版本都有变化），列的绝对位置完全不可依赖；唯一稳定的契约是表头行
-    （以 "# " 开头）中的列名。因此先从表头建立 名字→下标 索引，再取行内
-    字段。"bytes_out" 被接受为 HAProxy 原生列名 "bout" 的别名，以兼容测试
-    桩及可能的代理层改写。
+    为什么按列名而不是列下标解析：HAProxy 的 stat 列集合随版本增删（2.8
+    的表头有 205 列，2.x 各小版本都不一样），列的绝对位置完全不可依赖；
+    唯一稳定的契约是表头行（以 "# " 开头）中的列名。因此先从表头建立
+    名字→下标 索引，再取行内字段。"bytes_out"/"bytes_in" 被接受为 HAProxy
+    原生列名 "bout"/"bin" 的别名，以兼容测试桩及可能的代理层改写。
+
+    **必需列与可选列**：pxname/svname/scur/bout 缺失即抛 StatParseError
+    （见 _REQUIRED_STAT_COLS）；监控视图用的那些列缺失时按 0 处理，只让
+    对应曲线为空——不能因为某个版本少了一列 h1_open_streams 就让限速
+    监控整个停摆。
 
     只保留 svname == "FRONTEND" 的汇总行：type 掩码虽已请求"仅 frontend"，
     但按行再校验一次可以防御掩码语义变化或桩数据混入其他行。内建 "stats"
@@ -203,7 +218,7 @@ def parse_show_stat(out: str) -> list[model.FrontendStat]:
                 # 数据继续——collector 的容错逻辑（§3.7）会兜住这次失败。
                 raise StatParseError(
                     "haproxy: show stat header missing required columns "
-                    f"(pxname/svname/scur/bytes_out|bout): {line}")
+                    f"({'/'.join(_REQUIRED_STAT_COLS)}): {line}")
             continue
         if col_idx is None:
             # 数据行先于表头出现：回包不是合法的 show stat CSV。
@@ -226,7 +241,28 @@ def parse_show_stat(out: str) -> list[model.FrontendStat]:
             scur = _parse_int_field(_field_at(fields, i_scur))
         except ValueError as e:
             raise StatParseError(f"haproxy: frontend {pxname}: bad scur: {e}") from e
-        stats.append(model.FrontendStat(name=pxname, bytes_out=bytes_out, conn_cur=scur))
+
+        def opt(*names: str, _f=fields, _c=col_idx) -> int:
+            return _optional_int(_f, _c, *names)
+
+        stats.append(model.FrontendStat(
+            name=pxname,
+            bytes_out=bytes_out,
+            conn_cur=scur,
+            bytes_in=opt("bytes_in", "bin"),
+            conn_tot=opt("conn_tot"),
+            sess_tot=opt("stot"),
+            denied_conn=opt("dcon"),
+            denied_sess=opt("dses"),
+            denied_req=opt("dreq"),
+            denied_resp=opt("dresp"),
+            err_req=opt("ereq"),
+            # 只取 h1：h2/h3 没有 frontend 方向的 open_streams 列，
+            # 理由见 model.FrontendStat 的字段注释。
+            open_conns=opt("h1_open_connections"),
+            open_streams=opt("h1_open_streams"),
+            mode=_field_at(fields, col_idx.get("mode", -1)),
+        ))
 
     if col_idx is None:
         # 连表头都没有：空回包或完全非预期的输出，按失败处理。
@@ -234,19 +270,51 @@ def parse_show_stat(out: str) -> list[model.FrontendStat]:
     return stats
 
 
+def parse_show_info(out: str) -> model.InstanceStat:
+    """解析 "show info" 的 "Key: value" 逐行文本。
+
+    与 parse_show_stat 同样的取舍：CurrConns 是必需键（缺了就说明这根本
+    不是 show info 的回包），其余按 0/缺省处理。键名大小写与 HAProxy 输出
+    一致；未知键直接忽略——show info 的键集合同样随版本增删。
+    """
+    kv: dict[str, str] = {}
+    for line in out.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        k, sep, v = line.partition(":")
+        if sep:
+            kv[k.strip()] = v.strip()
+
+    if "CurrConns" not in kv:
+        raise InfoParseError(
+            f"haproxy: show info output missing CurrConns: {_first_line(out)}")
+
+    def num(key: str, default: int = 0) -> int:
+        raw = kv.get(key, "")
+        try:
+            return _parse_int_field(raw) if raw else default
+        except ValueError:
+            return default
+
+    return model.InstanceStat(
+        curr_conns=num("CurrConns"),
+        cum_conns=num("CumConns"),
+        cum_req=num("CumReq"),
+        conn_rate=num("ConnRate"),
+        sess_rate=num("SessRate"),
+        max_conn=num("Maxconn"),
+        run_queue=num("Run_queue"),
+        idle_pct=num("Idle_pct", 100),
+        uptime_s=num("Uptime_sec"),
+    )
+
+
 def _is_error_reply(out: str) -> bool:
     """判断回包首行是否命中已知错误前缀。只看首行：错误回包的后续行
     （若有）是补充说明，不影响成败判定。"""
     line = _first_line(out)
     return line.startswith(_ERROR_REPLY_PREFIXES)
-
-
-def _is_missing_entry_reply(out: str) -> bool:
-    """识别 "set map" 的"条目不存在"回包。不同 HAProxy 版本的措辞不完全
-    一致（"entry not found" / "unable to find ..."），因此用小写子串匹配
-    兜住两种已知变体，而不是精确比对。"""
-    lowered = out.lower()
-    return "not found" in lowered or "unable to find" in lowered
 
 
 def _first_line(s: str) -> str:
@@ -264,6 +332,23 @@ def _field_at(fields: list[str], i: int) -> str:
     if i < 0 or i >= len(fields):
         return ""
     return fields[i].strip()
+
+
+def _optional_int(fields: list[str], col_idx: dict[str, int], *names: str) -> int:
+    """取一个**可选**数值列：按 names 的先后顺序找第一个存在的列名。
+
+    缺列、空值、非法值一律返回 0。这与必需列的处理刻意相反：监控视图的
+    列少一个只该让对应曲线为空，不该让整次采样（连同限速超限判定）失败。
+    """
+    for n in names:
+        i = col_idx.get(n, -1)
+        if i < 0:
+            continue
+        try:
+            return _parse_int_field(_field_at(fields, i))
+        except ValueError:
+            return 0
+    return 0
 
 
 def _parse_int_field(s: str) -> int:

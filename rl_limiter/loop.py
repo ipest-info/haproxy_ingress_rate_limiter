@@ -1,10 +1,17 @@
-# rl_limiter.loop —— 集中式快环（v2.0 主控制循环）。
+# rl_limiter.loop —— 监控主循环（单 HAProxy 模型，监控单位 = frontend）。
 #
-# 每个 tick 按固定流水线执行"采集 → 决策 → 分配 → 执行 → 上报"。
-# 其中"分配"一步的由来：决策器产出的是环境级聚合整形值（bwlim_bps），
-# 需要按各挂载点（Target = 节点 × frontend）近期用量加权拆分后才能写回
-# 各台 HAProxy——原慢环的加权分配算法在 v2.0 降级为执行路径的一步
-# （见 model.py 顶部说明）。
+# 每个 tick 按固定流水线执行"采集 → 超限判定 → 发布"。限速本身由本机
+# 内核 tc 执行（见 rl_limiter.tcshaper）；本循环的职责是每秒产出各受管 frontend 的
+# 带宽视图，并对照配置里的限额做**持续超限告警**。
+#
+# 说明：下发不在本循环里，而由两个独立任务承担——enforcer 把监听端口与
+# 后端写进 haproxy.cfg，tcshaper 把限额下发到内核 tc。每次配置应用后本
+# 循环 set 事件叫醒它们（见 _apply_config 末尾）。
+#
+# 限额与数据面同源之后，"实测超过限额"基本只剩三种可能：tc 下发失败
+# （tcshaper 会另行告警）、流量打满限额而 HTB 有正常的 burst 过冲余量、
+# 或者**口径差异**——tc 限的是链路层字节（含 IP/TCP 头），本循环采的是
+# HAProxy 的应用层 bytes_out，后者本就应该略低于前者。
 #
 # 并发模型：整个循环运行在单个 asyncio 任务中，组件间不会并发访问，
 # 因此无需任何锁；配置通过 asyncio.Queue 注入，时间通过 tick_interval_s
@@ -16,111 +23,147 @@ import asyncio
 import logging
 import time
 
-from . import allocator, model
+from . import model
 
 # 周期状态汇总日志的输出频率：每 60 个 tick（约每分钟）输出一条 info，
-# 便于在正常运行时低成本确认"循环活着、配置版本正确、各环境用量正常"。
+# 便于在正常运行时低成本确认"循环活着、配置版本正确、各节点用量正常"。
 STATUS_SUMMARY_EVERY_TICKS = 60
 
+# 持续超限告警判据：mean10 连续高于限额这么多秒才告警（瞬时冲高不告），
+# 回落同样持续这么多秒才解除——两侧都有滞回，避免在临界值附近抖动刷屏。
+OVER_ALERT_AFTER_S = 10
 
-def executor_mode(executor) -> str:
-    """兼容两种执行器契约：mode 既可能是属性/property，也可能是方法。
-
-    并行开发的 Executor 模块尚未定版，这里做一次运行时探测以解耦：
-    取到可调用对象就调用它，否则按属性值直接使用。
-    """
-    m = getattr(executor, "mode", "")
-    return m() if callable(m) else m
+# 超限持续期间的重复提醒间隔（秒）：进入告警后每隔这么久再发一条，
+# 避免长期配置漂移只在最初告警一次就淹没在日志里。
+OVER_REMIND_EVERY_S = 300
 
 
-def _summarize_quotas(envs: list[model.EnvQuota]) -> str:
-    """把环境配额压缩成单个日志字段，格式 "env1=200.00Mbps;env2=..."，
-    数值为人类可读的 Mbps（保留两位小数）。"""
-    return ";".join(f"{e.env_id}={e.quota_mbps:.2f}Mbps" for e in envs)
+def _summarize_quotas(frontends: list[model.FrontendConfig]) -> str:
+    """把各 frontend 限额压缩成单个日志字段，格式
+    "fe_main=200000000;fe_api=..."，数值为配置口径的 bits/s。"""
+    return ";".join(f"{f.name}={f.quota_bits_per_sec}" for f in frontends)
 
 
-def _summarize_usages(usages: list[model.EnvUsage]) -> str:
-    """把各环境用量压缩成单个日志字段，格式
-    "env1:mean10=98.76Mbps,conn=6;env2:..."。mean10 为计费口径的 10 秒
-    滑动均值（换算为 Mbps 展示），conn 为当前并发连接数之和。"""
+def _summarize_usages(usages: list[model.FrontendUsage]) -> str:
+    """把各 frontend 用量压缩成单个日志字段，格式
+    "fe_main:mean10_bytes_per_s=12345,conn=6;..."。mean10 为计费口径的
+    10 秒滑动均值（bytes/s），conn 为当前并发连接数。"""
     return ";".join(
-        f"{u.env_id}:mean10={model.to_mbps(u.mean10_bps):.2f}Mbps,conn={u.conn_cur}"
+        f"{u.name}:mean10_bytes_per_s={u.mean10_bps:.0f},conn={u.conn_cur}"
         for u in usages
     )
 
 
-class ControlLoop:
-    """rl-limiter 的集中式快速控制环。
+class _OverState:
+    """单个 frontend 的超限滞回状态（纯计数，秒数即 tick 数）。"""
 
-    组件契约（与并行开发的模块约定）：
-      - collector.set_mapping(dict[Target, str])；async collector.tick(now)
-        -> list[EnvUsage]；collector.degraded_nodes() -> set[str]
-      - governor.update_config(list[EnvQuota])；governor.tick(now, usages)
-        -> list[Decision]
-      - allocator.allocate(bwlim_bps, targets, target_ewma) -> dict[Target, int]
-      - async executor.apply(list[tuple[Decision, dict[Target, int]]])
-        -> list[Exception]；executor.set_mode(mode)
-      - sampler 可选回调：sampler(now, usages, decisions)，供上报器缓冲样本。
+    __slots__ = ("over_secs", "under_secs", "alerting", "since_last_remind")
+
+    def __init__(self):
+        self.over_secs = 0
+        self.under_secs = 0
+        self.alerting = False
+        self.since_last_remind = 0
+
+
+class MonitorLoop:
+    """rl-limiter 的集中监控循环。
+
+    组件契约：
+      - collector.set_managed(set[str])；async collector.tick(now)
+        -> list[FrontendUsage]；collector.degraded -> bool；
+        collector.instance -> InstanceUsage（整机监控视图，tick 后刷新）
+      - sampler 可选回调：sampler(now, usages, instance)，供控制台
+        StatusHub 记录每拍快照。
     """
 
-    def __init__(self, collector, governor, executor, sampler=None, log=None):
+    def __init__(self, collector, sampler=None, log=None,
+                 config_applied: "asyncio.Event | list[asyncio.Event] | None" = None):
         self._collector = collector
-        self._governor = governor
-        self._executor = executor
         self._sampler = sampler
         self._log = log if log is not None else logging.getLogger("rl_limiter.loop")
         # 最近一次成功应用的 ControllerConfig 版本号；单任务访问，无需原子量。
         self._version: int = 0
         # 已处理的 tick 累计数，用于日志节流与错误定位。
         self._ticks: int = 0
+        # frontend 名 → 限额（bytes/s），超限判定的基准；随配置热更。
+        self._quotas: dict[str, float] = {}
+        # 当前生效的受管 frontend 配置，供 enforcer 取用（见 frontends()）。
+        self._frontends: list[model.FrontendConfig] = []
+        # frontend 名 → 超限滞回状态。
+        self._over: dict[str, _OverState] = {}
+        # 每次应用配置后被 set 的信号量，供各"下发"类任务（写 cfg 的
+        # enforcer、下发限速的 tcshaper）做到"配置一改就立刻生效"，而不是
+        # 干等下一个周期性 reconcile。None = 没人关心（纯监控形态）。
+        #
+        # **每个任务必须各持一个 Event，不能共用**：这些任务在被唤醒后会
+        # clear() 自己的事件，共用一个的话，A 先醒来 clear 掉、B 还没回到
+        # wait，就会漏掉这次变更（要等 30 秒的周期兜底才补上）。
+        # 为兼容只有一个下发任务的调用方，这里也接受单个 Event。
+        if config_applied is None:
+            self._config_applied: list[asyncio.Event] = []
+        elif isinstance(config_applied, asyncio.Event):
+            self._config_applied = [config_applied]
+        else:
+            self._config_applied = list(config_applied)
 
     @property
     def version(self) -> int:
         """最近一次应用的配置版本号（尚未应用任何配置时为 0）。
-        上报器在样本/心跳中携带它，供后台核对配置是否推送到位。"""
+        数据库模式下是配置内容的校验和；控制台展示它，便于核对配置
+        是否已热更到位。"""
         return self._version
+
+    def frontends(self) -> list[model.FrontendConfig]:
+        """当前生效的受管 frontend 配置。
+
+        配置下发任务（enforcer）拿它渲染 haproxy.cfg 的受管区块。每轮
+        reconcile 都现取，因此配置热更后拿到的必然是新值。
+        """
+        return list(self._frontends)
 
     def seed(self, cfg: model.ControllerConfig) -> None:
         """在 run 启动之前同步应用一份初始配置，即"引导"语义：让循环从
-        第一个 tick 起就带着配额工作，而不是空转等管理后台。
-
-        三个使用场景（见 __main__ 的引导优先级）：
-          - 独立运行模式的本地静态配额；
-          - 接入后台时的本地 envs 兜底；
-          - fail-static 缓存（设计文档 §3.7：断联期间按最后一次下发的
-            配置继续限速，绝不放开为不限速）。
+        第一个 tick 起就带着限额基准工作（引导配置来自启动时加载的数据库
+        快照或本地 YAML）。
 
         seed 与 run 内的配置应用走同一条 _apply_config 路径，语义完全一致。
         """
         self._apply_config(cfg)
 
     def _apply_config(self, cfg: model.ControllerConfig) -> None:
-        """把一份配置原子地灌入三个组件：先归一化（补默认值、归一非法
-        模式），再依次更新决策器的配额、采集器的 Target→env 映射、执行器
-        的运行模式，最后记录版本号。调用方保证串行（seed 在 run 之前，
-        run 内单任务），组件间不会看到半新半旧的配置。"""
-        cfg.normalize()
-        self._governor.update_config(cfg.envs)
-        self._collector.set_mapping(cfg.target_to_env())
-        self._executor.set_mode(cfg.mode)
+        """把一份配置原子地灌入：更新采集器的受管 frontend 集合与超限判定
+        基准，最后记录版本号。调用方保证串行（seed 在 run 之前，run 内单
+        任务），组件间不会看到半新半旧的配置。"""
+        self._frontends = list(cfg.frontends)
+        self._collector.set_managed(cfg.names())
+        self._quotas = cfg.quotas()
+        # 已下线 frontend 的滞回状态一并丢弃；限额变化的保留计数（判定基准
+        # 换了，但"持续性"语义连续——限额下调后本就该尽快告警）。
+        for name in list(self._over):
+            if name not in self._quotas:
+                del self._over[name]
         self._version = cfg.version
         self._log.info(
-            "配置已应用到快环（映射/配额/模式已更新） "
-            "version=%s mode=%s envs=%d env_quotas=%s",
-            cfg.version, cfg.mode, len(cfg.envs), _summarize_quotas(cfg.envs),
+            "配置已应用到监控循环（受管 frontend / 限额基准已更新） "
+            "version=%s frontends=%d quotas=%s",
+            cfg.version, len(cfg.frontends), _summarize_quotas(cfg.frontends),
         )
+        # 叫醒配置下发任务。放在最后：等本循环的基准先更新完，避免
+        # enforcer 已经把新配置写进数据面、监控这边还在按旧基准判超限。
+        for ev in self._config_applied:
+            ev.set()
 
     async def run(self, config_queue: asyncio.Queue | None,
                   tick_interval_s: float = 1.0) -> None:
         """驱动循环直至所在任务被取消。
 
-        - config_queue 传递管理后台推送的新配置（Reporter.config_queue）；
-          独立运行模式下传 None，循环退化为纯 tick 驱动。
+        - config_queue 传递配置源投递的新配置（数据库轮询任务，见
+          dbconfig.watch）；standalone 模式下传 None，循环退化为纯 tick
+          驱动。
         - 顺序保证：某个 tick 之前已经送达的配置，一定在处理该 tick 之前
           被应用——每拍开头先非阻塞地把队列里排队的配置全部排空再跑流水
-          线。理由：若先按旧配置执行本 tick，这一秒就会按旧配额/旧模式做
-          决策，对"后台刚下调配额"或"dry-run 切 enforce"这类变更意味着
-          多放行一秒流量。
+          线，超限判定永远基于最新限额。
         - 节拍对齐：用"计算下一拍的绝对时刻再 sleep 差值"的方式推进，
           单拍处理耗时不会累积成节拍漂移。
         """
@@ -143,52 +186,87 @@ class ControlLoop:
             now_m = ev.time()
             if next_at <= now_m:
                 # 本拍耗时已超过一个周期：重新对齐到"当前时刻 + 周期"，
-                # 跳过错过的拍而不是连续补拍——补拍风暴只会加重下游
-                # （HAProxy runtime API）的压力，且对限速精度没有帮助。
+                # 跳过错过的拍而不是连续补拍。
                 next_at = now_m + tick_interval_s
             await asyncio.sleep(max(0.0, next_at - ev.time()))
 
     async def _tick(self, now: float) -> None:
-        """一次完整的快环流水线：采集 → 决策 → 分配 → 执行 → 上报。"""
+        """一次完整的监控流水线：采集 → 超限判定 → 发布。"""
         self._ticks += 1
 
-        # 采集：所有节点的 frontend 统计按环境聚合（全局视图）。
+        # 采集：本机 HAProxy 的各受管 frontend 统计。
         usages = await self._collector.tick(now)
-        # 决策：AIMD 三段状态机产出各环境的聚合整形值。
-        decisions = self._governor.tick(now, usages)
 
-        # 分配：把每个环境的聚合整形值按各挂载点的 60s EWMA 用量加权拆分
-        # 成 per-Target 的整数值（bytes/s），这是写回各 HAProxy map 的最终值。
-        ewma_by_env = {u.env_id: u.target_ewma for u in usages}
-        batch: list[tuple[model.Decision, dict[model.Target, int]]] = []
-        for d in decisions:
-            allocations = allocator.allocate(
-                d.bwlim_bps, d.targets, ewma_by_env.get(d.env_id, {}))
-            batch.append((d, allocations))
+        # 超限判定（带滞回的告警状态机）。
+        for u in usages:
+            self._check_over(u)
 
-        # 执行：执行失败绝不能中断循环——HAProxy 可能正在 reload（设计
-        # 文档 §3.7），TCP stats socket 短暂不可用是预期内故障；下一个
-        # tick 会带着新决策自然重试，残留在 HAProxy 上的旧整形值维持原样
-        # （安全方向）。executor 按契约把逐条错误收集成列表返回而不抛出。
-        errs = await self._executor.apply(batch)
-        for err in errs or []:
-            self._log.error(
-                "本拍下发整形值时发生错误（循环继续，不中断限速，下拍自然重试） "
-                "tick=%d err=%s", self._ticks, err)
-
-        # 上报：把本 tick 的完整结果交给可选的 sampler 回调（上报器缓冲）。
+        # 采样发布：把本 tick 的完整结果交给可选的 sampler 回调（控制台）。
+        # 实例视图与 frontend 用量出自同一拍，一并交出去——否则页面上
+        # 两个 tab 的曲线会差半秒，看起来像是数据对不上。
         if self._sampler is not None:
-            self._sampler(now, usages, decisions)
+            self._sampler(now, usages, self._collector.instance)
 
         # 周期状态汇总：每 STATUS_SUMMARY_EVERY_TICKS 个 tick 输出一次，
         # 正常运行时以约 1 条/分钟的成本留下可核对的运行痕迹。
         if self._ticks % STATUS_SUMMARY_EVERY_TICKS == 0:
-            degraded = sorted(self._collector.degraded_nodes())
+            alerting = sorted(
+                name for name, st in self._over.items() if st.alerting)
             self._log.info(
                 "运行状态周期汇总（每 60 拍输出一次） "
-                "tick=%d config_version=%s mode=%s envs=%d "
-                "degraded_nodes=%s envs_summary=%s",
-                self._ticks, self._version, executor_mode(self._executor),
-                len(usages), ",".join(degraded) if degraded else "-",
+                "tick=%d config_version=%s frontends=%d "
+                "sampling_degraded=%s over_quota=%s summary=%s",
+                self._ticks, self._version, len(usages),
+                self._collector.degraded,
+                ",".join(alerting) if alerting else "-",
                 _summarize_usages(usages),
             )
+
+    def _check_over(self, u: model.FrontendUsage) -> None:
+        """推进单个单元的超限滞回状态机并按需打告警/解除日志。
+
+        判据用 mean10（承诺口径）对比限额；degraded（采样失联，数据陈旧）
+        或限额未配置（<=0）时判定暂停、计数原地冻结——陈旧数据既不该
+        触发新告警，也不该解除已有告警。
+        """
+        quota = self._quotas.get(u.name, 0.0)
+        if quota <= 0 or u.degraded:
+            return
+        st = self._over.get(u.name)
+        if st is None:
+            st = self._over[u.name] = _OverState()
+
+        if u.mean10_bps > quota:
+            st.over_secs += 1
+            st.under_secs = 0
+        else:
+            st.under_secs += 1
+            st.over_secs = 0
+
+        if not st.alerting and st.over_secs >= OVER_ALERT_AFTER_S:
+            st.alerting = True
+            st.since_last_remind = 0
+            self._log.warning(
+                "frontend 带宽持续高于限额（下发正常时这通常只是 HTB 的 "
+                "burst 过冲；注意监控是应用层口径、tc 限的是链路层口径，"
+                "前者理应略低于后者。若持续偏高很多，请检查 tc 下发是否失败"
+                "——tcshaper 会另行告警） frontend=%s mean10_bytes_per_s=%.0f "
+                "quota_bytes_per_s=%.0f utilization=%.2f over_secs=%d",
+                u.name, u.mean10_bps, quota, u.mean10_bps / quota,
+                st.over_secs)
+        elif st.alerting and st.under_secs >= OVER_ALERT_AFTER_S:
+            st.alerting = False
+            self._log.info(
+                "frontend 带宽已回落到限额以内，解除持续超限告警 "
+                "frontend=%s mean10_bytes_per_s=%.0f quota_bytes_per_s=%.0f",
+                u.name, u.mean10_bps, quota)
+        elif st.alerting:
+            st.since_last_remind += 1
+            if st.since_last_remind >= OVER_REMIND_EVERY_S:
+                st.since_last_remind = 0
+                self._log.warning(
+                    "frontend 带宽仍持续高于限额（重复提醒，每 %d 秒一次） "
+                    "frontend=%s mean10_bytes_per_s=%.0f quota_bytes_per_s=%.0f "
+                    "utilization=%.2f",
+                    OVER_REMIND_EVERY_S, u.name, u.mean10_bps, quota,
+                    u.mean10_bps / quota)

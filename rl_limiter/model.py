@@ -1,335 +1,407 @@
 # rl_limiter.model —— 全服务共享的领域类型（"词汇表"层）。
 #
-# v2.0 架构背景（重大调整）：限速服务与 HAProxy 分离部署，一个 rl-limiter
-# 服务通过内网 TCP 连接并控制多台 HAProxy。原设计的"每节点 Agent 快环 +
-# 中心慢环"合并为一个集中式快环：服务每秒采样所有节点，把同一环境分布在
-# 多台 HAProxy 上的流量全局聚合后做 AIMD 决策，再按各挂载点近期用量加权
-# 把整形值分配写回各节点（原慢环的加权分配算法降级为执行路径的一步）。
+# 架构背景（v0.4 起的单 HAProxy 模型）：一个 rl-limiter 实例管**一台**
+# 与它同机的 HAProxy。限速由**内核 tc（HTB）**执行（见 rl_limiter.tcshaper）；
+# rl-limiter 负责两件事：
+#   1. 监控——每秒经本机 unix stats socket 采样各受管 frontend 的
+#      bytes_out，对照限额做持续超限告警；
+#   2. 下发——把配置（监听端口、限额、后端服务器）渲染进 haproxy.cfg 的
+#      受管区块并 reload，让改动即时生效。
 #
-# 单位约定（非常重要，混淆会带来量级误差）——分三层，各司其职：
-#   1. 内部计算口径：一律「字节每秒」（bytes/s，float）。HAProxy stats 的
-#      bytes_out 本身就是字节计数，内部保持字节口径避免反复换算。所有算法
-#      （采集差分、AIMD、加权分配）都在这一口径上进行。
-#   2. 人类可读口径：一律「兆比特每秒」（Mbps）。凡是给人看的地方——配置
-#      文件字段（quota_mbps）、日志里的带宽字段（*_mbps）、CLI 参数、文档
-#      ——统一用 Mbps，且保留两位小数，符合运维/商务对带宽的日常认知。
-#   3. 机器交换口径：metrics/heartbeat 上报 payload 里的速率仍保留精确的
-#      bytes/s（后台需要精确值做计费/对账，自行按需换算展示），不因展示
-#      需要而损失精度。
+# **监控与限速的单位都是 frontend**：一个 frontend = 一个监听端口 +
+# 一个 tc 速率类 + 一组后端服务器。tc 按**源端口**分类，而源端口就是该
+# frontend 的监听端口，因此这个对应关系是天然的，也不存在"跨 frontend
+# 的总限额"这种东西。
 #
-# 换算集中在本模块的 to_mbps / mbps_to_bytes_per_sec 两个函数，其余代码
-# 不得自行写 *8/1e6 之类的散装换算。EnvQuota 以 Mbps 存储配额，只在
-# quota_bytes_per_sec 属性处转成内部计算口径。
+# 历史包袱说明：v0.3 及以前有"节点 / 业务环境（env）"两层分组，用于一个
+# 集中服务监控多台 HAProxy。改为同机部署后一个实例只对一台 HAProxy 负责，
+# 那两层分组失去意义，已整体移除（EnvQuota/EnvUsage/Target/env_groups
+# 及 envs、env_targets 两张表）。对应的旧版本见 tag v0.3.0-colocated。
+#
+# 单位约定（非常重要，混淆会带来 8 倍误差）：
+#   - 内部所有速率一律为「字节每秒」（bytes/s，float）。HAProxy stats 的
+#     bytes_out 本身就是字节计数，内部保持字节口径避免反复换算。
+#   - 配置中的限额（数据库与本地 YAML 的 quota_bps 字段）一律为
+#     「比特每秒」（bits/s），遵循运维习惯：200_000_000 表示 200 Mbps。
+#   - 两种口径只在 FrontendConfig.quota_bytes_per_sec 这一处转换
+#     （除以 8），其余代码不得再做单位换算。
 
 from __future__ import annotations
 
-import enum
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
-
-# 1 Mbps = 1_000_000 bits/s = 125_000 bytes/s（十进制兆，网络带宽惯例，
-# 不是 1024 进制）。带宽换算全服务只认这一个常量。
-BITS_PER_MBIT = 1_000_000
-BYTES_PER_MBIT = BITS_PER_MBIT / 8  # 125_000
-
-
-def to_mbps(bytes_per_sec: float) -> float:
-    """内部计算口径（bytes/s）→ 人类可读口径（Mbps）。
-
-    用于日志与任何展示场景：调用方通常再 `%.2f` 保留两位小数。
-    例：25_000_000 bytes/s → 200.0 Mbps。
-    """
-    return bytes_per_sec * 8 / BITS_PER_MBIT
-
-
-def mbps_to_bytes_per_sec(mbps: float) -> float:
-    """人类可读口径（Mbps）→ 内部计算口径（bytes/s）。
-
-    用于配置入口把 quota_mbps 转成算法用的 bytes/s。
-    例：200 Mbps → 25_000_000 bytes/s。
-    """
-    return mbps * BYTES_PER_MBIT
-
-# 执行器（executor）的两种运行模式：
-#   - dry-run：只计算并记录本应写入的整形值，不真正改动 HAProxy，
-#     用于灰度观察与新环境验证（安全默认值）；
-#   - enforce：把整形值真实写入各 HAProxy 的 bwlim map，实际生效限速。
-# 非法模式一律归一为 dry-run（安全方向）。
-MODE_DRY_RUN = "dry-run"
-MODE_ENFORCE = "enforce"
-
-
-class Target(NamedTuple):
-    """限速目标：某台 HAProxy 节点上的某个 frontend。
-
-    v2.0 的关键变化——同一个环境的 frontend 可能分布在多台 HAProxy 上，
-    因此 (node, frontend) 二元组才是采集与执行的最小单位；纯 frontend
-    名字不再全局唯一。
-    """
-
-    node: str      # HAProxy 节点名（与配置 haproxy_nodes[].name 对应）
-    frontend: str  # 该节点上的 frontend 名（stats 输出的 pxname 列）
-
-    def __str__(self) -> str:
-        return f"{self.node}/{self.frontend}"
+from typing import Any
 
 
 @dataclass(slots=True)
 class FrontendStat:
-    """从某台 HAProxy 的 `show stat` 采样得到的单个 frontend 行。
+    """从 HAProxy 的 `show stat` 采样得到的单个 frontend 行（原始累计值）。
 
-    统计口径遵循设计文档 §3.1：用 frontend 的 bytes_out（发回客户端的
-    应用层字节数）而非网卡计数，与计费口径一致且天然按 frontend 拆分。
+    这里只收「HAProxy 真的统计了」的列——stats CSV 有 200+ 列，绝大多数
+    是 QUIC/H3 的细分错误码，与本项目的监控视图无关。字段的取舍依据见
+    docs/05-监控视图.md 的可行性分析。
     """
 
-    name: str       # frontend 名称（pxname 列）
-    bytes_out: int  # 下行方向累计字节数（单调递增计数器，速率由相邻两秒差分得出）
-    conn_cur: int   # 当前并发连接数（scur 列），用于资源保护水位观测
+    name: str            # frontend 名称（pxname）
+    bytes_out: int       # 下行累计字节（bout）；速率由相邻两秒差分得出
+    conn_cur: int        # 当前并发连接数（scur）
+    bytes_in: int = 0    # 上行累计字节（bin）
+    # 累计连接/会话数。conn_tot 是 TCP 连接，stot 是会话——HTTP keep-alive
+    # 下一条连接可承载多个会话，两者不等价。
+    conn_tot: int = 0
+    sess_tot: int = 0
+    # 被拒绝的连接/会话/请求/响应。实测：`tcp-request connection reject`
+    # 计入 denied_conn，`tcp-request content reject` 计入 denied_req。
+    # 这几项之和是本项目对"丢失连接数"的口径（HAProxy 没有"丢包"概念）。
+    denied_conn: int = 0
+    denied_sess: int = 0
+    denied_req: int = 0
+    denied_resp: int = 0
+    err_req: int = 0     # 请求错误数（ereq）
+    # HTTP/1 的连接/流计数（h1_open_connections / h1_open_streams）。实测
+    # 这两列是**按 frontend** 统计的，可据此拆出活跃/空闲：有在途流的连接
+    # 算活跃，建着但没有流的（keep-alive 空等）算空闲。
+    #
+    # 为什么只取 h1：stats CSV 里 h2 只有 h2_open_connections 与
+    # h2_backend_open_streams——**前端方向的 open_streams 根本没有这一列**，
+    # h3 连 open_connections 都没有。拿 h2 的连接数配 h1 的流数会把 h2 连接
+    # 全算成空闲，比不算更糟。受管区块渲染出的 bind 不带 alpn，协商不到
+    # h2/h3，因此本项目自己生成的 frontend 全部落在 h1 口径内。
+    #
+    # 注意 mode tcp 下没有"流"的概念，这两个值都是 0——TCP 模式下每条
+    # 连接就是一条数据通道，全部按活跃计。
+    open_conns: int = 0
+    open_streams: int = 0
+    mode: str = ""       # tcp | http（决定活跃/空闲怎么算）
 
+    @property
+    def denied_total(self) -> int:
+        """本项目对"丢失连接数"的口径：连接级 + 会话级 + 请求级的拒绝之和。
 
-class GovState(enum.Enum):
-    """决策器对某环境所处的 AIMD 状态（设计文档 §3.3 三段）。"""
-
-    NORMAL = "normal"          # 常态：整形值停在弹性上限（quota × elastic_ceiling）
-    TIGHTENING = "tightening"  # 收紧中：mean10 持续超配额，按 md_factor 乘性下压
-    RECOVERING = "recovering"  # 恢复中：mean10 持续低于低水位，按 ai_step_frac 加性放松
-
-    def __str__(self) -> str:
-        return self.value
-
-
-@dataclass(slots=True)
-class EnvUsage:
-    """采集器每个 tick（1s）按环境聚合出的用量视图。
-
-    v2.0：聚合范围是该环境在**所有节点**上的全部 Target——环境总带宽
-    直接全局可见，无需再经过慢环上报汇总。
-    """
-
-    env_id: str
-    # 瞬时速率（bytes/s）：本秒与上一秒计数器的差分之和。噪声最大，
-    # 仅作观测参考，不直接驱动限速决策。
-    rate_bps: float = 0.0
-    # 10 秒滑动窗口均值（bytes/s）。承诺/计费口径（已拍板：10s 均值 ≤
-    # 约定带宽，瞬时容忍 110%），是快环收紧/恢复判据的直接输入。
-    mean10_bps: float = 0.0
-    # 约 60 秒 EWMA（bytes/s），平滑趋势观测与加权分配的兜底输入。
-    ewma60_bps: float = 0.0
-    # 该环境全部 Target 当前并发连接数之和。
-    conn_cur: int = 0
-    # 采样已持续失败（节点失联等），速率值沿用最后一次成功采样的结果
-    # （设计文档 §3.7 fail-static）。degraded 时 governor 冻结该环境。
-    degraded: bool = False
-    # 每个 Target 的 60s EWMA 用量（bytes/s），是执行路径按挂载点加权
-    # 分配整形值的输入（原慢环算法的输入，v2.0 下沉到这里）。
-    target_ewma: dict[Target, float] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class Decision:
-    """决策器每 tick 针对单个环境产出的执行指令。"""
-
-    env_id: str
-    targets: list[Target]  # 该环境的全部挂载点（分配器据此拆分聚合值）
-    bwlim_bps: float       # 目标聚合整形值（bytes/s，环境全局口径）
-    state: GovState
-    # bwlim_bps 相比上次产出是否变化（迟滞 epsilon = 0.1% × quota）。
-    # 执行器据此跳过无变化的写入，减少 runtime API 压力。
-    changed: bool = False
-
-
-@dataclass(slots=True)
-class GovParams:
-    """本地快环控制参数（设计文档 §3.3），可由管理后台下发并按环境覆盖。
-
-    默认值即 §3.3 拍板组合：1.10 / 0.90 / 3s / 5s / ×0.9 / 0.95 / +5%。
-    """
-
-    # 弹性上限系数：ceil = quota × elastic_ceiling。常态下允许冲高到
-    # 配额的 110%（瞬时容忍口径）。
-    elastic_ceiling: float = 1.10
-    # 恢复判据低水位：mean10 < quota × low_watermark 持续 recover_after_s
-    # 秒后开始放松。
-    low_watermark: float = 0.90
-    # mean10 > quota 需持续的秒数，达到后触发乘性收紧。
-    tighten_after_s: int = 3
-    # mean10 低于低水位需持续的秒数，达到后触发加性恢复。急收慢放：
-    # 恢复等待窗口比收紧窗口长。
-    recover_after_s: int = 5
-    # 乘性收紧系数：bwlim = max(quota × tighten_floor, bwlim × md_factor)。
-    md_factor: float = 0.9
-    # 收紧下限系数：整形值永不低于 quota × tighten_floor，防止过度惩罚。
-    tighten_floor: float = 0.95
-    # 加性恢复步长：每秒放松 quota × ai_step_frac，直至回到弹性上限。
-    ai_step_frac: float = 0.05
-
-    def normalize(self) -> None:
-        """把零值/非法字段回填为默认值，使局部覆盖也能得到自洽参数。
-
-        特别地 md_factor 必须落在 (0,1) 开区间才有"乘性收紧"的意义。
+        HAProxy 没有"丢包"概念，能称得上"丢失"的只有它自己主动拒掉的那些。
+        denied_resp 是响应方向的拒绝（后端已经应答过了），不算连接丢失，
+        故不计入。
         """
-        d = GovParams()
-        if self.elastic_ceiling <= 0:
-            self.elastic_ceiling = d.elastic_ceiling
-        if self.low_watermark <= 0:
-            self.low_watermark = d.low_watermark
-        if self.tighten_after_s <= 0:
-            self.tighten_after_s = d.tighten_after_s
-        if self.recover_after_s <= 0:
-            self.recover_after_s = d.recover_after_s
-        if self.md_factor <= 0 or self.md_factor >= 1:
-            self.md_factor = d.md_factor
-        if self.tighten_floor <= 0:
-            self.tighten_floor = d.tighten_floor
-        if self.ai_step_frac <= 0:
-            self.ai_step_frac = d.ai_step_frac
+        return self.denied_conn + self.denied_sess + self.denied_req
 
-    @classmethod
-    def from_dict(cls, d: dict[str, Any] | None) -> "GovParams | None":
-        if d is None:
-            return None
-        p = cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
-        p.normalize()
-        return p
+    @property
+    def active_conns(self) -> int:
+        """活跃连接数：有在途请求/流的连接。
+
+        mode tcp 下没有流的概念，每条连接都在传数据，全部计为活跃。
+        """
+        if self.mode == "http" and self.open_conns:
+            return min(self.open_streams, self.open_conns)
+        return self.conn_cur
+
+    @property
+    def idle_conns(self) -> int:
+        """空闲连接数：建立着但当前没有在途流（HTTP keep-alive 等待中）。"""
+        if self.mode == "http" and self.open_conns:
+            return max(0, self.open_conns - self.open_streams)
+        return 0
+
+
+@dataclass(slots=True)
+class InstanceStat:
+    """从 HAProxy 的 `show info` 采样得到的进程级指标（原始值）。
+
+    与 FrontendStat 互补：前者是"这台 HAProxy 整体"，后者是"某个监听端口"。
+    实例级的带宽/拒绝数由各 frontend 汇总得出（show info 不给这些）。
+    """
+
+    curr_conns: int = 0      # CurrConns：当前连接数
+    # 以下三项是**进程范围**的累计量，包含 rl-limiter 自己对 runtime API
+    # 的连接（每秒两条）。因此实例视图的"每秒新建连接数"不用它们，改用
+    # Σ frontend conn_tot（见 collector._tick_instance 的注释与实测数据）。
+    # 保留解析是因为它们对排障有用（比如核对采集器自身的开销）。
+    cum_conns: int = 0       # CumConns：累计连接数
+    cum_req: int = 0         # CumReq：累计请求数
+    conn_rate: int = 0       # ConnRate：HAProxy 自己算的每秒新建连接数
+    sess_rate: int = 0       # SessRate：每秒新建会话数
+    max_conn: int = 0        # Maxconn：进程连接上限（画水位线用）
+    run_queue: int = 0       # Run_queue：任务队列长度
+    idle_pct: int = 100      # Idle_pct：HAProxy 自报的空闲率，越低越忙
+    uptime_s: int = 0
+
+
+@dataclass(slots=True)
+class NicStat:
+    """从 /proc/net/dev 采样得到的网卡计数器（原始累计值）。
+
+    **为什么需要它**：HAProxy 是 L4/L7 代理，只统计字节与连接，
+    **完全不统计数据包**，更没有"丢包"的概念。监控视图里要求的
+    "每秒流入/流出数据包数""每秒丢失入/出包数"只能从网卡取。
+
+    同机部署（rl-limiter 与 HAProxy 在同一台机器）才拿得到这份数据——
+    这是同机形态的又一处收益。
+
+    口径提醒：网卡计数是**整机**的，含 HAProxy 之外的全部流量，也无法
+    按 frontend 拆分。控制台上它只出现在"实例"视图并标注为网卡口径。
+    """
+
+    iface: str = ""
+    rx_bytes: int = 0
+    rx_packets: int = 0
+    rx_dropped: int = 0
+    rx_errs: int = 0
+    tx_bytes: int = 0
+    tx_packets: int = 0
+    tx_dropped: int = 0
+    tx_errs: int = 0
+
+
+@dataclass(slots=True)
+class ServerEntry:
+    """受管 frontend 背后的一台后端服务器（haproxy.cfg 里的一行 server）。
+
+    字段刻意只覆盖"标准化 Web 界面"需要的那几项：地址、端口、权重、
+    健康检查。更冷门的 server 参数（ssl、sni、cookie…）不在受管区块的
+    表达能力内——需要时应把该 frontend 从受管区块移出、改为手写。
+    """
+
+    name: str                    # server 条目名（同一 frontend 内唯一）
+    address: str                 # 后端地址（IP 或可解析的主机名）
+    port: int                    # 后端端口
+    weight: int = 100            # 负载权重；balance 算法按它分配
+    check: bool = True           # 是否启用主动健康检查
+    check_inter_ms: int = 2000   # 健康检查间隔（毫秒），check 为真时才写入
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "elastic_ceiling": self.elastic_ceiling,
-            "low_watermark": self.low_watermark,
-            "tighten_after_s": self.tighten_after_s,
-            "recover_after_s": self.recover_after_s,
-            "md_factor": self.md_factor,
-            "tighten_floor": self.tighten_floor,
-            "ai_step_frac": self.ai_step_frac,
+            "name": self.name, "address": self.address, "port": self.port,
+            "weight": self.weight, "check": self.check,
+            "check_inter_ms": self.check_inter_ms,
         }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ServerEntry":
+        return cls(
+            name=str(d["name"]), address=str(d["address"]), port=int(d["port"]),
+            weight=int(d.get("weight", 100)),
+            check=bool(d.get("check", True)),
+            check_inter_ms=int(d.get("check_inter_ms", 2000)),
+        )
 
 
 @dataclass(slots=True)
-class EnvQuota:
-    """一个环境的配额与挂载点清单，配置分发的最小单元（§3.5 数据模型）。
+class FrontendConfig:
+    """一个受管 frontend：监听端口 + 限速 + 后端服务器清单。
 
-    v2.0：targets 显式携带节点维度——同一环境可以横跨多台 HAProxy。
+    对应 haproxy.cfg 受管区块里的一个 `listen` 段（listen 而非
+    frontend+backend 分写，是因为本项目里两者一一对应，合成一段能让
+    生成的配置更短、也更贴近 stats 里的 pxname）。
+
+    quota_bits_per_sec 同时是两件事的依据：下发到内核 tc 的类速率
+    （真实限速），以及监控侧的超限告警基准。两者同源，因此 v0.3 那种
+    "库里改了、数据面忘了改"的配置漂移在本模型下不可能发生。
     """
 
-    env_id: str
-    # 环境配额，单位「兆比特每秒」（Mbps，人类可读口径），如 200 或
-    # 200.5。这是配置与展示的统一带宽单位；进入内部计算前经
-    # quota_bytes_per_sec 属性转成 bytes/s。允许小数。
-    quota_mbps: float
-    targets: list[Target] = field(default_factory=list)
-    # 快环参数覆盖；None 表示整体使用默认参数。
-    params: GovParams | None = None
+    name: str                       # frontend 名（= stats 里的 pxname，全局唯一）
+    bind_port: int                  # 监听端口
+    quota_bits_per_sec: int         # 限额（bit/s），运维口径
+    bind_address: str = ""          # 监听地址；空 = 所有地址（HAProxy 的 `bind :port`）
+    mode: str = "tcp"               # tcp | http
+    maxconn: int = 0                # 0 = 不写该指令，沿用 global/defaults
+    balance: str = "roundrobin"     # 后端负载均衡算法
+    timeout_connect_ms: int = 5000
+    timeout_client_ms: int = 50000
+    timeout_server_ms: int = 50000
+    servers: list[ServerEntry] = field(default_factory=list)
 
     @property
     def quota_bytes_per_sec(self) -> float:
-        """Mbps → bytes/s 的唯一换算边界（进入内部计算口径）。"""
-        return mbps_to_bytes_per_sec(self.quota_mbps)
+        """bits/s → bytes/s 的唯一换算边界（除以 8）。
 
-    def effective_params(self) -> GovParams:
-        """返回实际生效参数：无覆盖用默认；有覆盖经 normalize 补齐。"""
-        if self.params is None:
-            return GovParams()
-        p = GovParams(**self.params.to_dict())
-        p.normalize()
-        return p
+        下发给 tc 的类速率（tcshaper 会再 ×8 换回 bit/s，因为 tc 的 rate
+        参数用 bit）与监控侧的判定基准都取这个值，单位换算全服务只此一处。
+        """
+        return self.quota_bits_per_sec / 8.0
 
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "EnvQuota":
-        targets = [
-            Target(t["node"], t["frontend"]) for t in d.get("targets", [])
-        ]
-        return cls(
-            env_id=d.get("env_id", ""),
-            quota_mbps=float(d.get("quota_mbps", 0)),
-            targets=targets,
-            params=GovParams.from_dict(d.get("params")),
-        )
+    @property
+    def bind_spec(self) -> str:
+        """haproxy.cfg 里 `bind` 指令的参数形态。"""
+        return f"{self.bind_address}:{self.bind_port}" if self.bind_address \
+            else f":{self.bind_port}"
 
     def to_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "env_id": self.env_id,
-            "quota_mbps": self.quota_mbps,
-            "targets": [{"node": t.node, "frontend": t.frontend} for t in self.targets],
+        return {
+            "name": self.name,
+            "bind_address": self.bind_address,
+            "bind_port": self.bind_port,
+            "quota_bps": self.quota_bits_per_sec,
+            "mode": self.mode,
+            "maxconn": self.maxconn,
+            "balance": self.balance,
+            "timeout_connect_ms": self.timeout_connect_ms,
+            "timeout_client_ms": self.timeout_client_ms,
+            "timeout_server_ms": self.timeout_server_ms,
+            "servers": [s.to_dict() for s in self.servers],
         }
-        if self.params is not None:
-            out["params"] = self.params.to_dict()
-        return out
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "FrontendConfig":
+        return cls(
+            name=str(d["name"]),
+            bind_port=int(d["bind_port"]),
+            quota_bits_per_sec=int(d["quota_bps"]),
+            bind_address=str(d.get("bind_address", "") or ""),
+            mode=str(d.get("mode", "tcp")),
+            maxconn=int(d.get("maxconn", 0) or 0),
+            balance=str(d.get("balance", "roundrobin")),
+            timeout_connect_ms=int(d.get("timeout_connect_ms", 5000)),
+            timeout_client_ms=int(d.get("timeout_client_ms", 50000)),
+            timeout_server_ms=int(d.get("timeout_server_ms", 50000)),
+            servers=[ServerEntry.from_dict(s) for s in (d.get("servers") or [])],
+        )
+
+
+@dataclass(slots=True)
+class FrontendUsage:
+    """采集器每个 tick（1s）为单个受管 frontend 产出的用量视图。
+
+    速率字段一律 bytes/s；控制台展示时才换算成 Mbps。
+
+    字段分两组：**限速相关**（rate/mean10/ewma60，限速与超限告警的判据，
+    自项目第一版就有）与**监控视图相关**（其余，为 docs/05-监控视图.md 的
+    "监听端口视图"补齐）。前者不可随意改动——它们是计费与告警口径。
+    """
+
+    name: str
+    # 本 tick 的瞬时下行速率（相邻两秒 bytes_out 差分）。
+    rate_bps: float = 0.0
+    # 10 秒滑动窗口均值——承诺口径，也是超限告警的判据（毛刺不告警）。
+    mean10_bps: float = 0.0
+    # 60 秒 EWMA，仅供趋势观测。
+    ewma60_bps: float = 0.0
+    # 当前并发连接数，用于资源保护水位观测。
+    conn_cur: int = 0
+    # --- 以下为监控视图字段（不参与限速/告警判定）---
+    # 上行速率（bytes_in 差分）。限速只作用于下行，上行仅作观测。
+    rate_in_bps: float = 0.0
+    # 每秒新建连接数（conn_tot 差分）。
+    conn_new_ps: float = 0.0
+    # 每秒丢失连接数（FrontendStat.denied_total 差分）。
+    conn_denied_ps: float = 0.0
+    # 活跃 / 非活跃（空闲）连接数，见 FrontendStat 的同名属性。
+    active_conns: int = 0
+    idle_conns: int = 0
+    # --- 以下四项来自内核 tc 的该 frontend 专属队列（见 tcshaper）---
+    # 这是限速迁到 tc 之后白捡的能力：HAProxy 完全不统计数据包，网卡计数
+    # 又无法按 frontend 拆，而 tc 的每个 class 正好对应一个 frontend。
+    # 口径：**出方向、链路层字节**（含 IP/TCP 头），与上面 HAProxy 口径
+    # 的 rate_bps 并列展示时会略高，那是正常的。
+    pkts_out_ps: float = 0.0     # 每秒流出数据包数
+    drop_out_ps: float = 0.0     # 每秒丢弃包数——限速丢的包就在这里
+    overlimit_ps: float = 0.0    # 每秒触发限速被延迟的次数（限额吃紧的直接信号）
+    backlog_bytes: int = 0       # 当前排队字节数
+    # 采样失联：本 tick 的值是沿用上一秒的陈旧值（fail-static），
+    # 超限判定应暂停，控制台标红。
+    degraded: bool = False
+
+
+@dataclass(slots=True)
+class InstanceUsage:
+    """采集器每个 tick 产出的**整台 HAProxy** 的用量视图。
+
+    与 FrontendUsage 的关系：后者是单个监听端口，前者是这台 HAProxy 的
+    全貌。实例级的连接数直接来自 `show info`；带宽与拒绝数 `show info`
+    不给（TotalBytesOut 只统计出向且含 backend），因此由**全部 frontend
+    汇总**得出——包括不在受管清单里的那些，"整个实例"就该是整个实例。
+
+    数据包相关的四个字段来自网卡（/proc/net/dev），是**整机口径**，含
+    HAProxy 之外的流量：HAProxy 作为 L4/L7 代理完全不统计数据包，这部分
+    只能从网卡取。控制台上须标注清楚，不能与 HAProxy 口径混为一谈。
+    """
+
+    # --- 连接视图（show info + frontend 汇总）---
+    # 每秒新建连接数取 Σ frontend conn_tot 的差分，**不是** show info 的
+    # CumConns——后者含采集器自身对 runtime API 的连接，会有恒定底噪。
+    conn_new_ps: float = 0.0
+    conn_denied_ps: float = 0.0  # 每秒丢失连接数（Σ frontend denied 差分）
+    conn_cur: int = 0            # 并发连接数（CurrConns）
+    active_conns: int = 0        # 活跃连接数（Σ frontend）
+    idle_conns: int = 0          # 非活跃连接数（Σ frontend）
+    max_conn: int = 0            # 进程连接上限，画水位线用
+    # --- 带宽视图（HAProxy 口径，Σ frontend 差分，bytes/s）---
+    rate_in_bps: float = 0.0
+    rate_out_bps: float = 0.0
+    # --- 数据包视图（网卡口径，整机范围）---
+    nic: str = ""                # 采样的网卡名；空串 = 未取到网卡数据
+    pkts_in_ps: float = 0.0
+    pkts_out_ps: float = 0.0
+    drop_in_ps: float = 0.0      # 每秒丢失入包数（rx_dropped 差分）
+    drop_out_ps: float = 0.0     # 每秒丢失出包数（tx_dropped 差分）
+    nic_rate_in_bps: float = 0.0   # 网卡口径入向速率，与 HAProxy 口径对照用
+    nic_rate_out_bps: float = 0.0
+    # --- 进程健康 ---
+    idle_pct: int = 100          # HAProxy 自报空闲率，越低越忙
+    degraded: bool = False       # 采样失联，本 tick 是陈旧值
 
 
 @dataclass(slots=True)
 class ControllerConfig:
-    """管理后台通过长轮询接口（§3.6）下发的带版本配置文档。
+    """投递给监控主循环的运行期配置文档（业务配置的内存形态）。
 
-    同时也是 fail-static 本地缓存的持久化格式（§3.7：与后台断联时按
-    最后一次下发的配置继续限速，恢复后先拉全量）。version 单调比较：
-    服务以本地版本号发起长轮询，后台仅在版本不一致时立即返回新配置。
-    注意：HAProxy 节点的连接信息（地址/超时/map 路径）属于基础设施
-    配置，只在本地 YAML 维护，不随后台配置下发。
+    version 是配置版本号：数据库模式下取内容校验和，本地 YAML 模式恒为 0。
+    控制台展示它，便于核对热更新是否已到位。
     """
 
     version: int = 0
-    mode: str = MODE_DRY_RUN
-    envs: list[EnvQuota] = field(default_factory=list)
-    report_interval_s: int = 5    # 用量样本上报间隔（秒）
-    heartbeat_interval_s: int = 10  # 心跳间隔（秒）
+    frontends: list[FrontendConfig] = field(default_factory=list)
 
-    def normalize(self) -> None:
-        """模式非法归一为 dry-run（安全方向），间隔非正取默认，并逐个
-        归一各环境的参数覆盖。所有配置入口（后台下发、本地 YAML、缓存
-        加载）都必须先经过这里。"""
-        if self.mode != MODE_ENFORCE:
-            self.mode = MODE_DRY_RUN
-        if self.report_interval_s <= 0:
-            self.report_interval_s = 5
-        if self.heartbeat_interval_s <= 0:
-            self.heartbeat_interval_s = 10
-        for e in self.envs:
-            if e.params is not None:
-                e.params.normalize()
+    def quotas(self) -> dict[str, float]:
+        """frontend 名 → 限额（bytes/s），供超限判定使用。"""
+        return {f.name: f.quota_bytes_per_sec for f in self.frontends}
 
-    def target_to_env(self) -> dict[Target, str]:
-        """把环境列表展平为 Target → env_id 查找表，供采集器聚合。
-        同一 Target 被多个环境声明时后者覆盖前者（配置校验应阻止）。"""
-        m: dict[Target, str] = {}
-        for e in self.envs:
-            for t in e.targets:
-                m[t] = e.env_id
-        return m
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ControllerConfig":
-        cfg = cls(
-            version=int(d.get("version", 0)),
-            mode=d.get("mode", MODE_DRY_RUN),
-            envs=[EnvQuota.from_dict(e) for e in d.get("envs", [])],
-            report_interval_s=int(d.get("report_interval_s", 5)),
-            heartbeat_interval_s=int(d.get("heartbeat_interval_s", 10)),
-        )
-        cfg.normalize()
-        return cfg
+    def names(self) -> set[str]:
+        """全部受管 frontend 名，供采集器过滤 `show stat` 的行。"""
+        return {f.name for f in self.frontends}
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
-            "mode": self.mode,
-            "envs": [e.to_dict() for e in self.envs],
-            "report_interval_s": self.report_interval_s,
-            "heartbeat_interval_s": self.heartbeat_interval_s,
+            "frontends": [f.to_dict() for f in self.frontends],
         }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ControllerConfig":
+        return cls(
+            version=int(d.get("version", 0)),
+            frontends=[FrontendConfig.from_dict(f) for f in (d.get("frontends") or [])],
+        )
 
 
 @dataclass(slots=True)
 class NodeConfig:
-    """一台受控 HAProxy 节点的连接配置（基础设施配置，仅本地 YAML）。
+    """本机 HAProxy 的连接配置（基础设施配置，启动时定型）。
 
-    v2.0：runtime API 不再是本机 unix socket，而是 HAProxy 在内网监听
-    的 TCP stats socket（haproxy.cfg：`stats socket ipv4@<内网IP>:9999
-    level admin`）。该端口具备 admin 权限，必须只绑内网并用安全组/防火
-    墙限制仅限速服务可达。
+    采样通道二选一，由配置决定（校验强制恰好给一种）：
+
+    - **本机 unix socket（同机部署，推荐）**：rl-limiter 与 HAProxy 装在
+      同一台服务器上，haproxy.cfg 写
+      `stats socket /run/haproxy/admin.sock mode 660 level user`，配置里
+      填 socket_path。stats socket 完全不占网络端口，访问权靠文件属主/
+      属组控制——同机形态下这是最小攻击面的接法。
+    - **内网 TCP（远程只读观测，兼容保留）**：haproxy.cfg 写
+      `stats socket ipv4@<内网IP>:9999 level user`，配置里填 host/port。
+      端口必须只绑内网并用安全组/防火墙限制仅监控服务可达。注意这种形态
+      下**无法下发配置**（改 cfg + reload 必须在本机做）。
+
+    两种形态下 rl-limiter 对 stats socket 都只做只读采样，`level user`
+    即够；配置下发走的是文件 + reload，与 stats socket 无关。
     """
 
-    name: str                # 节点名（Target.node 引用它）
-    host: str                # 内网地址
-    port: int                # TCP stats socket 端口
-    bwlim_map_path: str = "/etc/haproxy/maps/bwlim.map"  # 该节点上 bwlim map 的路径（map 标识）
+    name: str = "haproxy"    # 本机 HAProxy 的标识名（多机共用配置库时区分用）
+    host: str = ""           # 内网地址（TCP 形态）
+    port: int = 0            # TCP stats socket 端口（TCP 形态）
     timeout_s: float = 0.5   # 单次 runtime API 命令超时（连接 + 读写）
+    socket_path: str = ""    # 本机 unix stats socket 路径（同机形态）
+
+    @property
+    def is_unix(self) -> bool:
+        """该节点是否走本机 unix socket 采样（同机部署形态）。"""
+        return bool(self.socket_path)
+
+    def endpoint(self) -> str:
+        """人类可读的采样端点描述，用于日志与控制台展示。"""
+        return self.socket_path if self.is_unix else f"{self.host}:{self.port}"
