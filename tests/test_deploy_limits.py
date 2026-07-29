@@ -45,26 +45,52 @@ def node_services() -> dict:
     return {n: s for n, s in doc["services"].items() if n.startswith("node")}
 
 
+def effective(svc: dict, name: str) -> int:
+    """某个 node 服务实际生效的 maxconn/maxpipes。
+
+    compose 用 HAPROXY_MAXCONN / HAPROXY_MAXPIPES 把模板里的生产默认值
+    （100 万）降到演示量级——入口脚本会就地改写 cfg，所以这里也得按覆盖后
+    的值算，否则测的是一个跑不到的数。
+    """
+    env = svc.get("environment") or {}
+    override = env.get("HAPROXY_" + name.upper())
+    return int(override) if override is not None else cfg_directive(name)
+
+
 def test_compose_nofile_covers_haproxy_fd_need():
     """FD 需求 = maxconn×2 + maxpipes×2 + 34（管道那项是 splice 用的）。
 
     给不够 HAProxy **拒绝启动**：
-        [ALERT] Cannot raise FD limit to 400034, limit is 4096.
+        [ALERT] Cannot raise FD limit to 4000034, limit is 4096.
     """
-    maxconn = cfg_directive("maxconn")
-    maxpipes = cfg_directive("maxpipes")
-    assert maxconn and maxpipes, "基线 cfg 里应显式写死这两项"
-    need = maxconn * 2 + maxpipes * 2 + 34
+    assert cfg_directive("maxconn") and cfg_directive("maxpipes"), \
+        "基线 cfg 里应显式写死这两项"
 
     services = node_services()
     assert services, "compose 里应有 node* 服务"
     for name, svc in services.items():
+        maxconn = effective(svc, "maxconn")
+        maxpipes = effective(svc, "maxpipes")
+        need = maxconn * 2 + maxpipes * 2 + 34
         nofile = svc["ulimits"]["nofile"]
         for which in ("soft", "hard"):
             assert nofile[which] >= need, (
                 f"{name} 的 ulimits.nofile.{which}={nofile[which]} 不够 "
                 f"{need}（maxconn={maxconn} maxpipes={maxpipes}）"
             )
+
+
+def test_nr_open_target_covers_template_default():
+    """模板默认值（不带 compose 覆盖）也必须有地方能跑起来。
+
+    100 万连接 = 400 万 fd，而 fs.nr_open 默认 1048576 —— 抬不上去 HAProxy
+    根本起不来。调优表的目标值必须盖得住模板默认值，否则"照抄骨架到生产"
+    这条路是断的。
+    """
+    need = cfg_directive("maxconn") * 2 + cfg_directive("maxpipes") * 2 + 34
+    assert int(tune_target("fs.nr_open")) >= need, (
+        f"fs.nr_open 目标值盖不住模板默认值需要的 {need} 个 fd"
+    )
 
 
 def test_somaxconn_target_covers_configured_backlog():

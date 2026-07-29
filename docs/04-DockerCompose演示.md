@@ -288,16 +288,25 @@ docker compose exec node1 grep -o 'limit [0-9]*' /etc/haproxy/haproxy.cfg
   网络命名空间**的整机口径，含 compose 内部的东西向流量。口径说明见
   [05-监控视图.md](05-监控视图.md)。
 
-三台节点还各设了 `ulimits.nofile: 262144`。这不是随手写的余量：
-`haproxy-base.cfg` 里 `maxconn 100000`，而 HAProxy 需要的文件描述符数
-= `maxconn × 2 + 34` = 200034（实测精确值）。容器默认的 nofile 常常只有
-1024/4096，给不够 HAProxy 会**拒绝启动**并打
+三台节点还各设了 `ulimits.nofile: 524288`。这不是随手写的余量：HAProxy
+需要的文件描述符数 = `maxconn × 2 + maxpipes × 2 + 34`（管道那两项是
+splice 用的，本项目开着 splice）。容器默认的 nofile 常常只有 1024/4096，
+给不够 HAProxy 会**拒绝启动**并打
 
 ```
-[ALERT] Cannot raise FD limit to 200034, limit is 4096.
+[ALERT] Cannot raise FD limit to 400034, limit is 4096.
 ```
 
-改 `maxconn` 时务必同步改这里。调优基线的完整说明见
+**演示跑的是降级量级**：`haproxy-base.cfg` 的默认值是 `maxconn 1000000`
+（默认值不该成为限制），对应 400 万 fd，而宿主机 `fs.nr_open` 默认只有
+1048576、**容器里改不动**，开发机上直接起不来。所以 compose 用
+`HAPROXY_MAXCONN` / `HAPROXY_MAXPIPES` 把它降到 10 万（= 400034 fd）——
+入口脚本会就地改写复制出来的 cfg，**模板本身不动**，仍是那份可以直接抄
+去生产的骨架。生产机器请先按 [08-内核参数调优.md](08-内核参数调优.md)
+把 `fs.nr_open` 抬上去，然后不设这两个变量、直接用模板默认值。
+
+改 `maxconn` 时务必同步改 `ulimits`；入口脚本会在启动前预检并直接报出
+该改成多少。调优基线的完整说明见
 [03-限速服务运行指南.md §5.1](03-限速服务运行指南.md) 与
 `deploy/docker/haproxy-base.cfg` 本身的注释（每项都带实测数字）。
 

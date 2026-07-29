@@ -51,7 +51,9 @@ frontends:
     quota_bps: 40000000         # 限额（bit/s），40 Mbps。既是 shared bwlim 的
                                 # limit（真实限速 = 该值 ÷ 8 bytes/s），
                                 # 也是超限告警基准——同源，不会漂移
-    maxconn: 2000               # 资源保护水位（0 = 不写该指令）；不是限速手段
+    maxconn: 0                  # 资源保护水位（0 = 不写该指令，沿用 global）；
+                                # 不是限速手段。**默认不设**——默认值不该成为
+                                # 限制，真要护资源时再显式给一个值
     balance: roundrobin         # roundrobin|static-rr|leastconn|first|source|random
     timeout_connect_ms: 5000
     timeout_client_ms: 50000

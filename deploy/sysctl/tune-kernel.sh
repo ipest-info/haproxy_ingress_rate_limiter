@@ -58,14 +58,15 @@ set -uo pipefail
 #   min      单值下限，当前值更大就不动
 #   minlist  空格分隔的多字段，**逐字段**取较大者
 #
-# 表里的值都按"32 核、TCP L4 代理、maxconn/maxpipes 各 100000"这条基线
-# 定的。改 maxconn 时需要复核的只有 somaxconn 与 nf_conntrack_max 两项。
+# 表里的值都按"32 核、TCP L4 代理、maxconn/maxpipes 各 1000000"这条基线
+# 定的（默认值不该成为限制，要限并发请显式配 frontend 级 maxconn）。
+# 改 maxconn 时需要连带复核的是 fs.nr_open、nf_conntrack_max 与 somaxconn。
 # ---------------------------------------------------------------------------
 read -r -d '' TUNABLES <<'EOF'
 net.core.somaxconn|min|65536|accept 队列上限。listen(2) 的 backlog 被它封顶，本项目 cfg 里写的 backlog 65536 只有它够大才真的生效；发行版默认 4096
 net.ipv4.tcp_max_syn_backlog|min|65536|半连接(SYN)队列。默认 1024，突发建连时溢出即丢 SYN
 net.ipv4.tcp_tw_reuse|set|1|复用 TIME_WAIT 给新的出向连接。默认 2 = 只对回环生效，对"代理到后端"这条路径等于没开
-net.ipv4.tcp_max_tw_buckets|min|1048576|TIME_WAIT 上限。默认 65536，高连接周转下会刷 "time wait bucket table overflow"
+net.ipv4.tcp_max_tw_buckets|min|2097152|TIME_WAIT 上限。默认 65536，高连接周转下会刷 "time wait bucket table overflow"；按 100 万连接基线给两倍余量
 net.ipv4.tcp_fin_timeout|set|15|FIN_WAIT_2 回收时长。默认 60 秒，压着临时端口不放
 net.ipv4.ip_local_port_range|minlist|32768 65535|临时端口。**只抬上界不下探**：tc 按源端口分类，下界降到 1024 会让到后端的临时端口撞上监听端口，把回程流量算进别人的限速类（见 tcshaper.ephemeral_conflicts）
 net.ipv4.tcp_slow_start_after_idle|set|0|默认 1：连接空闲一个 RTO 后 cwnd 被打回初始值。本项目大量长连接是"空闲一阵再猛传"，留着它等于每次都重新慢启动
@@ -75,8 +76,8 @@ net.core.rmem_max|min|16777216|SO_RCVBUF 显式设置的上限。本项目刻意
 net.core.wmem_max|min|16777216|同上，对应 SO_SNDBUF
 net.core.netdev_max_backlog|min|250000|软中断收包队列（每 CPU）。默认 1000，万兆以上最先在这里丢包；丢没丢看 /proc/net/softnet_stat 第 2 列
 net.core.netdev_budget|min|600|单次软中断轮询的收包预算，默认 300
-net.netfilter.nf_conntrack_max|min|1048576|**容器部署特别容易踩**：Docker 装 iptables 规则会把 conntrack 拉起来，于是每条连接都被跟踪。前后各 100000 条连接再加 TIME_WAIT，默认 262144 直接撑爆，内核开始静默丢包并打 "nf_conntrack: table full"
-fs.nr_open|min|1048576|单进程 RLIMIT_NOFILE 的硬天花板。本基线需要 400034，默认 1048576 够用；maxconn 涨到约 26 万以上时这一项会先成为墙，而它在容器里改不动
+net.netfilter.nf_conntrack_max|min|4194304|**容器部署特别容易踩**：Docker 装 iptables 规则会把 conntrack 拉起来，于是每条连接都被跟踪。maxconn 100 万意味着前后各 100 万条再加 TIME_WAIT，默认 262144 直接撑爆，内核开始静默丢包并打 "nf_conntrack: table full"。别忘了 nf_conntrack_buckets 一般取 max/4
+fs.nr_open|min|4194304|单进程 RLIMIT_NOFILE 的硬天花板。maxconn/maxpipes 各 100 万需要 4000034 个 fd，而默认只有 1048576——**不抬它 HAProxy 根本起不来**，且它在容器里改不动（compose 演示因此用 HAPROXY_MAXCONN 降到 10 万）
 EOF
 
 MODE=${1:-apply}
@@ -117,7 +118,7 @@ target_of() {
 if [ "$MODE" = dump ]; then
     echo "# /etc/sysctl.d/99-rl-limiter.conf"
     echo "# 由 deploy/sysctl/tune-kernel.sh dump 生成。落盘后执行 sysctl --system 生效。"
-    echo "# 面向：32 核、TCP L4 代理、HAProxy maxconn/maxpipes 各 100000。"
+    echo "# 面向：32 核、TCP L4 代理、HAProxy maxconn/maxpipes 各 1000000。"
     echo "# 注意：这些值是**下限**，本机若已有更大的值请不要照抄压低。"
     echo
     while IFS='|' read -r key mode want why; do

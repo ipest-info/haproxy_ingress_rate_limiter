@@ -73,12 +73,16 @@ services:
     # 明确报出来，不会静默地"没在限速"）。
     cap_add:
       - NET_ADMIN
-    # haproxy-base.cfg 里 maxconn 100000 + maxpipes 100000。FD 需求 =
-    # maxconn × 2 + maxpipes × 2 + 34 = 400034（实测逐项核对过；管道那一项
-    # 是 splice 用的，本项目开着 splice）。容器默认的 nofile 往往只有
-    # 1024/4096，给不够 HAProxy **拒绝启动**，改 maxconn/maxpipes 时记得
-    # 同步改这里。入口脚本会在启动前按 cfg 里的实际值预检一遍并直接报出
-    # 该改成多少，不必再去 haproxy 的 ALERT 里翻。
+    # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
+    # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
+    # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
+    #
+    # 这里用的是**演示量级**：haproxy-base.cfg 的默认值是 100 万连接
+    # （= 400 万 fd），而宿主机 `fs.nr_open` 默认只有 1048576、且**容器里
+    # 改不动**，开发机上直接起不来。所以演示用下面的 HAPROXY_MAXCONN /
+    # HAPROXY_MAXPIPES 降到 10 万（= 400034 fd）——降的是演示，模板本身
+    # 仍然是那份可以直接抄去生产的骨架。生产机器请按 docs/08 把
+    # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
     #
     # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
     # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
@@ -92,6 +96,9 @@ services:
       # 本实例对应配置库 haproxy_instances 里的哪一行（读写都只碰自己
       # 那些行）。值必须与库中登记的实例名一致。
       RL_NODE_NAME: hap-1
+      # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
+      HAPROXY_MAXCONN: "100000"
+      HAPROXY_MAXPIPES: "100000"
       RL_MYSQL_HOST: mysql
       RL_MYSQL_PORT: "3306"
       RL_MYSQL_USER: rl
@@ -125,12 +132,16 @@ services:
     # 明确报出来，不会静默地"没在限速"）。
     cap_add:
       - NET_ADMIN
-    # haproxy-base.cfg 里 maxconn 100000 + maxpipes 100000。FD 需求 =
-    # maxconn × 2 + maxpipes × 2 + 34 = 400034（实测逐项核对过；管道那一项
-    # 是 splice 用的，本项目开着 splice）。容器默认的 nofile 往往只有
-    # 1024/4096，给不够 HAProxy **拒绝启动**，改 maxconn/maxpipes 时记得
-    # 同步改这里。入口脚本会在启动前按 cfg 里的实际值预检一遍并直接报出
-    # 该改成多少，不必再去 haproxy 的 ALERT 里翻。
+    # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
+    # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
+    # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
+    #
+    # 这里用的是**演示量级**：haproxy-base.cfg 的默认值是 100 万连接
+    # （= 400 万 fd），而宿主机 `fs.nr_open` 默认只有 1048576、且**容器里
+    # 改不动**，开发机上直接起不来。所以演示用下面的 HAPROXY_MAXCONN /
+    # HAPROXY_MAXPIPES 降到 10 万（= 400034 fd）——降的是演示，模板本身
+    # 仍然是那份可以直接抄去生产的骨架。生产机器请按 docs/08 把
+    # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
     #
     # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
     # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
@@ -142,6 +153,9 @@ services:
       - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
       RL_NODE_NAME: hap-2
+      # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
+      HAPROXY_MAXCONN: "100000"
+      HAPROXY_MAXPIPES: "100000"
       RL_MYSQL_HOST: mysql
       RL_MYSQL_PORT: "3306"
       RL_MYSQL_USER: rl
@@ -173,12 +187,16 @@ services:
     # 明确报出来，不会静默地"没在限速"）。
     cap_add:
       - NET_ADMIN
-    # haproxy-base.cfg 里 maxconn 100000 + maxpipes 100000。FD 需求 =
-    # maxconn × 2 + maxpipes × 2 + 34 = 400034（实测逐项核对过；管道那一项
-    # 是 splice 用的，本项目开着 splice）。容器默认的 nofile 往往只有
-    # 1024/4096，给不够 HAProxy **拒绝启动**，改 maxconn/maxpipes 时记得
-    # 同步改这里。入口脚本会在启动前按 cfg 里的实际值预检一遍并直接报出
-    # 该改成多少，不必再去 haproxy 的 ALERT 里翻。
+    # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
+    # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
+    # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
+    #
+    # 这里用的是**演示量级**：haproxy-base.cfg 的默认值是 100 万连接
+    # （= 400 万 fd），而宿主机 `fs.nr_open` 默认只有 1048576、且**容器里
+    # 改不动**，开发机上直接起不来。所以演示用下面的 HAPROXY_MAXCONN /
+    # HAPROXY_MAXPIPES 降到 10 万（= 400034 fd）——降的是演示，模板本身
+    # 仍然是那份可以直接抄去生产的骨架。生产机器请按 docs/08 把
+    # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
     #
     # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
     # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
@@ -190,6 +208,9 @@ services:
       - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
       RL_NODE_NAME: hap-3
+      # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
+      HAPROXY_MAXCONN: "100000"
+      HAPROXY_MAXPIPES: "100000"
       RL_MYSQL_HOST: mysql
       RL_MYSQL_PORT: "3306"
       RL_MYSQL_USER: rl

@@ -81,6 +81,31 @@ else
     exit 1
 fi
 
+# 可选：就地覆盖 global 里的 maxconn / maxpipes。
+#
+# 为什么需要它：模板里的默认值按"**默认不该成为限制**"给到 100 万连接，
+# 对应 400 万 fd，而宿主机 `fs.nr_open` 默认只有 1048576（容器里改不动）。
+# 生产机器该按这个默认值来，但 compose 演示往往跑在开发机上，起不来。
+# 于是演示环境用这两个变量把量级降下来——**降的是演示，不是默认值**，
+# 模板本身仍然是那份可以直接抄去生产的骨架。
+#
+# 只改 global 段里的这两条指令；受管区块由 rl-limiter 渲染，互不相干。
+override_directive() {
+    local name=$1 val=$2
+    if ! grep -qE "^[[:space:]]*$name[[:space:]]+[0-9]+" "$HAPROXY_CFG"; then
+        log "警告：cfg 里没有 $name 指令，${name^^} 覆盖被忽略"
+        return 0
+    fi
+    sed -i -E "s/^([[:space:]]*)$name[[:space:]]+[0-9]+/\1$name $val/" "$HAPROXY_CFG"
+    log "已覆盖 $name=$val（模板默认值被本机环境变量替换）"
+}
+if [ -n "${HAPROXY_MAXCONN:-}" ]; then
+    override_directive maxconn "$HAPROXY_MAXCONN"
+fi
+if [ -n "${HAPROXY_MAXPIPES:-}" ]; then
+    override_directive maxpipes "$HAPROXY_MAXPIPES"
+fi
+
 # 限速自检：限速由内核 tc（HTB）执行，不再走 HAProxy 的 bwlim。
 # 限速静默失效是本项目最不能接受的故障（用户以为限住了，实际没有），
 # 所以这里在真正启动之前就把三个前提逐个验掉，缺哪个说哪个。
@@ -137,7 +162,7 @@ fi
 
 # FD 预检：HAProxy 需要 maxconn×2 + maxpipes×2 + 34 个 fd（管道那两个是
 # splice 用的），给不够它**拒绝启动**并留下
-#   [ALERT] Cannot raise FD limit to 400034, limit is 4096.
+#   [ALERT] Cannot raise FD limit to 4000034, limit is 4096.
 # 然后容器进入重启循环刷屏。这里提前把账算给运维看。
 #
 # 比的是**硬上限**：HAProxy 自己会把软上限抬到硬上限，所以软上限低不要紧。

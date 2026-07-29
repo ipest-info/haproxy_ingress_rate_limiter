@@ -239,8 +239,45 @@ input.bad:focus { box-shadow: 0 0 0 3px rgba(207,58,58,.15); }
   position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
   font-size: 12px; color: var(--text-muted); pointer-events: none;
 }
+/* 限额输入框 + 单位下拉：50 Gbps 写成 50000 Mbps 谁都看不出是多少。 */
+.unit-in { display: flex; gap: 6px; }
+.unit-in input { flex: 1 1 auto; min-width: 0; }
+.unit-in select { width: auto; flex: 0 0 auto; padding-right: 6px; }
 .err { font-size: 11.5px; color: var(--critical); margin-top: 4px; }
 .hint { font-size: 11.5px; color: var(--text-muted); }
+.hint code {
+  font: 11px/1 ui-monospace, Menlo, Consolas, monospace;
+  background: var(--surface-3); padding: 1px 4px; border-radius: 4px;
+}
+
+/* ---- 批量填充 ---- */
+textarea {
+  font: inherit; font-size: 13px; line-height: 1.5; padding: 6px 9px;
+  border-radius: 7px; border: 1px solid var(--border-strong);
+  background: var(--surface-1); color: var(--text-primary);
+  width: 100%; min-width: 0; resize: vertical;
+}
+textarea:focus {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak);
+}
+details.bulk {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface-1); margin-bottom: 12px; max-width: 880px;
+}
+details.bulk > summary {
+  padding: 8px 12px; cursor: pointer; font-size: 12.5px;
+  color: var(--text-secondary); user-select: none; list-style: none;
+  display: flex; align-items: center; gap: 8px;
+}
+details.bulk > summary::-webkit-details-marker { display: none; }
+details.bulk > summary::before { content: "▸ "; color: var(--text-muted); }
+details.bulk[open] > summary::before { content: "▾ "; }
+details.bulk > summary:hover { background: var(--surface-2); }
+.bulk-body { padding: 4px 12px 12px; border-top: 1px solid var(--border); }
+.f-pfx { width: 120px; } .f-bad { width: 260px; }
+.f-bpt { width: 150px; } .f-bac { width: 96px; }
+.f-bac button { width: 100%; }
+.srv-btns { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 /* 限额换算提示：Mbps ↔ bytes/s 的 8 倍混淆是本项目最贵的错误来源，
    把最终写进 cfg 的数值直接显示出来，让人在保存前就能发现。 */
 .conv {
@@ -302,7 +339,8 @@ details.adv > summary:hover { background: var(--surface-3); }
 }
 .toast.err { border-left-color: var(--critical); }
 @media (max-width: 720px) {
-  .f-name, .f-addr, .f-quota, .f-bal, .f-mode, .f-num, .f-port { width: 100%; }
+  .f-name, .f-addr, .f-quota, .f-bal, .f-mode, .f-num, .f-port,
+  .f-pfx, .f-bad, .f-bpt, .f-bac { width: 100%; }
   .tabs { top: 0; position: static; }
 }
 </style>
@@ -626,6 +664,12 @@ function editorHtml(fe, isNew) {
   const f = fe || {};
   const opt = (v, cur, label) =>
     `<option value="${esc(v)}"${v === (cur || "") ? " selected" : ""}>${esc(label || v)}</option>`;
+  // 限额的显示单位跟着数量级走：50 Gbps 写成 50000 Mbps 谁都看不出是多少。
+  // 新建时给 DEFAULT_QUOTA_BPS（50 Gbps）——默认值不该成为限制。
+  const qbps = f.quota_bps || DEFAULT_QUOTA_BPS;
+  const qUnit = qbps >= 1e9 ? 1e9 : 1e6;
+  // 去掉 5e10/1e9 这类除法带出来的浮点尾巴（50.000000000000004）。
+  const qVal = parseFloat((qbps / qUnit).toPrecision(12));
   return `
   <div class="sec">
     <div class="sec-h">监听</div>
@@ -662,11 +706,17 @@ function editorHtml(fe, isNew) {
     <div class="fields">
       <div class="f f-quota">
         <label>带宽限额 <span class="req">*</span></label>
-        <div class="suffix">
+        <div class="unit-in">
           <input class="i-quota" type="number" min="0" step="any"
-                 value="${f.quota_bps ? (f.quota_bps / 1e6) : ""}" placeholder="40">
-          <span>Mbps</span>
+                 value="${esc(qVal)}" placeholder="50">
+          <select class="i-qunit">
+            <option value="1000000"${qUnit === 1e6 ? " selected" : ""}>Mbps</option>
+            <option value="1000000000"${qUnit === 1e9 ? " selected" : ""}>Gbps</option>
+          </select>
         </div>
+        <div class="hint">${isNew
+          ? "默认 <b>50 Gbps</b>：默认值不设限，真要收着了再往下调"
+          : "改限额不需要 reload，存量连接立刻跟上"}</div>
         <div class="err" hidden></div>
       </div>
       <div class="conv"></div>
@@ -675,6 +725,42 @@ function editorHtml(fe, isNew) {
 
   <div class="sec">
     <div class="sec-h">后端服务器 <span class="hint">至少一台，否则请求会返回 503</span></div>
+
+    <!-- 批量填充：一台一台点着加是这个界面上最费时间的操作。地址、端口
+         都支持整段粘贴，名称按前缀自动编号——运维手边的清单往往就是一列
+         IP，直接贴进来即可。 -->
+    <details class="bulk" ${isNew ? "open" : ""}>
+      <summary>批量填充 <span class="hint">粘贴一列地址即可，名称自动编号</span></summary>
+      <div class="bulk-body">
+        <div class="fields">
+          <div class="f f-pfx">
+            <label>名称前缀</label>
+            <input class="b-prefix" value="srv" placeholder="srv" autocomplete="off">
+            <div class="hint">自动编号 srv1、srv2…</div>
+          </div>
+          <div class="f f-bad">
+            <label>地址（每行一个）</label>
+            <textarea class="b-addr" rows="4" spellcheck="false"
+              placeholder="10.0.0.11&#10;10.0.0.12:9000&#10;10.0.0.20-24&#10;web-a.internal"></textarea>
+            <div class="hint">逗号/空格/换行都算分隔；支持 <code>地址:端口</code>
+              与末段区间 <code>10.0.0.20-24</code></div>
+          </div>
+          <div class="f f-bpt">
+            <label>端口</label>
+            <input class="b-port" placeholder="9000" autocomplete="off">
+            <div class="hint">只填一个 = 所有地址都用它<br>
+              也可写 <code>9000-9003</code></div>
+          </div>
+          <div class="f f-bac">
+            <label>&nbsp;</label>
+            <button class="b-append sm primary">追加</button>
+            <button class="b-replace sm" style="margin-top:6px">替换全部</button>
+          </div>
+        </div>
+        <div class="err err-bulk" hidden></div>
+      </div>
+    </details>
+
     <table>
       <thead><tr>
         <th class="col-nm">名称</th><th class="col-ad">地址</th><th class="col-pt">端口</th>
@@ -684,7 +770,11 @@ function editorHtml(fe, isNew) {
       <tbody class="i-servers"></tbody>
     </table>
     <div class="empty" hidden>还没有后端服务器</div>
-    <div style="margin-top:8px"><button class="i-addsrv sm">+ 添加服务器</button></div>
+    <div class="srv-btns">
+      <button class="i-addsrv sm">+ 添加服务器</button>
+      <button class="i-renum sm ghost">按前缀重新编号</button>
+      <span class="hint">往「地址」或「端口」格子里直接粘贴多行也会自动展开成多行</span>
+    </div>
     <div class="err err-srv" hidden style="margin-top:6px"></div>
   </div>
 
@@ -731,6 +821,118 @@ function editorHtml(fe, isNew) {
   </div>`;
 }
 
+// ============================================================ 批量填充解析
+// 这一段是**纯函数**，不碰 DOM：tests/test_bulkfill.py 会把 BULKFILL 标记
+// 之间的代码抽出来用 node 跑。改动请连带看那边——粘贴解析错了不会报错，
+// 只会把地址悄悄拼歪，等下发到 haproxy.cfg 才发现。
+// >>> BULKFILL >>>
+
+/** 切分粘贴来的一坨文本：换行、逗号、分号、空白都算分隔符。 */
+function splitTokens(text) {
+  return String(text == null ? "" : text)
+    .split(/[\s,;]+/).map(s => s.trim()).filter(Boolean);
+}
+
+/** 展开末段区间：10.0.0.20-24 → 10.0.0.20 … 10.0.0.24。
+ *  只在前三段全是数字时才认，否则 web-1.internal 这种主机名会被切坏。 */
+function expandIpRange(token) {
+  const m = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.)(\d{1,3})-(\d{1,3})$/.exec(token);
+  if (!m) return null;
+  const from = +m[2], to = +m[3];
+  if (from > to || to > 255) return null;
+  const out = [];
+  for (let i = from; i <= to; i++) out.push(m[1] + i);
+  return out;
+}
+
+/** 拆 host:port。裸 IPv6 本身就一堆冒号，所以只认两种明确写法：
+ *  [::1]:9000（方括号）和**恰好一个冒号**的 host:port。其余原样当地址，
+ *  宁可让人自己补端口，也不要把 fd00::5 猜成 "fd00:" + 端口 5。 */
+function splitHostPort(token) {
+  const br = /^\[(.+)\]:(\d+)$/.exec(token);
+  if (br) return {address: br[1], port: +br[2]};
+  if (/^\[(.+)\]$/.test(token)) return {address: token.slice(1, -1), port: null};
+  const parts = token.split(":");
+  if (parts.length === 2 && parts[0] && /^\d+$/.test(parts[1]))
+    return {address: parts[0], port: +parts[1]};
+  return {address: token, port: null};
+}
+
+/** 地址栏 → [{address, port|null}, …] */
+function parseAddresses(text) {
+  const out = [];
+  for (const tok of splitTokens(text)) {
+    const hp = splitHostPort(tok);
+    const range = expandIpRange(hp.address);
+    if (range) range.forEach(a => out.push({address: a, port: hp.port}));
+    else out.push(hp);
+  }
+  return out;
+}
+
+/** 端口栏 → {ports:[…]} 或 {error}。支持 9000 / 9000-9003 / 混写。 */
+function parsePorts(text) {
+  const out = [];
+  for (const tok of splitTokens(text)) {
+    const m = /^(\d+)-(\d+)$/.exec(tok);
+    if (m) {
+      const from = +m[1], to = +m[2];
+      if (from > to) return {error: `端口区间「${tok}」起点比终点大`};
+      if (to - from > 1024) return {error: `端口区间「${tok}」展开超过 1024 个，多半是写错了`};
+      for (let p = from; p <= to; p++) out.push(p);
+    } else if (/^\d+$/.test(tok)) {
+      out.push(+tok);
+    } else {
+      return {error: `端口「${tok}」不是数字`};
+    }
+  }
+  return {ports: out};
+}
+
+/** 前缀 + 序号自动命名，跳过已占用的名字（追加时不会撞上已有的行）。 */
+function genNames(prefix, count, taken) {
+  const used = new Set(taken || []);
+  const out = [];
+  let n = 1;
+  for (let i = 0; i < count; i++) {
+    let name;
+    do { name = `${prefix}${n++}`; } while (used.has(name));
+    used.add(name); out.push(name);
+  }
+  return out;
+}
+
+/** 地址 × 端口 → 后端服务器列表。整个批量填充的规则都在这里：
+ *   - 地址自带端口（10.0.0.5:9000）时**以自带的为准**；
+ *   - 端口只给一个 → 所有地址都用它（最常见：一个后端端口打天下）；
+ *   - 端口给多个 → 必须与地址一一对应，对不上**宁可报错也不猜**：
+ *     猜错的后果是流量打到错误的端口，而界面上看着一切正常。 */
+function combineServers(addrText, portText, prefix, taken) {
+  const addrs = parseAddresses(addrText);
+  if (!addrs.length) return {error: "请先粘贴后端地址"};
+  const pp = parsePorts(portText);
+  if (pp.error) return pp;
+  const ports = pp.ports;
+  if (ports.length > 1 && ports.length !== addrs.length)
+    return {error: `端口给了 ${ports.length} 个、地址有 ${addrs.length} 个，对不上`};
+
+  const rows = [];
+  for (const a of addrs) {
+    const port = a.port != null ? a.port
+      : ports.length === 1 ? ports[0]
+      : ports.length ? ports[rows.length] : null;
+    if (port == null)
+      return {error: `「${a.address}」没有端口：请在端口栏填一个，或用 地址:端口 写法`};
+    if (!(port >= 1 && port <= 65535))
+      return {error: `端口 ${port} 不在 1–65535`};
+    rows.push({address: a.address, port});
+  }
+  const names = genNames(prefix, rows.length, taken);
+  rows.forEach((r, i) => { r.name = names[i]; });
+  return {rows};
+}
+// <<< BULKFILL <<<
+
 function serverRow(s) {
   s = s || {};
   const tr = document.createElement("tr");
@@ -748,12 +950,13 @@ function serverRow(s) {
 
 function readEditor(root, fallbackName) {
   const q = parseFloat($(".i-quota", root).value);
+  const qUnit = parseFloat($(".i-qunit", root).value) || 1e6;
   return {
     name: ($(".i-name", root).value || fallbackName || "").trim(),
     bind_address: $(".i-addr", root).value.trim(),
     bind_port: parseInt($(".i-port", root).value, 10),
-    // 界面按运维习惯用 Mbps，接口用 bit/s——换算只在这一处。
-    quota_bps: Math.round((isFinite(q) ? q : 0) * 1e6),
+    // 界面按运维习惯用 Mbps/Gbps，接口用 bit/s——换算只在这一处。
+    quota_bps: Math.round((isFinite(q) ? q : 0) * qUnit),
     mode: $(".i-mode", root).value,
     balance: $(".i-balance", root).value,
     maxconn: parseInt($(".i-maxconn", root).value, 10) || 0,
@@ -770,6 +973,12 @@ function readEditor(root, fallbackName) {
     })),
   };
 }
+
+// 新建 frontend 的默认限额：50 Gbps。**默认值不该成为限制**——不填限额
+// 建出来的入口应该是"能跑多快跑多快"，等真要收着了再显式往下调。反过来
+// （默认给个小值）会让人在排查慢的时候满世界找原因，最后发现是默认值。
+// 与 deploy/mysql/init.sql 里 quota_bps 列的 DEFAULT 保持一致。
+const DEFAULT_QUOTA_BPS = 50e9;
 
 const NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const ADDR_RE = /^[A-Za-z0-9._:-]{1,255}$/;
@@ -822,7 +1031,26 @@ function wireEditor(root, fe, isNew, onDone) {
   const tbody = $(".i-servers", root);
   const emptyHint = $(".empty", root);
   ((fe && fe.servers) || []).forEach(s => tbody.appendChild(serverRow(s)));
-  if (isNew && !tbody.children.length) tbody.appendChild(serverRow());
+
+  const rows = () => $$(".i-servers tr", root);
+  const nameOf = tr => $(".s-name", tr).value.trim();
+  // 前缀非法时静默退回 srv：这里不是要教育用户，是不要让自动命名反过来
+  // 生成一堆过不了校验的名字。
+  const prefix = () => {
+    const p = ($(".b-prefix", root).value || "").trim();
+    return NAME_RE.test(p + "1") ? p : "srv";
+  };
+  /** 给名字空着的行补上自动名。手填的名字一概不动。 */
+  const autoName = () => {
+    const blanks = rows().filter(tr => !nameOf(tr));
+    if (!blanks.length) return;
+    const names = genNames(prefix(), blanks.length, rows().map(nameOf).filter(Boolean));
+    blanks.forEach((tr, i) => { $(".s-name", tr).value = names[i]; });
+  };
+  const addRow = (s) => { const tr = serverRow(s); tbody.appendChild(tr); return tr; };
+
+  if (isNew && !tbody.children.length) addRow();
+  autoName();
 
   const initial = JSON.stringify(readEditor(root, fe && fe.name));
   const refresh = () => {
@@ -845,8 +1073,84 @@ function wireEditor(root, fe, isNew, onDone) {
   root.addEventListener("change", refresh);
   root.addEventListener("x", refresh);          // 移除服务器行
   $(".i-addsrv", root).onclick = (e) => {
-    e.preventDefault(); tbody.appendChild(serverRow()); refresh();
+    e.preventDefault(); addRow(); autoName(); refresh();
   };
+  $(".i-renum", root).onclick = (e) => {
+    e.preventDefault();
+    // 与 autoName 不同：这个按钮**会覆盖手填的名字**，所以只在显式点击时做。
+    const all = rows();
+    const names = genNames(prefix(), all.length, []);
+    all.forEach((tr, i) => { $(".s-name", tr).value = names[i]; });
+    refresh();
+    toast(`已按前缀「${prefix()}」重新编号 ${all.length} 台`);
+  };
+
+  // ---- 批量填充 ----------------------------------------------------------
+  const bulkErr = $(".err-bulk", root);
+  const bulkFill = (replace) => {
+    const addrText = $(".b-addr", root).value, portText = $(".b-port", root).value;
+    // 先干跑一遍只为验错——报错时表格必须一个字都没动过。
+    const probe = combineServers(addrText, portText, "srv", []);
+    if (probe.error) {
+      bulkErr.hidden = false; bulkErr.textContent = probe.error;
+      return;
+    }
+    bulkErr.hidden = true;
+    if (replace) tbody.innerHTML = "";
+    // 追加时先清掉没填地址的空行。新建表单默认就带一行空的，不清的话
+    // 批量填完还剩一行填不动的残行卡着保存——正是这个界面最烦人的地方。
+    // 没地址的行本来也过不了校验，删掉不会丢任何已填的内容。
+    else rows().filter(tr => !$(".s-addr", tr).value.trim()).forEach(tr => tr.remove());
+    // taken 必须在删完空行之后取，否则被删掉的 srv1 还占着号，新行从 srv2 起。
+    const r = combineServers(addrText, portText, prefix(),
+                             rows().map(nameOf).filter(Boolean));
+    r.rows.forEach(addRow);
+    // 填完清空输入框：不清的话再点一下就又追加一遍，而且看不出来。
+    $(".b-addr", root).value = ""; $(".b-port", root).value = "";
+    refresh();
+    toast(`已${replace ? "替换为" : "追加"} ${r.rows.length} 台后端服务器`);
+  };
+  $(".b-append", root).onclick = (e) => { e.preventDefault(); bulkFill(false); };
+  $(".b-replace", root).onclick = (e) => { e.preventDefault(); bulkFill(true); };
+
+  // 往表格里的「地址」「端口」格子直接粘贴多行时自动展开成多行。
+  // 运维手边的清单往往就在剪贴板里，这一步省掉了"先数几台、再点几次添加"。
+  tbody.addEventListener("paste", (ev) => {
+    const input = ev.target;
+    if (!input.classList) return;
+    const isAddr = input.classList.contains("s-addr");
+    const isPort = input.classList.contains("s-port");
+    if (!isAddr && !isPort) return;
+    const text = (ev.clipboardData || window.clipboardData).getData("text");
+    const items = isAddr ? parseAddresses(text) : (parsePorts(text).ports || []);
+    if (items.length <= 1) return;              // 单个值走浏览器默认行为
+    ev.preventDefault();
+
+    const tr = input.closest("tr");
+    const all = rows();
+    let idx = all.indexOf(tr);
+    if (isAddr) {
+      // 第一条填进当前行，其余在它后面依次插入——不覆盖后面已有的行。
+      items.forEach((it, i) => {
+        const target = i === 0 ? tr : tbody.insertBefore(serverRow(), all[idx + 1] || null);
+        $(".s-addr", target).value = it.address;
+        if (it.port != null) $(".s-port", target).value = it.port;
+        if (i > 0) idx++;
+      });
+    } else {
+      // 端口是"一列值"，按顺序往下填已有的行，不凭空造行——真造出来的是
+      // 一批没有地址的空行，保存时才报错。多出来的明说丢了几个。
+      const targets = rows().slice(idx);
+      items.slice(0, targets.length).forEach((p, i) => {
+        $(".s-port", targets[i]).value = p;
+      });
+      if (items.length > targets.length)
+        toast(`粘贴了 ${items.length} 个端口，但从这一行往下只有 `
+              + `${targets.length} 行，多出来的已忽略`, true);
+    }
+    autoName();
+    refresh();
+  });
   refresh();
 
   $(".i-cancel", root).onclick = () => {

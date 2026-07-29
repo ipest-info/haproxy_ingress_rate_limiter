@@ -73,11 +73,15 @@ CREATE TABLE IF NOT EXISTS haproxy_frontends (
     bind_address    VARCHAR(64)  NOT NULL DEFAULT '',
     bind_port       INT UNSIGNED NOT NULL,
     mode            VARCHAR(8)   NOT NULL DEFAULT 'tcp',   -- tcp | http
-    -- 限额（bit/s）。既是 shared bwlim 的 limit（真实限速 = ÷8 bytes/s），
+    -- 限额（bit/s）。既是下发给内核 tc 的 limit（真实限速 = ÷8 bytes/s），
     -- 也是超限告警基准——同源，因此不可能漂移。
-    quota_bps       BIGINT       NOT NULL,
-    -- 资源保护水位（NULL/0 = 不写该指令，沿用 global/defaults）。
-    -- 不是限速手段：防止限速导致连接堆积耗尽内存/fd。
+    --
+    -- 默认 50 Gbps：**默认值不该成为限制**。不填限额建出来的 frontend
+    -- 应该是"能跑多快跑多快"，等真要收着了再显式往下调；反过来（默认给
+    -- 一个小值）会让人在排查慢的时候满世界找原因，最后发现是默认值。
+    quota_bps       BIGINT       NOT NULL DEFAULT 50000000000,
+    -- 资源保护水位（NULL/0 = 不写该指令，沿用 global 的 maxconn）。
+    -- 不是限速手段：防止限速导致连接堆积耗尽内存/fd。默认不设。
     maxconn         INT UNSIGNED NULL DEFAULT NULL,
     balance         VARCHAR(32)  NOT NULL DEFAULT 'roundrobin',
     -- 各项超时（毫秒）。NULL = 采用 rl-limiter 的默认值，不必逐行填。
@@ -125,9 +129,11 @@ INSERT INTO haproxy_instances (name, socket_path, timeout_ms) VALUES
 INSERT INTO haproxy_frontends
     (instance, name, bind_address, bind_port, mode, quota_bps, maxconn, balance)
 VALUES
-    ('hap-1', 'fe_main', '', 8080, 'tcp', 40000000, 2000, 'roundrobin'),
-    ('hap-2', 'fe_main', '', 8080, 'tcp', 40000000, 2000, 'roundrobin'),
-    ('hap-3', 'fe_main', '', 8080, 'tcp', 40000000, 2000, 'roundrobin');
+    -- maxconn 留 NULL：默认不设并发上限（沿用 global）。演示要看的是
+    -- **限速**，并发上限只会在压测调高并发时莫名其妙地先挡住。
+    ('hap-1', 'fe_main', '', 8080, 'tcp', 40000000, NULL, 'roundrobin'),
+    ('hap-2', 'fe_main', '', 8080, 'tcp', 40000000, NULL, 'roundrobin'),
+    ('hap-3', 'fe_main', '', 8080, 'tcp', 40000000, NULL, 'roundrobin');
 
 -- 后端都指向 compose 里的模拟业务服务 web:9000。
 INSERT INTO haproxy_servers
