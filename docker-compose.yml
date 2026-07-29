@@ -37,8 +37,8 @@ services:
       - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       - mysql-data:/var/lib/mysql
     # 只在本机回环暴露 3306，方便宿主机直接用 mysql 客户端改配置。
-    ports:
-      - "127.0.0.1:3306:3306"
+    networks:
+      - default
     healthcheck:
       # TCP ping：初始化阶段的临时实例只监听 unix socket，ping 通 TCP
       # 即表示真实实例（含 init.sql 灌数）已就绪。
@@ -46,19 +46,6 @@ services:
       interval: 2s
       timeout: 3s
       retries: 60
-    restart: unless-stopped
-
-  # ---- HAProxy 后端：模拟业务 web 服务（每次请求返回随机大小响应）----
-  web:
-    build: .
-    command: python3 tools/random_web.py --port 9000
-    environment:
-      # 响应体大小区间（字节）：默认 256 KiB ~ 2 MiB，可按需覆盖。
-      WEB_MIN_BYTES: ${WEB_MIN_BYTES:-262144}
-      WEB_MAX_BYTES: ${WEB_MAX_BYTES:-2097152}
-      # /big 大文件下载端点的默认大小：512 MiB（40 Mbps 限速下约 100s
-      # 下完），供长连接大文件场景（loadgen 的 big worker）使用。
-      WEB_BIG_BYTES: ${WEB_BIG_BYTES:-536870912}
     restart: unless-stopped
 
   # ---- 三台节点：Ubuntu 24.04 + HAProxy 2.8(发行版自带) + 同机 rl-limiter。
@@ -114,9 +101,8 @@ services:
       # systemctl，用入口脚本落的 master pid 发 SIGUSR2）。
       RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
       RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
-    ports:
-      - "8080:8080"              # hap-1 / fe_main（宿主机可 curl 体验限速）
-      - "127.0.0.1:8090:8090"    # hap-1 的控制台
+    networks:
+      - default
     depends_on:
       mysql:
         condition: service_healthy
@@ -124,140 +110,14 @@ services:
         condition: service_started
     restart: unless-stopped
 
-  node2:
-    build:
-      context: .
-    # 限速由内核 tc 执行，容器默认没有操作网络设备的权限，必须显式给。
-    # 少了它 rl-limiter 一启动就会因为 tc 权限不足而退出（入口脚本会
-    # 明确报出来，不会静默地"没在限速"）。
-    cap_add:
-      - NET_ADMIN
-    # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
-    # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
-    # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
-    #
-    # 这里用的是**演示量级**：haproxy-base.cfg 的默认值是 100 万连接
-    # （= 400 万 fd），而宿主机 `fs.nr_open` 默认只有 1048576、且**容器里
-    # 改不动**，开发机上直接起不来。所以演示用下面的 HAPROXY_MAXCONN /
-    # HAPROXY_MAXPIPES 降到 10 万（= 400034 fd）——降的是演示，模板本身
-    # 仍然是那份可以直接抄去生产的骨架。生产机器请按 docs/08 把
-    # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
-    #
-    # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
-    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
-    ulimits:
-      nofile:
-        soft: 524288
-        hard: 524288
-    volumes:
-      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
-    environment:
-      RL_NODE_NAME: hap-2
-      # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
-      HAPROXY_MAXCONN: "100000"
-      HAPROXY_MAXPIPES: "100000"
-      RL_MYSQL_HOST: mysql
-      RL_MYSQL_PORT: "3306"
-      RL_MYSQL_USER: rl
-      RL_MYSQL_PASSWORD: rl_pass
-      RL_MYSQL_DB: rl_limiter
-      RL_MYSQL_POLL_S: "3"
-      RL_CONSOLE_PORT: "8090"
-      RL_CONSOLE_BIND: 0.0.0.0
-      # 配置自动下发：库里改监听端口/限额/后端服务器 → 本机 rl-limiter
-      # 立刻把它们渲染进这份 cfg 的受管区块并 reload（容器里没有
-      # systemctl，用入口脚本落的 master pid 发 SIGUSR2）。
-      RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
-      RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
-    ports:
-      - "8082:8080"              # hap-2 / fe_main
-      - "127.0.0.1:8092:8090"    # hap-2 的控制台
-    depends_on:
-      mysql:
-        condition: service_healthy
-      web:
-        condition: service_started
-    restart: unless-stopped
-
-  node3:
-    build:
-      context: .
-    # 限速由内核 tc 执行，容器默认没有操作网络设备的权限，必须显式给。
-    # 少了它 rl-limiter 一启动就会因为 tc 权限不足而退出（入口脚本会
-    # 明确报出来，不会静默地"没在限速"）。
-    cap_add:
-      - NET_ADMIN
-    # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
-    # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
-    # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
-    #
-    # 这里用的是**演示量级**：haproxy-base.cfg 的默认值是 100 万连接
-    # （= 400 万 fd），而宿主机 `fs.nr_open` 默认只有 1048576、且**容器里
-    # 改不动**，开发机上直接起不来。所以演示用下面的 HAPROXY_MAXCONN /
-    # HAPROXY_MAXPIPES 降到 10 万（= 400034 fd）——降的是演示，模板本身
-    # 仍然是那份可以直接抄去生产的骨架。生产机器请按 docs/08 把
-    # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
-    #
-    # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
-    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
-    ulimits:
-      nofile:
-        soft: 524288
-        hard: 524288
-    volumes:
-      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
-    environment:
-      RL_NODE_NAME: hap-3
-      # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
-      HAPROXY_MAXCONN: "100000"
-      HAPROXY_MAXPIPES: "100000"
-      RL_MYSQL_HOST: mysql
-      RL_MYSQL_PORT: "3306"
-      RL_MYSQL_USER: rl
-      RL_MYSQL_PASSWORD: rl_pass
-      RL_MYSQL_DB: rl_limiter
-      RL_MYSQL_POLL_S: "3"
-      RL_CONSOLE_PORT: "8090"
-      RL_CONSOLE_BIND: 0.0.0.0
-      # 配置自动下发：库里改监听端口/限额/后端服务器 → 本机 rl-limiter
-      # 立刻把它们渲染进这份 cfg 的受管区块并 reload（容器里没有
-      # systemctl，用入口脚本落的 master pid 发 SIGUSR2）。
-      RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
-      RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
-    ports:
-      - "8083:8080"              # hap-3 / fe_main
-      - "127.0.0.1:8093:8090"    # hap-3 的控制台
-    depends_on:
-      mysql:
-        condition: service_healthy
-      web:
-        condition: service_started
-    restart: unless-stopped
-
-  # ---- 客户端群：可在线调节并发数的压测服务（模拟并发带宽）----
-  loadgen:
-    build: .
-    # 三个入口各是一台独立节点：worker 轮转绑定入口，每台节点各自被
-    # 本机 tc 压在自己的限额内、互不影响。
-    command: >-
-      python3 tools/loadgen.py
-      --target http://node1:8080/
-      --control-port 8081
-    environment:
-      # 初始并发：LOADGEN_CONCURRENCY=32 docker compose up -d 即可改；
-      # 运行中用控制端口在线调节（见文件头速查）。
-      LOADGEN_CONCURRENCY: ${LOADGEN_CONCURRENCY:-1000}
-      # 长连接大文件下载场景：每个入口 N 条长连接循环下载 /big（默认
-      # 每入口 1 条）。验证 tc 对存量长连接的持续限速与限额
-      # 调整（reload + hard-stop）对在途下载的影响。
-      LOADGEN_BIG_PER_TARGET: ${LOADGEN_BIG_PER_TARGET:-1}
-    ports:
-      - "8084:8081"   # 控制端口（宿主机 8084）：GET /status、PUT /concurrency
-    depends_on:
-      - node1
-      - node2
-      - node3
-    restart: unless-stopped
 
 volumes:
   mysql-data:
+
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.211.0.0/24
+          gateway: 10.211.0.1
