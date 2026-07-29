@@ -114,6 +114,15 @@ class MonitorLoop:
         是否已热更到位。"""
         return self._version
 
+    def quotas_view(self) -> dict[str, float]:
+        """当前各 frontend 的限额（bytes/s）。
+
+        监控数据落库要把**当时的限额**一起记进每个桶——限额会被人改，
+        事后从配置里查到的是现在的值而不是当时的值，没有它回查时就读不出
+        "那条曲线到底有没有打满"。
+        """
+        return dict(self._quotas)
+
     def frontends(self) -> list[model.FrontendConfig]:
         """当前生效的受管 frontend 配置。
 

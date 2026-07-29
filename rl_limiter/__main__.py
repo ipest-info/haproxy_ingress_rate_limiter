@@ -25,7 +25,7 @@ import sys
 from . import config as configmod
 from . import dbconfig
 from . import enforcer as enforcermod
-from . import haproxy, model
+from . import haproxy, metricstore, model
 from . import netdev
 from . import tcshaper as tcmod
 from . import webconsole
@@ -82,6 +82,12 @@ ENV_TC_IFACE = "RL_TC_IFACE"
 # 不设则跟随 RL_TC_IFACE；设为 "-" 表示禁用入向包统计。
 ENV_NIC = "RL_NIC"
 
+# 监控数据落库（90 天回查）。默认开启，仅在数据库配置模式下生效——落库表
+# 与配置表在同一个库里，纯 YAML 部署没有可写的地方。设为 0/false 关闭
+# （此时只有内存里最近 10 分钟的实时曲线，没有历史回查）。
+# 分级保留与容量实测见 docs/07-监控数据回查.md。
+ENV_METRICS_RETENTION = "RL_METRICS_RETENTION"
+
 
 def _summarize_frontends(frontends: list[model.FrontendConfig]) -> str:
     """把受管 frontend 清单压缩成单个日志字段，格式：
@@ -103,7 +109,8 @@ async def _amain(cfg, log: logging.Logger,
                  enforcer: "enforcermod.HAProxyEnforcer | None" = None,
                  apply_period_s: float = DEFAULT_APPLY_PERIOD_S,
                  shaper: "tcmod.TcShaper | None" = None,
-                 nic: str = "") -> None:
+                 nic: str = "",
+                 metrics_retention: bool = True) -> None:
     """事件循环内的主体：组装组件、引导配置、并发运行监控循环与配置源。
 
     db_opts 非 None 表示配置来自 MySQL（数据库配置模式，生产权威）：
@@ -141,7 +148,21 @@ async def _amain(cfg, log: logging.Logger,
             haproxy=cfg.haproxy,
             degraded_fn=lambda: col.degraded)
 
-    sampler = hub.record if hub is not None else None
+    # 监控数据落库（90 天回查）。只在数据库模式下启用——落库表与配置表
+    # 在同一个库里，纯 YAML 部署没有可写的地方。
+    store = None
+    if db_opts is not None and metrics_retention:
+        store = metricstore.MetricStore(db_opts, instance, log)
+
+    # sampler 要同时喂给控制台（内存实时曲线）与落库（分级聚合）。落库只
+    # 做内存累加、不做 IO，因此这里多挂一个 sink 不会拖慢监控循环。
+    def sampler(now, usages, inst=None):
+        if hub is not None:
+            hub.record(now, usages, inst)
+        if store is not None:
+            store.record(now, usages, inst, ctl.quotas_view())
+    if hub is None and store is None:
+        sampler = None
     # 配置下发启用时，监控循环每应用一份配置就 set 这个事件，enforcer
     # 任务据此立刻把新配置写进本机 haproxy.cfg（见 enforcer 模块头）。
     # 配置一变就叫醒"下发"类任务（写 cfg 的 enforcer、下发限速的 tcshaper）。
@@ -221,8 +242,12 @@ async def _amain(cfg, log: logging.Logger,
     if hub is not None:
         tasks.append(asyncio.create_task(
             webconsole.run_console(console_port, hub, logbuf, db_opts, log,
-                                   bind=console_bind, instance=instance),
+                                   bind=console_bind, instance=instance,
+                                   store=store),
             name="web-console"))
+    if store is not None:
+        tasks.append(asyncio.create_task(
+            metricstore.run_metric_store(store, log), name="metric-store"))
     if enforcer is not None and cfg_applied is not None:
         # 目标配置取自监控循环当前生效的那一份。每次 reconcile 现取，
         # 因此配置热更后拿到的必然是新值。
@@ -260,6 +285,14 @@ async def _amain(cfg, log: logging.Logger,
         if t is not stop_task and t.exception() is not None:
             log.error("常驻任务异常退出，服务整体退出交由 systemd 拉起 "
                       "task=%s err=%s", t.get_name(), t.exception())
+    # 停机前把未关闭的监控桶写完（最多等几秒）。不做的话每次重启都会在
+    # 历史曲线上留一个缺口，见 MetricStore.flush。
+    if store is not None:
+        try:
+            await store.drain()
+        except Exception as e:
+            log.warning("停机时写出监控数据失败，已跳过 err=%s", e)
+
     for t in (stop_task, *tasks):
         t.cancel()
     await asyncio.gather(stop_task, *tasks, return_exceptions=True)
@@ -425,6 +458,10 @@ def main() -> None:
 
     config_source = db_opts.describe() if db_opts is not None else f"文件 {args.config}"
 
+    # 监控数据落库开关（默认开）。
+    raw_ret = (os.environ.get(ENV_METRICS_RETENTION) or "").strip().lower()
+    metrics_retention = raw_ret not in ("0", "false", "no", "off")
+
     # 实例视图的**入向**包统计要采哪张网卡（"-" = 显式禁用）。出向的包/
     # 丢包由 tc 按 frontend 统计，不走这里。默认跟随限速网卡——两者本来
     # 就该是同一张（客户端流量进出的那张），分开设只会给人配错的机会。
@@ -454,7 +491,8 @@ def main() -> None:
                            console_port=console_port, logbuf=logbuf,
                            instance=instance, console_bind=console_bind,
                            enforcer=enforcer, apply_period_s=apply_period_s,
-                           shaper=shaper, nic=nic))
+                           shaper=shaper, nic=nic,
+                           metrics_retention=metrics_retention))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
     log.info("rl-limiter 服务已停止")
