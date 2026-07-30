@@ -37,8 +37,8 @@ services:
       - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       - mysql-data:/var/lib/mysql
     # 只在本机回环暴露 3306，方便宿主机直接用 mysql 客户端改配置。
-    network_mode: host
-
+    networks:
+      - default
     healthcheck:
       # TCP ping：初始化阶段的临时实例只监听 unix socket，ping 通 TCP
       # 即表示真实实例（含 init.sql 灌数）已就绪。
@@ -75,8 +75,8 @@ services:
     # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
     ulimits:
       nofile:
-        soft: 524288
-        hard: 524288
+        soft: 1048576
+        hard: 1048576
     volumes:
       - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
@@ -84,8 +84,8 @@ services:
       # 那些行）。值必须与库中登记的实例名一致。
       RL_NODE_NAME: hap-1
       # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
-      HAPROXY_MAXCONN: "100000"
-      HAPROXY_MAXPIPES: "100000"
+      HAPROXY_MAXCONN: "1000000"
+      HAPROXY_MAXPIPES: "1000000"
       RL_MYSQL_HOST: mysql
       RL_MYSQL_PORT: "3306"
       RL_MYSQL_USER: rl
@@ -101,8 +101,8 @@ services:
       # systemctl，用入口脚本落的 master pid 发 SIGUSR2）。
       RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
       RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
-    network_mode: host
-
+    networks:
+      - default
     depends_on:
       mysql:
         condition: service_healthy
@@ -112,3 +112,10 @@ services:
 volumes:
   mysql-data:
 
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.211.0.0/24
+          gateway: 10.211.0.1
