@@ -60,14 +60,16 @@ def shaper(**kw):
 
 
 # 一份贴近真实 `tc class show` 输出的样例（htb 会把速率换算成可读单位）。
+# classid 的次要号是**十六进制**：0x1f90 = 8080。样例必须照 tc 的真实
+# 输出写——早先这里写成 1:8080 是自洽的假数据，正好把十六进制这件事盖住了。
 CLASSES_OK = """\
 class htb 1:1 root prio 0 rate 100Gbit ceil 100Gbit burst 0b cburst 0b
-class htb 1:8080 root leaf 8080: prio 0 rate 40Mbit ceil 40Mbit burst 50000b cburst 1600b
+class htb 1:1f90 root leaf 1f90: prio 0 rate 40Mbit ceil 40Mbit burst 50000b cburst 1600b
 """
 FILTERS_OK = """\
 filter parent 1: protocol ip pref 1 u32 chain 0
 filter parent 1: protocol ip pref 1 u32 chain 0 fh 800: ht divisor 1
-filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:8080 not_in_hw
+filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:1f90 not_in_hw
   match 00001f90/0000ffff at 20
 """
 
@@ -79,7 +81,42 @@ filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 80
 def test_classid_is_the_listen_port():
     """classid 次要号直接取监听端口：端口天然唯一，因此 classid 稳定——
     增删 frontend 不会让别人的 classid 漂移，reconcile 才能只改不重建。"""
-    assert T.classid_for(8080) == "1:8080"
+    assert T.classid_for(8080) == "1:1f90"      # 0x1f90 = 8080
+    assert T.classid_for(443) == "1:1bb"
+
+
+@pytest.mark.parametrize("port", [2, 80, 443, 8080, 9999, 10000, 14223, 65535])
+def test_classid_minor_is_hex_and_always_within_16_bits(port):
+    """**线上事故的回归测试**：classid 的次要号被 iproute2 按十六进制解析
+    （get_tc_classid 里的 strtoul(str, &p, 16)），而这里原先是按十进制拼的。
+
+        tc class add ... classid 1:14223 ...
+        Error: argument "1:14223" is wrong: invalid class ID
+
+    边界正好在端口 10000：1–9999 的十进制串碰巧也是合法十六进制
+    （0x9999 < 0xFFFF）所以"能用"，**10000 以上的端口全部下发失败——那些
+    frontend 根本没有限速**。这就是为什么全部用 8080 做样例的老测试一条都
+    没红：8080 恰好是那个能蒙混过关的区间。
+    """
+    cid = T.classid_for(port)
+    minor = cid.split(":", 1)[1]
+    assert int(minor, 16) == port, "次要号按十六进制读回来必须等于端口本身"
+    assert 1 <= int(minor, 16) <= 0xFFFF, "次要号是 16 位，超了 tc 直接拒绝"
+    assert len(minor) <= 4, f"{cid} 超过 4 个十六进制位，tc 会判为 invalid class ID"
+
+
+def test_classid_round_trips_through_tc_output():
+    """下发用的 classid 与从 tc 输出读回的次要号必须是同一个数。
+
+    两边只要有一边用错进制，比对就永远不相等——每一轮 reconcile 都判定
+    "类不存在"然后重建整棵树，限速被反复推倒重来。
+    """
+    for port in (80, 8080, 14223, 65535):
+        cid = T.classid_for(port)
+        line = f"class htb {cid} root leaf x: prio 0 rate 40Mbit ceil 40Mbit\n"
+        assert T.parse_classes(line) == {port: 40_000_000}
+        flt = f"filter parent 1: u32 fh 800::800 flowid {cid} not_in_hw\n"
+        assert T.parse_filter_minors(flt) == {port}
 
 
 @pytest.mark.parametrize("rate_bytes,expect", [
@@ -185,7 +222,7 @@ async def test_new_frontend_triggers_rebuild():
     assert res.ok and res.changed and res.action == "rebuild"
     joined = [" ".join(c) for c in fake.mutations()]
     assert any("qdisc del" in c for c in joined), "重建要先清旧树"
-    assert any("classid 1:9090" in c for c in joined)
+    assert any("classid 1:2382" in c for c in joined)   # 0x2382 = 9090
 
 
 async def test_rebuild_covers_every_frontend_completely():
@@ -196,13 +233,77 @@ async def test_rebuild_covers_every_frontend_completely():
     joined = [" ".join(c) for c in fake.mutations()]
     # 单位回环：配置口径 40 Mbps → 内部 5_000_000 bytes/s → tc 口径
     # 40_000_000 bit/s。这条断言就是在钉这个来回不许错 8 倍。
-    assert any("class add" in c and "classid 1:8080" in c and "rate 40000000bit" in c
+    # classid 走十六进制（0x1f90 = 8080），而 u32 的 match sport 走十进制
+    # ——两边格式不同是 tc 自己的约定，这几条断言把它钉死。
+    assert any("class add" in c and "classid 1:1f90" in c and "rate 40000000bit" in c
                for c in joined), "配置的 40 Mbps 必须原样落到 tc 上"
-    assert any("qdisc add" in c and "parent 1:8080" in c for c in joined)
+    assert any("qdisc add" in c and "parent 1:1f90" in c for c in joined)
     assert any("filter add" in c and "protocol ip " in c + " " and "sport 8080" in c
-               for c in joined)
+               for c in joined), "u32 的源端口匹配是十进制，不跟着 classid 变"
     assert any("filter add" in c and "protocol ipv6" in c and "sport 8080" in c
                for c in joined)
+
+
+async def test_upgrade_from_the_buggy_decimal_layout_rebuilds():
+    """从带 bug 的老版本升上来时，网卡上留着按十进制拼出的旧类
+    （端口 8080 → 类 1:8080，按十六进制读回来是 32896）。
+
+    这些旧类对不上任何监听端口，结构判定必须因此失败并**整棵重建**——
+    重建第一步就是 qdisc del root，把旧树连同残留的类一起清掉。若这里
+    误判成"结构一致"，就会走 rate-change 去改一个并不存在的类，限速
+    悄悄停留在旧配置上。
+    """
+    old_layout = (
+        "class htb 1:1 root prio 0 rate 100Gbit ceil 100Gbit burst 0b cburst 0b\n"
+        "class htb 1:8080 root leaf 8080: prio 0 rate 40Mbit ceil 40Mbit\n")
+    old_filters = "filter parent 1: u32 fh 800::800 flowid 1:8080 not_in_hw\n"
+    sh, fake = shaper(classes=old_layout, filters=old_filters)
+    res = await sh.reconcile([fe("a", port=8080, quota=40_000_000)])
+    assert res.ok and res.changed and res.action == "rebuild", (
+        "旧布局必须触发重建，不能被当成结构一致")
+    joined = [" ".join(c) for c in fake.mutations()]
+    assert any("qdisc del" in c for c in joined), "重建要先把旧树清掉"
+    assert any("classid 1:1f90" in c for c in joined), "新类要用十六进制次要号"
+
+
+async def test_high_ports_produce_ids_tc_will_accept():
+    """**线上事故的回归测试（第二处）**：不只是 classid，叶子 qdisc 的
+    handle 也是十六进制的 16 位数。
+
+        tc qdisc add ... parent 1:378f handle 14223: fq_codel
+        Error: argument "14223:" is wrong: invalid qdisc ID
+
+    这条比 classid 那处更阴——它是**非致命命令**，失败只记一行日志，表现为
+    "限速在跑，但类内没有公平队列"，不会有人注意到。
+
+    所以这里不逐条断言字面量，而是把规则本身钉住：**凡是 tc 的 ID 位置
+    （classid / parent / handle 的 <数字>: 部分），都必须是 ≤4 位十六进制，
+    且按十六进制读回来等于端口。** 用真实 tc 跑过一遍这些命令确认无
+    "invalid class ID / invalid qdisc ID"。
+    """
+    import re as _re
+    ports = [2, 80, 443, 8080, 9999, 10000, 14223, 65535]
+    sh, fake = shaper()
+    await sh.reconcile([fe(f"fe{p}", port=p) for p in ports])
+    ids = set()
+    for cmd in fake.mutations():
+        for i, tok in enumerate(cmd):
+            # classid/parent/handle 后面跟的那个 token 才是 ID
+            if i and cmd[i - 1] in ("classid", "parent", "handle"):
+                ids.add(tok)
+    assert ids, "没抓到任何 tc ID，测试本身失效了"
+    for tok in ids:
+        major, _, minor = tok.partition(":")
+        for part in (major, minor):
+            if not part:
+                continue
+            assert _re.fullmatch(r"[0-9a-f]{1,4}", part), (
+                f"tc ID {tok!r} 里的 {part!r} 不是 ≤4 位十六进制，"
+                f"tc 会判 invalid class/qdisc ID")
+    # 每个端口都得有自己的类与叶子队列，且两处用的是同一个十六进制值
+    for port in ports:
+        assert f"1:{port:x}" in ids, f"端口 {port} 的 classid 没下发"
+        assert f"{port:x}:" in ids, f"端口 {port} 的叶子 qdisc handle 没下发"
 
 
 async def test_default_class_is_created_and_unshaped():
@@ -267,7 +368,7 @@ async def test_commands_are_argv_never_shell_strings():
 CLASS_STATS_JSON = """[
  {"class":"htb","handle":"1:1","bytes":10,"packets":1,"drops":0,
   "overlimits":0,"backlog":0,"qlen":0},
- {"class":"htb","handle":"1:8080","bytes":123456,"packets":100,"drops":7,
+ {"class":"htb","handle":"1:1f90","bytes":123456,"packets":100,"drops":7,
   "overlimits":42,"backlog":2048,"qlen":3}
 ]"""
 

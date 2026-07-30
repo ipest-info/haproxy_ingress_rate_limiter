@@ -138,7 +138,8 @@ def cmd_verify(args) -> int:
 
     extra = (set(classes) - {T.DEFAULT_CLASS_MINOR}) - set(want)
     for port in sorted(extra):
-        print(f"  [warn] 网卡上有配置里没有的限速类 1:{port} —— "
+        print(f"  [warn] 网卡上有配置里没有的限速类 {T.classid_for(port)}"
+              f"（端口 {port}）—— "
               f"多半是删掉的 frontend 残留，下一轮 reconcile 会清掉")
 
     print("核对结论：" + ("与配置一致" if bad == 0 else f"**{bad} 项不一致，限速未按配置生效**"))

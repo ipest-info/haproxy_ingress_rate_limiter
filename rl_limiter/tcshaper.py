@@ -32,14 +32,18 @@
 #
 #     tc qdisc add dev eth0 root handle 1: htb default 1
 #     tc class add dev eth0 parent 1: classid 1:1    htb rate <线速>      # 兜底类，不整形
-#     tc class add dev eth0 parent 1: classid 1:8080 htb rate 40mbit ceil 40mbit
+#     tc class add dev eth0 parent 1: classid 1:1f90 htb rate 40mbit ceil 40mbit
 #     tc filter add dev eth0 protocol ip parent 1: prio 1 u32 \
-#         match ip sport 8080 0xffff flowid 1:8080
+#         match ip sport 8080 0xffff flowid 1:1f90
 #
 # **classid 的次要号直接取监听端口**：端口在本模型里天然唯一（一个 frontend
 # = 一个监听端口），因此 classid 稳定且无需额外分配表——改配置、重排序、
 # 增删 frontend 都不会让别的 frontend 的 classid 漂移。次要号 1 留给兜底类，
 # 所以拒绝监听 1 端口（那也不是现实中会用的端口）。
+#
+# 注意上面 8080 出现了两次、写法却不同：**classid 的次要号是十六进制**
+# （0x1f90 = 8080），而 u32 的 `match ip sport` 取的是十进制。两边格式不同
+# 是 tc 自己的约定，不是笔误——写混了的后果见 classid_for 的注释。
 #
 # ## 与 bwlim 的三处行为差异（都要向运维讲清楚）
 #
@@ -181,8 +185,25 @@ def burst_bytes(rate_bytes_per_s: float) -> int:
 
 
 def classid_for(port: int) -> str:
-    """监听端口 → classid。次要号直接取端口，理由见文件头。"""
-    return f"{ROOT_HANDLE}{port}"
+    """监听端口 → classid。次要号直接取端口，理由见文件头。
+
+    **次要号必须按十六进制写**。iproute2 解析 classid 用的是
+    `strtoul(str, &p, 16)`（lib/utils.c 的 get_tc_classid），也就是说
+    `1:14223` 里的 14223 会被当成 0x14223 = 82467，超出次要号的 16 位上限
+    直接报错：
+
+        Error: argument "1:14223" is wrong: invalid class ID
+
+    实测边界正好在端口 10000：1–9999 的十进制写法碰巧也是合法的十六进制
+    （0x9999 = 39321 < 0xFFFF），所以"能用"——但它落到的次要号并不是端口
+    本身，只是恰好自洽（写进去和读出来是同一个字符串）。**10000 以上的端口
+    全部下发失败，那些 frontend 根本没有限速。**
+
+    改成十六进制之后，次要号在数值上真正等于端口，1–65535 全部落在
+    0x0001–0xFFFF 内。读回时务必用 int(minor, 16) 配对——tc 输出的
+    classid 也是十六进制且不带 0x 前缀。
+    """
+    return f"{ROOT_HANDLE}{port:x}"
 
 
 def _check_shapeable(frontends: list[model.FrontendConfig]) -> None:
@@ -249,9 +270,16 @@ def _rebuild_cmds(iface: str,
              "burst", str(burst_bytes(f.quota_bytes_per_sec))], True))
         # 叶子队列：同一 frontend 内各连接之间公平排队。老内核可能没有
         # fq_codel，缺了只是失去类内公平性，限速本身不受影响 → 非致命。
+        #
+        # handle 的主要号和 classid 的次要号一样是**十六进制的 16 位数**，
+        # 同样不能拿十进制端口去拼：
+        #     tc qdisc add ... handle 14223: fq_codel
+        #     Error: argument "14223:" is wrong: invalid qdisc ID
+        # 这一条是非致命命令，失败只会记一行日志——真出事的话表现为
+        # "限速在跑但类内没有公平队列"，比 class 失败更难发现。
         cmds.append((
             ["tc", "qdisc", "add", "dev", iface, "parent", cid,
-             "handle", f"{port}:", LEAF_QDISC], False))
+             "handle", f"{port:x}:", LEAF_QDISC], False))
         # 分类：出方向、源端口 = 该 frontend 的监听端口。IPv4/IPv6 各一条
         # ——只写 IPv4 的话，客户端走 IPv6 进来时限速会整个失效。
         cmds.append((
@@ -278,14 +306,19 @@ def rate_change_cmd(iface: str, port: int, rate_bits_per_s: int) -> list[str]:
             "burst", str(burst_bytes(rate_bits_per_s / 8))]
 
 
-# `tc class show` 的一行形如：
-#   class htb 1:8080 root prio 0 rate 40Mbit ceil 40Mbit burst 50000b cburst 1600b
+# `tc class show` 的一行形如（端口 8080 = 0x1f90）：
+#   class htb 1:1f90 root prio 0 rate 40Mbit ceil 40Mbit burst 50000b cburst 1600b
+#
+# **classid 一律是十六进制**（tc 输出不带 0x 前缀），所以这里要认 a-f，
+# 读回时也必须 int(minor, 16)。用 \d+ 会让 "1:378f" 整行匹配不上，比对
+# 就以为这个类不存在，于是每一轮都重建——限速被反复推倒重来。
 _CLASS_RE = re.compile(
-    r"^class\s+htb\s+\d+:(?P<minor>\d+)\b.*?\brate\s+(?P<rate>\S+)", re.M)
+    r"^class\s+htb\s+[0-9a-f]+:(?P<minor>[0-9a-f]+)\b.*?\brate\s+(?P<rate>\S+)",
+    re.M | re.I)
 # `tc filter show` 里 u32 匹配项的 flowid 行与 match 行是分开的两行：
-#   filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:8080
+#   filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:1f90
 #     match 00001f90/0000ffff at 20
-_FILTER_FLOWID_RE = re.compile(r"\bflowid\s+\d+:(?P<minor>\d+)")
+_FILTER_FLOWID_RE = re.compile(r"\bflowid\s+[0-9a-f]+:(?P<minor>[0-9a-f]+)", re.I)
 
 _UNITS = {"": 1, "bit": 1, "kbit": 1_000, "mbit": 1_000_000, "gbit": 1_000_000_000,
           "tbit": 1_000_000_000_000,
@@ -311,11 +344,14 @@ def parse_rate(text: str) -> int:
 
 
 def parse_classes(out: str) -> dict[int, int]:
-    """解析 `tc class show`：classid 次要号 → 速率（bit/s）。"""
+    """解析 `tc class show`：classid 次要号 → 速率（bit/s）。
+
+    次要号按十六进制读（tc 就是这么输出的），与 classid_for 配对。
+    """
     res: dict[int, int] = {}
     for m in _CLASS_RE.finditer(out):
         try:
-            res[int(m.group("minor"))] = parse_rate(m.group("rate"))
+            res[int(m.group("minor"), 16)] = parse_rate(m.group("rate"))
         except TcError:
             continue          # 单条解析不了不该毁掉整次比对
     return res
@@ -328,7 +364,7 @@ def parse_filter_minors(out: str) -> set[int]:
     固定；真正需要发现的是"某个 frontend 的分类规则丢了/多了"，看 flowid
     集合就够，解析 match 反而会因 tc 输出格式变化而变脆。
     """
-    return {int(m.group("minor")) for m in _FILTER_FLOWID_RE.finditer(out)}
+    return {int(m.group("minor"), 16) for m in _FILTER_FLOWID_RE.finditer(out)}
 
 
 class TcShaper:
@@ -472,6 +508,10 @@ def parse_class_stats(out: str) -> dict[int, TcClassStat]:
 
     只保留 HTB 叶子类里 classid 次要号能对上监听端口的那些；兜底类
     （次要号 1）不是任何 frontend，跳过。
+
+    handle 里的次要号同样是**十六进制**（tc 的 JSON 与文本输出用的是同一套
+    格式化）。按十进制读的话 "1:1f90" 会抛 ValueError 被下面的 continue
+    悄悄跳过——监控视图里那条"数据包与丢包"曲线就会一直是空的，而且不报错。
     """
     if not out.strip():
         return {}
@@ -485,7 +525,7 @@ def parse_class_stats(out: str) -> dict[int, TcClassStat]:
         if ":" not in handle:
             continue
         try:
-            minor = int(handle.split(":", 1)[1])
+            minor = int(handle.split(":", 1)[1], 16)
         except ValueError:
             continue
         if minor == DEFAULT_CLASS_MINOR:
