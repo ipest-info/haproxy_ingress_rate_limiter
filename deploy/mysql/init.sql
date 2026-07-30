@@ -11,8 +11,16 @@
 -- haproxy_servers 渲染进本机 haproxy.cfg 的受管区块并 reload，所以在这里
 -- （或 Web 控制台上）改完即真正生效，不存在"库改了、cfg 忘了改"的漂移。
 --
--- 单位约定：quota_bps 一律为 bit/s（运维口径，40000000 = 40 Mbps）；
--- 下发给内核 tc 的类速率同样是 bit/s（原样，不换算）。
+-- 单位约定：**限额一律用 Mbps**（quota_mbps，40 = 40 Mbps，允许小数）。
+-- 数据库、本地 YAML、Web 控制台三个配置入口用的都是这一个单位；换算成
+-- bit/s（下发给 tc）与 bytes/s（内部计算）只在代码里的一处发生。
+--
+-- 从更早的 quota_bps（bit/s）升级，执行一次：
+--   ALTER TABLE haproxy_frontends
+--     CHANGE quota_bps quota_mbps DOUBLE NOT NULL DEFAULT 50000;
+--   UPDATE haproxy_frontends SET quota_mbps = quota_mbps / 1000000;
+--   -- 两条的顺序不能反：先改类型再换算。反过来的话除法发生在 BIGINT 上，
+--   -- 结果会被四舍五入到整数——实测 40500000 会变成 41 而不是 40.5。
 --
 -- 本库除配置外还存**监控数据**（metric_rollup 表，分级保留支持 90 天
 -- 回查）——见该表上方的说明。
@@ -76,13 +84,16 @@ CREATE TABLE IF NOT EXISTS haproxy_frontends (
     bind_address    VARCHAR(64)  NOT NULL DEFAULT '',
     bind_port       INT UNSIGNED NOT NULL,
     mode            VARCHAR(8)   NOT NULL DEFAULT 'tcp',   -- tcp | http
-    -- 限额（bit/s）。既是下发给内核 tc 的 limit（真实限速 = ÷8 bytes/s），
-    -- 也是超限告警基准——同源，因此不可能漂移。
+    -- 限额（**Mbps**）。既是下发给内核 tc 的类速率（真实限速），也是超限
+    -- 告警基准——同源，因此不可能漂移。
     --
-    -- 默认 50 Gbps：**默认值不该成为限制**。不填限额建出来的 frontend
-    -- 应该是"能跑多快跑多快"，等真要收着了再显式往下调；反过来（默认给
-    -- 一个小值）会让人在排查慢的时候满世界找原因，最后发现是默认值。
-    quota_bps       BIGINT       NOT NULL DEFAULT 50000000000,
+    -- 单位是 Mbps 而不是 bit/s：这是人填的字段，40 就是 40 Mbps，不用数
+    -- 零。DOUBLE 是为了允许小数（0.5 Mbps 这种小额度是真实需求）。
+    --
+    -- 默认 50000（= 50 Gbps）：**默认值不该成为限制**。不填限额建出来的
+    -- frontend 应该是"能跑多快跑多快"，等真要收着了再显式往下调；反过来
+    -- （默认给一个小值）会让人在排查慢的时候满世界找原因，最后发现是默认值。
+    quota_mbps      DOUBLE       NOT NULL DEFAULT 50000,
     -- 资源保护水位（NULL/0 = 不写该指令，沿用 global 的 maxconn）。
     -- 不是限速手段：防止限速导致连接堆积耗尽内存/fd。默认不设。
     maxconn         INT UNSIGNED NULL DEFAULT NULL,
@@ -186,13 +197,13 @@ INSERT INTO haproxy_instances (name, socket_path, timeout_ms) VALUES
 -- 的 shared bwlim limit）。这些行会被各自机器上的 rl-limiter 渲染进
 -- 本机 haproxy.cfg 的受管区块。
 INSERT INTO haproxy_frontends
-    (instance, name, bind_address, bind_port, mode, quota_bps, maxconn, balance)
+    (instance, name, bind_address, bind_port, mode, quota_mbps, maxconn, balance)
 VALUES
     -- maxconn 留 NULL：默认不设并发上限（沿用 global）。演示要看的是
     -- **限速**，并发上限只会在压测调高并发时莫名其妙地先挡住。
-    ('hap-1', 'fe_main', '', 8080, 'tcp', 40000000, NULL, 'roundrobin'),
-    ('hap-2', 'fe_main', '', 8080, 'tcp', 40000000, NULL, 'roundrobin'),
-    ('hap-3', 'fe_main', '', 8080, 'tcp', 40000000, NULL, 'roundrobin');
+    ('hap-1', 'fe_main', '', 8080, 'tcp', 40, NULL, 'roundrobin'),
+    ('hap-2', 'fe_main', '', 8080, 'tcp', 40, NULL, 'roundrobin'),
+    ('hap-3', 'fe_main', '', 8080, 'tcp', 40, NULL, 'roundrobin');
 
 -- 后端都指向 compose 里的模拟业务服务 web:9000。
 INSERT INTO haproxy_servers
@@ -208,7 +219,7 @@ VALUES
 --   进入 mysql： docker compose exec mysql mysql -url -prl_pass rl_limiter
 --
 --   调整限额（40 Mbps → 20 Mbps）——**只需这一步**：
---     UPDATE haproxy_frontends SET quota_bps = 20000000
+--     UPDATE haproxy_frontends SET quota_mbps = 20
 --       WHERE instance = 'hap-1' AND name = 'fe_main';
 --     该节点的 rl-limiter 会在一个轮询周期内把它写进本机 haproxy.cfg 的
 --     受管区块（haproxy -c 校验 → 原子替换 → reload），数据面即时生效。
@@ -220,8 +231,8 @@ VALUES
 --
 --   加一个监听端口（记得同时给它至少一台后端，否则会被校验拒绝）：
 --     INSERT INTO haproxy_frontends
---       (instance, name, bind_port, quota_bps) VALUES
---       ('hap-1', 'fe_api', 8081, 8000000);
+--       (instance, name, bind_port, quota_mbps) VALUES
+--       ('hap-1', 'fe_api', 8081, 8);
 --     INSERT INTO haproxy_servers
 --       (instance, frontend, name, address, port) VALUES
 --       ('hap-1', 'fe_api', 'api1', 'web', 9000);

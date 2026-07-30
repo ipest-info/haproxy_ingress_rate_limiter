@@ -14,10 +14,10 @@ from rl_limiter import config, dbconfig, model
 SERVICE_ROW = ("info", 1.0)
 INSTANCE_ROW = ("haproxy", None, None, "/run/haproxy/admin.sock", 500)
 FRONTEND_ROWS = [
-    # name, bind_address, bind_port, mode, quota_bps, maxconn, balance,
+    # name, bind_address, bind_port, mode, quota_mbps, maxconn, balance,
     # timeout_connect_ms, timeout_client_ms, timeout_server_ms
-    ("fe_main", "", 8080, "tcp", 40_000_000, 2000, "roundrobin", 5000, 50000, 50000),
-    ("fe_api", "127.0.0.1", 8081, "http", 8_000_000, None, "leastconn", None, None, None),
+    ("fe_main", "", 8080, "tcp", 40.0, 2000, "roundrobin", 5000, 50000, 50000),
+    ("fe_api", "127.0.0.1", 8081, "http", 8.0, None, "leastconn", None, None, None),
 ]
 SERVER_ROWS = [
     # frontend, name, address, port, weight, check_enabled, check_inter_ms
@@ -115,7 +115,7 @@ def test_canonical_is_stable_across_equal_content():
 
 def test_frontend_payload_validation_accepts_good():
     fe = dbconfig._validate_frontend_payload({
-        "name": "fe_x", "bind_port": 9000, "quota_bps": 8_000_000,
+        "name": "fe_x", "bind_port": 9000, "quota_mbps": 8.0,
         "servers": [{"name": "s1", "address": "10.0.0.1", "port": 80}],
     })["frontend"]
     assert isinstance(fe, model.FrontendConfig) and fe.name == "fe_x"
@@ -124,9 +124,9 @@ def test_frontend_payload_validation_accepts_good():
 @pytest.mark.parametrize("payload,match", [
     ("not a dict", "必须是 JSON 对象"),
     ({"name": "fe_x"}, "字段缺失或类型错误"),
-    ({"name": "fe x", "bind_port": 1, "quota_bps": 8000,
+    ({"name": "fe x", "bind_port": 1, "quota_mbps": 8,
       "servers": [{"name": "s", "address": "1.1.1.1", "port": 1}]}, "name 非法"),
-    ({"name": "fe_x", "bind_port": 1, "quota_bps": 8000, "servers": []},
+    ({"name": "fe_x", "bind_port": 1, "quota_mbps": 8, "servers": []},
      "servers 不能为空"),
 ])
 def test_frontend_payload_validation_rejects(payload, match):

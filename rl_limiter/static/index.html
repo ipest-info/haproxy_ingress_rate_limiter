@@ -239,10 +239,6 @@ input.bad:focus { box-shadow: 0 0 0 3px rgba(207,58,58,.15); }
   position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
   font-size: 12px; color: var(--text-muted); pointer-events: none;
 }
-/* 限额输入框 + 单位下拉：50 Gbps 写成 50000 Mbps 谁都看不出是多少。 */
-.unit-in { display: flex; gap: 6px; }
-.unit-in input { flex: 1 1 auto; min-width: 0; }
-.unit-in select { width: auto; flex: 0 0 auto; padding-right: 6px; }
 .err { font-size: 11.5px; color: var(--critical); margin-top: 4px; }
 .hint { font-size: 11.5px; color: var(--text-muted); }
 .hint code {
@@ -452,8 +448,8 @@ const $$ = (s, el) => [...(el || document).querySelectorAll(s)];
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
-// 速率一律以 bytes/s 在内部流转，只在显示时换算成 Mbps（×8÷1e6），
-// 与配置里的 quota_bps（bit/s）口径对齐。
+// 速率一律以 bytes/s 在内部流转，只在显示时换算成 Mbps（×8÷1e6）——
+// 与配置里的 quota_mbps 同一个单位，曲线和限额可以直接对着看。
 const fmtMbps = (bps) => (bps * 8 / 1e6).toFixed(2);
 // 每秒计数类（连接数、包数）：小数值给一位小数，大数值取整——差分出来的
 // 每秒值经常在个位数，全部取整会让曲线看着一跳一跳的。
@@ -664,12 +660,10 @@ function editorHtml(fe, isNew) {
   const f = fe || {};
   const opt = (v, cur, label) =>
     `<option value="${esc(v)}"${v === (cur || "") ? " selected" : ""}>${esc(label || v)}</option>`;
-  // 限额的显示单位跟着数量级走：50 Gbps 写成 50000 Mbps 谁都看不出是多少。
-  // 新建时给 DEFAULT_QUOTA_BPS（50 Gbps）——默认值不该成为限制。
-  const qbps = f.quota_bps || DEFAULT_QUOTA_BPS;
-  const qUnit = qbps >= 1e9 ? 1e9 : 1e6;
-  // 去掉 5e10/1e9 这类除法带出来的浮点尾巴（50.000000000000004）。
-  const qVal = parseFloat((qbps / qUnit).toPrecision(12));
+  // 限额**只有 Mbps 一个单位**：库、YAML、这个输入框填的是同一个数，
+  // 中间不做任何换算，也就没有"界面按 Gbps 填、库里存 bit/s"那种对不上的
+  // 空间。新建时给 DEFAULT_QUOTA_MBPS——默认值不该成为限制。
+  const qMbps = f.quota_mbps || DEFAULT_QUOTA_MBPS;
   return `
   <div class="sec">
     <div class="sec-h">监听</div>
@@ -706,16 +700,13 @@ function editorHtml(fe, isNew) {
     <div class="fields">
       <div class="f f-quota">
         <label>带宽限额 <span class="req">*</span></label>
-        <div class="unit-in">
+        <div class="suffix">
           <input class="i-quota" type="number" min="0" step="any"
-                 value="${esc(qVal)}" placeholder="50">
-          <select class="i-qunit">
-            <option value="1000000"${qUnit === 1e6 ? " selected" : ""}>Mbps</option>
-            <option value="1000000000"${qUnit === 1e9 ? " selected" : ""}>Gbps</option>
-          </select>
+                 value="${esc(qMbps)}" placeholder="50000">
+          <span>Mbps</span>
         </div>
         <div class="hint">${isNew
-          ? "默认 <b>50 Gbps</b>：默认值不设限，真要收着了再往下调"
+          ? "默认 <b>50000 Mbps</b>（50 Gbps）：默认值不设限，真要收着了再往下调"
           : "改限额不需要 reload，存量连接立刻跟上"}</div>
         <div class="err" hidden></div>
       </div>
@@ -950,13 +941,12 @@ function serverRow(s) {
 
 function readEditor(root, fallbackName) {
   const q = parseFloat($(".i-quota", root).value);
-  const qUnit = parseFloat($(".i-qunit", root).value) || 1e6;
   return {
     name: ($(".i-name", root).value || fallbackName || "").trim(),
     bind_address: $(".i-addr", root).value.trim(),
     bind_port: parseInt($(".i-port", root).value, 10),
-    // 界面按运维习惯用 Mbps/Gbps，接口用 bit/s——换算只在这一处。
-    quota_bps: Math.round((isFinite(q) ? q : 0) * qUnit),
+    // 界面、接口、库里都是 Mbps——这里没有换算，原样送出去。
+    quota_mbps: isFinite(q) ? q : 0,
     mode: $(".i-mode", root).value,
     balance: $(".i-balance", root).value,
     maxconn: parseInt($(".i-maxconn", root).value, 10) || 0,
@@ -974,11 +964,12 @@ function readEditor(root, fallbackName) {
   };
 }
 
-// 新建 frontend 的默认限额：50 Gbps。**默认值不该成为限制**——不填限额
-// 建出来的入口应该是"能跑多快跑多快"，等真要收着了再显式往下调。反过来
-// （默认给个小值）会让人在排查慢的时候满世界找原因，最后发现是默认值。
-// 与 deploy/mysql/init.sql 里 quota_bps 列的 DEFAULT 保持一致。
-const DEFAULT_QUOTA_BPS = 50e9;
+// 新建 frontend 的默认限额，单位 Mbps（50000 = 50 Gbps）。**默认值不该
+// 成为限制**——不填限额建出来的入口应该是"能跑多快跑多快"，等真要收着了
+// 再显式往下调。反过来（默认给个小值）会让人在排查慢的时候满世界找原因，
+// 最后发现是默认值。与 deploy/mysql/init.sql 里 quota_mbps 列的 DEFAULT
+// 保持一致。
+const DEFAULT_QUOTA_MBPS = 50000;
 
 const NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const ADDR_RE = /^[A-Za-z0-9._:-]{1,255}$/;
@@ -993,8 +984,9 @@ function validate(root, p, isNew) {
     errs.set(".i-port", "端口需在 1–65535");
   if (p.bind_address && !ADDR_RE.test(p.bind_address))
     errs.set(".i-addr", "地址含非法字符");
-  if (!(p.quota_bps > 0)) errs.set(".i-quota", "限额必须大于 0");
-  else if (p.quota_bps < 8) errs.set(".i-quota", "限额太小（不足 1 byte/s）");
+  if (!(p.quota_mbps > 0)) errs.set(".i-quota", "限额必须大于 0");
+  // 服务端的下限是"换算成 bytes/s 后不足 1"，即 0.000008 Mbps。
+  else if (p.quota_mbps < 8e-6) errs.set(".i-quota", "限额太小（不足 1 byte/s）");
 
   let srvErr = "";
   if (!p.servers.length) srvErr = "至少要有一台后端服务器";
@@ -1058,9 +1050,9 @@ function wireEditor(root, fe, isNew, onDone) {
     // 限额换算提示。Mbps ↔ bytes/s 的 8 倍混淆是本项目最贵的错误来源，
     // 把最终写进 cfg 的数值直接显示出来，保存前就能发现填错了一位。
     const conv = $(".conv", root);
-    conv.innerHTML = p.quota_bps > 0
-      ? `↔ <b>${(p.quota_bps / 8 / 1e6).toFixed(2)} MB/s</b>　`
-        + `写入 haproxy.cfg 的 <code>limit</code> = <b>${Math.floor(p.quota_bps / 8)}</b> bytes/s`
+    conv.innerHTML = p.quota_mbps > 0
+      ? `↔ <b>${(p.quota_mbps / 8).toFixed(2)} MB/s</b>　`
+        + `下发给 tc 的 <code>rate</code> = <b>${Math.round(p.quota_mbps * 1e6)}</b> bit/s`
       : "";
     emptyHint.hidden = tbody.children.length > 0;
     const dirty = JSON.stringify(p) !== initial;

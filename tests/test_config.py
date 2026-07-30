@@ -22,7 +22,7 @@ haproxy:
 frontends:
   - name: fe_main
     bind_port: 8080
-    quota_bps: 40000000
+    quota_mbps: 40
     maxconn: 2000
     servers:
       - {name: web1, address: 10.0.0.21, port: 9000}
@@ -31,7 +31,7 @@ frontends:
     bind_address: 127.0.0.1
     bind_port: 8081
     mode: http
-    quota_bps: 8000000
+    quota_mbps: 8
     balance: leastconn
     servers:
       - {name: api1, address: 10.0.0.31, port: 8000}
@@ -46,7 +46,7 @@ def load_from(tmp_path, text=VALID):
 
 def one_fe(**over):
     """构造只含一个 frontend 的最小 YAML，便于逐字段做拒绝路径测试。"""
-    f = {"name": "fe_a", "bind_port": 8080, "quota_bps": 8000000}
+    f = {"name": "fe_a", "bind_port": 8080, "quota_mbps": 8}
     f.update(over)
     body = "\n".join(f"    {k}: {v!r}" for k, v in f.items() if k != "servers")
     srv = over.get("servers", "\n      - {name: s1, address: 1.2.3.4, port: 80}")
@@ -104,8 +104,8 @@ def test_controller_config_roundtrip(tmp_path):
      r"frontends 不能为空"),
     (one_fe(name="fe bad"), r"name 非法"),
     (one_fe(bind_port=0), r"bind_port 必须在 1-65535"),
-    (one_fe(quota_bps=0), r"quota_bps 必须为正数"),
-    (one_fe(quota_bps=4), r"太小"),
+    (one_fe(quota_mbps=0), r"quota_mbps 必须为正数"),
+    (one_fe(quota_mbps=0.000004), r"太小"),
     (one_fe(mode="udp"), r"mode 取值非法"),
     (one_fe(balance="magic"), r"balance 取值非法"),
     (one_fe(maxconn=-1), r"maxconn 不能为负"),
@@ -126,8 +126,8 @@ def test_validation_rejects(tmp_path, text, match):
 def test_duplicate_frontend_name_rejected(tmp_path):
     """重名会让采样数据张冠李戴（名字要与 stats 的 pxname 一一对应）。"""
     text = ("haproxy: {socket_path: /run/h.sock}\nfrontends:\n"
-            "  - {name: fe_a, bind_port: 1, quota_bps: 8000, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n"
-            "  - {name: fe_a, bind_port: 2, quota_bps: 8000, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n")
+            "  - {name: fe_a, bind_port: 1, quota_mbps: 8, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n"
+            "  - {name: fe_a, bind_port: 2, quota_mbps: 8, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n")
     with pytest.raises(ValueError, match="重复"):
         load_from(tmp_path, text)
 
@@ -135,8 +135,8 @@ def test_duplicate_frontend_name_rejected(tmp_path):
 def test_duplicate_bind_port_rejected(tmp_path):
     """两个 frontend 绑同一端口会让 HAProxy 起不来——启动时就拦下。"""
     text = ("haproxy: {socket_path: /run/h.sock}\nfrontends:\n"
-            "  - {name: fe_a, bind_port: 8080, quota_bps: 8000, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n"
-            "  - {name: fe_b, bind_port: 8080, quota_bps: 8000, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n")
+            "  - {name: fe_a, bind_port: 8080, quota_mbps: 8, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n"
+            "  - {name: fe_b, bind_port: 8080, quota_mbps: 8, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n")
     with pytest.raises(ValueError, match="冲突"):
         load_from(tmp_path, text)
 
@@ -175,7 +175,7 @@ def test_error_message_contains_path(tmp_path):
 ])
 def test_haproxy_wiring_validation(tmp_path, hap, match):
     text = ("haproxy: " + hap + "\nfrontends:\n"
-            "  - {name: fe_a, bind_port: 1, quota_bps: 8000, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n")
+            "  - {name: fe_a, bind_port: 1, quota_mbps: 8, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n")
     with pytest.raises(ValueError, match=match):
         load_from(tmp_path, text)
 
@@ -183,7 +183,7 @@ def test_haproxy_wiring_validation(tmp_path, hap, match):
 def test_tcp_wiring_accepted(tmp_path):
     """远程只读观测形态：填 host/port 走内网 TCP。"""
     text = ("haproxy: {host: 10.0.0.11, port: 9999}\nfrontends:\n"
-            "  - {name: fe_a, bind_port: 1, quota_bps: 8000, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n")
+            "  - {name: fe_a, bind_port: 1, quota_mbps: 8, servers: [{name: s, address: 1.1.1.1, port: 1}]}\n")
     cfg = load_from(tmp_path, text)
     assert cfg.haproxy.is_unix is False
     assert cfg.haproxy.endpoint() == "10.0.0.11:9999"
@@ -193,3 +193,41 @@ def test_shipped_example_config_is_valid():
     """随仓库发布的示例配置必须能被真实加载——它是运维的起点。"""
     cfg = config.load("deploy/config/limiter.example.yaml")
     assert [f.name for f in cfg.frontends] == ["fe_main", "fe_api"]
+
+
+# ---------------------------------------------------------------------------
+# 单位契约：配置一律 Mbps
+# ---------------------------------------------------------------------------
+
+def test_quota_unit_is_mbps_end_to_end():
+    """配置里填的 40 就是 40 Mbps，一路换算到 tc 与内部口径都不许错。
+
+    这条钉的是全项目最贵的一类错误：8 倍（bit/byte）与 1e6 倍（Mbps/bps）
+    的混淆。换算只发生在 FrontendConfig 的两个 property 里，这里把三个
+    口径一次性对齐。
+    """
+    fe = model.FrontendConfig(
+        name="fe_a", bind_port=8080, quota_mbps=40,
+        servers=[model.ServerEntry(name="s", address="10.0.0.1", port=80)])
+    assert fe.quota_mbps == 40
+    assert fe.quota_bits_per_sec == 40_000_000        # 下发给 tc 的 rate
+    assert fe.quota_bytes_per_sec == 5_000_000        # 内部与告警判定口径
+
+
+def test_quota_accepts_fractions():
+    """0.5 Mbps 这种小额度是真实需求，不能因为字段是整数而被截断。"""
+    fe = model.FrontendConfig(
+        name="fe_a", bind_port=8080, quota_mbps=0.5,
+        servers=[model.ServerEntry(name="s", address="10.0.0.1", port=80)])
+    assert fe.quota_bits_per_sec == 500_000
+    assert fe.quota_bytes_per_sec == 62_500
+
+
+def test_quota_survives_the_dict_round_trip():
+    """控制台接口与数据库都走 to_dict/from_dict，单位不能在这来回里漂。"""
+    fe = model.FrontendConfig(
+        name="fe_a", bind_port=8080, quota_mbps=40.5,
+        servers=[model.ServerEntry(name="s", address="10.0.0.1", port=80)])
+    again = model.FrontendConfig.from_dict(fe.to_dict())
+    assert again.quota_mbps == 40.5
+    assert again.quota_bits_per_sec == fe.quota_bits_per_sec

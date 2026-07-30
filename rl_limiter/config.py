@@ -4,7 +4,7 @@
 #   1. **本机 HAProxy 的接线**（haproxy 段）：stats socket 怎么连
 #      （本机 unix socket 或内网 TCP）、命令超时；
 #   2. **受管 frontend 清单**（frontends 段）：每个 frontend 的监听端口、
-#      限额（quota_bps）、模式、超时、后端服务器列表。这份清单既是监控
+#      限额（quota_mbps）、模式、超时、后端服务器列表。这份清单既是监控
 #      的判定基准，也是写进 haproxy.cfg 受管区块的**唯一数据源**——
 #      两者同源，v0.3 那种"库里改了、cfg 忘了改"的配置漂移不再可能；
 #   3. 服务级运行参数：log_level、tick_interval_s。
@@ -15,8 +15,9 @@
 #     两种来源的错误信息与拒绝行为完全一致；
 #   - 本地 YAML 文件（load）：standalone / 开发联调。
 #
-# 单位约定：限额一律按运维口径的「比特每秒」（quota_bps，200000000 =
-# 200 Mbps）书写，内部统一换算为 bytes/s（见 model.FrontendConfig）。
+# 单位约定：**限额的配置单位一律是 Mbps**（quota_mbps，200 = 200 Mbps，
+# 允许小数），数据库、YAML、控制台接口三个入口完全一致；内部统一换算为
+# bytes/s（换算点只有 model.FrontendConfig 的两个 property）。
 #
 # 加载流程：读文件 → yaml.safe_load → 补默认值 → 校验。load 本身不打日志，
 # 成功日志由 main 统一输出；失败通过异常信息精确指出问题字段、当前值与
@@ -185,6 +186,17 @@ def _int_field(d: dict[str, Any], key: str, default: int, where: str) -> int:
         raise ValueError(f"{where}.{key} 必须是整数，当前值 {raw!r}") from None
 
 
+def _float_field(d: dict[str, Any], key: str, default: float, where: str) -> float:
+    """限额用得上：Mbps 允许小数（0.5 Mbps 这种小额度是真实需求）。"""
+    raw = d.get(key, default)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{where}.{key} 必须是数字，当前值 {raw!r}") from None
+
+
 def _parse_frontend(i: int, f: dict[str, Any]) -> model.FrontendConfig:
     where = f"frontends[{i}]"
     name = str(f.get("name", "") or "").strip()
@@ -212,7 +224,7 @@ def _parse_frontend(i: int, f: dict[str, Any]) -> model.FrontendConfig:
     return model.FrontendConfig(
         name=name,
         bind_port=_int_field(f, "bind_port", 0, where),
-        quota_bits_per_sec=_int_field(f, "quota_bps", 0, where),
+        quota_mbps=_float_field(f, "quota_mbps", 0.0, where),
         bind_address=str(f.get("bind_address", "") or "").strip(),
         mode=str(f.get("mode", "tcp") or "tcp").strip().lower(),
         maxconn=_int_field(f, "maxconn", 0, where),
@@ -285,15 +297,15 @@ def _validate(cfg: ServiceConfig) -> None:
                 f"HAProxy 启动失败")
         seen_ports[key] = f.name
 
-        if f.quota_bits_per_sec <= 0:
+        if f.quota_mbps <= 0:
             raise ValueError(
-                f"{where} ({f.name}): quota_bps 必须为正数（当前值 "
-                f"{f.quota_bits_per_sec!r}）——它既是下发给内核 tc 的 "
-                f"limit，也是超限告警基准；HAProxy 也不接受 limit 0")
+                f"{where} ({f.name}): quota_mbps 必须为正数（当前值 "
+                f"{f.quota_mbps!r}）——它既是下发给内核 tc 的类速率，"
+                f"也是超限告警基准；tc 也不接受 rate 0")
         if f.quota_bytes_per_sec < 1:
             raise ValueError(
-                f"{where} ({f.name}): quota_bps={f.quota_bits_per_sec} 太小"
-                f"（不足 8 bit/s），换算成 bytes/s 后不足 1，HAProxy 会拒绝")
+                f"{where} ({f.name}): quota_mbps={f.quota_mbps} 太小"
+                f"（换算成 bytes/s 后不足 1），tc 会拒绝这个速率")
 
         if f.mode not in _MODES:
             raise ValueError(

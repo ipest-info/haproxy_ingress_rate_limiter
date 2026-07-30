@@ -33,9 +33,9 @@ class FakeCollector:
         return self._usages
 
 
-def fe(name="fe_a", quota_bps=8_000_000, port=8080, servers=None):
+def fe(name="fe_a", quota_mbps=8.0, port=8080, servers=None):
     return model.FrontendConfig(
-        name=name, bind_port=port, quota_bits_per_sec=quota_bps,
+        name=name, bind_port=port, quota_mbps=quota_mbps,
         servers=servers or [model.ServerEntry(name="s1", address="10.0.0.1", port=80)])
 
 
@@ -54,20 +54,20 @@ def cfg(*frontends, version=1):
 def test_apply_config_sets_managed_and_quotas():
     col = FakeCollector()
     ctl = MonitorLoop(col)
-    ctl.seed(cfg(fe("fe_a", 8_000_000), fe("fe_b", 16_000_000, port=8081)))
+    ctl.seed(cfg(fe("fe_a", 8.0), fe("fe_b", 16.0, port=8081)))
     assert col.managed == {"fe_a", "fe_b"}
     assert ctl.version == 1
     # 限额基准换算成 bytes/s（÷8）——单位换算只在 model 一处。
-    assert [f.quota_bits_per_sec for f in ctl.frontends()] == [8_000_000, 16_000_000]
+    assert [f.quota_mbps for f in ctl.frontends()] == [8.0, 16.0]
 
 
 def test_frontends_follows_hot_reload():
     """enforcer 每轮现取，因此配置热更后拿到的必然是新值。"""
     ctl = MonitorLoop(FakeCollector())
-    ctl.seed(cfg(fe("fe_a", 8_000_000)))
-    assert ctl.frontends()[0].quota_bits_per_sec == 8_000_000
-    ctl.seed(cfg(fe("fe_a", 4_000_000), version=2))
-    assert ctl.frontends()[0].quota_bits_per_sec == 4_000_000
+    ctl.seed(cfg(fe("fe_a", 8.0)))
+    assert ctl.frontends()[0].quota_mbps == 8.0
+    ctl.seed(cfg(fe("fe_a", 4.0), version=2))
+    assert ctl.frontends()[0].quota_mbps == 4.0
 
 
 def test_config_applied_event_wakes_enforcer():
@@ -105,7 +105,7 @@ async def test_over_quota_alert_needs_sustained_excess(caplog):
     """瞬时冲高不告警：mean10 需连续高于限额 OVER_ALERT_AFTER_S 秒。"""
     col = FakeCollector()
     ctl = MonitorLoop(col, log=logging.getLogger("t.over"))
-    ctl.seed(cfg(fe("fe_a", 8_000_000)))          # 限额 = 1_000_000 bytes/s
+    ctl.seed(cfg(fe("fe_a", 8.0)))          # 8 Mbps = 1_000_000 bytes/s
     over = [usage("fe_a", mean10=1_500_000)]
 
     with caplog.at_level(logging.WARNING, logger="t.over"):
@@ -118,7 +118,7 @@ async def test_over_quota_alert_needs_sustained_excess(caplog):
 async def test_over_quota_clears_after_sustained_recovery(caplog):
     col = FakeCollector()
     ctl = MonitorLoop(col, log=logging.getLogger("t.clear"))
-    ctl.seed(cfg(fe("fe_a", 8_000_000)))
+    ctl.seed(cfg(fe("fe_a", 8.0)))
     with caplog.at_level(logging.INFO, logger="t.clear"):
         await drive(ctl, col, [usage("fe_a", mean10=1_500_000)], OVER_ALERT_AFTER_S)
         caplog.clear()
@@ -130,7 +130,7 @@ async def test_degraded_pauses_over_quota_judgement(caplog):
     """采样失联时数据是陈旧的：既不该触发新告警，也不该解除已有告警。"""
     col = FakeCollector()
     ctl = MonitorLoop(col, log=logging.getLogger("t.deg"))
-    ctl.seed(cfg(fe("fe_a", 8_000_000)))
+    ctl.seed(cfg(fe("fe_a", 8.0)))
     with caplog.at_level(logging.WARNING, logger="t.deg"):
         await drive(ctl, col,
                     [usage("fe_a", mean10=9_999_999, degraded=True)],
@@ -165,13 +165,13 @@ async def test_config_applied_before_tick():
     """某拍之前送达的配置，一定在该拍之前被应用——超限判定永远基于最新限额。"""
     col = FakeCollector([usage("fe_a")])
     ctl = MonitorLoop(col)
-    ctl.seed(cfg(fe("fe_a", 8_000_000)))
+    ctl.seed(cfg(fe("fe_a", 8.0)))
     q: asyncio.Queue = asyncio.Queue()
-    q.put_nowait(cfg(fe("fe_a", 4_000_000), version=7))
+    q.put_nowait(cfg(fe("fe_a", 4.0), version=7))
     task = asyncio.create_task(ctl.run(q, tick_interval_s=0.01))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert ctl.version == 7
-    assert ctl.frontends()[0].quota_bits_per_sec == 4_000_000
+    assert ctl.frontends()[0].quota_mbps == 4.0

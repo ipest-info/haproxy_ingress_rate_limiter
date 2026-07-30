@@ -230,7 +230,7 @@ def _check_shapeable(frontends: list[model.FrontendConfig]) -> None:
                           f"无法按端口分类限速")
         seen.add(f.bind_port)
         if int(f.quota_bytes_per_sec) < 1:
-            raise TcError(f"frontend {f.name} 的限额 {f.quota_bits_per_sec} bit/s "
+            raise TcError(f"frontend {f.name} 的限额 {f.quota_mbps} Mbps "
                           f"不足 1 字节/秒，无法整形")
 
 

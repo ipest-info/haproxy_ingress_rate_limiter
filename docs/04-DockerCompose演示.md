@@ -58,7 +58,7 @@ systemd `Restart=always` 的语义），由 compose 拉起。
 
 演示种子：hap-1 / hap-2 / hap-3 各有一个 `fe_main`，监听 8080、限额
 **40 Mbps**、后端指向 `web:9000`。这些行由各自机器上的 rl-limiter 渲染成
-haproxy.cfg 的受管区块——**cfg 里的 limit 与库里的 quota_bps 同源**。
+haproxy.cfg 的受管区块——**下发给 tc 的类速率与库里的 quota_mbps 同源**。
 
 聚合限速语义：shared bwlim 限的是**本 frontend 全部连接的总速率**——
 与连接数、单连接快慢无关，存量长连接持续受控；限额调整（改 cfg +
@@ -142,7 +142,7 @@ curl -N http://localhost:8090/api/stream           # SSE 实时流（每拍一�
 curl http://localhost:8090/api/logs?after=0        # 日志增量拉取
 # 新建或整体更新一个 frontend（含它的后端服务器列表）
 curl -X PUT http://localhost:8090/api/frontends/fe_main -d '{
-  "name": "fe_main", "bind_port": 8080, "quota_bps": 20000000,
+  "name": "fe_main", "bind_port": 8080, "quota_mbps": 20,
   "mode": "tcp", "maxconn": 2000, "balance": "roundrobin",
   "servers": [{"name": "web1", "address": "web", "port": 9000}]
 }'
@@ -210,7 +210,7 @@ curl http://localhost:8084/status    # big_downloads[]：每条在途下载的
 ```bash
 # 唯一一步：改库（也可以直接在控制台的 frontend 卡片上点「编辑」）
 docker compose exec mysql mysql -url -prl_pass rl_limiter \
-  -e "UPDATE haproxy_frontends SET quota_bps = 20000000
+  -e "UPDATE haproxy_frontends SET quota_mbps = 20
       WHERE instance = 'hap-1' AND name = 'fe_main';"
 
 # 几秒内（一个 RL_MYSQL_POLL_S 轮询周期）观察它自动落到数据面：

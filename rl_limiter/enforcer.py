@@ -127,7 +127,7 @@ def _check_renderable(frontends: list[model.FrontendConfig]) -> None:
                 f"frontend {f.name}: bind_address {f.bind_address!r} 含非法字符")
         if int(f.quota_bytes_per_sec) < 1:
             raise EnforceError(
-                f"frontend {f.name}: 限额 {f.quota_bits_per_sec} bit/s 换算后不足 "
+                f"frontend {f.name}: 限额 {f.quota_mbps} Mbps 换算后不足 "
                 f"1 byte/s，HAProxy 会拒绝")
         for s in f.servers:
             if not _SAFE_NAME.match(s.name):

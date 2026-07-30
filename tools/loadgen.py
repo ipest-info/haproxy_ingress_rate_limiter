@@ -26,7 +26,7 @@
 # 观测：每 --report-s 秒输出一次吞吐报告——首行为汇总，随后是**按目标
 # 逐行的表格**（每个 HAProxy 入口一行：并发/速率/请求数/错误数/状态），
 # 某个入口打不通时该行速率归零、错误上涨、状态标"不通"，一眼定位。
-# Mbps 口径与 rl-limiter 的 quota_bps 一致；/status 返回同样的分目标
+# Mbps 口径与 rl-limiter 的 quota_mbps 一致；/status 返回同样的分目标
 # 数据，便于脚本化断言"吞吐已被压到配额附近"。
 #
 # 实现要点：
@@ -366,7 +366,7 @@ class LoadGen:
                 "吞吐观测 concurrency=%d big_per_target=%d total_mbps=%.1f "
                 "total_req_per_s=%.1f requests_total=%d errors_total=%d\n  %s\n  %s",
                 self.concurrency, self._big_per_target,
-                total_bytes_rate * 8 / 1e6,  # Mbps：与 quota_bps 同口径
+                total_bytes_rate * 8 / 1e6,  # Mbps：与 quota_mbps 同口径
                 total_req_rate,
                 self.requests_total, self.errors_total,
                 header, "\n  ".join(rows))

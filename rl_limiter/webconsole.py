@@ -171,7 +171,7 @@ class StatusHub:
         # 换算好的 bytes/s 一并给出：图表的限额参考线用它，避免前端各处
         # 重复做 ÷8，单位换算只在服务端一处。
         for name, d in self._fe_config.items():
-            d["quota_bytes_per_s"] = d["quota_bps"] / 8.0
+            d["quota_bytes_per_s"] = d["quota_mbps"] * 1e6 / 8.0
 
     def _haproxy_view(self) -> dict[str, Any]:
         """本机 HAProxy 视图：接线 + 采样健康。"""

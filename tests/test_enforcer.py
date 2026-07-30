@@ -28,9 +28,9 @@ backend hand_written
 """
 
 
-def fe(name="fe_main", port=8080, quota=40_000_000, servers=None, **kw):
+def fe(name="fe_main", port=8080, quota=40.0, servers=None, **kw):   # Mbps
     return model.FrontendConfig(
-        name=name, bind_port=port, quota_bits_per_sec=quota,
+        name=name, bind_port=port, quota_mbps=quota,
         servers=servers if servers is not None else
         [model.ServerEntry(name="web1", address="10.0.0.21", port=9000)],
         **kw)
@@ -99,7 +99,7 @@ def test_render_bind_address_and_maxconn():
      "含非法字符"),
     (fe(servers=[model.ServerEntry(name="s", address="1.1.1.1\n    acl x", port=1)]),
      "含非法字符"),
-    (fe(quota=4), "不足"),
+    (fe(quota=0.000004), "不足"),
 ])
 def test_render_refuses_injection_and_bad_values(bad, match):
     """渲染前的白名单复核：这些值会被原样写进配置文件，放行任意字符

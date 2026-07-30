@@ -91,10 +91,10 @@ ENV_METRICS_RETENTION = "RL_METRICS_RETENTION"
 
 def _summarize_frontends(frontends: list[model.FrontendConfig]) -> str:
     """把受管 frontend 清单压缩成单个日志字段，格式：
-    "fe_main@:8080,quota_bps=40000000,servers=2;..."。
-    quota_bps 为配置口径的 bits/s。"""
+    "fe_main@:8080,quota=40Mbps,servers=2;..."。
+    限额按配置口径的 Mbps 输出，与库/YAML/控制台里填的是同一个数。"""
     return ";".join(
-        f"{f.name}@{f.bind_spec},quota_bps={f.quota_bits_per_sec},"
+        f"{f.name}@{f.bind_spec},quota={f.quota_mbps}Mbps,"
         f"mode={f.mode},servers={len(f.servers)}"
         for f in frontends
     )

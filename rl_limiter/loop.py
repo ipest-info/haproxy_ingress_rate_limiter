@@ -41,7 +41,7 @@ OVER_REMIND_EVERY_S = 300
 def _summarize_quotas(frontends: list[model.FrontendConfig]) -> str:
     """把各 frontend 限额压缩成单个日志字段，格式
     "fe_main=200000000;fe_api=..."，数值为配置口径的 bits/s。"""
-    return ";".join(f"{f.name}={f.quota_bits_per_sec}" for f in frontends)
+    return ";".join(f"{f.name}={f.quota_mbps}Mbps" for f in frontends)
 
 
 def _summarize_usages(usages: list[model.FrontendUsage]) -> str:

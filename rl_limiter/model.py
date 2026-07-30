@@ -19,12 +19,14 @@
 # 及 envs、env_targets 两张表）。对应的旧版本见 tag v0.3.0-colocated。
 #
 # 单位约定（非常重要，混淆会带来 8 倍误差）：
+#   - **配置的限额单位一律是 Mbps**（`quota_mbps`，允许小数）。数据库、
+#     本地 YAML、控制台接口三个配置入口用的都是这一个字段、这一个单位，
+#     不存在"这里填 bit/s、那里填 Mbps"的分裂。40 就是 40 Mbps。
 #   - 内部所有速率一律为「字节每秒」（bytes/s，float）。HAProxy stats 的
 #     bytes_out 本身就是字节计数，内部保持字节口径避免反复换算。
-#   - 配置中的限额（数据库与本地 YAML 的 quota_bps 字段）一律为
-#     「比特每秒」（bits/s），遵循运维习惯：200_000_000 表示 200 Mbps。
-#   - 两种口径只在 FrontendConfig.quota_bytes_per_sec 这一处转换
-#     （除以 8），其余代码不得再做单位换算。
+#   - 换算只在 FrontendConfig 的两个 property 里发生
+#     （quota_bits_per_sec = ×1e6，quota_bytes_per_sec = 再 ÷8），
+#     其余代码一律不得再做单位换算。
 
 from __future__ import annotations
 
@@ -191,14 +193,14 @@ class FrontendConfig:
     frontend+backend 分写，是因为本项目里两者一一对应，合成一段能让
     生成的配置更短、也更贴近 stats 里的 pxname）。
 
-    quota_bits_per_sec 同时是两件事的依据：下发到内核 tc 的类速率
-    （真实限速），以及监控侧的超限告警基准。两者同源，因此 v0.3 那种
-    "库里改了、数据面忘了改"的配置漂移在本模型下不可能发生。
+quota_mbps 同时是两件事的依据：下发到内核 tc 的类速率（真实限速），
+    以及监控侧的超限告警基准。两者同源，因此 v0.3 那种"库里改了、数据面
+    忘了改"的配置漂移在本模型下不可能发生。
     """
 
     name: str                       # frontend 名（= stats 里的 pxname，全局唯一）
     bind_port: int                  # 监听端口
-    quota_bits_per_sec: int         # 限额（bit/s），运维口径
+    quota_mbps: float               # 限额（Mbps），**配置的唯一单位**，允许小数
     bind_address: str = ""          # 监听地址；空 = 所有地址（HAProxy 的 `bind :port`）
     mode: str = "tcp"               # tcp | http
     maxconn: int = 0                # 0 = 不写该指令，沿用 global/defaults
@@ -209,11 +211,20 @@ class FrontendConfig:
     servers: list[ServerEntry] = field(default_factory=list)
 
     @property
-    def quota_bytes_per_sec(self) -> float:
-        """bits/s → bytes/s 的唯一换算边界（除以 8）。
+    def quota_bits_per_sec(self) -> int:
+        """Mbps → bit/s。tc 的 rate 参数用 bit，这里换过去。
 
-        下发给 tc 的类速率（tcshaper 会再 ×8 换回 bit/s，因为 tc 的 rate
-        参数用 bit）与监控侧的判定基准都取这个值，单位换算全服务只此一处。
+        取整到整数 bit/s：tc 本身也只接受整数，留小数只会让"配置里写的"和
+        "实际下发的"对不上。0.0000001 Mbps 这种输入由校验拦掉，不在这里兜。
+        """
+        return int(round(self.quota_mbps * 1_000_000))
+
+    @property
+    def quota_bytes_per_sec(self) -> float:
+        """Mbps → bytes/s。全服务的单位换算只在这两个 property 里发生。
+
+        下发给 tc 的类速率（tcshaper 会再 ×8 换回 bit/s）与监控侧的判定
+        基准都取这个值。
         """
         return self.quota_bits_per_sec / 8.0
 
@@ -228,7 +239,7 @@ class FrontendConfig:
             "name": self.name,
             "bind_address": self.bind_address,
             "bind_port": self.bind_port,
-            "quota_bps": self.quota_bits_per_sec,
+            "quota_mbps": self.quota_mbps,
             "mode": self.mode,
             "maxconn": self.maxconn,
             "balance": self.balance,
@@ -243,7 +254,7 @@ class FrontendConfig:
         return cls(
             name=str(d["name"]),
             bind_port=int(d["bind_port"]),
-            quota_bits_per_sec=int(d["quota_bps"]),
+            quota_mbps=float(d["quota_mbps"]),
             bind_address=str(d.get("bind_address", "") or ""),
             mode=str(d.get("mode", "tcp")),
             maxconn=int(d.get("maxconn", 0) or 0),

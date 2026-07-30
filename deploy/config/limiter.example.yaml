@@ -12,7 +12,7 @@
 #     受管区块并 reload。
 # 两者同源，因此不存在"配置改了、数据面忘了改"的漂移。
 #
-# 单位约定：quota_bps 一律为 bit/s（运维口径，40000000 = 40 Mbps），
+# 单位约定：**限额一律用 Mbps**（quota_mbps，40 = 40 Mbps，允许小数），
 # 服务内部统一换算为 bytes/s（唯一换算点在 model.FrontendConfig）。
 
 log_level: info                 # debug | info | warn | error
@@ -48,7 +48,7 @@ frontends:
     bind_address: ""            # 留空 = 所有地址（HAProxy 的 `bind :port`）
     bind_port: 8080
     mode: tcp                   # tcp | http
-    quota_bps: 40000000         # 限额（bit/s），40 Mbps。既是 shared bwlim 的
+    quota_mbps: 40              # 限额（Mbps）。既是下发给内核 tc 的
                                 # limit（真实限速 = 该值 ÷ 8 bytes/s），
                                 # 也是超限告警基准——同源，不会漂移
     maxconn: 0                  # 资源保护水位（0 = 不写该指令，沿用 global）；
@@ -74,7 +74,7 @@ frontends:
     bind_address: 127.0.0.1     # 只监听回环
     bind_port: 8081
     mode: http
-    quota_bps: 8000000          # 8 Mbps
+    quota_mbps: 8               # 8 Mbps
     balance: leastconn
     servers:
       - {name: api1, address: 10.0.0.31, port: 8000}

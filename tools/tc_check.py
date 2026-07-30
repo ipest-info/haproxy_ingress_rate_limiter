@@ -56,7 +56,7 @@ def cmd_plan(args) -> int:
     print("# 只改限额时不重建，逐个类就地改（不打断任何连接）：")
     for f in sorted(fes, key=lambda x: x.bind_port):
         rate = int(f.quota_bytes_per_sec) * 8
-        print(f"  # {f.name}: {f.quota_bits_per_sec} bit/s")
+        print(f"  # {f.name}: {f.quota_mbps} Mbps")
         print("  " + " ".join(T.rate_change_cmd(args.iface, f.bind_port, rate)))
     return 0
 

@@ -9,9 +9,9 @@ from aiohttp.test_utils import TestClient, TestServer
 from rl_limiter import model, webconsole
 
 
-def fe(name="fe_a", quota_bps=8_000_000, port=8080):
+def fe(name="fe_a", quota_mbps=8.0, port=8080):
     return model.FrontendConfig(
-        name=name, bind_port=port, quota_bits_per_sec=quota_bps,
+        name=name, bind_port=port, quota_mbps=quota_mbps,
         servers=[model.ServerEntry(name="s1", address="10.0.0.1", port=80)])
 
 
@@ -107,7 +107,7 @@ def test_overview_exposes_frontend_config():
     """界面的编辑表单以 overview 的 frontends 为初值。"""
     o = hub().overview()
     f = o["frontends"]["fe_a"]
-    assert f["bind_port"] == 8080 and f["quota_bps"] == 8_000_000
+    assert f["bind_port"] == 8080 and f["quota_mbps"] == 8.0
     assert f["quota_bytes_per_s"] == 1_000_000
     assert [s["name"] for s in f["servers"]] == ["s1"]
 

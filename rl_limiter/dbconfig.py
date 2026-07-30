@@ -7,7 +7,7 @@
 #   haproxy_instances   受管 HAProxy 实例：stats socket 接线
 #                       （socket_path 或 host/port，二选一 + 超时）
 #   haproxy_frontends   该实例的受管 frontend：监听地址端口、模式、
-#                       限额 quota_bps、maxconn、balance、各项超时
+#                       限额 quota_mbps、maxconn、balance、各项超时
 #   haproxy_servers     各 frontend 的后端服务器：地址端口、权重、健康检查
 #
 # 一个 rl-limiter 实例只管**一台** HAProxy（单 HAProxy 模型，v0.4 起）。
@@ -84,7 +84,7 @@ _SQL_INSTANCE = (
     "FROM haproxy_instances WHERE name = %s"
 )
 _SQL_FRONTENDS = (
-    "SELECT name, bind_address, bind_port, mode, quota_bps, maxconn, balance, "
+    "SELECT name, bind_address, bind_port, mode, quota_mbps, maxconn, balance, "
     "timeout_connect_ms, timeout_client_ms, timeout_server_ms "
     "FROM haproxy_frontends WHERE instance = %s ORDER BY name"
 )
@@ -212,14 +212,14 @@ def rows_to_raw(
         })
 
     fronts: list[dict[str, Any]] = []
-    for (name, bind_address, bind_port, mode, quota_bps, maxconn, balance,
+    for (name, bind_address, bind_port, mode, quota_mbps, maxconn, balance,
          t_connect, t_client, t_server) in frontend_rows:
         fe: dict[str, Any] = {
             "name": name,
             "bind_address": bind_address or "",
             "bind_port": bind_port or 0,
             "mode": mode or "tcp",
-            "quota_bps": quota_bps or 0,
+            "quota_mbps": quota_mbps or 0,
             "maxconn": maxconn or 0,
             "balance": balance or "roundrobin",
             "servers": servers_by_fe.get(str(name), []),
@@ -496,18 +496,18 @@ async def upsert_frontend(opts: MySQLOptions, instance: str, payload: Any) -> No
     fe = _validate_frontend_payload(payload)["frontend"]
     stmts: list[tuple[str, tuple]] = [
         ("INSERT INTO haproxy_frontends "
-         "(instance, name, bind_address, bind_port, mode, quota_bps, maxconn, "
+         "(instance, name, bind_address, bind_port, mode, quota_mbps, maxconn, "
          " balance, timeout_connect_ms, timeout_client_ms, timeout_server_ms) "
          "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
          "ON DUPLICATE KEY UPDATE "
          " bind_address=VALUES(bind_address), bind_port=VALUES(bind_port), "
-         " mode=VALUES(mode), quota_bps=VALUES(quota_bps), "
+         " mode=VALUES(mode), quota_mbps=VALUES(quota_mbps), "
          " maxconn=VALUES(maxconn), balance=VALUES(balance), "
          " timeout_connect_ms=VALUES(timeout_connect_ms), "
          " timeout_client_ms=VALUES(timeout_client_ms), "
          " timeout_server_ms=VALUES(timeout_server_ms)",
          (instance, fe.name, fe.bind_address, fe.bind_port, fe.mode,
-          fe.quota_bits_per_sec, fe.maxconn, fe.balance,
+          fe.quota_mbps, fe.maxconn, fe.balance,
           fe.timeout_connect_ms, fe.timeout_client_ms, fe.timeout_server_ms)),
         ("DELETE FROM haproxy_servers WHERE instance = %s AND frontend = %s",
          (instance, fe.name)),

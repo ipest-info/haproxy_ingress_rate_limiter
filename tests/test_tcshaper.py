@@ -22,9 +22,9 @@ from rl_limiter import tcshaper as T
 IFACE = "eth0"
 
 
-def fe(name="fe_main", port=8080, quota=40_000_000):
+def fe(name="fe_main", port=8080, quota=40.0):   # quota 单位 = Mbps
     return model.FrontendConfig(
-        name=name, bind_port=port, quota_bits_per_sec=quota,
+        name=name, bind_port=port, quota_mbps=quota,
         servers=[model.ServerEntry(name="s1", address="10.0.0.1", port=80)])
 
 
@@ -183,7 +183,7 @@ async def test_duplicate_port_refused():
 
 async def test_quota_too_small_refused():
     sh, _ = shaper()
-    res = await sh.reconcile([fe(quota=4)])     # 4 bit/s < 1 byte/s
+    res = await sh.reconcile([fe(quota=0.000004)])   # 4 bit/s < 1 byte/s
     assert not res.ok and "无法整形" in res.error
 
 
@@ -195,7 +195,7 @@ async def test_no_change_when_already_consistent():
     """已经一致就一条命令都不发——否则周期兜底会每 30 秒重建一次队列树，
     每次重建都有一个不整形的窗口。"""
     sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK)
-    res = await sh.reconcile([fe(port=8080, quota=40_000_000)])
+    res = await sh.reconcile([fe(port=8080, quota=40.0)])
     assert res.ok and not res.changed
     assert fake.mutations() == []
 
@@ -205,7 +205,7 @@ async def test_rate_only_change_uses_class_change_not_rebuild():
     连接立刻按新限额跑**——这正是 tc 方案相对 bwlim 的优势（bwlim 改限额
     要 reload，存量连接还得等 hard-stop-after 宽限期）。"""
     sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK)
-    res = await sh.reconcile([fe(port=8080, quota=80_000_000)])
+    res = await sh.reconcile([fe(port=8080, quota=80.0)])
     assert res.ok and res.changed and res.action == "rate-change"
     muts = fake.mutations()
     assert len(muts) == 1
@@ -229,7 +229,7 @@ async def test_rebuild_covers_every_frontend_completely():
     """每个 frontend 都要有：HTB 类、叶子队列、IPv4 分类、IPv6 分类。
     少了 IPv6 那条，客户端走 IPv6 进来时限速会整个失效。"""
     sh, fake = shaper()          # 空状态 = 首次运行
-    await sh.reconcile([fe("a", port=8080, quota=40_000_000)])
+    await sh.reconcile([fe("a", port=8080, quota=40.0)])
     joined = [" ".join(c) for c in fake.mutations()]
     # 单位回环：配置口径 40 Mbps → 内部 5_000_000 bytes/s → tc 口径
     # 40_000_000 bit/s。这条断言就是在钉这个来回不许错 8 倍。
@@ -258,7 +258,7 @@ async def test_upgrade_from_the_buggy_decimal_layout_rebuilds():
         "class htb 1:8080 root leaf 8080: prio 0 rate 40Mbit ceil 40Mbit\n")
     old_filters = "filter parent 1: u32 fh 800::800 flowid 1:8080 not_in_hw\n"
     sh, fake = shaper(classes=old_layout, filters=old_filters)
-    res = await sh.reconcile([fe("a", port=8080, quota=40_000_000)])
+    res = await sh.reconcile([fe("a", port=8080, quota=40.0)])
     assert res.ok and res.changed and res.action == "rebuild", (
         "旧布局必须触发重建，不能被当成结构一致")
     joined = [" ".join(c) for c in fake.mutations()]
