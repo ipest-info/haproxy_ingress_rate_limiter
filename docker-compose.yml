@@ -106,8 +106,6 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-      web:
-        condition: service_started
     restart: unless-stopped
 
 
