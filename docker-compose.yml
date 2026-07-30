@@ -37,8 +37,8 @@ services:
       - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       - mysql-data:/var/lib/mysql
     # 只在本机回环暴露 3306，方便宿主机直接用 mysql 客户端改配置。
-    networks:
-      - default
+    network_mode: host
+
     healthcheck:
       # TCP ping：初始化阶段的临时实例只监听 unix socket，ping 通 TCP
       # 即表示真实实例（含 init.sql 灌数）已就绪。
@@ -101,8 +101,8 @@ services:
       # systemctl，用入口脚本落的 master pid 发 SIGUSR2）。
       RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
       RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
-    networks:
-      - default
+    network_mode: host
+
     depends_on:
       mysql:
         condition: service_healthy
@@ -112,10 +112,3 @@ services:
 volumes:
   mysql-data:
 
-
-networks:
-  default:
-    ipam:
-      config:
-        - subnet: 10.211.0.0/24
-          gateway: 10.211.0.1
