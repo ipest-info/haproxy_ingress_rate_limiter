@@ -64,26 +64,33 @@ services:
     # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
     # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
     #
-    # 这里用的是**演示量级**：haproxy-base.cfg 的默认值是 100 万连接
-    # （= 400 万 fd），而宿主机 `fs.nr_open` 默认只有 1048576、且**容器里
-    # 改不动**，开发机上直接起不来。所以演示用下面的 HAPROXY_MAXCONN /
-    # HAPROXY_MAXPIPES 降到 10 万（= 400034 fd）——降的是演示，模板本身
-    # 仍然是那份可以直接抄去生产的骨架。生产机器请按 docs/08 把
-    # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
+    # 下面 HAPROXY_MAXCONN/MAXPIPES 都是 100 万，于是
+    #     FD 需求 = 1000000×2 + 1000000×2 + 34 = 4000034
+    # nofile 必须盖得住这个数（tests/test_deploy_limits.py 会盯着这条）。
+    #
+    # **注意：这已经超过宿主机 `fs.nr_open` 的默认值 1048576。** 那是单
+    # 进程 RLIMIT_NOFILE 的硬天花板，**容器里改不动**——不先在宿主机抬上去，
+    # 容器连启动都启不来（runc 设 rlimit 直接失败）。先执行：
+    #     sudo sysctl -w fs.nr_open=4194304
+    # 要持久化用 deploy/sysctl/tune-kernel.sh dump（表里已含这一项）。
+    #
+    # 开发机上不想动宿主机内核参数的话，把这两个变量连同 nofile 一起降到
+    # 10 万量级即可（10 万连接 = 400034 fd，nofile 524288 就够）。
     #
     # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
     # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
     ulimits:
       nofile:
-        soft: 1048576
-        hard: 1048576
+        soft: 4194304
+        hard: 4194304
     volumes:
       - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
     environment:
       # 本实例对应配置库 haproxy_instances 里的哪一行（读写都只碰自己
       # 那些行）。值必须与库中登记的实例名一致。
       RL_NODE_NAME: hap-1
-      # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
+      # 与 haproxy-base.cfg 的默认值一致（100 万）。改这两个数**必须**同步
+      # 改上面的 ulimits.nofile 与宿主机的 fs.nr_open，见那段注释。
       HAPROXY_MAXCONN: "1000000"
       HAPROXY_MAXPIPES: "1000000"
       RL_MYSQL_HOST: mysql
