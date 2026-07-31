@@ -80,7 +80,7 @@ _SQL_SERVICE = (
 )
 # 本实例自己那一行接线。按 name 参数化取，一个配置库可服务多台机器。
 _SQL_INSTANCE = (
-    "SELECT name, host, port, socket_path, timeout_ms "
+    "SELECT name, host, port, socket_path, timeout_ms, limit_scope, host_quota_mbps "
     "FROM haproxy_instances WHERE name = %s"
 )
 _SQL_FRONTENDS = (
@@ -186,7 +186,8 @@ def rows_to_raw(
             raw["tick_interval_s"] = tick
 
     if instance_row is not None:
-        name, host, port, socket_path, timeout_ms = instance_row
+        (name, host, port, socket_path, timeout_ms,
+         limit_scope, host_quota_mbps) = instance_row
         raw["haproxy"] = {
             "name": name,
             # NULL 列统一规整成空/零：同机形态下 host/port 就是空的，
@@ -195,6 +196,13 @@ def rows_to_raw(
             "port": port or 0,
             "socket_path": socket_path or "",
             "timeout_ms": timeout_ms or 0,
+            # 限速范围与整机限额也是实例级配置，随配置轮询热更新——把整机
+            # 限额从 1000 调到 500 和改某个 frontend 的限额一样立刻生效。
+            # 列是 NOT NULL DEFAULT 'frontend'，这里的兜底只为老库缺列/
+            # 值为空的极端情况。兜底成 "frontend" 而不是 "host"：整机范围
+            # 缺限额会被校验拒掉，那就成了"库里少个值 → 服务起不来"。
+            "limit_scope": limit_scope or "frontend",
+            "host_quota_mbps": host_quota_mbps or 0,
         }
 
     # 先按 frontend 归拢后端服务器，再挂到各 frontend 上。
@@ -480,8 +488,12 @@ def _validate_frontend_payload(d: Any) -> dict[str, Any]:
 
     # 复用配置层的白名单，保证"经控制台写入"与"直接写库后被加载"两条
     # 路径的接受集合完全一致。
+    # 这个临时配置只为跑 frontend 级的校验规则。限速范围固定用 frontend：
+    # 整机限速那条"必须给正的 host_quota_mbps"是**实例级**约束，跟"这个
+    # frontend 填得对不对"无关，不该在这里把用户的请求拒掉。
     tmp = configmod.ServiceConfig(haproxy=model.NodeConfig(
-        name="haproxy", socket_path="/run/haproxy/admin.sock"), frontends=[fe])
+        name="haproxy", socket_path="/run/haproxy/admin.sock",
+        limit_scope="frontend"), frontends=[fe])
     configmod._validate(tmp)     # 不通过则抛 ValueError，调用方按 400 应答
     return {"frontend": fe}
 

@@ -359,6 +359,15 @@ class ControllerConfig:
 
     version: int = 0
     frontends: list[FrontendConfig] = field(default_factory=list)
+    # 限速范围与整机限额。放进运行期配置而不是只在启动时读一次，是因为
+    # 它们要能随配置热更新改——把整机限额从 1000 调到 500 应该和改某个
+    # frontend 的限额一样立刻生效。
+    limit_scope: str = "frontend"
+    host_quota_mbps: float = 0.0
+
+    @property
+    def host_quota_bytes_per_sec(self) -> float:
+        return self.host_quota_mbps * 1_000_000 / 8.0
 
     def quotas(self) -> dict[str, float]:
         """frontend 名 → 限额（bytes/s），供超限判定使用。"""
@@ -407,6 +416,29 @@ class NodeConfig:
     port: int = 0            # TCP stats socket 端口（TCP 形态）
     timeout_s: float = 0.5   # 单次 runtime API 命令超时（连接 + 读写）
     socket_path: str = ""    # 本机 unix stats socket 路径（同机形态）
+
+    # ---- 限速范围（见 tcshaper 模块头的"两种限速范围"）-------------------
+    # "frontend" 按 frontend 分别限速：每个监听端口一个速率类，用 u32 按
+    #            源端口分类。**默认值**——不是因为它更好，而是因为它是老
+    #            行为：默认切到整机限速会给升级上来的机器**凭空加一个总
+    #            闸门**，那正是"默认值不该成为限制"要避免的事。
+    # "host"     整机限速：一个速率类罩住本机网卡的全部出向流量，不按端口
+    #            分类。**新装机器推荐用它**——简单得多，也没有按源端口分类
+    #            带来的那一串坑（临时端口撞监听端口、classid 进制、每加一
+    #            个 frontend 就要动队列树）。用它必须显式给 host_quota_mbps。
+    limit_scope: str = "frontend"
+    # 整机限额（Mbps）。limit_scope="host" 时必填且必须为正；
+    # limit_scope="frontend" 时这个值不用，各 frontend 各自的限额说了算。
+    host_quota_mbps: float = 0.0
+
+    @property
+    def host_quota_bytes_per_sec(self) -> float:
+        """整机限额 Mbps → bytes/s。与 FrontendConfig 的换算口径一致。"""
+        return self.host_quota_mbps * 1_000_000 / 8.0
+
+    @property
+    def is_host_scope(self) -> bool:
+        return self.limit_scope == "host"
 
     @property
     def is_unix(self) -> bool:

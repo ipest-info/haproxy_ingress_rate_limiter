@@ -78,7 +78,10 @@ class ServiceConfig:
 
     def to_controller_config(self, version: int = 0) -> model.ControllerConfig:
         """转成投递给监控主循环的运行期配置。"""
-        return model.ControllerConfig(version=version, frontends=list(self.frontends))
+        return model.ControllerConfig(
+            version=version, frontends=list(self.frontends),
+            limit_scope=self.haproxy.limit_scope,
+            host_quota_mbps=self.haproxy.host_quota_mbps)
 
 
 def load(path: str) -> ServiceConfig:
@@ -167,12 +170,15 @@ def _parse_haproxy(h: Any) -> model.NodeConfig:
     if timeout_ms <= 0:
         timeout_ms = DEFAULT_TIMEOUT_MS
 
+    scope = str(h.get("limit_scope", "frontend") or "frontend").strip().lower()
     return model.NodeConfig(
         name=str(h.get("name", "haproxy") or "haproxy").strip(),
         host=str(h.get("host", "") or "").strip(),
         port=port,
         timeout_s=timeout_ms / 1000.0,
         socket_path=str(h.get("socket_path", "") or "").strip(),
+        limit_scope=scope,
+        host_quota_mbps=_float_field(h, "host_quota_mbps", 0.0, "haproxy"),
     )
 
 
@@ -261,6 +267,21 @@ def _validate(cfg: ServiceConfig) -> None:
             f"改成别的值会让速率口径与告警阈值整体失真")
 
     _validate_haproxy(cfg.haproxy)
+
+    scope = cfg.haproxy.limit_scope
+    if scope not in ("host", "frontend"):
+        raise ValueError(
+            f"haproxy.limit_scope 取值非法 {scope!r}，"
+            f"可选 host（整机限速，默认）/ frontend（按监听端口分别限速）")
+    if scope == "host":
+        if cfg.haproxy.host_quota_mbps <= 0:
+            raise ValueError(
+                f"限速范围是 host（整机限速）时必须给正的 "
+                f"haproxy.host_quota_mbps，当前值 {cfg.haproxy.host_quota_mbps!r}")
+        if cfg.haproxy.host_quota_bytes_per_sec < 1:
+            raise ValueError(
+                f"host_quota_mbps={cfg.haproxy.host_quota_mbps} 太小"
+                f"（换算成 bytes/s 后不足 1），tc 会拒绝这个速率")
 
     if not cfg.frontends:
         # 没有受管 frontend 时服务无事可做：既没有要监控的对象，受管区块

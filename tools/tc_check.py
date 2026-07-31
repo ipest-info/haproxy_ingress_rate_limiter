@@ -33,31 +33,45 @@ from rl_limiter import config as configmod  # noqa: E402
 from rl_limiter import tcshaper as T  # noqa: E402
 
 
-def _load_frontends(path: str):
-    cfg = configmod.load(path)
-    return cfg.frontends
+def _load_cfg(path: str):
+    """读配置。**配置写错是运维最常见的情况，不该甩一段 traceback 出来**
+    ——校验器的报错信息本身就是人话（"限速范围是 host 时必须给正的
+    haproxy.host_quota_mbps，当前值 0.0"），直接打出来即可。"""
+    try:
+        return configmod.load(path)
+    except (ValueError, OSError) as e:
+        print(f"读取配置失败：{e}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+def _plan(cfg) -> "T.ShapePlan":
+    """从配置造出限速计划——两种范围（整机 / 按 frontend）都走这一条。"""
+    return T.ShapePlan.from_config(
+        cfg.haproxy.limit_scope, cfg.haproxy.host_quota_mbps, cfg.frontends)
 
 
 def cmd_plan(args) -> int:
     """只打印将要执行的 tc 命令，绝不执行。"""
-    fes = _load_frontends(args.config)
+    cfg = _load_cfg(args.config)
+    plan = _plan(cfg)
     try:
-        T._check_shapeable(fes)
+        T._check_plan(plan)
     except T.TcError as e:
         print(f"配置无法整形：{e}", file=sys.stderr)
         return 1
 
-    print(f"# 网卡 {args.iface}，共 {len(fes)} 个受管 frontend")
+    print(f"# 网卡 {args.iface}，限速范围 {plan.scope}——{plan.describe()}")
     print("# 首次运行 / 结构变化时执行以下序列（重建整棵队列树）：")
-    for argv, fatal in T._rebuild_cmds(args.iface, fes):
+    for argv, fatal in T._rebuild_cmds(args.iface, plan):
         note = "" if fatal else "    # 失败不致命"
         print("  " + " ".join(argv) + note)
     print()
-    print("# 只改限额时不重建，逐个类就地改（不打断任何连接）：")
-    for f in sorted(fes, key=lambda x: x.bind_port):
-        rate = int(f.quota_bytes_per_sec) * 8
-        print(f"  # {f.name}: {f.quota_mbps} Mbps")
-        print("  " + " ".join(T.rate_change_cmd(args.iface, f.bind_port, rate)))
+    print("# 只改限额时不重建，就地改（不打断任何连接）：")
+    for minor, rate in sorted(T.desired_rates(plan).items()):
+        label = ("整机" if plan.scope == T.SCOPE_HOST
+                 else next(f.name for f in cfg.frontends if f.bind_port == minor))
+        print(f"  # {label}: {rate / 1e6:g} Mbps")
+        print("  " + " ".join(T.rate_change_cmd(args.iface, minor, rate)))
     return 0
 
 
@@ -104,10 +118,12 @@ def cmd_doctor(args) -> int:
 
 def cmd_verify(args) -> int:
     """读回网卡实况，与配置逐条核对。"""
-    fes = _load_frontends(args.config)
+    cfg = _load_cfg(args.config)
+    fes = cfg.frontends
+    plan = _plan(cfg)
     sh = T.TcShaper(args.iface)
     classes, cbursts, filtered = asyncio.run(sh.observe())
-    want = T.desired_rates(fes)
+    want = T.desired_rates(plan)
 
     print(f"网卡 {args.iface} 实况核对：")
     bad_default = 0
@@ -127,6 +143,27 @@ def cmd_verify(args) -> int:
         print("  [ok]   兜底类存在且 cburst 正常（未分类流量按线速放行）")
 
     bad = bad_default
+    if plan.scope == T.SCOPE_HOST:
+        # 整机范围下只有一个受限类，没有"每个 frontend 一条"这回事。
+        rate = want[T.HOST_CLASS_MINOR]
+        got = classes.get(T.HOST_CLASS_MINOR)
+        if got is None:
+            print(f"  [FAIL] 没有整机限速类 {T.classid_for(T.HOST_CLASS_MINOR)}"
+                  f" —— **本机未被限速**")
+            bad += 1
+        elif got != rate:
+            print(f"  [FAIL] 整机限额不符：配置 {rate} bit/s，实际 {got} bit/s")
+            bad += 1
+        elif T._cburst_too_small(cbursts.get(T.HOST_CLASS_MINOR), rate):
+            print(f"  [FAIL] 整机限速类的 cburst 只有 "
+                  f"{cbursts.get(T.HOST_CLASS_MINOR)} 字节 —— 实际吞吐会远低于限额")
+            bad += 1
+        else:
+            print(f"  [ok]   整机限速 {rate / 1e6:g} Mbps 已生效")
+        print("核对结论：" + ("与配置一致" if bad == 0
+                          else f"**{bad} 项不一致，限速未按配置生效**"))
+        return 0 if bad == 0 else 1
+
     by_port = {f.bind_port: f for f in fes}
     for port in sorted(want):
         f = by_port[port]

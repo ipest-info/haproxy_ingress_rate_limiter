@@ -22,6 +22,15 @@ from rl_limiter import tcshaper as T
 IFACE = "eth0"
 
 
+def fe_plan(frontends):
+    """按 frontend 限速的计划。
+
+    本文件里绝大多数用例测的都是这个范围（每个监听端口一个类 + 源端口
+    分类）；整机限速的用例单列在文件末尾。
+    """
+    return T.ShapePlan(scope=T.SCOPE_FRONTEND, frontends=tuple(frontends))
+
+
 def fe(name="fe_main", port=8080, quota=40.0):   # quota 单位 = Mbps
     return model.FrontendConfig(
         name=name, bind_port=port, quota_mbps=quota,
@@ -168,7 +177,7 @@ def test_parse_tolerates_empty_output():
 async def test_empty_list_refused_without_touching_kernel():
     """空清单 = 撤掉全部限速。那是事故不是配置操作，且必须**一条命令都不发**。"""
     sh, fake = shaper()
-    res = await sh.reconcile([])
+    res = await sh.reconcile(fe_plan([]))
     assert not res.ok and "撤掉全部限速" in res.error
     assert fake.calls == []
 
@@ -177,20 +186,20 @@ async def test_port_colliding_with_default_class_refused():
     """classid 次要号取端口，1 号被兜底类占了——必须报清楚而不是让 tc
     抛一句难懂的错。"""
     sh, fake = shaper()
-    res = await sh.reconcile([fe(port=1)])
+    res = await sh.reconcile(fe_plan([fe(port=1)]))
     assert not res.ok and "兜底类" in res.error
     assert fake.calls == []
 
 
 async def test_duplicate_port_refused():
     sh, _ = shaper()
-    res = await sh.reconcile([fe("a", port=8080), fe("b", port=8080)])
+    res = await sh.reconcile(fe_plan([fe("a", port=8080), fe("b", port=8080)]))
     assert not res.ok and "被多个 frontend 使用" in res.error
 
 
 async def test_quota_too_small_refused():
     sh, _ = shaper()
-    res = await sh.reconcile([fe(quota=0.000004)])   # 4 bit/s < 1 byte/s
+    res = await sh.reconcile(fe_plan([fe(quota=0.000004)]))   # 4 bit/s < 1 byte/s
     assert not res.ok and "无法整形" in res.error
 
 
@@ -202,7 +211,7 @@ async def test_no_change_when_already_consistent():
     """已经一致就一条命令都不发——否则周期兜底会每 30 秒重建一次队列树，
     每次重建都有一个不整形的窗口。"""
     sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK)
-    res = await sh.reconcile([fe(port=8080, quota=40.0)])
+    res = await sh.reconcile(fe_plan([fe(port=8080, quota=40.0)]))
     assert res.ok and not res.changed
     assert fake.mutations() == []
 
@@ -212,7 +221,7 @@ async def test_rate_only_change_uses_class_change_not_rebuild():
     连接立刻按新限额跑**——这正是 tc 方案相对 bwlim 的优势（bwlim 改限额
     要 reload，存量连接还得等 hard-stop-after 宽限期）。"""
     sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK)
-    res = await sh.reconcile([fe(port=8080, quota=80.0)])
+    res = await sh.reconcile(fe_plan([fe(port=8080, quota=80.0)]))
     assert res.ok and res.changed and res.action == "rate-change"
     muts = fake.mutations()
     assert len(muts) == 1
@@ -225,7 +234,7 @@ async def test_new_frontend_triggers_rebuild():
     """结构变化（新增 frontend）只能重建——tc 没有"插入一个类并保持其余
     不动"的原子操作。"""
     sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK)
-    res = await sh.reconcile([fe("a", port=8080), fe("b", port=9090)])
+    res = await sh.reconcile(fe_plan([fe("a", port=8080), fe("b", port=9090)]))
     assert res.ok and res.changed and res.action == "rebuild"
     joined = [" ".join(c) for c in fake.mutations()]
     assert any("qdisc del" in c for c in joined), "重建要先清旧树"
@@ -236,7 +245,7 @@ async def test_rebuild_covers_every_frontend_completely():
     """每个 frontend 都要有：HTB 类、叶子队列、IPv4 分类、IPv6 分类。
     少了 IPv6 那条，客户端走 IPv6 进来时限速会整个失效。"""
     sh, fake = shaper()          # 空状态 = 首次运行
-    await sh.reconcile([fe("a", port=8080, quota=40.0)])
+    await sh.reconcile(fe_plan([fe("a", port=8080, quota=40.0)]))
     joined = [" ".join(c) for c in fake.mutations()]
     # 单位回环：配置口径 40 Mbps → 内部 5_000_000 bytes/s → tc 口径
     # 40_000_000 bit/s。这条断言就是在钉这个来回不许错 8 倍。
@@ -265,7 +274,7 @@ async def test_upgrade_from_the_buggy_decimal_layout_rebuilds():
         "class htb 1:8080 root leaf 8080: prio 0 rate 40Mbit ceil 40Mbit\n")
     old_filters = "filter parent 1: u32 fh 800::800 flowid 1:8080 not_in_hw\n"
     sh, fake = shaper(classes=old_layout, filters=old_filters)
-    res = await sh.reconcile([fe("a", port=8080, quota=40.0)])
+    res = await sh.reconcile(fe_plan([fe("a", port=8080, quota=40.0)]))
     assert res.ok and res.changed and res.action == "rebuild", (
         "旧布局必须触发重建，不能被当成结构一致")
     joined = [" ".join(c) for c in fake.mutations()]
@@ -291,7 +300,7 @@ async def test_high_ports_produce_ids_tc_will_accept():
     import re as _re
     ports = [2, 80, 443, 8080, 9999, 10000, 14223, 65535]
     sh, fake = shaper()
-    await sh.reconcile([fe(f"fe{p}", port=p) for p in ports])
+    await sh.reconcile(fe_plan([fe(f"fe{p}", port=p) for p in ports]))
     ids = set()
     for cmd in fake.mutations():
         for i, tok in enumerate(cmd):
@@ -332,8 +341,8 @@ async def test_every_htb_class_sets_both_burst_and_cburst():
     除受管端口之外的所有流量。所以这里对**每一个** htb 类都查，一个都不放过。
     """
     sh, fake = shaper()
-    await sh.reconcile([fe("a", port=8080, quota=40.0),
-                        fe("b", port=14223, quota=4000.0)])
+    await sh.reconcile(fe_plan([fe("a", port=8080, quota=40.0),
+                                fe("b", port=14223, quota=4000.0)]))
     classes = [c for c in fake.mutations()
                if c[:3] == ["tc", "class", "add"] and "htb" in c]
     assert len(classes) == 3, "兜底类 + 两个 frontend 类，一个都不能少"
@@ -354,7 +363,7 @@ async def test_rate_change_also_carries_cburst():
     看着改成功了，实际吞吐塌下来。
     """
     sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK)
-    res = await sh.reconcile([fe(port=8080, quota=80.0)])
+    res = await sh.reconcile(fe_plan([fe(port=8080, quota=80.0)]))
     assert res.action == "rate-change"
     cmd = [c for c in fake.mutations() if c[:3] == ["tc", "class", "change"]][0]
     assert "cburst" in cmd, "class change 也必须显式给 cburst"
@@ -376,7 +385,7 @@ async def test_default_class_is_created_and_unshaped():
     """没被分类的流量（SSH、监控、后端方向）必须落进一个不整形的兜底类，
     否则一开限速整台机器的其它流量都被拖下水。"""
     sh, fake = shaper()
-    await sh.reconcile([fe()])
+    await sh.reconcile(fe_plan([fe()]))
     joined = [" ".join(c) for c in fake.mutations()]
     assert any("htb default 1" in c for c in joined)
     assert any(f"classid 1:1 htb rate {T.DEFAULT_CLASS_RATE_BPS}bit" in c
@@ -391,7 +400,7 @@ async def test_missing_root_qdisc_on_first_run_is_not_fatal():
     """首次运行时 `tc qdisc del root` 必然失败（本来就没有），不能因此
     放弃整次下发。"""
     sh, _ = shaper(fail_on=["qdisc del"])
-    res = await sh.reconcile([fe()])
+    res = await sh.reconcile(fe_plan([fe()]))
     assert res.ok and res.changed
 
 
@@ -399,14 +408,14 @@ async def test_missing_leaf_qdisc_is_not_fatal():
     """老内核可能没有 fq_codel。缺了只是失去类内公平性，限速本身照常——
     不该让整个限速下发失败。"""
     sh, _ = shaper(fail_on=["fq_codel"])
-    res = await sh.reconcile([fe()])
+    res = await sh.reconcile(fe_plan([fe()]))
     assert res.ok and res.changed
 
 
 async def test_class_add_failure_is_reported_not_swallowed():
     """真正的限速命令失败必须上报：此时限速没生效，静默等于假装限住了。"""
     sh, _ = shaper(fail_on=["class add"])
-    res = await sh.reconcile([fe()])
+    res = await sh.reconcile(fe_plan([fe()]))
     assert not res.ok and "tc 命令失败" in res.error
 
 
@@ -414,7 +423,7 @@ async def test_commands_are_argv_never_shell_strings():
     """本模块以 root/CAP_NET_ADMIN 执行命令，必须逐个参数传递——走 shell
     等于把配置库里的值暴露给命令行解析。"""
     sh, fake = shaper()
-    await sh.reconcile([fe()])
+    await sh.reconcile(fe_plan([fe()]))
     for argv in fake.calls:
         assert isinstance(argv, list) and all(isinstance(a, str) for a in argv)
         assert argv[0] == "tc"
@@ -492,7 +501,7 @@ async def test_ephemeral_conflict_warns_but_does_not_block(caplog):
     sh, _ = shaper()
     sh._log = logging.getLogger("t.eph")
     with caplog.at_level(logging.WARNING, logger="t.eph"):
-        res = await sh.reconcile([fe("bad", port=40000)])
+        res = await sh.reconcile(fe_plan([fe("bad", port=40000)]))
     assert res.ok, "只告警，不阻断"
     assert any("临时端口范围" in r.getMessage() for r in caplog.records)
 
@@ -514,7 +523,7 @@ async def test_upgrade_repairs_frontend_cburst_even_when_rate_matches():
         "class htb 1:1f90 root leaf 1f90: prio 0 rate 40Mbit ceil 40Mbit "
         "burst 50000b cburst 1600b\n")
     sh, fake = shaper(classes=only_fe_bad, filters=FILTERS_OK)
-    res = await sh.reconcile([fe(port=8080, quota=40.0)])   # 限额与现状相同
+    res = await sh.reconcile(fe_plan([fe(port=8080, quota=40.0)]))   # 限额与现状相同
     assert res.ok and res.changed, "cburst 坏了就不能报告『无变化』"
     cmds = [" ".join(c) for c in fake.mutations()]
     assert any("class change" in c and "cburst 50000" in c for c in cmds), cmds
@@ -531,7 +540,7 @@ async def test_upgrade_repairs_default_class_cburst_by_rebuilding():
         "class htb 1:1f90 root leaf 1f90: prio 0 rate 40Mbit ceil 40Mbit "
         "burst 50000b cburst 50000b\n")
     sh, fake = shaper(classes=good_fe_bad_default, filters=FILTERS_OK)
-    res = await sh.reconcile([fe(port=8080, quota=40.0)])
+    res = await sh.reconcile(fe_plan([fe(port=8080, quota=40.0)]))
     assert res.action == "rebuild", "兜底类只能靠重建修"
     cmds = [" ".join(c) for c in fake.mutations()]
     assert any("classid 1:1 htb" in c and "cburst 8388608" in c for c in cmds), cmds
@@ -547,3 +556,178 @@ def test_parse_size_handles_tc_1024_based_units():
     assert not T._cburst_too_small(5000192, 4_000_000_000)
     assert T._cburst_too_small(1600, 4_000_000_000)
     assert T._cburst_too_small(None, 4_000_000_000)
+
+
+# ---------------------------------------------------------------------------
+# 整机限速（scope=host）
+#
+# 这个范围的全部意义在于**不做按端口分类**：队列树固定两个类，加多少个
+# frontend 都不变。因此这里要盯的边界与上面那批正好互补：
+#   1. 树的形状与 frontend 数量无关（这是它相对按端口限速的核心优势）；
+#   2. 空 frontend 清单在这里**不是**事故（那边是），限速照样罩着整机；
+#   3. 免限端口必须 IPv4+IPv6 都有——链路打满时那是唯一还能进机器的路；
+#   4. 改整机限额同样走 class change，不重建、不打断连接。
+# ---------------------------------------------------------------------------
+
+def host_plan(mbps=1000.0, frontends=(), exempt=T.DEFAULT_EXEMPT_PORTS):
+    return T.ShapePlan.from_config("host", mbps, list(frontends), exempt)
+
+
+# 整机范围下网卡上该有的样子：1:1 免限类（线速）+ 1:2 整机限速类。
+# 次要号 2 是十六进制的 "2"，和十进制同形，但仍然走同一条解析路径。
+HOST_CLASSES_OK = """\
+class htb 1:1 root prio 0 rate 100Gbit ceil 100Gbit burst 8Mb cburst 8Mb
+class htb 1:2 root leaf 2: prio 0 rate 1000Mbit ceil 1000Mbit burst 1250000b cburst 1250000b
+"""
+# 免限端口 22 的分类规则指向免限类 1:1（受限流量不需要任何 filter，
+# 它是 htb 的 default）。
+HOST_FILTERS_OK = """\
+filter parent 1: protocol ip pref 1 u32 chain 0
+filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:1 not_in_hw
+  match 00000016/0000ffff at 20
+"""
+
+
+def test_host_scope_tree_has_exactly_two_classes_and_no_port_filters():
+    """整机限速的队列树：免限类 + 整机类 + 叶子队列 + 免限端口的 v4/v6 规则。
+
+    关键是**没有任何按监听端口的分类规则**——整机类是 htb 的 default，
+    没被免限规则挑走的流量自动落进去。按源端口分类的那一串坑（临时端口
+    误分类、classid 进制、每改一个 frontend 就重建）在这里全都不存在。
+    """
+    cmds = [" ".join(a) for a, _ in T._rebuild_cmds(IFACE, host_plan(1000.0))]
+    assert any("htb default 2" in c for c in cmds), "整机类必须是 htb 的兜底类"
+    classes = [c for c in cmds if " class add " in c]
+    assert len(classes) == 2, f"整机范围只该有免限类和整机类两个：{classes}"
+    assert any("classid 1:1 htb" in c for c in classes)
+    assert any("classid 1:2 htb rate 1000000000bit" in c for c in classes)
+    # 免限端口 22：IPv4 与 IPv6 各一条，都指向免限类。
+    filters = [c for c in cmds if " filter add " in c]
+    assert len(filters) == 2, f"只该有免限端口的两条规则：{filters}"
+    assert any("protocol ip " in c and "sport 22" in c and "flowid 1:1" in c
+               for c in filters)
+    assert any("protocol ipv6 " in c and "sport 22" in c and "flowid 1:1" in c
+               for c in filters), "只写 IPv4 的话，链路打满时 IPv6 的 SSH 照样进不来"
+
+
+def test_host_scope_tree_is_independent_of_frontend_count():
+    """加多少个 frontend，整机限速的命令序列一个字节都不变。
+
+    这正是整机范围省掉的那份代价：按 frontend 限速下每增删一个入口都要
+    重建整棵树（重建期间有一个不整形的窗口）。
+    """
+    none = T._rebuild_cmds(IFACE, host_plan(1000.0))
+    many = T._rebuild_cmds(IFACE, host_plan(1000.0, frontends=[
+        fe(name=f"fe{i}", port=9000 + i, quota=10.0) for i in range(20)]))
+    assert none == many
+
+
+def test_host_scope_leaf_qdisc_handle_is_hex_and_nonfatal():
+    """叶子队列的 handle 与 classid 次要号同源，同样按十六进制拼；
+    老内核没有 fq_codel 时它失败不该中断下发。"""
+    leaf = [(a, fatal) for a, fatal in T._rebuild_cmds(IFACE, host_plan())
+            if a[:3] == ["tc", "qdisc", "add"] and "fq_codel" in a]
+    assert len(leaf) == 1
+    argv, fatal = leaf[0]
+    assert "2:" in argv and not fatal
+
+
+def test_host_scope_accepts_empty_frontend_list():
+    """整机限速下空 frontend 清单是正常状态（这台机器还没配入口），
+    限速依旧罩着整机——与按 frontend 限速的语义正好相反。"""
+    T._check_plan(host_plan(1000.0, frontends=[]))          # 不该抛
+    with pytest.raises(T.TcError, match="清单为空"):
+        T._check_plan(fe_plan([]))
+
+
+def test_host_scope_requires_a_positive_quota():
+    """整机范围没有"每个 frontend 各自的限额"可退，限额缺失 = 限不住。
+    默认值 0 会被拒——**宁可起不来，也不要看起来在限其实没限**。"""
+    with pytest.raises(T.TcError, match="整机限额"):
+        T._check_plan(host_plan(0.0))
+
+
+@pytest.mark.parametrize("port", [0, 65536, -1])
+def test_host_scope_rejects_out_of_range_exempt_port(port):
+    with pytest.raises(T.TcError, match="免限端口"):
+        T._check_plan(host_plan(1000.0, exempt=(port,)))
+
+
+def test_unknown_scope_is_rejected_before_any_command():
+    with pytest.raises(T.TcError, match="未知的限速范围"):
+        T._check_plan(T.ShapePlan(scope="global"))
+
+
+def test_desired_filter_minors_without_exempt_ports_is_empty():
+    """免限端口清空时整机范围一条 filter 都不需要——受限流量走 default。"""
+    assert T.desired_filter_minors(host_plan(1000.0, exempt=())) == set()
+    assert T.desired_filter_minors(host_plan(1000.0)) == {T.DEFAULT_CLASS_MINOR}
+
+
+async def test_host_scope_noop_when_already_consistent():
+    """已经一致就一条命令都不发：否则每 30 秒重建一次队列树 = 每 30 秒抖一次。"""
+    sh, fake = shaper(classes=HOST_CLASSES_OK, filters=HOST_FILTERS_OK)
+    res = await sh.reconcile(host_plan(1000.0))
+    assert res.ok and not res.changed
+    assert fake.mutations() == []
+
+
+async def test_host_quota_change_goes_through_class_change_not_rebuild():
+    """只改整机限额 → `tc class change 1:2`，不重建。
+
+    整机限速是一个总闸门，调它的频率只会比调单个 frontend 更高（扩容、
+    削峰）；每次调都重建整棵树的话，每次调限额都要抖一下全机流量。
+    """
+    sh, fake = shaper(classes=HOST_CLASSES_OK, filters=HOST_FILTERS_OK)
+    res = await sh.reconcile(host_plan(2000.0))
+    assert res.ok and res.changed and res.action == "rate-change"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    assert len(cmds) == 1, cmds
+    assert "class change" in cmds[0] and "classid 1:2" in cmds[0]
+    assert "rate 2000000000bit" in cmds[0] and "ceil 2000000000bit" in cmds[0]
+    assert "cburst" in cmds[0], "cburst 才是 ceil 那一路的桶，改速率必须一起改"
+
+
+async def test_switching_scope_rebuilds_the_tree():
+    """从按 frontend 限速切到整机限速：网卡上还是老结构，必须重建。
+
+    切换范围时最怕的是"看着切了、其实两套规则并存"——按端口的类还在，
+    整机类没建起来。结构比对（have_ports vs want）会直接判定不一致。
+    """
+    sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK)   # 老的按端口结构
+    res = await sh.reconcile(host_plan(1000.0))
+    assert res.ok and res.action == "rebuild"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    assert cmds[0].startswith("tc qdisc del"), "重建必须先把旧树整个清掉"
+    assert not any("1:1f90" in c for c in cmds), "旧的按端口的类不该被重新建出来"
+
+
+async def test_host_scope_repairs_bad_cburst_from_older_version():
+    """从漏给 cburst 的旧版本升上来：速率对，桶被 tc 按 MTU 量级兜底。
+    整机类的桶坏了 = 整台机器的吞吐远低于限额，必须修。"""
+    bad = ("class htb 1:1 root prio 0 rate 100Gbit ceil 100Gbit burst 8Mb cburst 8Mb\n"
+           "class htb 1:2 root leaf 2: prio 0 rate 1000Mbit ceil 1000Mbit "
+           "burst 1250000b cburst 1600b\n")
+    sh, fake = shaper(classes=bad, filters=HOST_FILTERS_OK)
+    res = await sh.reconcile(host_plan(1000.0))          # 限额与现状相同
+    assert res.ok and res.changed, "cburst 坏了就不能报告『无变化』"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    assert any("class change" in c and "classid 1:2" in c and "cburst 1250000" in c
+               for c in cmds), cmds
+
+
+async def test_host_scope_does_not_warn_about_ephemeral_ports(caplog):
+    """临时端口撞监听端口只在按源端口分类时才是问题。整机限速不分类，
+    这条告警在这个范围下毫无意义——不要拿无关告警去吓运维。"""
+    import logging
+    hot = fe(name="fe_hot", port=40000, quota=10.0)      # 落在临时端口范围内
+    with caplog.at_level(logging.WARNING):
+        sh, _ = shaper(classes=HOST_CLASSES_OK, filters=HOST_FILTERS_OK)
+        await sh.reconcile(host_plan(1000.0, frontends=[hot]))
+    assert not any("临时端口" in r.message for r in caplog.records)
+
+
+def test_host_plan_describe_mentions_quota_and_exempt_ports():
+    """日志里那一行是运维判断"到底限的是什么"的唯一依据。"""
+    d = host_plan(1000.0).describe()
+    assert "整机限速" in d and "1000 Mbps" in d and "22" in d

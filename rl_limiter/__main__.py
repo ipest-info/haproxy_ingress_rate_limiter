@@ -266,7 +266,12 @@ async def _amain(cfg, log: logging.Logger,
         # 两者共享同一个"配置已更新"事件——asyncio.Event 是电平触发，
         # 一次 set 能同时唤醒多个等待者。
         tasks.append(asyncio.create_task(
-            tcmod.run_shaper(shaper, lambda: ctl.frontends(), tc_applied,
+            tcmod.run_shaper(
+                shaper,
+                # 限速范围与整机限额都在实例级配置里，随配置热更新一起变。
+                lambda: tcmod.ShapePlan.from_config(
+                    ctl.limit_scope(), ctl.host_quota_mbps(), ctl.frontends()),
+                tc_applied,
                              log, period_s=apply_period_s),
             name="tc-shaper"))
 

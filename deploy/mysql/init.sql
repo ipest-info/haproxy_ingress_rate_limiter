@@ -22,6 +22,17 @@
 --   -- 两条的顺序不能反：先改类型再换算。反过来的话除法发生在 BIGINT 上，
 --   -- 结果会被四舍五入到整数——实测 40500000 会变成 41 而不是 40.5。
 --
+-- 从没有"限速范围"的版本升级，执行一次：
+--   ALTER TABLE haproxy_instances
+--     ADD COLUMN limit_scope     VARCHAR(16) NOT NULL DEFAULT 'frontend',
+--     ADD COLUMN host_quota_mbps DOUBLE      NOT NULL DEFAULT 0;
+--   -- 默认值就是升级后的行为：limit_scope='frontend' = 保持原样，
+--   -- **不会给已有机器凭空加一个整机总闸门**。要整机限速的机器再显式改：
+--   --   UPDATE haproxy_instances SET limit_scope = 'host', host_quota_mbps = 1000
+--   --     WHERE name = '<实例>';
+--   -- 只改 limit_scope 不给 host_quota_mbps 的话该实例会**启动失败**
+--   -- （而不是悄悄按某个默认值限住），两条要一起改。
+--
 -- 本库除配置外还存**监控数据**（metric_rollup 表，分级保留支持 90 天
 -- 回查）——见该表上方的说明。
 --
@@ -65,12 +76,30 @@ CREATE TABLE IF NOT EXISTS haproxy_instances (
     port            INT UNSIGNED NULL DEFAULT NULL,
     socket_path     VARCHAR(255) NULL DEFAULT NULL,
     -- 单次 runtime API 命令超时（连接 + 读写，毫秒）；<=0 按默认 500 处理。
-    timeout_ms      INT          NOT NULL DEFAULT 500
+    timeout_ms      INT          NOT NULL DEFAULT 500,
+    -- ---- 限速范围（这台机器的限速怎么划分）--------------------------------
+    -- 'host'     整机限速（**新装机器推荐**）：一个速率类罩住本机网卡的全部出向
+    --            流量，不按端口分类。简单得多，也没有按源端口分类带来的那
+    --            一串坑（临时端口撞监听端口、classid 进制、每增删一个
+    --            frontend 就要重建队列树）。此时 host_quota_mbps 必填。
+    -- 'frontend' **默认**：按监听端口分别限速，每个 frontend 一个速率类。
+    --            默认值是它不是因为更好，而是因为它是老行为——默认切成
+    --            整机限速会给升级上来的机器**凭空加一个总闸门**。
+    limit_scope     VARCHAR(16)  NOT NULL DEFAULT 'frontend',
+    -- 整机限额（Mbps，允许小数）。limit_scope='host' 时必须为正。
+    -- 默认 0 = 没填：配成 host 却忘了填限额会被校验直接拒绝，而不是
+    -- 悄悄按某个默认值把机器限住。
+    --
+    -- 注意它罩住的是**本机全部出向流量**——代理流量、连后端的流量、监控
+    -- 上报都算在内。这正是"整机限速"的定义，但要心里有数。
+    host_quota_mbps DOUBLE       NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------------------------------------------------------------------
--- 3. haproxy_frontends：受管 frontend = 一个监听端口 + 一个 shared bwlim
---    速率桶 + 一组后端服务器。**监控与限速的单位都是它**。
+-- 3. haproxy_frontends：受管 frontend = 一个监听端口 + 一组后端服务器 +
+--    一个限额。**监控的单位是它**；限速的单位取决于 haproxy_instances
+--    的 limit_scope：'frontend' 时每个 frontend 一个 tc 速率类，'host'
+--    时全机共用一个类、这里的 quota_mbps 只作为超限告警基准。
 --
 --    这些字段会被原样渲染进 haproxy.cfg，因此名字/地址的字符集受严格
 --    限制（见 rl_limiter/config.py 的白名单）——放宽等于允许通过配置库
@@ -193,8 +222,8 @@ INSERT INTO haproxy_instances (name, socket_path, timeout_ms) VALUES
     ('hap-2', '/run/haproxy/admin.sock', 500),
     ('hap-3', '/run/haproxy/admin.sock', 500);
 
--- 每台一个受管 frontend，监听 8080，限额 40 Mbps（= 5,000,000 bytes/s
--- 的 shared bwlim limit）。这些行会被各自机器上的 rl-limiter 渲染进
+-- 每台一个受管 frontend，监听 8080，限额 40 Mbps（下发给内核 tc 的类速率
+-- 就是 40000000bit/s）。这些行会被各自机器上的 rl-limiter 渲染进
 -- 本机 haproxy.cfg 的受管区块。
 INSERT INTO haproxy_frontends
     (instance, name, bind_address, bind_port, mode, quota_mbps, maxconn, balance)

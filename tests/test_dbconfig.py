@@ -12,7 +12,10 @@ from rl_limiter import config, dbconfig, model
 
 # 与 deploy/mysql/init.sql 种子同构的行样本。
 SERVICE_ROW = ("info", 1.0)
-INSTANCE_ROW = ("haproxy", None, None, "/run/haproxy/admin.sock", 500)
+# 列序与 dbconfig._INSTANCE_SQL 一致：
+#   name, host, port, socket_path, timeout_ms, limit_scope, host_quota_mbps
+INSTANCE_ROW = ("haproxy", None, None, "/run/haproxy/admin.sock", 500,
+                "frontend", 0.0)
 FRONTEND_ROWS = [
     # name, bind_address, bind_port, mode, quota_mbps, maxconn, balance,
     # timeout_connect_ms, timeout_client_ms, timeout_server_ms
@@ -62,7 +65,7 @@ def test_null_columns_fall_back_to_defaults():
 
 def test_tcp_instance_row():
     """远程观测形态：host/port 有值、socket_path 为 NULL。"""
-    cfg = build(instance_row=("haproxy", "10.0.0.11", 9999, None, 500))
+    cfg = build(instance_row=("haproxy", "10.0.0.11", 9999, None, 500, "frontend", 0.0))
     assert cfg.haproxy.is_unix is False
     assert cfg.haproxy.endpoint() == "10.0.0.11:9999"
 

@@ -101,6 +101,34 @@ LEAF_QDISC = "fq_codel"
 # 本机临时端口范围（内核给出向连接分配源端口的区间）。
 PROC_EPHEMERAL_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
 
+# ---------------------------------------------------------------------------
+# 两种限速范围
+# ---------------------------------------------------------------------------
+# SCOPE_HOST：整机限速。一个速率类罩住本机网卡的全部出向流量，
+#   **不做任何按端口的分类**。队列树只有两个类，加多少个 frontend 都不变。
+#   按源端口分类带来的那一串麻烦在这个范围下全部不存在：
+#     - 临时端口撞监听端口导致回程流量被误分类（docs/06 §6）→ 不存在
+#     - classid 次要号的进制坑（10000 以上端口全废）→ 不存在
+#     - 每增删一个 frontend 就要重建队列树 → 不存在
+#   代价是没法"这个入口 100M、那个入口 200M"。**新装机器推荐用它。**
+#
+# SCOPE_FRONTEND（**默认**）：按 frontend 分别限速，每个监听端口一个类 +
+#   一条 u32 源端口分类规则。它是默认值不是因为更好，而是因为它是老行为
+#   ——默认切成整机限速会给升级上来的机器凭空加一个总闸门，那正是
+#   "默认值不该成为限制"要避免的事。
+SCOPE_HOST = "host"
+SCOPE_FRONTEND = "frontend"
+SCOPES = (SCOPE_HOST, SCOPE_FRONTEND)
+
+# 整机限速类的 classid 次要号。次要号 1 留给**免限类**（管理流量），
+# 所以整机类用 2。
+HOST_CLASS_MINOR = 2
+
+# 免限的管理端口：整机限速把本机全部出向都罩住，SSH 也不例外。链路打满时
+# 连不上机器是运维事故，所以默认给 22 开一条免限通道（流量极小，不影响
+# 限速准确性）。只从本机环境变量读，**绝不从配置库读**——与网卡名同理。
+DEFAULT_EXEMPT_PORTS = (22,)
+
 
 @dataclass(slots=True)
 class TcClassStat:
@@ -242,6 +270,44 @@ def classid_for(port: int) -> str:
     return f"{ROOT_HANDLE}{port:x}"
 
 
+@dataclass(frozen=True)
+class ShapePlan:
+    """一次限速下发要表达的全部意图。
+
+    从"一个 frontend 列表"升级成这个对象，是因为限速范围现在有两种：整机
+    限速下 frontend 列表根本用不着（只要一个总限额），而按 frontend 限速
+    下才需要逐个端口。把范围显式带进来，比让下游去猜要好。
+    """
+
+    scope: str = SCOPE_FRONTEND
+    # 整机限额（bit/s）。scope=host 时用。
+    host_rate_bits_per_s: int = 0
+    # 各 frontend 的限额。scope=frontend 时用；scope=host 时只用来记日志。
+    frontends: tuple[model.FrontendConfig, ...] = ()
+    # 免限的管理端口（只在 scope=host 下有意义）。
+    exempt_ports: tuple[int, ...] = DEFAULT_EXEMPT_PORTS
+
+    @classmethod
+    def from_config(cls, scope: str, host_quota_mbps: float,
+                    frontends: list[model.FrontendConfig],
+                    exempt_ports: tuple[int, ...] = DEFAULT_EXEMPT_PORTS
+                    ) -> "ShapePlan":
+        """从运行期配置造一个计划。整机限额的 Mbps → bit/s 换算在这里。"""
+        return cls(
+            scope=scope,
+            host_rate_bits_per_s=int(round(host_quota_mbps * 1_000_000)),
+            frontends=tuple(frontends),
+            exempt_ports=tuple(exempt_ports),
+        )
+
+    def describe(self) -> str:
+        if self.scope == SCOPE_HOST:
+            return (f"整机限速 {self.host_rate_bits_per_s / 1e6:g} Mbps"
+                    f"（免限端口 {','.join(map(str, self.exempt_ports)) or '无'}）")
+        return ";".join(f"{f.name}@:{f.bind_port}={f.quota_mbps:g}Mbps"
+                        for f in sorted(self.frontends, key=lambda x: x.bind_port))
+
+
 def _check_shapeable(frontends: list[model.FrontendConfig]) -> None:
     """进入 argv 之前的最后一道校验。
 
@@ -270,21 +336,107 @@ def _check_shapeable(frontends: list[model.FrontendConfig]) -> None:
                           f"不足 1 字节/秒，无法整形")
 
 
-def desired_rates(frontends: list[model.FrontendConfig]) -> dict[int, int]:
-    """期望状态：监听端口 → 限额（bit/s，tc 的口径）。
+def _check_plan(plan: ShapePlan) -> None:
+    """下发前的最后一道校验，按范围分别看。"""
+    if plan.scope not in SCOPES:
+        raise TcError(f"未知的限速范围 {plan.scope!r}，可选 {'/'.join(SCOPES)}")
+    if plan.scope == SCOPE_HOST:
+        # 整机限速不看 frontend 列表——**列表为空也照样限速**。这和按
+        # frontend 限速正好相反：那边空清单等于撤掉全部限速（是事故），
+        # 这边空清单只是"这台机器还没配入口"，限速依旧罩着整机。
+        if plan.host_rate_bits_per_s < 8:
+            raise TcError(
+                f"整机限额 {plan.host_rate_bits_per_s} bit/s 不足 1 字节/秒，"
+                f"无法整形。整机限速模式下必须给一个正的整机限额")
+        for p in plan.exempt_ports:
+            if not (1 <= p <= 65535):
+                raise TcError(f"免限端口 {p} 越界")
+        return
+    _check_shapeable(list(plan.frontends))
+
+
+def desired_rates(plan: ShapePlan) -> dict[int, int]:
+    """期望状态：classid 次要号 → 限额（bit/s，tc 的口径）。
+
+    两种范围返回的是同一种形状，于是 reconcile 的比对逻辑不用分叉：
+      - 整机：{HOST_CLASS_MINOR: 整机限额}
+      - 按 frontend：{监听端口: 该 frontend 的限额}
 
     内部一律 bytes/s，只在这里换回 bit/s——因为 tc 的 rate 参数用 bit。
     """
-    return {f.bind_port: int(f.quota_bytes_per_sec) * 8 for f in frontends}
+    if plan.scope == SCOPE_HOST:
+        return {HOST_CLASS_MINOR: plan.host_rate_bits_per_s}
+    return {f.bind_port: int(f.quota_bytes_per_sec) * 8 for f in plan.frontends}
 
 
-def _rebuild_cmds(iface: str,
-                  frontends: list[model.FrontendConfig]) -> list[tuple[list[str], bool]]:
+def desired_filter_minors(plan: ShapePlan) -> set[int]:
+    """期望状态：filter 的 flowid 应该指向哪些 classid 次要号。
+
+    整机范围下**受限流量不需要任何 filter**（它是 htb 的 default 类），
+    只有免限端口那几条规则指向免限类。按 frontend 范围下则是每个端口一条。
+    """
+    if plan.scope == SCOPE_HOST:
+        return {DEFAULT_CLASS_MINOR} if plan.exempt_ports else set()
+    return {f.bind_port for f in plan.frontends}
+
+
+def _rebuild_cmds(iface: str, plan: ShapePlan) -> list[tuple[list[str], bool]]:
     """重建整棵 tc 树的命令序列。
 
     返回 (argv, fatal) 列表：fatal 为假的命令失败只记警告不中断——
     删除不存在的根 qdisc、老内核没有 fq_codel，都属于这一类。
     """
+    if plan.scope == SCOPE_HOST:
+        return _rebuild_cmds_host(iface, plan)
+    return _rebuild_cmds_frontend(iface, list(plan.frontends))
+
+
+def _rebuild_cmds_host(iface: str, plan: ShapePlan) -> list[tuple[list[str], bool]]:
+    """整机限速的队列树——**只有两个类，与 frontend 数量无关**。
+
+        1:1   免限类（线速）：管理端口走这里，链路打满时 SSH 还能进
+        1:2   整机限速类：htb 的 default，**其余全部出向流量都落在这里**
+
+    注意"其余全部"是字面意思：代理流量、连后端的流量、监控上报、数据库
+    连接……都被这一个总闸门罩着。这正是"整机限速"的定义——机器对外总共
+    就这么多带宽——但要心里有数，别以为它只限代理那部分。
+    """
+    rate = plan.host_rate_bits_per_s
+    cmds: list[tuple[list[str], bool]] = [
+        (["tc", "qdisc", "del", "dev", iface, "root"], False),
+        # default 指向整机限速类：没被 filter 挑走的一律受限。
+        (["tc", "qdisc", "add", "dev", iface, "root", "handle", ROOT_HANDLE,
+          "htb", "default", str(HOST_CLASS_MINOR)], True),
+        # 免限类：线速放行，实际不构成约束。
+        (["tc", "class", "add", "dev", iface, "parent", ROOT_HANDLE,
+          "classid", classid_for(DEFAULT_CLASS_MINOR), "htb",
+          *_htb_rate_args(DEFAULT_CLASS_RATE_BPS)], True),
+        # 整机限速类。
+        (["tc", "class", "add", "dev", iface, "parent", ROOT_HANDLE,
+          "classid", classid_for(HOST_CLASS_MINOR), "htb",
+          *_htb_rate_args(rate)], True),
+        # 叶子队列：整机这一个类里所有连接之间公平排队，避免单条大流把
+        # 别的连接饿死。老内核没有 fq_codel 时失败不致命。
+        (["tc", "qdisc", "add", "dev", iface, "parent",
+          classid_for(HOST_CLASS_MINOR), "handle", f"{HOST_CLASS_MINOR:x}:",
+          LEAF_QDISC], False),
+    ]
+    # 管理端口免限。IPv4/IPv6 各一条——只写 IPv4 的话，走 IPv6 的 SSH
+    # 照样会被限速罩住，而那恰恰是链路打满时唯一还能用的入口。
+    for port in plan.exempt_ports:
+        for proto, match in (("ip", "ip"), ("ipv6", "ip6")):
+            cmds.append((
+                ["tc", "filter", "add", "dev", iface, "protocol", proto,
+                 "parent", ROOT_HANDLE, "prio", "1", "u32",
+                 "match", match, "sport", str(port), "0xffff",
+                 "flowid", classid_for(DEFAULT_CLASS_MINOR)], True))
+    return cmds
+
+
+def _rebuild_cmds_frontend(
+        iface: str,
+        frontends: list[model.FrontendConfig]) -> list[tuple[list[str], bool]]:
+    """按 frontend 限速的队列树：每个监听端口一个类 + 一条源端口分类规则。"""
     cmds: list[tuple[list[str], bool]] = [
         # 先清掉旧树。首次运行时根本没有根 qdisc，报错是正常的，故非致命。
         (["tc", "qdisc", "del", "dev", iface, "root"], False),
@@ -332,15 +484,18 @@ def _rebuild_cmds(iface: str,
     return cmds
 
 
-def rate_change_cmd(iface: str, port: int, rate_bits_per_s: int) -> list[str]:
+def rate_change_cmd(iface: str, minor: int, rate_bits_per_s: int) -> list[str]:
     """只改某个类的速率，不动结构。
+
+    `minor` 是 classid 的次要号：按 frontend 限速时它就是监听端口，整机
+    限速时是 HOST_CLASS_MINOR。两种范围共用这一条路径。
 
     这是本方案相对 bwlim 的一处实打实的优势：改限额不需要 reload HAProxy，
     **存量连接立刻按新限额跑**（bwlim 下存量连接要等 hard-stop-after 宽限期
     被断开重连才会跟上）。
     """
     return ["tc", "class", "change", "dev", iface, "parent", ROOT_HANDLE,
-            "classid", classid_for(port), "htb", *_htb_rate_args(rate_bits_per_s)]
+            "classid", classid_for(minor), "htb", *_htb_rate_args(rate_bits_per_s)]
 
 
 # `tc class show` 的一行形如（端口 8080 = 0x1f90）：
@@ -534,7 +689,7 @@ class TcShaper:
             self._log.debug("读取 tc 类统计失败，本拍跳过 err=%s", e)
             return {}
 
-    async def reconcile(self, frontends: list[model.FrontendConfig]) -> TcResult:
+    async def reconcile(self, plan: ShapePlan) -> TcResult:
         """把网卡上的限速状态收敛到配置描述的样子。
 
         三条路径，按"对流量的打扰程度"从小到大：
@@ -544,13 +699,17 @@ class TcShaper:
              → 整棵重建。重建期间有一个极短的窗口不整形，这是必要代价。
         """
         try:
-            _check_shapeable(frontends)
+            _check_plan(plan)
         except TcError as e:
             return TcResult(ok=False, changed=False, error=str(e))
 
-        names = sorted(f.name for f in frontends)
-        self._warn_ephemeral(frontends)
-        want = desired_rates(frontends)
+        names = sorted(f.name for f in plan.frontends)
+        # 临时端口撞监听端口只在**按源端口分类**时才是问题。整机限速不分类，
+        # 这条告警在那个范围下毫无意义，不要去吓运维。
+        if plan.scope == SCOPE_FRONTEND:
+            self._warn_ephemeral(list(plan.frontends))
+        want = desired_rates(plan)
+        want_filters = desired_filter_minors(plan)
         try:
             classes, cbursts, filtered = await self.observe()
         except Exception as e:                      # 读状态失败按重建处理
@@ -561,7 +720,7 @@ class TcShaper:
         structure_ok = (
             DEFAULT_CLASS_MINOR in classes
             and have_ports == set(want)
-            and filtered == set(want)
+            and filtered == want_filters
         )
         # 兜底类的 cburst 也要核。它承载全机未受管流量，被 tc 按 MTU 量级
         # 兜底过的话整台机器都会降速，且**没有任何 frontend 的速率会显示
@@ -581,29 +740,31 @@ class TcShaper:
                 # 速率变了要改，cburst 偏小同样要改——后者是升级场景：
                 # 速率没动，但旧版本留下的桶只有 MTU 量级。rate_change_cmd
                 # 现在会把 burst/cburst 一起重新写上。
-                drifted = {p: r for p, r in want.items()
-                           if classes.get(p) != r
-                           or _cburst_too_small(cbursts.get(p), r)}
+                # want 的键在整机范围下是 HOST_CLASS_MINOR、在按 frontend
+                # 范围下是监听端口——两种都是 classid 次要号，所以这段比对
+                # 与调速逻辑对两种范围完全通用，不用分叉。
+                drifted = {m: r for m, r in want.items()
+                           if classes.get(m) != r
+                           or _cburst_too_small(cbursts.get(m), r)}
                 if not drifted:
                     return TcResult(ok=True, changed=False, frontends=names)
-                for port, rate in sorted(drifted.items()):
-                    await self._tc(rate_change_cmd(self.iface, port, rate))
+                for minor, rate in sorted(drifted.items()):
+                    await self._tc(rate_change_cmd(self.iface, minor, rate))
                 self._log.warning(
                     "已就地调整 tc 限速（未重建队列树，存量连接立刻按新限额跑，"
-                    "无需 reload HAProxy） iface=%s changed=%s",
-                    self.iface,
-                    ";".join(f"{p}={r}bit" for p, r in sorted(drifted.items())))
+                    "无需 reload HAProxy） iface=%s scope=%s changed=%s",
+                    self.iface, plan.scope,
+                    ";".join(f"{classid_for(m)}={r}bit"
+                             for m, r in sorted(drifted.items())))
                 return TcResult(ok=True, changed=True, frontends=names,
                                 action="rate-change")
 
-            for argv, fatal in _rebuild_cmds(self.iface, frontends):
+            for argv, fatal in _rebuild_cmds(self.iface, plan):
                 await self._tc(argv, fatal=fatal)
             self._log.warning(
                 "已重建本机网卡的 tc 限速队列树（数据面已按新配置整形） "
-                "iface=%s frontends=%s",
-                self.iface,
-                ";".join(f"{f.name}@:{f.bind_port}={int(f.quota_bytes_per_sec)*8}bit"
-                         for f in sorted(frontends, key=lambda x: x.bind_port)))
+                "iface=%s scope=%s %s",
+                self.iface, plan.scope, plan.describe())
             return TcResult(ok=True, changed=True, frontends=names,
                             action="rebuild")
         except TcError as e:
