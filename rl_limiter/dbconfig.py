@@ -534,6 +534,54 @@ async def upsert_frontend(opts: MySQLOptions, instance: str, payload: Any) -> No
     await _exec_tx(opts, stmts)
 
 
+def _validate_limit_payload(d: Any) -> tuple[str, float]:
+    """把控制台传入的限速范围载荷规整并校验。
+
+    校验完全复用配置层（config._validate）的那一段，而不是在这里另写一份
+    ——否则控制台放行的取值可能在下一轮轮询加载时被拒，表现成"界面上保存
+    成功了、服务却起不来/回退到旧配置"。
+    """
+    if not isinstance(d, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+    scope = str(d.get("limit_scope", "") or "").strip().lower()
+    raw_quota = d.get("host_quota_mbps", 0)
+    try:
+        quota = float(raw_quota if raw_quota not in (None, "") else 0)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"host_quota_mbps 必须是数字，当前值 {raw_quota!r}") from None
+
+    # 借一个最小可用的 frontend 让实例级校验能跑起来：这里要判的是
+    # limit_scope / host_quota_mbps 这两个实例级字段，与具体有哪些
+    # frontend 无关。
+    probe = model.FrontendConfig(
+        name="probe", bind_port=80, quota_mbps=1.0,
+        servers=[model.ServerEntry(name="s", address="127.0.0.1", port=80)])
+    tmp = configmod.ServiceConfig(haproxy=model.NodeConfig(
+        name="haproxy", socket_path="/run/haproxy/admin.sock",
+        limit_scope=scope, host_quota_mbps=quota), frontends=[probe])
+    configmod._validate(tmp)     # 不通过则抛 ValueError，调用方按 400 应答
+    return scope, quota
+
+
+async def update_limit(opts: MySQLOptions, instance: str, payload: Any) -> None:
+    """改这台机器的限速范围与整机限额。
+
+    这是**实例级**配置，不属于任何 frontend——所以它有自己的端点，而不是
+    塞进某个 frontend 的表单里。改完和改限额一样走轮询热更新：切范围会让
+    tcshaper 重建队列树，只改整机限额则走 `tc class change`，不打断连接。
+    """
+    scope, quota = _validate_limit_payload(payload)
+    n = (await _exec_tx(opts, [
+        ("UPDATE haproxy_instances SET limit_scope = %s, host_quota_mbps = %s "
+         "WHERE name = %s", (scope, quota, instance)),
+    ]))[0]
+    if n == 0:
+        raise ValueError(
+            f"实例 {instance!r} 不在配置库里——先用 tools/bootstrap_db.py "
+            f"把本机登记进去")
+
+
 async def delete_frontend(opts: MySQLOptions, instance: str, name: str) -> None:
     """删除一个受管 frontend 及其全部后端服务器。
 

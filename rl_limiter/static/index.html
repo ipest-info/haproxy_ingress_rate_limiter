@@ -241,6 +241,29 @@ input.bad:focus { box-shadow: 0 0 0 3px rgba(207,58,58,.15); }
 }
 .err { font-size: 11.5px; color: var(--critical); margin-top: 4px; }
 .hint { font-size: 11.5px; color: var(--text-muted); }
+
+/* ---- 限速范围（实例级） ---- */
+/* 两个选项各占一行：文案不短，挤在一行会被 flex 拆成竖排的碎块。 */
+.limit-row { display: flex; flex-direction: column; gap: 9px; }
+.limit-row label {
+  display: flex; align-items: baseline; gap: 7px; cursor: pointer;
+  font-size: 13px; color: var(--text-primary); margin: 0;
+}
+/* 文案整体作为**一个** flex 项，否则 <b> 与后面的文字会各自成项、各自换行。 */
+.limit-row label > span { flex: 1 1 auto; }
+/* 全局 `input { width: 100% }` 是给文本框写的，单选框套上去会撑满整行、
+   把文案挤没——必须在这里改回来。 */
+.limit-row input[type=radio] {
+  width: auto; flex: none; margin: 0; cursor: pointer;
+  position: relative; top: 1px;
+}
+.limit-actions { display: flex; align-items: center; gap: 8px; margin-top: 3px; }
+.limit-quota { display: flex; align-items: center; gap: 6px; }
+/* class 选择器的 display 会盖掉 [hidden] 的 display:none（UA 样式表优先级
+   最低），不补这一条的话 hidden=true 设了也照样显示。 */
+.limit-quota[hidden] { display: none; }
+.limit-quota input { width: 110px; }
+.limit-note { margin-top: 12px; line-height: 1.75; }
 .hint code {
   font: 11px/1 ui-monospace, Menlo, Consolas, monospace;
   background: var(--surface-3); padding: 1px 4px; border-radius: 4px;
@@ -388,6 +411,30 @@ details.adv > summary:hover { background: var(--surface-3); }
           <div><div class="stat-l">连接上限</div><div class="stat-v" id="i-maxconn">–</div></div>
           <div><div class="stat-l">HAProxy 空闲率</div><div class="stat-v" id="i-idle">–<small>%</small></div></div>
         </div>
+      </div>
+    </div>
+
+    <!-- 限速范围：实例级配置，不属于任何监听端口，所以放在实例这一页。 -->
+    <div class="card">
+      <div class="card-head"><span class="card-title">限速范围</span>
+        <span class="grow"></span>
+        <span class="hint">由内核 tc 执行；改完经配置库热更新生效</span></div>
+      <div class="card-body">
+        <div class="limit-row">
+          <label><input type="radio" name="limit-scope" value="frontend">
+            <span><b>按监听端口</b>——每个端口各限各的，限额在「监听端口」页各自设置</span></label>
+          <label><input type="radio" name="limit-scope" value="host">
+            <span><b>整机限速</b>——一个总闸门罩住本机网卡的<b>全部</b>出向流量</span></label>
+          <div class="limit-actions">
+            <span class="limit-quota" hidden>
+              整机限额 <input id="limit-host-quota" type="number" min="0" step="any"
+                           placeholder="必填"> <small>Mbps</small>
+            </span>
+            <span class="grow"></span>
+            <button id="limit-save" class="primary">保存</button>
+          </div>
+        </div>
+        <div class="hint limit-note"></div>
       </div>
     </div>
 
@@ -1373,6 +1420,67 @@ function renderApplyBanner(en) {
   }
 }
 
+// ============================================================ 限速范围
+// 实例级配置：整机限速 or 按监听端口限速。放在实例页而不是某个端口的表单里
+// ——它不属于任何一个端口，塞进去只会让人以为"这个端口切成整机限速"。
+function limitScopeUI() {
+  const radios = () => [...document.querySelectorAll('input[name=limit-scope]')];
+  const picked = () => (radios().find(r => r.checked) || {}).value || "frontend";
+  const quotaBox = $(".limit-quota"), quotaIn = $("#limit-host-quota");
+
+  function refresh() {
+    const host = picked() === "host";
+    quotaBox.hidden = !host;
+    // 说明文字随选择变——整机限速罩住的范围比大多数人第一反应要宽，
+    // 这一句必须写在按钮旁边，而不是只写在文档里。
+    $(".limit-note").innerHTML = host
+      ? "整机限速下，<b>本机网卡的全部出向流量</b>都算在这一个限额里："
+        + "代理发给客户端的、HAProxy 连后端的、监控上报的、连数据库的。"
+        + "「监听端口」页上各端口的限额此时<b>只作为超限告警基准</b>，"
+        + "不再是各自的闸门。SSH（22）默认免限，避免链路打满时登不上机器。"
+      : "按监听端口限速：每个端口一个独立的速率类，限额在「监听端口」页"
+        + "各自设置。切换到整机限速会重建本机网卡的队列树（有一个极短的"
+        + "不整形窗口）。";
+  }
+  radios().forEach(r => { r.onchange = refresh; });
+
+  $("#limit-save").onclick = async (ev) => {
+    const btn = ev.target, scope = picked();
+    const q = parseFloat(quotaIn.value);
+    // 前端先拦一道，理由同后端：整机限速缺限额 = 限不住，不该等到服务
+    // 下一轮加载配置时才失败。
+    if (scope === "host" && !(q > 0)) {
+      toast("整机限速必须填一个正的整机限额（Mbps）", true);
+      quotaIn.focus();
+      return;
+    }
+    btn.disabled = true; btn.textContent = "下发中…";
+    try {
+      const r = await fetch("/api/limit", {
+        method: "PUT",
+        body: JSON.stringify({limit_scope: scope,
+                              host_quota_mbps: scope === "host" ? q : 0}),
+      });
+      const j = await r.json();
+      toast(r.ok ? (j.note || "已保存") : (j.error || "保存失败"), !r.ok);
+    } catch (e) {
+      toast("请求失败: " + e, true);
+    }
+    btn.disabled = false; btn.textContent = "保存";
+  };
+  refresh();
+
+  return function apply(limit) {
+    if (!limit) return;
+    // 正在编辑时不要被轮询覆盖：与 frontend 编辑面板同样的处理。
+    if (document.activeElement === quotaIn) return;
+    const r = radios().find(x => x.value === limit.scope);
+    if (r) r.checked = true;
+    if (limit.host_quota_mbps > 0) quotaIn.value = limit.host_quota_mbps;
+    refresh();
+  };
+}
+
 async function loadOverview() {
   const o = await (await fetch("/api/overview")).json();
   $("#svc-version").textContent = o.service_version || "–";
@@ -1385,6 +1493,7 @@ async function loadOverview() {
   $("#uptime").textContent = up >= 3600
     ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
   renderApplyBanner(o.enforce);
+  applyLimit(o.limit);
   if (o.latest && o.latest.instance) updateInstance(o.latest.instance);
 
   const names = Object.keys(o.frontends || {}).sort();
@@ -1466,8 +1575,11 @@ window.addEventListener("beforeunload", (e) => {
   if ($$(".editor.open .dirty").some(d => !d.hidden)) { e.preventDefault(); e.returnValue = ""; }
 });
 
+let applyLimit = () => {};
+
 (async function boot() {
   buildInstanceCharts();
+  applyLimit = limitScopeUI();
   await loadOverview();
   try {
     const h = await (await fetch("/api/history")).json();

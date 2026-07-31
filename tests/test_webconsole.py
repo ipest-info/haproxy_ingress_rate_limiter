@@ -173,7 +173,8 @@ async def test_write_endpoints_require_db_mode(client):
     假装成功。"""
     for method, path in (("put", "/api/frontends/fe_a"),
                          ("post", "/api/frontends"),
-                         ("delete", "/api/frontends/fe_a")):
+                         ("delete", "/api/frontends/fe_a"),
+                         ("put", "/api/limit")):
         r = await getattr(client, method)(path, data="{}")
         assert r.status == 409, path
         assert "MySQL" in (await r.json())["error"]
@@ -205,3 +206,99 @@ async def test_json_endpoints_declare_utf8(client):
     for path in ("/api/overview", "/api/logs", "/api/history"):
         r = await client.get(path)
         assert r.charset == "utf-8", path
+
+
+# ---------------------------------------------------------------------------
+# 限速范围（实例级）
+# ---------------------------------------------------------------------------
+
+def test_overview_exposes_limit_scope():
+    """界面必须能显示当前限速范围。看不到它的话，一台整机限速的机器上
+    每个端口都标着自己的限额，看起来像各限各的，实际全被一个总闸门罩着。"""
+    h = hub()
+    assert h.overview()["limit"] == {"scope": "frontend", "host_quota_mbps": 0.0}
+    h.update_config(model.ControllerConfig(
+        version=2, frontends=[fe()], limit_scope="host", host_quota_mbps=2000.0))
+    assert h.overview()["limit"] == {"scope": "host", "host_quota_mbps": 2000.0}
+
+
+def test_limit_payload_requires_positive_host_quota():
+    """整机限速缺限额 = 限不住。必须在写库前就拒，而不是等下一轮轮询
+    加载配置时才失败——那时界面已经报"保存成功"了。"""
+    from rl_limiter import dbconfig
+    with pytest.raises(ValueError, match="host_quota_mbps"):
+        dbconfig._validate_limit_payload({"limit_scope": "host"})
+    with pytest.raises(ValueError, match="host_quota_mbps"):
+        dbconfig._validate_limit_payload(
+            {"limit_scope": "host", "host_quota_mbps": 0})
+    with pytest.raises(ValueError, match="host_quota_mbps"):
+        dbconfig._validate_limit_payload(
+            {"limit_scope": "host", "host_quota_mbps": -1})
+
+
+def test_limit_payload_rejects_unknown_scope():
+    from rl_limiter import dbconfig
+    with pytest.raises(ValueError, match="limit_scope"):
+        dbconfig._validate_limit_payload({"limit_scope": "global"})
+    with pytest.raises(ValueError, match="limit_scope"):
+        dbconfig._validate_limit_payload({})
+
+
+def test_limit_payload_accepts_both_scopes():
+    from rl_limiter import dbconfig
+    assert dbconfig._validate_limit_payload(
+        {"limit_scope": "frontend"}) == ("frontend", 0.0)
+    assert dbconfig._validate_limit_payload(
+        {"limit_scope": "host", "host_quota_mbps": 1500.5}) == ("host", 1500.5)
+    # 界面上的输入框给过来的是字符串，别在这儿卡住。
+    assert dbconfig._validate_limit_payload(
+        {"limit_scope": "host", "host_quota_mbps": "1500.5"}) == ("host", 1500.5)
+
+
+def test_limit_payload_rejects_non_numeric_quota():
+    from rl_limiter import dbconfig
+    with pytest.raises(ValueError, match="必须是数字"):
+        dbconfig._validate_limit_payload(
+            {"limit_scope": "host", "host_quota_mbps": "一千"})
+
+
+def test_limit_payload_validation_is_the_same_one_config_uses():
+    """控制台与"直接写库后被加载"两条路径的接受集合必须完全一致，否则会
+    出现"界面上保存成功了、服务却加载不了这份配置"。这里盯的是它确实走的
+    config._validate，而不是另抄了一份规则。"""
+    from rl_limiter import config as configmod
+    from rl_limiter import dbconfig
+    calls = []
+    orig = configmod._validate
+
+    def spy(cfg):
+        calls.append(cfg.haproxy.limit_scope)
+        return orig(cfg)
+    configmod._validate = spy
+    try:
+        dbconfig._validate_limit_payload({"limit_scope": "host",
+                                          "host_quota_mbps": 100})
+    finally:
+        configmod._validate = orig
+    assert calls == ["host"]
+
+
+def test_hidden_quota_box_is_actually_hidden_by_css():
+    """`[hidden]` 的 display:none 来自 UA 样式表，优先级最低——任何 class
+    选择器上的 display 都会盖掉它。整机限额输入框正是这么被"藏"漏的：
+    JS 把 hidden 设成 true 了，框子照样显示在页面上。
+
+    这条盯的是那个补丁还在。"""
+    css = (webconsole._STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert ".limit-quota { display: flex" in css
+    assert ".limit-quota[hidden] { display: none; }" in css, (
+        "给 .limit-quota 设了 display 就必须补 [hidden] 那一条，否则藏不住")
+
+
+def test_radio_width_is_reset_from_the_global_input_rule():
+    """全局 `input, select { width: 100% }` 是给文本框写的。单选框套上去会
+    撑满整行、把旁边的文案挤成竖排——实测过一次。"""
+    css = (webconsole._STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert "input, select {" in css and "width: 100%" in css
+    i = css.index(".limit-row input[type=radio] {")
+    assert "width: auto" in css[i:i + 200]

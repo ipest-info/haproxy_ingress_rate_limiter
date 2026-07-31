@@ -144,6 +144,10 @@ class StatusHub:
         self._subs: set[asyncio.Queue] = set()
         # frontend 名 → 该 frontend 的完整配置视图（界面表单的初值）。
         self._fe_config: dict[str, dict[str, Any]] = {}
+        # 实例级的限速范围（见 update_config）。初值与配置层默认一致，
+        # 第一份配置到达前界面就按"按 frontend 限速"显示。
+        self._limit: dict[str, Any] = {"scope": "frontend",
+                                       "host_quota_mbps": 0.0}
         self._started = time.time()
 
     # ---- 配置与数据注入 ----
@@ -168,6 +172,11 @@ class StatusHub:
     def update_config(self, cfg: model.ControllerConfig) -> None:
         """记录当前生效的受管 frontend 配置（界面的编辑表单以它为初值）。"""
         self._fe_config = {f.name: f.to_dict() for f in cfg.frontends}
+        # 限速范围是**实例级**配置，不属于任何 frontend，但界面必须显示它
+        # ——否则一台整机限速的机器上，每个监听端口都标着自己的限额，看着
+        # 像是各限各的，实际全被一个总闸门罩着。
+        self._limit = {"scope": cfg.limit_scope,
+                       "host_quota_mbps": cfg.host_quota_mbps}
         # 换算好的 bytes/s 一并给出：图表的限额参考线用它，避免前端各处
         # 重复做 ÷8，单位换算只在服务端一处。
         for name, d in self._fe_config.items():
@@ -253,6 +262,9 @@ class StatusHub:
             "uptime_s": time.time() - self._started,
             # 各受管 frontend 的完整配置：界面的编辑表单以它为初值。
             "frontends": self._fe_config,
+            # 限速范围：整机限速时界面要明确说出"每个端口的限额只是告警
+            # 基准，真正的闸门是整机那一个"。
+            "limit": dict(self._limit),
             "haproxy": self._haproxy_view(),
             "latest": self._history[-1] if self._history else None,
         }
@@ -413,6 +425,15 @@ def build_app(
             note_extra="随后由本机 rl-limiter 写入 haproxy.cfg 受管区块并 "
                        "reload，数据面即时生效")
 
+    async def handle_update_limit(request: web.Request) -> web.Response:
+        """改限速范围与整机限额（实例级，不属于任何 frontend）。"""
+        async def action(payload):
+            await dbconfig.update_limit(db_opts, instance, payload)
+        return await _mutate(
+            request, action,
+            note_extra="切换限速范围会重建本机网卡的 tc 队列树（有一个极短的"
+                       "不整形窗口）；只改整机限额则就地生效，不打断连接")
+
     async def handle_delete_frontend(request: web.Request) -> web.Response:
         name = request.match_info["name"]
 
@@ -437,6 +458,9 @@ def build_app(
     app.router.add_put("/api/frontends/{name}", handle_upsert_frontend)
     app.router.add_post("/api/frontends", handle_upsert_frontend)
     app.router.add_delete("/api/frontends/{name}", handle_delete_frontend)
+    # 限速范围是实例级的，所以是自己的端点而不是某个 frontend 的字段。
+    # 只有 PUT：它是单行配置的整体替换，没有"新建"与"删除"的语义。
+    app.router.add_put("/api/limit", handle_update_limit)
     return app
 
 
