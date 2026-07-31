@@ -106,17 +106,27 @@ def cmd_verify(args) -> int:
     """读回网卡实况，与配置逐条核对。"""
     fes = _load_frontends(args.config)
     sh = T.TcShaper(args.iface)
-    classes, filtered = asyncio.run(sh.observe())
+    classes, cbursts, filtered = asyncio.run(sh.observe())
     want = T.desired_rates(fes)
 
     print(f"网卡 {args.iface} 实况核对：")
+    bad_default = 0
     if T.DEFAULT_CLASS_MINOR not in classes:
         print(f"  [FAIL] 没有兜底类 1:{T.DEFAULT_CLASS_MINOR} —— 队列树多半"
               f"根本没建起来（rl-limiter 没在跑？或 tc 下发失败）")
         return 1
-    print("  [ok]   兜底类存在（未分类流量按线速放行）")
+    if T._cburst_too_small(cbursts.get(T.DEFAULT_CLASS_MINOR),
+                           T.DEFAULT_CLASS_RATE_BPS):
+        # 这一条是整机级的：兜底类承载本机所有未受管流量，它的桶被兜底成
+        # MTU 量级会让整台机器降速，而每个 frontend 看起来都完全正常。
+        print(f"  [FAIL] 兜底类 1:{T.DEFAULT_CLASS_MINOR} 的 cburst 只有 "
+              f"{cbursts.get(T.DEFAULT_CLASS_MINOR)} 字节 —— "
+              f"**本机未受管流量会被它整体压住**（见 docs/06 §9）")
+        bad_default = 1
+    else:
+        print("  [ok]   兜底类存在且 cburst 正常（未分类流量按线速放行）")
 
-    bad = 0
+    bad = bad_default
     by_port = {f.bind_port: f for f in fes}
     for port in sorted(want):
         f = by_port[port]
@@ -132,6 +142,13 @@ def cmd_verify(args) -> int:
         elif not has_filter:
             print(f"  [FAIL] {f.name} (:{port}) 有限速类但**没有分类规则**，"
                   f"流量不会进这个类 —— 等于没限速")
+            bad += 1
+        elif T._cburst_too_small(cbursts.get(port), want[port]):
+            # cburst 才是 ceil 那一路的桶。它被 tc 按 MTU 量级兜底的话，
+            # rate 显示完全正常，实际吞吐却上不去（见 docs/06 §9 那次事故）。
+            print(f"  [FAIL] {f.name} (:{port}) cburst 只有 "
+                  f"{cbursts.get(port)} 字节，应约 "
+                  f"{T.burst_bytes(want[port] / 8)} —— **实际吞吐会远低于限额**")
             bad += 1
         else:
             print(f"  [ok]   {f.name} (:{port}) {got} bit/s，分类规则在位")

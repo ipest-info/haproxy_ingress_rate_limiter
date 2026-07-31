@@ -62,8 +62,15 @@ def shaper(**kw):
 # 一份贴近真实 `tc class show` 输出的样例（htb 会把速率换算成可读单位）。
 # classid 的次要号是**十六进制**：0x1f90 = 8080。样例必须照 tc 的真实
 # 输出写——早先这里写成 1:8080 是自洽的假数据，正好把十六进制这件事盖住了。
+# cburst 必须是我们自己算的值（8Mb / 50000b），不是 tc 按 MTU 兜底的
+# 1600b —— 后者是线上事故现场的样子，见 CLASSES_BAD_CBURST。
 CLASSES_OK = """\
-class htb 1:1 root prio 0 rate 100Gbit ceil 100Gbit burst 0b cburst 0b
+class htb 1:1 root prio 0 rate 100Gbit ceil 100Gbit burst 8Mb cburst 8Mb
+class htb 1:1f90 root leaf 1f90: prio 0 rate 40Mbit ceil 40Mbit burst 50000b cburst 50000b
+"""
+# 带 bug 的旧版本在网卡上留下的样子：速率对，cburst 被 tc 按 MTU 量级兜底。
+CLASSES_BAD_CBURST = """\
+class htb 1:1 root prio 0 rate 100Gbit ceil 100Gbit burst 2400b cburst 2400b
 class htb 1:1f90 root leaf 1f90: prio 0 rate 40Mbit ceil 40Mbit burst 50000b cburst 1600b
 """
 FILTERS_OK = """\
@@ -306,6 +313,65 @@ async def test_high_ports_produce_ids_tc_will_accept():
         assert f"{port:x}:" in ids, f"端口 {port} 的叶子 qdisc handle 没下发"
 
 
+async def test_every_htb_class_sets_both_burst_and_cburst():
+    """**线上事故的回归测试**：HTB 有两个令牌桶，`rate` 那路看 `burst`，
+    `ceil` 那路看 **`cburst`**。本项目 rate == ceil，所以真正决定吞吐上限
+    的是 cburst。
+
+    漏掉的话 iproute2 按 `rate / get_hz() + mtu` 自己算——现代内核 psched
+    是纳秒级（/proc/net/psched 第三字段 1000000），第一项几乎归零，于是
+    **无论速率填多大，算出来都只有一个 MTU 的量级**。事故现场：
+
+        class htb 1:1    rate 100Gbit ceil 100Gbit burst 2400b    cburst 2400b
+        class htb 1:378f rate 4Gbit   ceil 4Gbit   burst 5000000b cburst 1600b
+
+    桶只有 1600~2400 字节，类的实际吞吐被压在远低于配置速率的水平，而
+    `tc class show` 里的 `rate` 显示得好好的——不看 cburst 根本发现不了。
+
+    兜底类那条最要命：没被 filter 匹配的流量**全部**落在里面，也就是整机
+    除受管端口之外的所有流量。所以这里对**每一个** htb 类都查，一个都不放过。
+    """
+    sh, fake = shaper()
+    await sh.reconcile([fe("a", port=8080, quota=40.0),
+                        fe("b", port=14223, quota=4000.0)])
+    classes = [c for c in fake.mutations()
+               if c[:3] == ["tc", "class", "add"] and "htb" in c]
+    assert len(classes) == 3, "兜底类 + 两个 frontend 类，一个都不能少"
+    for cmd in classes:
+        cid = cmd[cmd.index("classid") + 1]
+        for key in ("rate", "ceil", "burst", "cburst"):
+            assert key in cmd, f"{cid} 少了 {key}——漏了就会被 tc 按 MTU 量级兜底"
+        # cburst 必须和 burst 一样大：rate == ceil，两个桶不该有区别
+        assert cmd[cmd.index("burst") + 1] == cmd[cmd.index("cburst") + 1], \
+            f"{cid} 的 burst 与 cburst 不一致"
+        assert int(cmd[cmd.index("cburst") + 1]) >= T.MIN_BURST_BYTES
+
+
+async def test_rate_change_also_carries_cburst():
+    """改限额走的是 `tc class change`，它同样会重置没给的参数。
+
+    只改 rate/ceil 不带 cburst 的话，一次调额就把桶打回 MTU 量级——限速
+    看着改成功了，实际吞吐塌下来。
+    """
+    sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile([fe(port=8080, quota=80.0)])
+    assert res.action == "rate-change"
+    cmd = [c for c in fake.mutations() if c[:3] == ["tc", "class", "change"]][0]
+    assert "cburst" in cmd, "class change 也必须显式给 cburst"
+    assert cmd[cmd.index("burst") + 1] == cmd[cmd.index("cburst") + 1]
+
+
+@pytest.mark.parametrize("mbps,expect", [
+    (40.0, 50_000),            # 40 Mbps → 10ms = 50000 字节
+    (4000.0, 5_000_000),       # 4 Gbps
+    (100000.0, 8 * 1024 * 1024),   # 100 Gbps（兜底类）夹到上限
+])
+def test_burst_scales_with_rate_not_with_mtu(mbps, expect):
+    """burst 必须随速率走。tc 的默认算法在纳秒时钟下几乎只剩 mtu 那一项，
+    这里钉住"我们自己算"这件事——差别就是 5000000 与 1600。"""
+    assert T.burst_bytes(mbps * 1e6 / 8) == expect
+
+
 async def test_default_class_is_created_and_unshaped():
     """没被分类的流量（SSH、监控、后端方向）必须落进一个不整形的兜底类，
     否则一开限速整台机器的其它流量都被拖下水。"""
@@ -429,3 +495,55 @@ async def test_ephemeral_conflict_warns_but_does_not_block(caplog):
         res = await sh.reconcile([fe("bad", port=40000)])
     assert res.ok, "只告警，不阻断"
     assert any("临时端口范围" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# 从带 bug 的版本升上来：坏掉的 cburst 必须被修回去
+# ---------------------------------------------------------------------------
+
+async def test_upgrade_repairs_frontend_cburst_even_when_rate_matches():
+    """升级场景：限额一个字没改，但网卡上留着旧版本写的 cburst 1600。
+
+    只比速率的话这里会判"完全一致、什么都不做"，坏桶就永远留着——修复
+    等于没上线。所以 cburst 偏小也要算作漂移，走 class change 重写。
+    """
+    # 兜底类是好的，只有 frontend 的 cburst 坏了——这样走的才是 rate-change
+    # 那条不打断连接的路径（兜底类坏了只能重建，见下一条）。
+    only_fe_bad = (
+        "class htb 1:1 root prio 0 rate 100Gbit ceil 100Gbit burst 8Mb cburst 8Mb\n"
+        "class htb 1:1f90 root leaf 1f90: prio 0 rate 40Mbit ceil 40Mbit "
+        "burst 50000b cburst 1600b\n")
+    sh, fake = shaper(classes=only_fe_bad, filters=FILTERS_OK)
+    res = await sh.reconcile([fe(port=8080, quota=40.0)])   # 限额与现状相同
+    assert res.ok and res.changed, "cburst 坏了就不能报告『无变化』"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    assert any("class change" in c and "cburst 50000" in c for c in cmds), cmds
+
+
+async def test_upgrade_repairs_default_class_cburst_by_rebuilding():
+    """兜底类的 cburst 坏了更严重——它承载全机未受管流量，而且不属于任何
+    frontend，rate-change 那条路径根本不会碰它。只能靠重建修。
+
+    这一条就是事故的核心：所有 frontend 的速率都显示正常，整机却在降速。
+    """
+    good_fe_bad_default = (
+        "class htb 1:1 root prio 0 rate 100Gbit ceil 100Gbit burst 2400b cburst 2400b\n"
+        "class htb 1:1f90 root leaf 1f90: prio 0 rate 40Mbit ceil 40Mbit "
+        "burst 50000b cburst 50000b\n")
+    sh, fake = shaper(classes=good_fe_bad_default, filters=FILTERS_OK)
+    res = await sh.reconcile([fe(port=8080, quota=40.0)])
+    assert res.action == "rebuild", "兜底类只能靠重建修"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    assert any("classid 1:1 htb" in c and "cburst 8388608" in c for c in cmds), cmds
+
+
+def test_parse_size_handles_tc_1024_based_units():
+    """tc 打字节数按 1024 折算且**有损**：5000000 会打成 "4883Kb"（5000192）。
+    精确比对必然误判，所以 _cburst_too_small 留了余量。"""
+    assert T.parse_size("1600b") == 1600
+    assert T.parse_size("8Mb") == 8 * 1024 ** 2
+    assert T.parse_size("4883Kb") == 5000192
+    # 折算误差不该被当成"偏小"
+    assert not T._cburst_too_small(5000192, 4_000_000_000)
+    assert T._cburst_too_small(1600, 4_000_000_000)
+    assert T._cburst_too_small(None, 4_000_000_000)

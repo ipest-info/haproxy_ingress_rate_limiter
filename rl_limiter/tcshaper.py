@@ -179,9 +179,45 @@ def burst_bytes(rate_bytes_per_s: float) -> int:
 
     取 10ms 的额度并夹在 [2×MTU, 8MB]：下限保证大包发得出去，上限避免
     高限额下攒出一个大到让秒级限速失真的桶。
+
+    **burst 与 cburst 必须都显式给，两个都不能漏**（线上事故，见下）。
     """
     return max(MIN_BURST_BYTES,
                min(MAX_BURST_BYTES, int(rate_bytes_per_s * BURST_SECONDS)))
+
+
+def _htb_rate_args(rate_bits_per_s: int) -> list[str]:
+    """一个 HTB 类的 rate/ceil/burst/cburst 四件套。
+
+    ## 为什么 cburst 必须显式给（一次线上事故）
+
+    HTB 有两个令牌桶：`rate` 那路由 `burst` 控制，`ceil` 那路由 **`cburst`**
+    控制。本项目 rate == ceil，所以**真正决定吞吐上限的是 cburst**。
+
+    漏掉任何一个，iproute2 会自己算一个默认值：
+
+        burst  = rate / get_hz() + mtu
+        cburst = ceil / get_hz() + mtu
+
+    现代内核的 psched 时钟是纳秒级（/proc/net/psched 第三字段 1000000），
+    第一项几乎归零，于是**无论速率填多大，算出来都只有一个 MTU 的量级**。
+    线上实测到的就是这个：
+
+        class htb 1:1    rate 100Gbit ceil 100Gbit burst 2400b    cburst 2400b
+        class htb 1:378f rate 4Gbit   ceil 4Gbit   burst 5000000b cburst 1600b
+
+    桶只有 1600~2400 字节，每个调度周期就只能放这么多出去——**类的实际
+    吞吐被压在远低于配置速率的水平**，而 `tc class show` 里的 `rate` 却
+    显示得好好的，不看 cburst 根本发现不了。
+
+    后果比"限速类跑不满"严重得多：**没被 filter 匹配的流量全都落在兜底类
+    1:1 里**，也就是这台机器上除受管端口之外的所有流量。事故现场的表现是
+    整机出向被压到入向的 80%（899 vs 1115 Mbps），`tc qdisc del root` 之后
+    立刻恢复。
+    """
+    burst = burst_bytes(rate_bits_per_s / 8)
+    return ["rate", f"{rate_bits_per_s}bit", "ceil", f"{rate_bits_per_s}bit",
+            "burst", str(burst), "cburst", str(burst)]
 
 
 def classid_for(port: int) -> str:
@@ -255,9 +291,14 @@ def _rebuild_cmds(iface: str,
         (["tc", "qdisc", "add", "dev", iface, "root", "handle", ROOT_HANDLE,
           "htb", "default", str(DEFAULT_CLASS_MINOR)], True),
         # 兜底类：没匹配到 filter 的流量走这里，线速放行。
+        #
+        # **这一条最要命**：本机上除受管端口之外的所有流量都落在这个类里。
+        # 早先这里只给了 rate、没给 burst/cburst，tc 自己算出来的默认值只有
+        # 2400 字节，于是整机流量被这个桶卡住——线上实测出向被压到入向的
+        # 80%。详见 _htb_rate_args 的注释。
         (["tc", "class", "add", "dev", iface, "parent", ROOT_HANDLE,
-          "classid", classid_for(DEFAULT_CLASS_MINOR),
-          "htb", "rate", f"{DEFAULT_CLASS_RATE_BPS}bit"], True),
+          "classid", classid_for(DEFAULT_CLASS_MINOR), "htb",
+          *_htb_rate_args(DEFAULT_CLASS_RATE_BPS)], True),
     ]
     for f in sorted(frontends, key=lambda x: x.bind_port):
         port = f.bind_port
@@ -265,9 +306,7 @@ def _rebuild_cmds(iface: str,
         cid = classid_for(port)
         cmds.append((
             ["tc", "class", "add", "dev", iface, "parent", ROOT_HANDLE,
-             "classid", cid, "htb",
-             "rate", f"{rate}bit", "ceil", f"{rate}bit",
-             "burst", str(burst_bytes(f.quota_bytes_per_sec))], True))
+             "classid", cid, "htb", *_htb_rate_args(rate)], True))
         # 叶子队列：同一 frontend 内各连接之间公平排队。老内核可能没有
         # fq_codel，缺了只是失去类内公平性，限速本身不受影响 → 非致命。
         #
@@ -301,13 +340,11 @@ def rate_change_cmd(iface: str, port: int, rate_bits_per_s: int) -> list[str]:
     被断开重连才会跟上）。
     """
     return ["tc", "class", "change", "dev", iface, "parent", ROOT_HANDLE,
-            "classid", classid_for(port), "htb",
-            "rate", f"{rate_bits_per_s}bit", "ceil", f"{rate_bits_per_s}bit",
-            "burst", str(burst_bytes(rate_bits_per_s / 8))]
+            "classid", classid_for(port), "htb", *_htb_rate_args(rate_bits_per_s)]
 
 
 # `tc class show` 的一行形如（端口 8080 = 0x1f90）：
-#   class htb 1:1f90 root prio 0 rate 40Mbit ceil 40Mbit burst 50000b cburst 1600b
+#   class htb 1:1f90 root prio 0 rate 40Mbit ceil 40Mbit burst 50000b cburst 50000b
 #
 # **classid 一律是十六进制**（tc 输出不带 0x 前缀），所以这里要认 a-f，
 # 读回时也必须 int(minor, 16)。用 \d+ 会让 "1:378f" 整行匹配不上，比对
@@ -315,6 +352,45 @@ def rate_change_cmd(iface: str, port: int, rate_bits_per_s: int) -> list[str]:
 _CLASS_RE = re.compile(
     r"^class\s+htb\s+[0-9a-f]+:(?P<minor>[0-9a-f]+)\b.*?\brate\s+(?P<rate>\S+)",
     re.M | re.I)
+# cburst 与 rate 在同一行，但可能在 rate 之前也可能之后，单独抓。
+_CBURST_RE = re.compile(
+    r"^class\s+htb\s+[0-9a-f]+:(?P<minor>[0-9a-f]+)\b.*?\bcburst\s+(?P<cburst>\S+)",
+    re.M | re.I)
+# tc 打印字节数时会按 1024 进制折算（sprint_size），且是**有损**的：
+# 5000000 会打成 "4883Kb"（= 5000192）。所以比对 cburst 必须留余量，
+# 见 CBURST_SLACK_BYTES。
+_SIZE_UNITS = {"b": 1, "": 1, "kb": 1024, "mb": 1024 ** 2, "gb": 1024 ** 3}
+# 比对 cburst 时的容差：tc 的 1024 进制折算最多差 1 KiB，给两倍余量。
+# 只在"实际值明显偏小"时才判定漂移——偏大不是本模块会造成的故障。
+CBURST_SLACK_BYTES = 2048
+
+
+def parse_size(text: str) -> int:
+    """把 tc 输出里的字节数（"1600b"、"4883Kb"、"8Mb"）解析成字节。"""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([A-Za-z]*)", text.strip())
+    if not m:
+        raise TcError(f"无法解析 tc 字节数: {text!r}")
+    unit = m.group(2).lower()
+    if unit not in _SIZE_UNITS:
+        raise TcError(f"无法识别 tc 字节单位: {text!r}")
+    return int(float(m.group(1)) * _SIZE_UNITS[unit])
+
+
+def parse_class_cbursts(out: str) -> dict[int, int]:
+    """解析 `tc class show`：classid 次要号 → cburst（字节）。
+
+    为什么要读它：**cburst 才是 ceil 那一路的桶**，漏给的话 tc 会按
+    `ceil/get_hz()+mtu` 算出一个 MTU 量级的值，类的吞吐被死死压住而
+    `rate` 看着完全正常（详见 _htb_rate_args）。只比 rate 的话，从带
+    bug 的版本升上来时会判定"一致"，坏的 cburst 就一直留着了。
+    """
+    res: dict[int, int] = {}
+    for m in _CBURST_RE.finditer(out):
+        try:
+            res[int(m.group("minor"), 16)] = parse_size(m.group("cburst"))
+        except TcError:
+            continue
+    return res
 # `tc filter show` 里 u32 匹配项的 flowid 行与 match 行是分开的两行：
 #   filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:1f90
 #     match 00001f90/0000ffff at 20
@@ -357,6 +433,21 @@ def parse_classes(out: str) -> dict[int, int]:
     return res
 
 
+
+def _cburst_too_small(actual: int | None, rate_bits_per_s: int) -> bool:
+    """网卡上实际的 cburst 是不是明显小于我们该写的值。
+
+    只判"偏小"：偏大不是本模块会造成的故障，而且 tc 打印字节数时按 1024
+    进制折算是有损的（5000000 会打成 "4883Kb" = 5000192），精确比对必然
+    误判，所以留 CBURST_SLACK_BYTES 的余量。
+
+    读不到（None）也算偏小——那多半是解析不了的老格式，重写一遍最省心。
+    """
+    if actual is None:
+        return True
+    return actual + CBURST_SLACK_BYTES < burst_bytes(rate_bits_per_s / 8)
+
+
 def parse_filter_minors(out: str) -> set[int]:
     """解析 `tc filter show`：已被分类指向的 classid 次要号集合。
 
@@ -393,13 +484,20 @@ class TcShaper:
                             " ".join(argv), msg)
         return out
 
-    async def observe(self) -> tuple[dict[int, int], set[int]]:
-        """读回当前网卡上的实际状态：(classid→速率, 已分类的 classid 集合)。"""
-        classes = parse_classes(await self._tc(
-            ["tc", "class", "show", "dev", self.iface], fatal=False))
+    async def observe(self) -> tuple[dict[int, int], dict[int, int], set[int]]:
+        """读回网卡实况：(classid→速率, classid→cburst, 已分类的 classid 集合)。
+
+        cburst 也要读回来——它才是 ceil 那一路的桶。只比速率的话，从漏给
+        cburst 的旧版本升上来时会判定"一致"，坏的桶就一直留着（见
+        _htb_rate_args 里那次事故）。
+        """
+        out = await self._tc(["tc", "class", "show", "dev", self.iface],
+                             fatal=False)
+        classes = parse_classes(out)
+        cbursts = parse_class_cbursts(out)
         minors = parse_filter_minors(await self._tc(
             ["tc", "filter", "show", "dev", self.iface], fatal=False))
-        return classes, minors
+        return classes, cbursts, minors
 
     def _warn_ephemeral(self, frontends: list[model.FrontendConfig]) -> None:
         """监听端口撞进临时端口范围时告警（同一组只说一次）。"""
@@ -454,10 +552,10 @@ class TcShaper:
         self._warn_ephemeral(frontends)
         want = desired_rates(frontends)
         try:
-            classes, filtered = await self.observe()
+            classes, cbursts, filtered = await self.observe()
         except Exception as e:                      # 读状态失败按重建处理
             self._log.warning("读取 tc 当前状态失败，按重建处理 err=%s", e)
-            classes, filtered = {}, set()
+            classes, cbursts, filtered = {}, {}, set()
 
         have_ports = set(classes) - {DEFAULT_CLASS_MINOR}
         structure_ok = (
@@ -465,10 +563,27 @@ class TcShaper:
             and have_ports == set(want)
             and filtered == set(want)
         )
+        # 兜底类的 cburst 也要核。它承载全机未受管流量，被 tc 按 MTU 量级
+        # 兜底过的话整台机器都会降速，且**没有任何 frontend 的速率会显示
+        # 异常**——只能靠这里发现。它不属于 want，所以单独判，并且只能靠
+        # 重建来修（rate-change 只走 want 里的类）。
+        if structure_ok and _cburst_too_small(
+                cbursts.get(DEFAULT_CLASS_MINOR), DEFAULT_CLASS_RATE_BPS):
+            self._log.warning(
+                "tc 兜底类的 cburst 偏小（%s 字节，期望约 %d），本机未受管流量"
+                "会被它压住——按重建处理 iface=%s",
+                cbursts.get(DEFAULT_CLASS_MINOR),
+                burst_bytes(DEFAULT_CLASS_RATE_BPS / 8), self.iface)
+            structure_ok = False
 
         try:
             if structure_ok:
-                drifted = {p: r for p, r in want.items() if classes.get(p) != r}
+                # 速率变了要改，cburst 偏小同样要改——后者是升级场景：
+                # 速率没动，但旧版本留下的桶只有 MTU 量级。rate_change_cmd
+                # 现在会把 burst/cburst 一起重新写上。
+                drifted = {p: r for p, r in want.items()
+                           if classes.get(p) != r
+                           or _cburst_too_small(cbursts.get(p), r)}
                 if not drifted:
                     return TcResult(ok=True, changed=False, frontends=names)
                 for port, rate in sorted(drifted.items()):
