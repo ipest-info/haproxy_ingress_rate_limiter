@@ -41,6 +41,7 @@
 | [docs/06-tc限速方案.md](docs/06-tc限速方案.md) | **限速为什么从 HAProxy bwlim 换成内核 tc**：实测依据、映射方式、行为差异，以及尚未验证的部分 |
 | [docs/07-监控数据回查.md](docs/07-监控数据回查.md) | **90 天回查怎么存怎么查**：分级保留、聚合语义、真实 MariaDB 上的容量与耗时实测 |
 | [docs/08-内核参数调优.md](docs/08-内核参数调优.md) | **让瓶颈落在 maxconn 而不是内核默认值上**：初始化阶段的 sysctl 调优与 FD 预检、哪些容器里改不动、怎么验证真的生效 |
+| [docs/09-裸机部署.md](docs/09-裸机部署.md) | **HAProxy 已装好的机器上怎么加 rl-limiter**：一键装机脚本、只起配置库的 compose、三项权限的由来 |
 
 ## 系统组成
 
@@ -58,6 +59,7 @@ rl_limiter/       # Python 3.11 + asyncio 服务（与 HAProxy 同机）
   webconsole.py   #   内置 Web 控制台（带宽曲线 + 端口/限额/后端服务器管理）
   loop.py         #   1s 监控主循环（采集 → 超限判定 → 发布）
 tools/            # fake_haproxy.py（联调假节点，支持 unix / TCP）
+                  # bootstrap_db.py（把本机登记进配置库，幂等、只增不改）
                   # random_web.py（随机大小响应的模拟后端）、loadgen.py（可调并发压测）
                   # tc_check.py（限速检查：plan 干跑 / doctor 体检 / verify 核对）
 deploy/           # systemd（同机形态）、haproxy 骨架配置示例、
@@ -66,6 +68,8 @@ deploy/           # systemd（同机形态）、haproxy 骨架配置示例、
                   #   haproxy-base.cfg（compose 用的 global/defaults 骨架）
   sysctl/         #   tune-kernel.sh（内核参数调优表：apply 调优 / check 体检 /
                   #   dump 出 sysctl.d 配置。初始化阶段自动跑）
+  bare/           #   裸机部署：rl-limiter.sh（一键装机+体检）、systemd unit
+                  #   模板、rl-limiter.env 模板、只起 MySQL 的 compose
 docker-compose.yml # 一键演示：MySQL + 三台 Ubuntu 24.04 节点 + 模拟后端 + 压测
 ```
 
@@ -94,6 +98,17 @@ make demo-up    # docker compose 一键演示：MySQL 配置 + 三台 Ubuntu 24.
 make demo-logs  # 观察各节点监控与 loadgen 分入口吞吐表格
 make demo-down  # 收场（含 MySQL 数据卷）
 ```
+
+**往已经装好 HAProxy 的机器上加 rl-limiter**（两个都跑在本机，只有配置库
+用 Docker）——见 [docs/09-裸机部署.md](docs/09-裸机部署.md)：
+
+```bash
+sudo BOOTSTRAP_BACKEND=10.0.0.21:9000 deploy/bare/rl-limiter.sh install
+deploy/bare/rl-limiter.sh check     # 体检：只看不改
+```
+
+装机脚本**不碰你的 haproxy.cfg**（缺 stats socket 时只告诉你该加哪一行），
+起来之后会跑一遍 `tc_check.py verify` 逐条核对限速真的在生效。
 
 **配置来源二选一**：设置 `RL_MYSQL_HOST` 等环境变量时从 **MySQL** 读取
 并轮询热更新（Web 控制台写的也是它）；否则回落到 `-c` 指定的本地 YAML
@@ -129,8 +144,9 @@ reload）见 `deploy/systemd/rl-limiter.service` 文件头。
 一一对应（数量对不上**直接报错，不猜**）。往表格的「地址」「端口」格子
 里直接粘贴多行同样会自动展开成多行。
 
-**默认值不设限**：新建监听端口的限额默认 **50 Gbps**（单位可切
-Mbps/Gbps），frontend 级 `maxconn` 默认不设，HAProxy 骨架的 `maxconn`
+**默认值不设限**：新建监听端口的限额默认 **50000 Mbps**（限速的配置单位
+一律是 Mbps——库、YAML、控制台三处同一个字段同一个单位），frontend 级
+`maxconn` 默认不设，HAProxy 骨架的 `maxconn`
 默认 100 万——**要限速/限并发时再显式往下调**，而不是让人在排查"为什么这么
 慢"时最后发现是某个默认值。100 万连接对应 400 万 fd，宿主机的
 `fs.nr_open` 得先抬上去，见 [docs/08](docs/08-内核参数调优.md)。

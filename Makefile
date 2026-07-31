@@ -9,7 +9,7 @@
 
 PY ?= python3
 
-.PHONY: all install test demo-up demo-logs demo-down
+.PHONY: all install test demo-up demo-logs demo-down bare-install bare-check bare-db-up bare-db-down
 
 all: test
 
@@ -31,3 +31,19 @@ demo-logs:
 
 demo-down:
 	docker compose down -v
+
+# ---------------------------------------------------------------------------
+# 裸机部署（HAProxy 与 rl-limiter 都跑在本机，只有配置库用 Docker）
+# 详见 docs/09-裸机部署.md。前提：本机 HAProxy 已装好。
+# ---------------------------------------------------------------------------
+bare-install:
+	sudo deploy/bare/rl-limiter.sh install
+
+bare-check:
+	deploy/bare/rl-limiter.sh check
+
+bare-db-up:
+	deploy/bare/rl-limiter.sh mysql-up
+
+bare-db-down:
+	deploy/bare/rl-limiter.sh mysql-down

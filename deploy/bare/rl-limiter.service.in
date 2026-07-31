@@ -1,0 +1,61 @@
+# rl-limiter systemd unit 模板（裸机部署）。
+#
+# 由 deploy/bare/rl-limiter.sh install 填入 @占位符@ 后装到
+# /etc/systemd/system/rl-limiter.service。别直接改装好的那份——重跑
+# install 会覆盖它；要改配置请改 /etc/rl-limiter/rl-limiter.env。
+#
+# 形态：HAProxy 与 rl-limiter 都直接跑在本机。rl-limiter 只采本机那台
+# HAProxy（unix stats socket），并把限速下发到本机网卡的 tc。
+#
+# 与旧版最大的差别：**现在必须有 CAP_NET_ADMIN**。限速已经从 HAProxy 的
+# bwlim 换成内核 tc（见 docs/06），tc 要操作网络设备。少了它 rl-limiter
+# 启动即失败——这是刻意的，"静默地没在限速"比起不来危险得多。
+
+[Unit]
+Description=rl-limiter - HAProxy ingress rate limiter (co-located, tc/HTB)
+Documentation=https://github.com/ipest-info/haproxy_ingress_rate_limiter
+# HAProxy 先起，它的 unix stats socket 才存在。刻意**不写 Requires**——
+# haproxy 挂了本服务只是采不到数（打 degraded 告警），不该被连坐停掉。
+After=network-online.target haproxy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=@ENVFILE@
+ExecStart=@VENV@/bin/rl-limiter
+Restart=always
+RestartSec=2
+
+# 专用非特权用户。读 HAProxy 的 unix stats socket 靠 haproxy 属组
+# （socket 是 mode 660）。
+User=@USER@
+Group=@USER@
+SupplementaryGroups=haproxy
+
+# ---- 权限：三件事，缺一个就有一项功能静默不工作 -------------------------
+# 1) tc 下发限速 → CAP_NET_ADMIN。Ambient 让非 root 进程也能拿到它。
+#    （AmbientCapabilities 要求该能力同时在 CapabilityBoundingSet 里。）
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+# 2) 改写 haproxy.cfg 的受管区块 → 目录可写（**目录**而非只有文件：原子
+#    替换要在同目录建临时文件再 rename）。ProtectSystem=strict 会把 /etc
+#    整个挂只读，所以要显式放开。
+ReadWritePaths=@HAPROXY_CFG_DIR@
+# 3) reload haproxy → 见 rl-limiter.sh install 装的 polkit 规则。
+#    用 polkit 而不是 sudo，就不必把下面的 NoNewPrivileges 放开。
+
+# ---- 加固 ---------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# FD 上限：rl-limiter 自己只开少量连接（一个 unix socket + MySQL 连接池 +
+# 控制台）。这里跟 HAProxy 的 maxconn 无关——那份 LimitNOFILE 要设在
+# **haproxy 自己的** unit 上，见 docs/08。
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
