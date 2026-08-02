@@ -54,7 +54,7 @@
 | [docs/07-监控数据回查.md](docs/07-监控数据回查.md) | **90 天回查怎么存怎么查**：分级保留、聚合语义、真实 MariaDB 上的容量与耗时实测 |
 | [docs/08-内核参数调优.md](docs/08-内核参数调优.md) | **让瓶颈落在 maxconn 而不是内核默认值上**：初始化阶段的 sysctl 调优与 FD 预检、哪些容器里改不动、怎么验证真的生效 |
 | [docs/09-裸机部署.md](docs/09-裸机部署.md) | **HAProxy 已装好的机器上怎么加 rl-limiter**：一键装机脚本、只起配置库的 compose、三项权限的由来 |
-| [docs/10-LVS-IPVS可行性.md](docs/10-LVS-IPVS可行性.md) | **换成 LVS/IPVS 行不行**：只有 NAT 模式可行的原因、逐项得失、验证计划与证据等级（研究，未动代码） |
+| [docs/10-LVS-IPVS可行性.md](docs/10-LVS-IPVS可行性.md) | **换成 LVS/IPVS 行不行**：只有 NAT 模式可行的原因、逐项得失、验证计划与证据等级。限速侧的关键前提已在等价内核路径上实测（研究，未动限速/转发代码） |
 
 ## 系统组成
 
@@ -76,7 +76,8 @@ tools/            # fake_haproxy.py（联调假节点，支持 unix / TCP）
                   # bootstrap_db.py（把本机登记进配置库，幂等、只增不改）
                   # random_web.py（随机大小响应的模拟后端）、loadgen.py（可调并发压测）
                   # tc_check.py（限速检查：plan 干跑 / doctor 体检 / verify 核对）
-                  # ipvs_probe.sh（LVS/IPVS 可行性实测：doctor / classify / stats）
+                  # ipvs_probe.sh（LVS/IPVS 可行性实测：doctor 体检 /
+                  # forward 转发路径实测（不需要 ip_vs）/ classify / stats）
 deploy/           # systemd（同机形态）、haproxy 骨架配置示例、
                   # YAML 示例配置、mysql/init.sql（配置库建表+种子）
   docker/         #   node-entrypoint.sh（节点入口：环境预检 + haproxy + rl-limiter）、
