@@ -428,7 +428,7 @@ details.adv > summary:hover { background: var(--surface-3); }
           <div class="limit-actions">
             <span class="limit-quota" hidden>
               整机限额 <input id="limit-host-quota" type="number" min="0" step="any"
-                           placeholder="必填"> <small>Mbps</small>
+                           placeholder="留空 = 不限速"> <small>Mbps</small>
             </span>
             <span class="grow"></span>
             <button id="limit-save" class="primary">保存</button>
@@ -1433,33 +1433,56 @@ function limitScopeUI() {
     quotaBox.hidden = !host;
     // 说明文字随选择变——整机限速罩住的范围比大多数人第一反应要宽，
     // 这一句必须写在按钮旁边，而不是只写在文档里。
-    $(".limit-note").innerHTML = host
-      ? "整机限速下，<b>本机网卡的全部出向流量</b>都算在这一个限额里："
-        + "代理发给客户端的、HAProxy 连后端的、监控上报的、连数据库的。"
-        + "「监听端口」页上各端口的限额此时<b>只作为超限告警基准</b>，"
-        + "不再是各自的闸门。SSH（22）默认免限，避免链路打满时登不上机器。"
-      : "按监听端口限速：每个端口一个独立的速率类，限额在「监听端口」页"
-        + "各自设置。切换到整机限速会重建本机网卡的队列树（有一个极短的"
-        + "不整形窗口）。";
+    const q = parseFloat(quotaIn.value);
+    if (!host) {
+      $(".limit-note").innerHTML = "按监听端口限速：每个端口一个独立的速率类，"
+        + "限额在「监听端口」页各自设置。切换到整机限速会重建本机网卡的"
+        + "队列树（有一个极短的不整形窗口）。";
+    } else if (!(q > 0)) {
+      // 默认状态。必须说成"不限速"而不是"没配好"——它就是默认值，
+      // 默认值不该成为限制。
+      $(".limit-note").innerHTML = "<b>当前不限速</b>：整机范围但没设限额，"
+        + "本机网卡按线速放行（网卡上不会有任何 tc 队列树）。"
+        + "要限的时候在左边填一个值即可。"
+        + "「监听端口」页上各端口的限额此时<b>只作为超限告警基准</b>。";
+    } else {
+      $(".limit-note").innerHTML = "整机限速下，<b>本机网卡的全部出向流量</b>"
+        + "都算在这一个限额里：代理发给客户端的、HAProxy 连后端的、监控"
+        + "上报的、连数据库的。「监听端口」页上各端口的限额此时<b>只作为"
+        + "超限告警基准</b>，不再是各自的闸门。"
+        + "SSH（22）默认免限，避免链路打满时登不上机器。";
+    }
   }
   radios().forEach(r => { r.onchange = refresh; });
+  // 限额框边填边更新说明：填上值那一刻说明文字就从"当前不限速"变成
+  // "全部出向流量都算在这个限额里"，不用等保存完才知道自己在做什么。
+  quotaIn.oninput = refresh;
 
   $("#limit-save").onclick = async (ev) => {
     const btn = ev.target, scope = picked();
-    const q = parseFloat(quotaIn.value);
-    // 前端先拦一道，理由同后端：整机限速缺限额 = 限不住，不该等到服务
-    // 下一轮加载配置时才失败。
-    if (scope === "host" && !(q > 0)) {
-      toast("整机限速必须填一个正的整机限额（Mbps）", true);
+    const raw = quotaIn.value.trim();
+    const q = parseFloat(raw);
+    // 留空 = 不限速（合法，且是默认）；填 0 或负数是配错了，前端先拦一道
+    // ——0 Mbps 谁也跑不动，那显然不是"不想限"的意思。
+    if (scope === "host" && raw !== "" && !(q > 0)) {
+      toast("整机限额必须是正数；不想限速就把它留空", true);
       quotaIn.focus();
       return;
     }
+    if (scope === "host" && raw === ""
+        && !confirm("整机限额留空 = 不限速。\n\n"
+                    + "如果本机原先有限速，保存后网卡上的队列树会被拆掉，"
+                    + "流量将按线速放行。确定吗？")) return;
     btn.disabled = true; btn.textContent = "下发中…";
     try {
       const r = await fetch("/api/limit", {
         method: "PUT",
-        body: JSON.stringify({limit_scope: scope,
-                              host_quota_mbps: scope === "host" ? q : 0}),
+        // null 而不是 0：**没设限额（不限速）与限成 0（配错了）是两件事**，
+        // 后端按这个区分，这里不能把 null 压成 0。
+        body: JSON.stringify({
+          limit_scope: scope,
+          host_quota_mbps: (scope === "host" && raw !== "") ? q : null,
+        }),
       });
       const j = await r.json();
       toast(r.ok ? (j.note || "已保存") : (j.error || "保存失败"), !r.ok);
@@ -1476,7 +1499,9 @@ function limitScopeUI() {
     if (document.activeElement === quotaIn) return;
     const r = radios().find(x => x.value === limit.scope);
     if (r) r.checked = true;
-    if (limit.host_quota_mbps > 0) quotaIn.value = limit.host_quota_mbps;
+    // null（没设 = 不限速）要把框子清空，不能留着上一次的值——否则界面
+    // 显示着 1000，实际根本没限速。
+    quotaIn.value = (limit.host_quota_mbps > 0) ? limit.host_quota_mbps : "";
     refresh();
   };
 }

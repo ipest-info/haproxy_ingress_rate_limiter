@@ -216,24 +216,31 @@ def test_overview_exposes_limit_scope():
     """界面必须能显示当前限速范围。看不到它的话，一台整机限速的机器上
     每个端口都标着自己的限额，看起来像各限各的，实际全被一个总闸门罩着。"""
     h = hub()
-    assert h.overview()["limit"] == {"scope": "frontend", "host_quota_mbps": 0.0}
+    # 默认：整机范围 + 没设限额 = 不限速。
+    assert h.overview()["limit"] == {"scope": "host", "host_quota_mbps": None}
     h.update_config(model.ControllerConfig(
         version=2, frontends=[fe()], limit_scope="host", host_quota_mbps=2000.0))
     assert h.overview()["limit"] == {"scope": "host", "host_quota_mbps": 2000.0}
 
 
-def test_limit_payload_requires_positive_host_quota():
-    """整机限速缺限额 = 限不住。必须在写库前就拒，而不是等下一轮轮询
-    加载配置时才失败——那时界面已经报"保存成功"了。"""
+def test_limit_payload_distinguishes_unset_from_zero():
+    """**没设限额（= 不限速，默认）与限成 0（= 配错了）必须分开。**
+
+    合并成一个 0 的话，"我配了整机限速但把限额打错了"会静默变成不限速
+    ——静默不限速是这个项目最不能接受的故障。
+    """
     from rl_limiter import dbconfig
-    with pytest.raises(ValueError, match="host_quota_mbps"):
-        dbconfig._validate_limit_payload({"limit_scope": "host"})
-    with pytest.raises(ValueError, match="host_quota_mbps"):
-        dbconfig._validate_limit_payload(
-            {"limit_scope": "host", "host_quota_mbps": 0})
-    with pytest.raises(ValueError, match="host_quota_mbps"):
-        dbconfig._validate_limit_payload(
-            {"limit_scope": "host", "host_quota_mbps": -1})
+    # 没填 / 填空串 = 不限速，合法。
+    assert dbconfig._validate_limit_payload({"limit_scope": "host"})[1] is None
+    assert dbconfig._validate_limit_payload(
+        {"limit_scope": "host", "host_quota_mbps": None})[1] is None
+    assert dbconfig._validate_limit_payload(
+        {"limit_scope": "host", "host_quota_mbps": ""})[1] is None
+    # 明确填了 0 / 负数 = 配错了，拒。
+    for bad in (0, -1, "0"):
+        with pytest.raises(ValueError, match="正数"):
+            dbconfig._validate_limit_payload(
+                {"limit_scope": "host", "host_quota_mbps": bad})
 
 
 def test_limit_payload_rejects_unknown_scope():
@@ -247,7 +254,7 @@ def test_limit_payload_rejects_unknown_scope():
 def test_limit_payload_accepts_both_scopes():
     from rl_limiter import dbconfig
     assert dbconfig._validate_limit_payload(
-        {"limit_scope": "frontend"}) == ("frontend", 0.0)
+        {"limit_scope": "frontend"}) == ("frontend", None)
     assert dbconfig._validate_limit_payload(
         {"limit_scope": "host", "host_quota_mbps": 1500.5}) == ("host", 1500.5)
     # 界面上的输入框给过来的是字符串，别在这儿卡住。

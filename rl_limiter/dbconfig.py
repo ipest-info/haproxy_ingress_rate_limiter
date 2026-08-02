@@ -198,11 +198,12 @@ def rows_to_raw(
             "timeout_ms": timeout_ms or 0,
             # 限速范围与整机限额也是实例级配置，随配置轮询热更新——把整机
             # 限额从 1000 调到 500 和改某个 frontend 的限额一样立刻生效。
-            # 列是 NOT NULL DEFAULT 'frontend'，这里的兜底只为老库缺列/
-            # 值为空的极端情况。兜底成 "frontend" 而不是 "host"：整机范围
-            # 缺限额会被校验拒掉，那就成了"库里少个值 → 服务起不来"。
-            "limit_scope": limit_scope or "frontend",
-            "host_quota_mbps": host_quota_mbps or 0,
+            # 列是 NOT NULL DEFAULT 'host'；这里的兜底只为老库缺列的极端
+            # 情况。整机范围 + 没设限额 = 不限速，所以兜底到它是安全的。
+            "limit_scope": limit_scope or "host",
+            # NULL 原样传下去：**NULL（没设，=不限速）与 0（配错了）是两件
+            # 不同的事**，在这里用 `or 0` 合并掉就再也分不出来了。
+            "host_quota_mbps": host_quota_mbps,
         }
 
     # 先按 frontend 归拢后端服务器，再挂到各 frontend 上。
@@ -534,7 +535,7 @@ async def upsert_frontend(opts: MySQLOptions, instance: str, payload: Any) -> No
     await _exec_tx(opts, stmts)
 
 
-def _validate_limit_payload(d: Any) -> tuple[str, float]:
+def _validate_limit_payload(d: Any) -> tuple[str, float | None]:
     """把控制台传入的限速范围载荷规整并校验。
 
     校验完全复用配置层（config._validate）的那一段，而不是在这里另写一份
@@ -544,12 +545,16 @@ def _validate_limit_payload(d: Any) -> tuple[str, float]:
     if not isinstance(d, dict):
         raise ValueError("请求体必须是 JSON 对象")
     scope = str(d.get("limit_scope", "") or "").strip().lower()
-    raw_quota = d.get("host_quota_mbps", 0)
-    try:
-        quota = float(raw_quota if raw_quota not in (None, "") else 0)
-    except (TypeError, ValueError):
-        raise ValueError(
-            f"host_quota_mbps 必须是数字，当前值 {raw_quota!r}") from None
+    raw_quota = d.get("host_quota_mbps", None)
+    # 界面上把限额框清空 → 传过来是 None/""，意思是"不限速"，不是 0。
+    if raw_quota is None or raw_quota == "":
+        quota = None
+    else:
+        try:
+            quota = float(raw_quota)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"host_quota_mbps 必须是数字，当前值 {raw_quota!r}") from None
 
     # 借一个最小可用的 frontend 让实例级校验能跑起来：这里要判的是
     # limit_scope / host_quota_mbps 这两个实例级字段，与具体有哪些

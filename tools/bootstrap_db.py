@@ -101,6 +101,11 @@ async def bootstrap(opts: dbconfig.MySQLOptions, args) -> int:
     try:
         async with conn.cursor() as cur:
             # 实例行：接线信息以命令行为准，重装时更新是对的。
+            #
+            # **刻意不碰 limit_scope / host_quota_mbps**：接线信息描述"这台
+            # 机器长什么样"，而限速范围与限额是运维调出来的策略。新建时走
+            # 列默认值（整机范围 + 不设限额 = 不限速，装完机器不会凭空多出
+            # 一个闸门）；重装时保留库里已有的值，不会把人调好的限额冲掉。
             await cur.execute(
                 "INSERT INTO haproxy_instances "
                 "(name, host, port, socket_path, timeout_ms) "

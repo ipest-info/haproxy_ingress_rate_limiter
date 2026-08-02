@@ -731,3 +731,86 @@ def test_host_plan_describe_mentions_quota_and_exempt_ports():
     """日志里那一行是运维判断"到底限的是什么"的唯一依据。"""
     d = host_plan(1000.0).describe()
     assert "整机限速" in d and "1000 Mbps" in d and "22" in d
+
+
+# ---------------------------------------------------------------------------
+# 默认 = 整机范围 + 没设限额 = 不限速
+#
+# 这是"默认值不该成为限制"在限速这一侧的落地：新装的机器开箱能跑满，
+# 要限的时候再给一个值。这一组盯的是它**既不限速、也不乱动网卡**。
+# ---------------------------------------------------------------------------
+
+def test_default_plan_is_host_scope_without_shaping():
+    """不给任何参数造出来的计划 = 整机范围、不限速。"""
+    p = T.ShapePlan()
+    assert p.scope == T.SCOPE_HOST
+    assert p.host_rate_bits_per_s is None
+    assert p.shaping_off
+    T._check_plan(p)                       # 合法状态，不该抛
+    assert "不限速" in p.describe()
+
+
+def test_unset_host_quota_is_not_the_same_as_zero():
+    """没设限额（不限速）与限成 0（配错了）必须分开。
+
+    合并成一个 0 的话，"配了整机限速但打错字"会静默变成不限速——本项目
+    最不能接受的故障就是静默不限速。
+    """
+    unset = T.ShapePlan.from_config("host", None, [])
+    assert unset.host_rate_bits_per_s is None and unset.shaping_off
+    T._check_plan(unset)                   # 合法
+
+    zero = T.ShapePlan.from_config("host", 0.0, [])
+    assert zero.host_rate_bits_per_s == 0 and not zero.shaping_off
+    with pytest.raises(T.TcError, match="留空"):
+        T._check_plan(zero)                # 配错了，拒
+
+
+async def test_no_shaping_on_a_clean_nic_sends_nothing():
+    """默认配置 + 干净网卡 = 一条命令都不发。
+
+    这里发一条 `qdisc del` 都是错的：周期兜底每 30 秒跑一次，那就是每 30
+    秒去删一次根 qdisc——日志刷屏不说，真有人手工建了别的整形规则也会被
+    我们反复删掉。
+    """
+    sh, fake = shaper(classes="", filters="")
+    res = await sh.reconcile(T.ShapePlan())
+    assert res.ok and not res.changed
+    assert fake.mutations() == [], fake.mutations()
+
+
+async def test_clearing_the_host_quota_tears_the_tree_down():
+    """从"限速中"改成"不限速"：树要拆掉，而且必须在日志里说清楚。
+
+    本机限速被关掉是件大事，不能悄悄发生。
+    """
+    sh, fake = shaper(classes=HOST_CLASSES_OK, filters=HOST_FILTERS_OK)
+    res = await sh.reconcile(T.ShapePlan())
+    assert res.ok and res.changed and res.action == "teardown"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    assert cmds == [f"tc qdisc del dev {IFACE} root"], cmds
+
+
+async def test_no_shaping_does_not_touch_the_nic_when_state_is_unreadable():
+    """读不到网卡现状时什么都不做——宁可这一轮不动，也不要在看不见现状的
+    情况下去 del 根 qdisc。"""
+    sh, fake = shaper(classes="", filters="", fail_on=("class show",))
+    res = await sh.reconcile(T.ShapePlan())
+    assert res.ok and not res.changed
+    assert fake.mutations() == []
+
+
+def test_default_scope_in_model_and_config_agree():
+    """model 的默认、配置层的默认、tcshaper 的默认必须是同一个。
+
+    三处任意一处漂了，就会出现"YAML 不写 limit_scope 时的行为"和"数据库
+    里那一列的默认值"不一致——而且只在某一条路径上才看得出来。
+    """
+    from rl_limiter import config as configmod
+    assert model.NodeConfig().limit_scope == T.SCOPE_HOST
+    assert model.NodeConfig().host_quota_mbps is None
+    assert model.ControllerConfig().limit_scope == T.SCOPE_HOST
+    assert T.ShapePlan().scope == T.SCOPE_HOST
+    # 配置层：YAML 里整个 haproxy 段不写 limit_scope 时的落点。
+    node = configmod._parse_haproxy({"socket_path": "/run/haproxy/admin.sock"})
+    assert node.limit_scope == T.SCOPE_HOST and node.host_quota_mbps is None

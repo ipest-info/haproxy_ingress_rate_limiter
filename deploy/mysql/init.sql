@@ -22,16 +22,21 @@
 --   -- 两条的顺序不能反：先改类型再换算。反过来的话除法发生在 BIGINT 上，
 --   -- 结果会被四舍五入到整数——实测 40500000 会变成 41 而不是 40.5。
 --
--- 从没有"限速范围"的版本升级，执行一次：
+-- 从没有"限速范围"的版本升级，执行一次（**注意 DEFAULT 与新装不同**）：
 --   ALTER TABLE haproxy_instances
 --     ADD COLUMN limit_scope     VARCHAR(16) NOT NULL DEFAULT 'frontend',
---     ADD COLUMN host_quota_mbps DOUBLE      NOT NULL DEFAULT 0;
---   -- 默认值就是升级后的行为：limit_scope='frontend' = 保持原样，
---   -- **不会给已有机器凭空加一个整机总闸门**。要整机限速的机器再显式改：
+--     ADD COLUMN host_quota_mbps DOUBLE      NULL DEFAULT NULL;
+--
+--   -- 新装默认 'host'（整机限速），升级默认 'frontend'——这两个默认值
+--   -- 不一样是**有意的**，各自对应一种"不改变现状"：
+--   --   新装：机器上本来什么限速都没有，整机范围 + 空限额 = 依旧不限速；
+--   --   升级：机器上已经按端口限着速，切成整机范围会让那些限额**全部
+--   --         失效**（静默丢限速，本项目最不能接受的故障）。
+--   -- 升级后想改用整机限速，逐台显式切：
 --   --   UPDATE haproxy_instances SET limit_scope = 'host', host_quota_mbps = 1000
 --   --     WHERE name = '<实例>';
---   -- 只改 limit_scope 不给 host_quota_mbps 的话该实例会**启动失败**
---   -- （而不是悄悄按某个默认值限住），两条要一起改。
+--   -- 切过去之前先确认各 frontend 的限额不再需要——整机范围下它们只剩
+--   -- 超限告警基准的作用，不再是各自的闸门。
 --
 -- 本库除配置外还存**监控数据**（metric_rollup 表，分级保留支持 90 天
 -- 回查）——见该表上方的说明。
@@ -78,21 +83,29 @@ CREATE TABLE IF NOT EXISTS haproxy_instances (
     -- 单次 runtime API 命令超时（连接 + 读写，毫秒）；<=0 按默认 500 处理。
     timeout_ms      INT          NOT NULL DEFAULT 500,
     -- ---- 限速范围（这台机器的限速怎么划分）--------------------------------
-    -- 'host'     整机限速（**新装机器推荐**）：一个速率类罩住本机网卡的全部出向
-    --            流量，不按端口分类。简单得多，也没有按源端口分类带来的那
-    --            一串坑（临时端口撞监听端口、classid 进制、每增删一个
-    --            frontend 就要重建队列树）。此时 host_quota_mbps 必填。
-    -- 'frontend' **默认**：按监听端口分别限速，每个 frontend 一个速率类。
-    --            默认值是它不是因为更好，而是因为它是老行为——默认切成
-    --            整机限速会给升级上来的机器**凭空加一个总闸门**。
-    limit_scope     VARCHAR(16)  NOT NULL DEFAULT 'frontend',
-    -- 整机限额（Mbps，允许小数）。limit_scope='host' 时必须为正。
-    -- 默认 0 = 没填：配成 host 却忘了填限额会被校验直接拒绝，而不是
-    -- 悄悄按某个默认值把机器限住。
+    -- 'host'     **默认**，整机限速：一个速率类罩住本机网卡的全部出向流量，
+    --            不按端口分类。限速本来就是按机器算的（一台机器 = 一份
+    --            带宽），按监听端口拆是特例；而且它没有按源端口分类带来的
+    --            那一串坑（临时端口撞监听端口、classid 进制、每增删一个
+    --            frontend 就要重建队列树）。
+    -- 'frontend' 按监听端口分别限速，每个 frontend 一个速率类。一台机器上
+    --            多个入口各有各的限额时用它。
     --
-    -- 注意它罩住的是**本机全部出向流量**——代理流量、连后端的流量、监控
-    -- 上报都算在内。这正是"整机限速"的定义，但要心里有数。
-    host_quota_mbps DOUBLE       NOT NULL DEFAULT 0
+    -- 注意：**升级已有库时这一列要显式指定 DEFAULT 'frontend'**（见文件头
+    -- 的迁移 SQL）。新装默认整机限速，升级保持原有行为——把老机器默认切成
+    -- 整机限速会让它们的按端口限速凭空消失，那是静默丢限速。
+    limit_scope     VARCHAR(16)  NOT NULL DEFAULT 'host',
+    -- 整机限额（Mbps，允许小数）。**NULL = 没设 = 不限速**，这是默认。
+    --
+    -- 列可空是有意的：NULL 与 0 必须能分开。
+    --   NULL  没设 → 不限速（默认值不该成为限制，要限时再给一个值）
+    --   >0    整机闸门
+    --   <=0   明显配错了（0 Mbps 谁也跑不动）→ 服务启动时直接拒绝
+    -- 用 0 兼表"没设"的话，"配了整机限速但打错字"会静默变成不限速。
+    --
+    -- 设了值时它罩住的是**本机全部出向流量**——代理流量、连后端的流量、
+    -- 监控上报都算在内。这正是"整机限速"的定义，但要心里有数。
+    host_quota_mbps DOUBLE       NULL DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------------------------------------------------------------------
@@ -217,10 +230,14 @@ CREATE TABLE IF NOT EXISTS metric_rollup (
 -- compose 里的三台节点，每台 = 一个 Ubuntu 24.04 容器跑 HAProxy + 同机
 -- rl-limiter。采样走本机 unix stats socket（三台恰好同路径——socket_path
 -- 是"该实例本机上的路径"）。
-INSERT INTO haproxy_instances (name, socket_path, timeout_ms) VALUES
-    ('hap-1', '/run/haproxy/admin.sock', 500),
-    ('hap-2', '/run/haproxy/admin.sock', 500),
-    ('hap-3', '/run/haproxy/admin.sock', 500);
+-- 演示三台都**显式**用按端口限速：这个演示要看的就是"每个监听端口各自被
+-- 压在 40 Mbps 以内"，而新装的默认值是整机限速 + 不设限额（= 不限速），
+-- 那样压测跑出来什么都看不见。生产上一台机器一份带宽的话用默认的整机限速
+-- 更省事，把 limit_scope 留默认、给 host_quota_mbps 填个值即可。
+INSERT INTO haproxy_instances (name, socket_path, timeout_ms, limit_scope) VALUES
+    ('hap-1', '/run/haproxy/admin.sock', 500, 'frontend'),
+    ('hap-2', '/run/haproxy/admin.sock', 500, 'frontend'),
+    ('hap-3', '/run/haproxy/admin.sock', 500, 'frontend');
 
 -- 每台一个受管 frontend，监听 8080，限额 40 Mbps（下发给内核 tc 的类速率
 -- 就是 40000000bit/s）。这些行会被各自机器上的 rl-limiter 渲染进

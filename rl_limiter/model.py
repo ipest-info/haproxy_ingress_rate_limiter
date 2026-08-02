@@ -362,12 +362,17 @@ class ControllerConfig:
     # 限速范围与整机限额。放进运行期配置而不是只在启动时读一次，是因为
     # 它们要能随配置热更新改——把整机限额从 1000 调到 500 应该和改某个
     # frontend 的限额一样立刻生效。
-    limit_scope: str = "frontend"
-    host_quota_mbps: float = 0.0
+    limit_scope: str = "host"
+    # None = 没设 = 不限速（默认）。语义与 NodeConfig 同名字段完全一致。
+    host_quota_mbps: float | None = None
 
     @property
     def host_quota_bytes_per_sec(self) -> float:
-        return self.host_quota_mbps * 1_000_000 / 8.0
+        return (self.host_quota_mbps or 0.0) * 1_000_000 / 8.0
+
+    @property
+    def has_host_quota(self) -> bool:
+        return self.host_quota_mbps is not None
 
     def quotas(self) -> dict[str, float]:
         """frontend 名 → 限额（bytes/s），供超限判定使用。"""
@@ -418,23 +423,36 @@ class NodeConfig:
     socket_path: str = ""    # 本机 unix stats socket 路径（同机形态）
 
     # ---- 限速范围（见 tcshaper 模块头的"两种限速范围"）-------------------
+    # "host"     **默认**，整机限速：一个速率类罩住本机网卡的全部出向流量，
+    #            不按端口分类。限速本来就是按机器算的（一台机器 = 一份
+    #            带宽），按监听端口拆是特例而不是通例；而且它没有按源端口
+    #            分类带来的那一串坑（临时端口撞监听端口、classid 进制、
+    #            每加一个 frontend 就要动队列树）。
     # "frontend" 按 frontend 分别限速：每个监听端口一个速率类，用 u32 按
-    #            源端口分类。**默认值**——不是因为它更好，而是因为它是老
-    #            行为：默认切到整机限速会给升级上来的机器**凭空加一个总
-    #            闸门**，那正是"默认值不该成为限制"要避免的事。
-    # "host"     整机限速：一个速率类罩住本机网卡的全部出向流量，不按端口
-    #            分类。**新装机器推荐用它**——简单得多，也没有按源端口分类
-    #            带来的那一串坑（临时端口撞监听端口、classid 进制、每加一
-    #            个 frontend 就要动队列树）。用它必须显式给 host_quota_mbps。
-    limit_scope: str = "frontend"
-    # 整机限额（Mbps）。limit_scope="host" 时必填且必须为正；
-    # limit_scope="frontend" 时这个值不用，各 frontend 各自的限额说了算。
-    host_quota_mbps: float = 0.0
+    #            源端口分类。一台机器上多个入口各有各的限额时用它。
+    limit_scope: str = "host"
+    # 整机限额（Mbps）。**None = 没设 = 不限速**，这是默认——默认值不该
+    # 成为限制，要限的时候再给一个值。
+    #
+    # None 与 0 是两件不同的事，所以这里是 float | None 而不是 float：
+    #   None  没设置 → 不整形（默认，新装机器开箱不限速）
+    #   >0    整机闸门
+    #   <=0   明显配错了（0 Mbps 谁也跑不动）→ 校验直接拒绝
+    # 用 0 兼表"没设"的话，"我配了整机限速但打错了字"就会静默变成不限速。
+    host_quota_mbps: float | None = None
 
     @property
     def host_quota_bytes_per_sec(self) -> float:
-        """整机限额 Mbps → bytes/s。与 FrontendConfig 的换算口径一致。"""
-        return self.host_quota_mbps * 1_000_000 / 8.0
+        """整机限额 Mbps → bytes/s。与 FrontendConfig 的换算口径一致。
+
+        没设限额时返回 0——调用方应先看 has_host_quota，别把它当成"限 0"。
+        """
+        return (self.host_quota_mbps or 0.0) * 1_000_000 / 8.0
+
+    @property
+    def has_host_quota(self) -> bool:
+        """是否设了整机限额。没设 = 不限速（而不是限成 0）。"""
+        return self.host_quota_mbps is not None
 
     @property
     def is_host_scope(self) -> bool:

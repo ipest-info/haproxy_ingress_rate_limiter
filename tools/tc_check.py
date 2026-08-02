@@ -61,6 +61,15 @@ def cmd_plan(args) -> int:
         return 1
 
     print(f"# 网卡 {args.iface}，限速范围 {plan.scope}——{plan.describe()}")
+    if plan.shaping_off:
+        # 默认状态：整机范围但没设限额。这里**没有命令可打**，说清楚就行
+        # ——打一句"不限速"比打一堆命令再让人自己看出来要好。
+        print("#")
+        print("# 这台机器当前不做限速，网卡上不会有任何 tc 队列树。")
+        print("# 要限速：给 haproxy.host_quota_mbps 填一个正数（Mbps），")
+        print("# 或者把 limit_scope 改成 frontend 按监听端口分别限速。")
+        return 0
+
     print("# 首次运行 / 结构变化时执行以下序列（重建整棵队列树）：")
     for argv, fatal in T._rebuild_cmds(args.iface, plan):
         note = "" if fatal else "    # 失败不致命"
@@ -123,9 +132,21 @@ def cmd_verify(args) -> int:
     plan = _plan(cfg)
     sh = T.TcShaper(args.iface)
     classes, cbursts, filtered = asyncio.run(sh.observe())
-    want = T.desired_rates(plan)
 
     print(f"网卡 {args.iface} 实况核对：")
+    if plan.shaping_off:
+        # 配置说不限速，那"网卡上干干净净"才是一致，有队列树反而是不一致
+        # （多半是改成不限速之前留下的，下一轮 reconcile 会拆掉）。
+        if not classes:
+            print("  [ok]   配置为不限速，网卡上确实没有限速队列树")
+            print("核对结论：与配置一致")
+            return 0
+        print(f"  [warn] 配置为不限速，但网卡上还有 {len(classes)} 个限速类"
+              f" —— 多半是改成不限速之前留下的，下一轮 reconcile 会拆掉")
+        print("核对结论：**数据面还在限速，配置说不限**（等一个 reconcile 周期）")
+        return 1
+
+    want = T.desired_rates(plan)
     bad_default = 0
     if T.DEFAULT_CLASS_MINOR not in classes:
         print(f"  [FAIL] 没有兜底类 1:{T.DEFAULT_CLASS_MINOR} —— 队列树多半"

@@ -146,8 +146,8 @@ class StatusHub:
         self._fe_config: dict[str, dict[str, Any]] = {}
         # 实例级的限速范围（见 update_config）。初值与配置层默认一致，
         # 第一份配置到达前界面就按"按 frontend 限速"显示。
-        self._limit: dict[str, Any] = {"scope": "frontend",
-                                       "host_quota_mbps": 0.0}
+        self._limit: dict[str, Any] = {"scope": "host",
+                                       "host_quota_mbps": None}
         self._started = time.time()
 
     # ---- 配置与数据注入 ----

@@ -88,11 +88,11 @@ class MonitorLoop:
         self._ticks: int = 0
         # frontend 名 → 限额（bytes/s），超限判定的基准；随配置热更。
         self._quotas: dict[str, float] = {}
-        # 限速范围与整机限额；随配置热更（见 _apply_config）。初值与配置
-        # 层的默认一致——限速任务只在 seed 之后才跑，这里主要是别让没配过
-        # 的实例看起来像是整机限速。
-        self._limit_scope = "frontend"
-        self._host_quota_mbps = 0.0
+        # 限速范围与整机限额；随配置热更（见 _apply_config）。初值与配置层
+        # 的默认一致（整机范围 + 没设限额 = 不限速）——限速任务只在 seed
+        # 之后才跑，所以这只是个安全的起点，不会真的去下发什么。
+        self._limit_scope = "host"
+        self._host_quota_mbps: float | None = None
         # 当前生效的受管 frontend 配置，供 enforcer 取用（见 frontends()）。
         self._frontends: list[model.FrontendConfig] = []
         # frontend 名 → 超限滞回状态。
@@ -132,7 +132,7 @@ class MonitorLoop:
         """当前的限速范围（"host" / "frontend"），随配置热更新变化。"""
         return self._limit_scope
 
-    def host_quota_mbps(self) -> float:
+    def host_quota_mbps(self) -> float | None:
         """当前的整机限额（Mbps）。限速范围是 host 时才有意义。"""
         return self._host_quota_mbps
 

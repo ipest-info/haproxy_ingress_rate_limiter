@@ -104,18 +104,22 @@ PROC_EPHEMERAL_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
 # ---------------------------------------------------------------------------
 # 两种限速范围
 # ---------------------------------------------------------------------------
-# SCOPE_HOST：整机限速。一个速率类罩住本机网卡的全部出向流量，
+# SCOPE_HOST（**默认**）：整机限速。一个速率类罩住本机网卡的全部出向流量，
 #   **不做任何按端口的分类**。队列树只有两个类，加多少个 frontend 都不变。
 #   按源端口分类带来的那一串麻烦在这个范围下全部不存在：
 #     - 临时端口撞监听端口导致回程流量被误分类（docs/06 §6）→ 不存在
 #     - classid 次要号的进制坑（10000 以上端口全废）→ 不存在
 #     - 每增删一个 frontend 就要重建队列树 → 不存在
-#   代价是没法"这个入口 100M、那个入口 200M"。**新装机器推荐用它。**
+#   代价是没法"这个入口 100M、那个入口 200M"。限额按机器算（一台机器 =
+#   一份带宽）是通例，所以它是默认。
 #
-# SCOPE_FRONTEND（**默认**）：按 frontend 分别限速，每个监听端口一个类 +
-#   一条 u32 源端口分类规则。它是默认值不是因为更好，而是因为它是老行为
-#   ——默认切成整机限速会给升级上来的机器凭空加一个总闸门，那正是
-#   "默认值不该成为限制"要避免的事。
+#   **默认还带一层：整机限额留空 = 不限速**（ShapePlan.shaping_off）。
+#   新装的机器开箱就该能跑满，要限的时候再给一个值——"默认值不该成为
+#   限制"。留空与填 0 是两件事：填 0 会被校验拒掉，因为 0 Mbps 谁也跑不
+#   动，那显然是配错了；用 0 兼表"没设"会让打错字静默变成不限速。
+#
+# SCOPE_FRONTEND：按 frontend 分别限速，每个监听端口一个类 + 一条 u32
+#   源端口分类规则。一台机器上多个入口各有各的限额时用它。
 SCOPE_HOST = "host"
 SCOPE_FRONTEND = "frontend"
 SCOPES = (SCOPE_HOST, SCOPE_FRONTEND)
@@ -279,29 +283,46 @@ class ShapePlan:
     下才需要逐个端口。把范围显式带进来，比让下游去猜要好。
     """
 
-    scope: str = SCOPE_FRONTEND
-    # 整机限额（bit/s）。scope=host 时用。
-    host_rate_bits_per_s: int = 0
+    scope: str = SCOPE_HOST
+    # 整机限额（bit/s）。scope=host 时用。**None = 没设限额 = 不限速**
+    # （见 model.NodeConfig.host_quota_mbps 里 None/0/正数三者的区别）。
+    host_rate_bits_per_s: int | None = None
     # 各 frontend 的限额。scope=frontend 时用；scope=host 时只用来记日志。
     frontends: tuple[model.FrontendConfig, ...] = ()
     # 免限的管理端口（只在 scope=host 下有意义）。
     exempt_ports: tuple[int, ...] = DEFAULT_EXEMPT_PORTS
 
     @classmethod
-    def from_config(cls, scope: str, host_quota_mbps: float,
+    def from_config(cls, scope: str, host_quota_mbps: float | None,
                     frontends: list[model.FrontendConfig],
                     exempt_ports: tuple[int, ...] = DEFAULT_EXEMPT_PORTS
                     ) -> "ShapePlan":
-        """从运行期配置造一个计划。整机限额的 Mbps → bit/s 换算在这里。"""
+        """从运行期配置造一个计划。整机限额的 Mbps → bit/s 换算在这里。
+
+        host_quota_mbps=None 原样传下去：**没设限额和限成 0 是两件事**，
+        在这里合并掉的话下游就再也分不出来了。
+        """
         return cls(
             scope=scope,
-            host_rate_bits_per_s=int(round(host_quota_mbps * 1_000_000)),
+            host_rate_bits_per_s=(None if host_quota_mbps is None
+                                  else int(round(host_quota_mbps * 1_000_000))),
             frontends=tuple(frontends),
             exempt_ports=tuple(exempt_ports),
         )
 
+    @property
+    def shaping_off(self) -> bool:
+        """这份计划是不是"不做限速"。
+
+        只有一种情况：整机范围但没设整机限额——也就是**默认配置**。新装的
+        机器开箱就该能跑满，要限的时候再给一个值。
+        """
+        return self.scope == SCOPE_HOST and self.host_rate_bits_per_s is None
+
     def describe(self) -> str:
         if self.scope == SCOPE_HOST:
+            if self.host_rate_bits_per_s is None:
+                return "整机范围，但未设整机限额 —— **不限速**"
             return (f"整机限速 {self.host_rate_bits_per_s / 1e6:g} Mbps"
                     f"（免限端口 {','.join(map(str, self.exempt_ports)) or '无'}）")
         return ";".join(f"{f.name}@:{f.bind_port}={f.quota_mbps:g}Mbps"
@@ -344,10 +365,14 @@ def _check_plan(plan: ShapePlan) -> None:
         # 整机限速不看 frontend 列表——**列表为空也照样限速**。这和按
         # frontend 限速正好相反：那边空清单等于撤掉全部限速（是事故），
         # 这边空清单只是"这台机器还没配入口"，限速依旧罩着整机。
+        if plan.host_rate_bits_per_s is None:
+            return          # 没设限额 = 不限速，是合法状态（且是默认）
         if plan.host_rate_bits_per_s < 8:
+            # 设了却设成 0/负数是另一回事：那是配错了，不是"不想限"。
+            # 两者在这里必须区别对待，否则打错一个字就静默变成不限速。
             raise TcError(
                 f"整机限额 {plan.host_rate_bits_per_s} bit/s 不足 1 字节/秒，"
-                f"无法整形。整机限速模式下必须给一个正的整机限额")
+                f"无法整形。不想限速就把整机限额留空，而不是填 0")
         for p in plan.exempt_ports:
             if not (1 <= p <= 65535):
                 raise TcError(f"免限端口 {p} 越界")
@@ -704,6 +729,8 @@ class TcShaper:
             return TcResult(ok=False, changed=False, error=str(e))
 
         names = sorted(f.name for f in plan.frontends)
+        if plan.shaping_off:
+            return await self._reconcile_off(names)
         # 临时端口撞监听端口只在**按源端口分类**时才是问题。整机限速不分类，
         # 这条告警在那个范围下毫无意义，不要去吓运维。
         if plan.scope == SCOPE_FRONTEND:
@@ -772,6 +799,35 @@ class TcShaper:
                 "tc 限速下发失败，**限速可能未按新配置生效**，将在下一轮重试 "
                 "iface=%s err=%s", self.iface, e)
             return TcResult(ok=False, changed=False, frontends=names, error=str(e))
+
+    async def _reconcile_off(self, names: list[str]) -> TcResult:
+        """"不限速"这个状态的收敛：网卡上不该有本模块建的队列树。
+
+        绝大多数时候（新装机器、默认配置）网卡上本来就什么都没有，这里
+        必须一条命令都不发——否则每 30 秒 `qdisc del` 一次，日志刷屏不说，
+        真有人手工建了别的整形规则也会被我们反复删掉。
+
+        真正要处理的是**从"限速中"改成"不限速"**：那时树还在，得拆掉，
+        并且要在日志里说清楚——本机限速被关掉是件大事，不能悄悄发生。
+        """
+        try:
+            classes, _, _ = await self.observe()
+        except Exception as e:
+            # 读不到状态时什么都不做：宁可这一轮不动，也不要在看不见现状的
+            # 情况下去 del 根 qdisc。
+            self._log.debug("未设整机限额，读取 tc 状态失败，本轮跳过 err=%s", e)
+            return TcResult(ok=True, changed=False, frontends=names)
+        if not classes:
+            return TcResult(ok=True, changed=False, frontends=names)
+        try:
+            await self._tc(["tc", "qdisc", "del", "dev", self.iface, "root"],
+                           fatal=False)
+        except TcError as e:
+            return TcResult(ok=False, changed=False, frontends=names, error=str(e))
+        self._log.warning(
+            "整机限额已清空，**本机限速已关闭**（原有的 tc 队列树已拆除，"
+            "网卡按线速放行） iface=%s", self.iface)
+        return TcResult(ok=True, changed=True, frontends=names, action="teardown")
 
     async def teardown(self) -> None:
         """撤掉本模块建立的整棵树（停机/切回 bwlim 方案时用）。"""

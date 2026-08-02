@@ -54,6 +54,20 @@ def one_fe(**over):
             "frontends:\n  -\n" + body + "\n    servers:" + srv + "\n")
 
 
+def _raw(**haproxy_over):
+    """最小可用的 raw 配置（与 yaml.safe_load 的产物同构），供实例级字段的
+    用例逐项改写。"""
+    h = {"name": "haproxy", "socket_path": "/run/haproxy/admin.sock"}
+    h.update(haproxy_over)
+    return {
+        "haproxy": h,
+        "frontends": [{
+            "name": "fe_a", "bind_port": 8080, "quota_mbps": 8,
+            "servers": [{"name": "s1", "address": "1.2.3.4", "port": 80}],
+        }],
+    }
+
+
 def test_load_full_config(tmp_path):
     cfg = load_from(tmp_path)
     assert cfg.log_level == "debug"
@@ -231,3 +245,55 @@ def test_quota_survives_the_dict_round_trip():
     again = model.FrontendConfig.from_dict(fe.to_dict())
     assert again.quota_mbps == 40.5
     assert again.quota_bits_per_sec == fe.quota_bits_per_sec
+
+
+# ---------------------------------------------------------------------------
+# 限速范围与整机限额（实例级）
+# ---------------------------------------------------------------------------
+
+def test_host_quota_unset_means_no_limit_not_zero():
+    """**留空与填 0 是两件事。**
+
+    留空 = 不限速（默认值不该成为限制）；填 0 = 配错了（0 Mbps 谁也跑不
+    动）。合并成一个 0 的话，"配了整机限速但打错字"会静默变成不限速。
+    """
+    cfg = config.from_raw(_raw(), "测试")               # 不写 limit_scope / 限额
+    assert cfg.haproxy.limit_scope == "host"
+    assert cfg.haproxy.host_quota_mbps is None
+    assert not cfg.haproxy.has_host_quota
+
+    raw = _raw()
+    raw["haproxy"]["host_quota_mbps"] = 1000
+    cfg = config.from_raw(raw, "测试")
+    assert cfg.haproxy.has_host_quota
+    assert cfg.haproxy.host_quota_bytes_per_sec == 125_000_000.0
+
+    for bad in (0, -1, 0.0):
+        raw = _raw()
+        raw["haproxy"]["host_quota_mbps"] = bad
+        with pytest.raises(ValueError, match="留空"):
+            config.from_raw(raw, "测试")
+
+
+def test_host_quota_ignored_when_scope_is_frontend():
+    """按 frontend 限速时整机限额用不上，写了个坏值也不该把配置卡住——
+    校验要盯的是"当前这种范围下真正会被用到的东西"。"""
+    raw = _raw()
+    raw["haproxy"]["limit_scope"] = "frontend"
+    raw["haproxy"]["host_quota_mbps"] = 0
+    cfg = config.from_raw(raw, "测试")                  # 不该抛
+    assert cfg.haproxy.limit_scope == "frontend"
+
+
+def test_unknown_limit_scope_is_rejected():
+    raw = _raw()
+    raw["haproxy"]["limit_scope"] = "global"
+    with pytest.raises(ValueError, match="limit_scope"):
+        config.from_raw(raw, "测试")
+
+
+def test_host_quota_must_be_a_number():
+    raw = _raw()
+    raw["haproxy"]["host_quota_mbps"] = "一千"
+    with pytest.raises(ValueError, match="必须是数字"):
+        config.from_raw(raw, "测试")

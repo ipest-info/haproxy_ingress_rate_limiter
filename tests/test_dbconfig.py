@@ -154,3 +154,38 @@ def test_from_env_reads_all_fields():
     })
     assert (opts.host, opts.port, opts.user, opts.password, opts.database,
             opts.poll_interval_s) == ("db", 3307, "u", "p", "d", 9.0)
+
+
+# ---------------------------------------------------------------------------
+# 限速范围与整机限额：NULL 一路传到底
+# ---------------------------------------------------------------------------
+
+def test_null_host_quota_stays_null_all_the_way():
+    """库里 host_quota_mbps 为 NULL（= 没设 = 不限速）时，**不能在组装
+    这一步被压成 0**。
+
+    压成 0 的后果不是"不限速"，而是配置校验直接把它判成非法（0 Mbps 谁也
+    跑不动），整台机器的 rl-limiter 起不来——一个 `or 0` 就能造成的停机。
+    """
+    row = ("haproxy", None, None, "/run/haproxy/admin.sock", 500, "host", None)
+    raw = dbconfig.rows_to_raw(SERVICE_ROW, row, FRONTEND_ROWS, SERVER_ROWS)
+    assert raw["haproxy"]["host_quota_mbps"] is None
+    cfg = config.from_raw(raw, source="测试数据库")     # 不该抛
+    assert cfg.haproxy.limit_scope == "host"
+    assert not cfg.haproxy.has_host_quota
+
+
+def test_zero_host_quota_from_db_is_rejected():
+    """库里明确写了 0 则是另一回事：那是配错了，必须拒——否则打错一个字
+    就静默变成不限速。"""
+    row = ("haproxy", None, None, "/run/haproxy/admin.sock", 500, "host", 0.0)
+    raw = dbconfig.rows_to_raw(SERVICE_ROW, row, FRONTEND_ROWS, SERVER_ROWS)
+    with pytest.raises(ValueError, match="留空"):
+        config.from_raw(raw, source="测试数据库")
+
+
+def test_positive_host_quota_from_db_flows_through():
+    row = ("haproxy", None, None, "/run/haproxy/admin.sock", 500, "host", 2000.0)
+    cfg = build(instance_row=row)
+    assert cfg.haproxy.has_host_quota
+    assert cfg.haproxy.host_quota_mbps == 2000.0
