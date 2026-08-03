@@ -224,7 +224,7 @@ class Collector:
         self._logged_tc_error = ""
 
     def set_managed(self, names: set[str]) -> None:
-        """整体替换受管 frontend 集合（配置下发时调用）。"""
+        """整体替换受管 frontend 集合（配置应用时调用）。"""
         self._managed = set(names)
         self._log.info(
             "已更新受管 frontend 集合，后续采样按新集合产出用量 frontends=%s",

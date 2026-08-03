@@ -659,7 +659,7 @@ async def _run_argv(argv: list[str]) -> tuple[int, str, str]:
     """执行 argv 并返回 (rc, stdout, stderr)。
 
     刻意用 argv 而不是 shell 字符串：本模块以 root/CAP_NET_ADMIN 运行，
-    走 shell 等于把配置库里的值暴露在命令行解析面前。
+    走 shell 等于把配置文件里的值暴露在命令行解析面前。
     """
     proc = await asyncio.create_subprocess_exec(
         *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)

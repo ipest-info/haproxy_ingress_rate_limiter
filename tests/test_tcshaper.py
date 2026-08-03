@@ -1,6 +1,6 @@
 # tests.test_tcshaper —— 用内核 tc（HTB）做限速。
 #
-# 这是继 enforcer 之后第二个**以 root 权限对生产数据面下命令**的模块，
+# 这是唯一一个**以 root 权限对生产数据面下命令**的模块，
 # 所以测试的重点同样不是"命令拼对了没有"，而是每条边界都不留烂摊子：
 #   1. 空清单/非法端口/限额过小 → 拒绝执行，不下任何命令；
 #   2. 已经一致 → 一条命令都不发（否则每 30 秒重建一次队列树 = 每 30 秒
@@ -410,7 +410,7 @@ async def test_class_add_failure_is_reported_not_swallowed():
 
 async def test_commands_are_argv_never_shell_strings():
     """本模块以 root/CAP_NET_ADMIN 执行命令，必须逐个参数传递——走 shell
-    等于把配置库里的值暴露给命令行解析。"""
+    等于把配置里的值暴露给命令行解析。"""
     sh, fake = shaper()
     await sh.reconcile([fe()])
     for argv in fake.calls:

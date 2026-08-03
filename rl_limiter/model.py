@@ -61,7 +61,7 @@ class FrontendStat:
     # 为什么只取 h1：stats CSV 里 h2 只有 h2_open_connections 与
     # h2_backend_open_streams——**前端方向的 open_streams 根本没有这一列**，
     # h3 连 open_connections 都没有。拿 h2 的连接数配 h1 的流数会把 h2 连接
-    # 全算成空闲，比不算更糟。受管区块渲染出的 bind 不带 alpn，协商不到
+    # 全算成空闲，比不算更糟。只要 cfg 里的 bind 不带 alpn，协商不到
     # h2/h3，因此本项目自己生成的 frontend 全部落在 h1 口径内。
     #
     # 注意 mode tcp 下没有"流"的概念，这两个值都是 0——TCP 模式下每条
@@ -346,7 +346,7 @@ class NodeConfig:
       下**无法下发配置**（改 cfg + reload 必须在本机做）。
 
     两种形态下 rl-limiter 对 stats socket 都只做只读采样，`level user`
-    即够；配置下发走的是文件 + reload，与 stats socket 无关。
+    即够；改负载均衡配置走的是编辑 cfg + reload，与 stats socket 无关。
     """
 
     name: str = "haproxy"    # 本机 HAProxy 的标识名（日志/控制台展示用）
