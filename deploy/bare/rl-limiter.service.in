@@ -29,6 +29,10 @@ EnvironmentFile=@ENVFILE@
 ExecStart=@VENV@/bin/rl-limiter -c @CONF_DIR@/config.yaml
 Restart=always
 RestartSec=2
+# 停机上限：服务自身的优雅停机有 10s 兜底（见 __main__ 的收尾超时），
+# 这里再给 systemd 一道 15s 的闸——绝不该出现 stop/restart 干等默认
+# 90s 的情况。
+TimeoutStopSec=15
 
 # 专用非特权用户。读 HAProxy 的 unix stats socket 靠 haproxy 属组
 # （socket 是 mode 660）。

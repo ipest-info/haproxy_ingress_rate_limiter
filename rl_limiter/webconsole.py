@@ -221,6 +221,22 @@ class StatusHub:
     def unsubscribe(self, q: asyncio.Queue) -> None:
         self._subs.discard(q)
 
+    def close(self) -> None:
+        """停机：给所有 SSE 订阅者投一个 None 哨兵，叫醒并结束它们。
+
+        没有这一步，优雅停机会被挂着的 /api/stream 卡住——aiohttp 的
+        cleanup 要等所有在途请求结束，而 SSE 处理器在 q.get() 上永远等
+        不到下一帧（监控循环已停）。实测：控制台页面开着时 restart 要
+        干等 60s（aiohttp 的 shutdown_timeout）才被强制掐断。
+        """
+        for q in list(self._subs):
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            q.put_nowait(None)
+
     def overview(self) -> dict[str, Any]:
         return {
             "service_version": self._service_version,
@@ -399,6 +415,8 @@ def build_app(
                     b"data: " + json.dumps(latest).encode() + b"\n\n")
             while True:
                 snap = await q.get()
+                if snap is None:          # 停机哨兵（见 StatusHub.close）
+                    break
                 await resp.write(
                     b"data: " + json.dumps(snap).encode() + b"\n\n")
         except (ConnectionResetError, ConnectionError, OSError):
@@ -448,4 +466,6 @@ async def run_console(
     try:
         await asyncio.Event().wait()  # 挂起至任务被取消
     finally:
+        # 先叫醒并结束所有 SSE 流，cleanup 才不会等在途请求等到超时。
+        hub.close()
         await runner.cleanup()

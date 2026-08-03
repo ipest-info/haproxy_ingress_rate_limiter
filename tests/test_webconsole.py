@@ -204,6 +204,24 @@ async def test_metrics_carries_latest_sample(client):
     assert 'rl_limiter_frontend_over_quota{frontend="fe_a"} 1' in body
 
 
+async def test_sse_stream_ends_on_hub_close(client):
+    """停机回归：hub.close() 必须让挂着的 /api/stream 立刻收尾。
+
+    否则优雅停机会被 SSE 卡住——aiohttp 的 cleanup 等在途请求，SSE 又
+    永远不返回，实测控制台页面开着时 systemctl restart 要干等 60s+。"""
+    import asyncio as _asyncio
+    h = client.app["hub"]
+    resp = await client.get("/api/stream")
+    h.record(1.0, [usage(rate=5.0)])
+    # 等到确实收到过数据帧（连接已建立、处理器在 q.get() 上等着）
+    line = await _asyncio.wait_for(resp.content.readline(), 2)
+    assert line.startswith(b"data:")
+    h.close()
+    # 处理器应随哨兵返回，连接随之走到 EOF——限时读完剩余字节。
+    await _asyncio.wait_for(resp.content.read(), 2)
+    assert resp.content.at_eof()
+
+
 async def test_json_endpoints_declare_utf8(client):
     """日志接口会带中文消息，同样不能让浏览器猜。"""
     for path in ("/api/overview", "/api/logs", "/api/history"):

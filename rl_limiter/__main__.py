@@ -246,7 +246,16 @@ async def _amain(cfg, log: logging.Logger,
                       "task=%s err=%s", t.get_name(), t.exception())
     for t in (stop_task, *tasks):
         t.cancel()
-    await asyncio.gather(stop_task, *tasks, return_exceptions=True)
+    # 收尾兜底超时：个别任务收不干净（如 aiohttp 等在途请求）时不无限
+    # 等——超时直接放弃，进程退出时事件循环会连带终止残余任务。没有
+    # 这道闸，systemd stop 会干等到 TimeoutStopSec 再 SIGKILL。
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(stop_task, *tasks, return_exceptions=True),
+            timeout=10.0)
+    except asyncio.TimeoutError:
+        log.warning("部分任务未在 10s 内退出，放弃等待直接停机（残余任务"
+                    "随进程终止）")
     if mlog is not None:
         # 把最后一个未满的分钟也写出去，然后关闭文件句柄。
         mlog.close()
