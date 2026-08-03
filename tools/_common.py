@@ -13,7 +13,7 @@ import sys
 def env_int(name: str, default: int, prog: str) -> int:
     """读取整数环境变量：未设置或空白返回 default；非法值打印带 prog
     前缀的中文错误后以退出码 1 结束进程（脚本口径的 fail-fast，区别于
-    rl_limiter.dbconfig 库口径的抛 ValueError）。"""
+    rl_limiter.config 库口径的抛 ValueError）。"""
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         return default

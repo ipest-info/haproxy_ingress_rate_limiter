@@ -2,14 +2,18 @@
 #
 # 由 deploy/bare/rl-limiter.sh install 填入 @占位符@ 后装到
 # /etc/systemd/system/rl-limiter.service。别直接改装好的那份——重跑
-# install 会覆盖它；要改配置请改 /etc/rl-limiter/rl-limiter.env。
+# install 会覆盖它；要改配置请改 /etc/rl-limiter/config.yaml（业务配置）
+# 与 /etc/rl-limiter/rl-limiter.env（本机环境变量）。
 #
-# 形态：HAProxy 与 rl-limiter 都直接跑在本机。rl-limiter 只采本机那台
-# HAProxy（unix stats socket），并把限速下发到本机网卡的 tc。
+# 形态：HAProxy 与 rl-limiter 都直接跑在本机。**haproxy.cfg 是负载均衡
+# 配置的唯一权威**（运维直接编辑 + reload），rl-limiter 只读它解析受管
+# frontend 清单，把 YAML 里登记的限额下发到本机网卡的 tc，并经本机
+# unix stats socket 采样监控。它**不写任何文件**：不改 cfg、不 reload
+# haproxy。
 #
-# 与旧版最大的差别：**现在必须有 CAP_NET_ADMIN**。限速已经从 HAProxy 的
-# bwlim 换成内核 tc（见 docs/06），tc 要操作网络设备。少了它 rl-limiter
-# 启动即失败——这是刻意的，"静默地没在限速"比起不来危险得多。
+# 权限要点：**必须有 CAP_NET_ADMIN**。限速由内核 tc 执行，tc 要操作网络
+# 设备。少了它 rl-limiter 启动即失败——这是刻意的，"静默地没在限速"比
+# 起不来危险得多。
 
 [Unit]
 Description=rl-limiter - HAProxy ingress rate limiter (co-located, tc/HTB)
@@ -22,7 +26,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=@ENVFILE@
-ExecStart=@VENV@/bin/rl-limiter
+ExecStart=@VENV@/bin/rl-limiter -c @CONF_DIR@/config.yaml
 Restart=always
 RestartSec=2
 
@@ -32,19 +36,14 @@ User=@USER@
 Group=@USER@
 SupplementaryGroups=haproxy
 
-# ---- 权限：三件事，缺一个就有一项功能静默不工作 -------------------------
-# 1) tc 下发限速 → CAP_NET_ADMIN。Ambient 让非 root 进程也能拿到它。
-#    （AmbientCapabilities 要求该能力同时在 CapabilityBoundingSet 里。）
+# tc 下发限速 → CAP_NET_ADMIN。Ambient 让非 root 进程也能拿到它。
+# （AmbientCapabilities 要求该能力同时在 CapabilityBoundingSet 里。）
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
-# 2) 改写 haproxy.cfg 的受管区块 → 目录可写（**目录**而非只有文件：原子
-#    替换要在同目录建临时文件再 rename）。ProtectSystem=strict 会把 /etc
-#    整个挂只读，所以要显式放开。
-ReadWritePaths=@HAPROXY_CFG_DIR@
-# 3) reload haproxy → 见 rl-limiter.sh install 装的 polkit 规则。
-#    用 polkit 而不是 sudo，就不必把下面的 NoNewPrivileges 放开。
 
 # ---- 加固 ---------------------------------------------------------------
+# 本服务对文件系统只有读需求（YAML 配置 + haproxy.cfg + stats socket），
+# 全程不写盘，ProtectSystem=strict 可以全只读、无需任何 ReadWritePaths。
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -52,9 +51,9 @@ PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-# FD 上限：rl-limiter 自己只开少量连接（一个 unix socket + MySQL 连接池 +
-# 控制台）。这里跟 HAProxy 的 maxconn 无关——那份 LimitNOFILE 要设在
-# **haproxy 自己的** unit 上，见 docs/08。
+# FD 上限：rl-limiter 自己只开少量连接（一个 unix socket + 控制台）。
+# 这里跟 HAProxy 的 maxconn 无关——那份 LimitNOFILE 要设在 **haproxy
+# 自己的** unit 上，见 docs/08。
 LimitNOFILE=65536
 
 [Install]

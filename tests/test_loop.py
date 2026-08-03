@@ -1,6 +1,6 @@
 # tests.test_loop —— 监控主循环的测试（单 HAProxy，单位 = frontend）。
 #
-# 覆盖：配置应用（受管集合/限额基准/叫醒 enforcer）、超限告警的滞回状态机、
+# 覆盖：配置应用（受管集合/限额基准/叫醒 tc 下发任务）、超限告警的滞回状态机、
 # degraded 时暂停判定、配置队列优先于 tick。
 
 from __future__ import annotations
@@ -33,10 +33,8 @@ class FakeCollector:
         return self._usages
 
 
-def fe(name="fe_a", quota_mbps=8.0, port=8080, servers=None):
-    return model.FrontendConfig(
-        name=name, bind_port=port, quota_mbps=quota_mbps,
-        servers=servers or [model.ServerEntry(name="s1", address="10.0.0.1", port=80)])
+def fe(name="fe_a", quota_mbps=8.0, port=8080):
+    return model.FrontendConfig(name=name, bind_port=port, quota_mbps=quota_mbps)
 
 
 def usage(name="fe_a", mean10=0.0, degraded=False):
@@ -62,7 +60,7 @@ def test_apply_config_sets_managed_and_quotas():
 
 
 def test_frontends_follows_hot_reload():
-    """enforcer 每轮现取，因此配置热更后拿到的必然是新值。"""
+    """tc 下发任务每轮现取，因此配置热更后拿到的必然是新值。"""
     ctl = MonitorLoop(FakeCollector())
     ctl.seed(cfg(fe("fe_a", 8.0)))
     assert ctl.frontends()[0].quota_mbps == 8.0
@@ -70,7 +68,7 @@ def test_frontends_follows_hot_reload():
     assert ctl.frontends()[0].quota_mbps == 4.0
 
 
-def test_config_applied_event_wakes_enforcer():
+def test_config_applied_event_wakes_shaper():
     """每次应用配置都叫醒下发任务——"改完立刻生效"靠的就是这个事件。"""
     ev = asyncio.Event()
     ctl = MonitorLoop(FakeCollector(), config_applied=ev)

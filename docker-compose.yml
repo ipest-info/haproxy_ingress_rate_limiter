@@ -1,57 +1,28 @@
-# docker compose 一键演示环境：MySQL 配置源 + 三台 **Ubuntu 24.04 节点**
-# （每台 = HAProxy + 同机 rl-limiter）+ 模拟业务后端 + 可调并发压测服务。
-# 详细玩法见 docs/04-DockerCompose演示.md。
+# docker compose 单节点环境：一台 **Ubuntu 24.04 节点**（= HAProxy +
+# 同机 rl-limiter）。完整的三节点演示（含模拟后端与压测服务）见
+# docker-compose-demo.yml 与 docs/04-DockerCompose演示.md。
 #
 #   启动：docker compose up -d --build
-#   控制台：http://localhost:8090 / :8092 / :8093（每台节点各一个）
-#   观察：docker compose logs -f node1 loadgen
-#   调并发：curl -X PUT http://localhost:8084/concurrency -d '{"concurrency": 32}'
-#   长连接大文件下载：curl -X PUT http://localhost:8084/big -d '{"per_target": 2}'
-#   收场：docker compose down -v
+#   控制台：http://localhost:8090
+#   观察：docker compose logs -f node1
+#   收场：docker compose down
 #
-# 部署形态：**rl-limiter 与 HAProxy 同机**。每个 node 容器 = 生产上的
-# 一台 ECS：容器内同时跑 haproxy 与 rl-limiter，rl-limiter 通过本机
-# unix socket（/run/haproxy/admin.sock）只采本机那台 HAProxy——stats
-# socket 不占任何网络端口，容器之间也无需互相可达。
+# 部署形态：**rl-limiter 与 HAProxy 同机**。node 容器 = 生产上的一台
+# ECS：容器内同时跑 haproxy 与 rl-limiter，rl-limiter 通过本机 unix
+# socket（/run/haproxy/admin.sock）只采本机那台 HAProxy——stats socket
+# 不占任何网络端口。
 #
-# 拓扑（三台 TCP L4 节点，各自独立；监听端口/限额/后端服务器都由各自的
-# rl-limiter 从配置库渲染进本机 haproxy.cfg 的受管区块）：
-#   loadgen ==打散==> node1:8080、node2:8080、node3:8080（各自 fe_main）
-#                          └──> web:9000（随机大小响应）
-#   node{1,2,3} 内的 rl-limiter ──轮询──> mysql（实例/frontend/后端服务器）
-#   node{1,2,3} 内的 rl-limiter ──show stat──> 本机 unix socket（不出容器）
-# 限速由各台机器的内核 tc（各 40 Mbps）在本机执行。每个控制台
-# 只管本机那台 HAProxy：可在页面上增删改监听端口、限额与后端服务器，
-# 保存即写库、随后自动写进 cfg 并 reload。
+# 配置来源只有两个本地文件（没有数据库）：
+#   - haproxy.cfg（挂 deploy/docker/haproxy-base.cfg 为模板）——负载
+#     均衡配置的**唯一权威**：监听端口、模式、后端服务器都写在这里，
+#     改完 reload HAProxy；rl-limiter 只读它解析受管 frontend 清单；
+#   - rl-limiter 的 YAML（挂 deploy/docker/limiter-node.yaml 为模板）——
+#     stats socket 接线 + quotas 限额登记（frontend 名 → Mbps）。
+# 两份文件的内容都被 rl-limiter 轮询（5s），改了即热生效。
+# 限速由本机内核 tc（HTB，按监听端口分类）执行。
 
 services:
-  # ---- 配置源：MySQL（表结构与演示种子数据见 deploy/mysql/init.sql）----
-  mysql:
-    image: mysql:8.4
-    environment:
-      MYSQL_ROOT_PASSWORD: root_pass
-      MYSQL_DATABASE: rl_limiter
-      MYSQL_USER: rl
-      MYSQL_PASSWORD: rl_pass
-    volumes:
-      - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-      - mysql-data:/var/lib/mysql
-    # 只在本机回环暴露 3306，方便宿主机直接用 mysql 客户端改配置。
-    networks:
-      - default
-    healthcheck:
-      # TCP ping：初始化阶段的临时实例只监听 unix socket，ping 通 TCP
-      # 即表示真实实例（含 init.sql 灌数）已就绪。
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
-      interval: 2s
-      timeout: 3s
-      retries: 60
-    restart: unless-stopped
-
-  # ---- 三台节点：Ubuntu 24.04 + HAProxy 2.8(发行版自带) + 同机 rl-limiter。
-  # 每个容器 = 生产上的一台 ECS，各管各的。挂进去的 haproxy-base.cfg 只是
-  # global/defaults 骨架，监听端口与后端由各自的 rl-limiter 从配置库渲染
-  # 进受管区块。stats socket 是容器内的 unix socket，不映射也无需互通。
+  # ---- 节点：Ubuntu 24.04 + HAProxy 2.8(发行版自带) + 同机 rl-limiter。
   node1:
     build:
       context: .
@@ -84,40 +55,25 @@ services:
         soft: 4194304
         hard: 4194304
     volumes:
+      # 两份配置模板（入口脚本复制成容器内的普通文件，进容器改副本即可
+      # 演示热生效；副本路径见 deploy/docker/node-entrypoint.sh）。
       - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
+      - ./deploy/docker/limiter-node.yaml:/etc/rl-limiter/config-template.yaml:ro
     environment:
-      # 本实例对应配置库 haproxy_instances 里的哪一行（读写都只碰自己
-      # 那些行）。值必须与库中登记的实例名一致。
-      RL_NODE_NAME: hap-1
       # 与 haproxy-base.cfg 的默认值一致（100 万）。改这两个数**必须**同步
       # 改上面的 ulimits.nofile 与宿主机的 fs.nr_open，见那段注释。
       HAPROXY_MAXCONN: "1000000"
       HAPROXY_MAXPIPES: "1000000"
-      RL_MYSQL_HOST: mysql
-      RL_MYSQL_PORT: "3306"
-      RL_MYSQL_USER: rl
-      RL_MYSQL_PASSWORD: rl_pass
-      RL_MYSQL_DB: rl_limiter
-      RL_MYSQL_POLL_S: "3"
       RL_CONSOLE_PORT: "8090"
       # 演示需要从宿主机打开控制台，故绑 0.0.0.0；宿主机侧只映射到回环
       # （下方 ports）。生产默认是 127.0.0.1，控制台无鉴权，切勿裸奔。
       RL_CONSOLE_BIND: 0.0.0.0
-      # 配置自动下发：库里改监听端口/限额/后端服务器 → 本机 rl-limiter
-      # 立刻把它们渲染进这份 cfg 的受管区块并 reload（容器里没有
-      # systemctl，用入口脚本落的 master pid 发 SIGUSR2）。
-      RL_APPLY_HAPROXY_CFG: /etc/haproxy/haproxy.cfg
-      RL_APPLY_RELOAD_CMD: kill -USR2 $$(cat /run/haproxy/master.pid)
+    ports:
+      - "127.0.0.1:8080:8080"   # fe_main（业务入口）
+      - "127.0.0.1:8090:8090"   # Web 控制台（只读）
     networks:
       - default
-    depends_on:
-      mysql:
-        condition: service_healthy
     restart: unless-stopped
-
-
-volumes:
-  mysql-data:
 
 
 networks:

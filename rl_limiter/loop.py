@@ -4,9 +4,8 @@
 # 内核 tc 执行（见 rl_limiter.tcshaper）；本循环的职责是每秒产出各受管 frontend 的
 # 带宽视图，并对照配置里的限额做**持续超限告警**。
 #
-# 说明：下发不在本循环里，而由两个独立任务承担——enforcer 把监听端口与
-# 后端写进 haproxy.cfg，tcshaper 把限额下发到内核 tc。每次配置应用后本
-# 循环 set 事件叫醒它们（见 _apply_config 末尾）。
+# 说明：下发不在本循环里，而由独立任务承担——tcshaper 把限额下发到
+# 内核 tc。每次配置应用后本循环 set 事件叫醒它（见 _apply_config 末尾）。
 #
 # 限额与数据面同源之后，"实测超过限额"基本只剩三种可能：tc 下发失败
 # （tcshaper 会另行告警）、流量打满限额而 HTB 有正常的 burst 过冲余量、
@@ -88,13 +87,13 @@ class MonitorLoop:
         self._ticks: int = 0
         # frontend 名 → 限额（bytes/s），超限判定的基准；随配置热更。
         self._quotas: dict[str, float] = {}
-        # 当前生效的受管 frontend 配置，供 enforcer 取用（见 frontends()）。
+        # 当前生效的受管 frontend 配置，供下发任务取用（见 frontends()）。
         self._frontends: list[model.FrontendConfig] = []
         # frontend 名 → 超限滞回状态。
         self._over: dict[str, _OverState] = {}
-        # 每次应用配置后被 set 的信号量，供各"下发"类任务（写 cfg 的
-        # enforcer、下发限速的 tcshaper）做到"配置一改就立刻生效"，而不是
-        # 干等下一个周期性 reconcile。None = 没人关心（纯监控形态）。
+        # 每次应用配置后被 set 的信号量，供"下发"类任务（下发限速的
+        # tcshaper）做到"配置一改就立刻生效"，而不是干等下一个周期性
+        # reconcile。None = 没人关心（纯监控形态）。
         #
         # **每个任务必须各持一个 Event，不能共用**：这些任务在被唤醒后会
         # clear() 自己的事件，共用一个的话，A 先醒来 clear 掉、B 还没回到
@@ -110,31 +109,22 @@ class MonitorLoop:
     @property
     def version(self) -> int:
         """最近一次应用的配置版本号（尚未应用任何配置时为 0）。
-        数据库模式下是配置内容的校验和；控制台展示它，便于核对配置
-        是否已热更到位。"""
+        取的是配置内容的校验和；控制台展示它，便于核对配置是否已热更
+        到位。"""
         return self._version
-
-    def quotas_view(self) -> dict[str, float]:
-        """当前各 frontend 的限额（bytes/s）。
-
-        监控数据落库要把**当时的限额**一起记进每个桶——限额会被人改，
-        事后从配置里查到的是现在的值而不是当时的值，没有它回查时就读不出
-        "那条曲线到底有没有打满"。
-        """
-        return dict(self._quotas)
 
     def frontends(self) -> list[model.FrontendConfig]:
         """当前生效的受管 frontend 配置。
 
-        配置下发任务（enforcer）拿它渲染 haproxy.cfg 的受管区块。每轮
-        reconcile 都现取，因此配置热更后拿到的必然是新值。
+        限速下发任务（tcshaper）拿它决定要建哪些 HTB 类。每轮 reconcile
+        都现取，因此配置热更后拿到的必然是新值。
         """
         return list(self._frontends)
 
     def seed(self, cfg: model.ControllerConfig) -> None:
         """在 run 启动之前同步应用一份初始配置，即"引导"语义：让循环从
-        第一个 tick 起就带着限额基准工作（引导配置来自启动时加载的数据库
-        快照或本地 YAML）。
+        第一个 tick 起就带着限额基准工作（引导配置来自启动时对
+        haproxy.cfg 的解析 + YAML 限额的合并）。
 
         seed 与 run 内的配置应用走同一条 _apply_config 路径，语义完全一致。
         """
@@ -158,8 +148,8 @@ class MonitorLoop:
             "version=%s frontends=%d quotas=%s",
             cfg.version, len(cfg.frontends), _summarize_quotas(cfg.frontends),
         )
-        # 叫醒配置下发任务。放在最后：等本循环的基准先更新完，避免
-        # enforcer 已经把新配置写进数据面、监控这边还在按旧基准判超限。
+        # 叫醒限速下发任务。放在最后：等本循环的基准先更新完，避免
+        # tcshaper 已经把新限额写进数据面、监控这边还在按旧基准判超限。
         for ev in self._config_applied:
             ev.set()
 
@@ -167,8 +157,8 @@ class MonitorLoop:
                   tick_interval_s: float = 1.0) -> None:
         """驱动循环直至所在任务被取消。
 
-        - config_queue 传递配置源投递的新配置（数据库轮询任务，见
-          dbconfig.watch）；standalone 模式下传 None，循环退化为纯 tick
+        - config_queue 传递配置源投递的新配置（cfg/YAML 轮询任务，见
+          cfgparse.watch）；standalone 模式下传 None，循环退化为纯 tick
           驱动。
         - 顺序保证：某个 tick 之前已经送达的配置，一定在处理该 tick 之前
           被应用——每拍开头先非阻塞地把队列里排队的配置全部排空再跑流水

@@ -1,126 +1,121 @@
 # haproxy_ingress_rate_limiter
 
 带宽账密计费模式下的入口限速与监控系统。**一个 rl-limiter 实例管一台与
-它同机的 HAProxy**：在 Web 界面上配置监听端口、限额与后端服务器，保存即
-写库，随后由本机 rl-limiter 渲染进 haproxy.cfg 的受管区块并 reload——
-**改完立刻生效**（实测一次下发 ~74 ms）。
+它同机的 HAProxy**。**haproxy.cfg 是负载均衡配置的唯一权威**：监听端口、
+模式、后端服务器由运维直接写在 cfg 里并自行 reload；rl-limiter 只**读**
+这份 cfg 解析出 frontend/listen 清单，与本地 YAML 里登记的限额（quotas）
+合并后做两件事：
 
-限速由**内核 tc（HTB）**执行：按源端口把每个 frontend 的出向流量分到
-自己的速率类里，该端口全部连接（含存量长连接）的总速率被硬性压在限额内，
-与连接数、单连接快慢无关。改限额走 `tc class change`，**连 reload 都不需要，
-存量连接立刻跟上**。rl-limiter 同时每秒经**本机 unix stats socket** 采样
-各 frontend 的下行带宽做持续超限告警。
+1. **限速**：把限额下发到本机网卡的**内核 tc（HTB）**——按源端口把每个
+   frontend 的出向流量分到自己的速率类里，该端口全部连接（含存量长连接）
+   的总速率被硬性压在限额内，与连接数、单连接快慢无关。改限额走
+   `tc class change`，**不 reload、存量连接立刻跟上**；
+2. **监控**：每秒经**本机 unix stats socket** 采样各 frontend 的下行带宽，
+   产出实时曲线（内置只读 Web 控制台）并做持续超限告警。
 
-> 之前用的是 HAProxy 的 shared bwlim。换掉是因为实测发现：**只要挂着
-> bwlim 滤镜，HAProxy 就会完全关闭内核 splice（零拷贝转发）**，同吞吐下
-> HAProxy 的 CPU 要多花一倍（0.59 → 0.33 CPU 秒/GB）。原委、行为差异与
+配置来源只有两个本地文件（**没有数据库**）：haproxy.cfg + rl-limiter 的
+YAML（`-c` 指定：stats socket 接线、cfg 路径、quotas 限额）。运行期轮询
+两者内容（5s），改了即热生效；文件短暂读不到时按最后一次配置继续跑
+（fail-static）。
+
+> 限速之前用的是 HAProxy 的 shared bwlim。换成 tc 是因为实测发现：**只要
+> 挂着 bwlim 滤镜，HAProxy 就会完全关闭内核 splice（零拷贝转发）**，同
+> 吞吐下 CPU 要多花一倍（0.59 → 0.33 CPU 秒/GB）。原委、行为差异与
 > **尚未验证的部分**见 [docs/06-tc限速方案.md](docs/06-tc限速方案.md)。
 >
 > 检查限速有没有真的生效：`python3 tools/tc_check.py doctor`（体检环境）、
 > `plan`（干跑看命令）、`verify`（核对网卡实况与配置是否一致）。
 
-> **同机部署的首要理由就是"改完立刻生效"**：只有在同一台机器上，服务
-> 才有可能直接改本机配置并 reload；跨机的集中服务做不到（要么开 SSH，
-> 要么另装 agent）。附带收益：stats socket 不占任何网络端口、无需对内网
-> 开放；一台机器的故障不外溢。
->
-> **受管区块**：rl-limiter 只重写 cfg 里 `# >>> BEGIN rl-limiter managed`
-> 与 `# <<< END rl-limiter managed` 之间的内容，标记之外（global、TLS、
-> ACL、手写的其它 backend）一个字节都不碰。
+> **同机部署的理由**：tc 只能在流量出口那台机器上做，限速与被限的流量
+> 必须同机。附带收益：stats socket 不占任何网络端口、无需对内网开放；
+> 一台机器的故障不外溢；rl-limiter 宕机不影响已下发的限速（tc 规则留在
+> 内核里）。
 
 ## 文档
 
 | 文档 | 说明 |
 | ---- | ---- |
 | [docs/00-需求说明.md](docs/00-需求说明.md) | 原始需求（名词定义、架构图、核心诉求） |
-| [docs/01-方案设计.md](docs/01-方案设计.md) | 方案设计（聚合限速、限额调整流程、监控与超限告警、MySQL 配置模型、容错） |
+| [docs/01-方案设计.md](docs/01-方案设计.md) | 方案设计（cfg 为权威的配置模型、tc 限速、监控与超限告警、容错） |
 | [docs/02-建议与讨论点.md](docs/02-建议与讨论点.md) | 需求改进建议与决策清单 |
-| [docs/03-限速服务运行指南.md](docs/03-限速服务运行指南.md) | 安装、配置来源（MySQL/YAML）、限额调整 SOP、HAProxy 侧接线 |
-| [docs/04-DockerCompose演示.md](docs/04-DockerCompose演示.md) | docker compose 一键演示（MySQL + 三台 Ubuntu 24.04 节点 + Web 控制台 + 可调并发压测） |
+| [docs/03-限速服务运行指南.md](docs/03-限速服务运行指南.md) | 安装、YAML/haproxy.cfg 两个配置文件怎么写、限额调整 SOP、HAProxy 侧接线 |
+| [docs/04-DockerCompose演示.md](docs/04-DockerCompose演示.md) | docker compose 一键演示（三台 Ubuntu 24.04 节点 + Web 控制台 + 可调并发压测） |
 | [docs/05-监控视图.md](docs/05-监控视图.md) | 监控视图：每条曲线的数据来源与口径 |
 | [docs/06-tc限速方案.md](docs/06-tc限速方案.md) | **限速为什么从 HAProxy bwlim 换成内核 tc**：实测依据、映射方式、行为差异，以及尚未验证的部分 |
-| [docs/07-监控数据回查.md](docs/07-监控数据回查.md) | **90 天回查怎么存怎么查**：分级保留、聚合语义、真实 MariaDB 上的容量与耗时实测 |
 | [docs/08-内核参数调优.md](docs/08-内核参数调优.md) | **让瓶颈落在 maxconn 而不是内核默认值上**：初始化阶段的 sysctl 调优与 FD 预检、哪些容器里改不动、怎么验证真的生效 |
-| [docs/09-裸机部署.md](docs/09-裸机部署.md) | **HAProxy 已装好的机器上怎么加 rl-limiter**：一键装机脚本、只起配置库的 compose、三项权限的由来 |
+| [docs/09-裸机部署.md](docs/09-裸机部署.md) | **HAProxy 已装好的机器上怎么加 rl-limiter**：一键装机脚本、两份配置文件、权限的由来 |
 
 ## 系统组成
 
 ```
 rl_limiter/       # Python 3.11 + asyncio 服务（与 HAProxy 同机）
-  model.py        #   共享领域类型（单位约定、FrontendConfig/ServerEntry、接线）
+  model.py        #   共享领域类型（单位约定、FrontendConfig、接线）
   haproxy.py      #   HAProxy runtime API 客户端（unix / TCP stats socket，只读采样）
   window.py       #   滑动窗口 + EWMA
   collector.py    #   每秒采样，按 frontend 产出用量；fail-static 与降级
-  dbconfig.py     #   MySQL 配置源（启动加载 + 轮询热更新 + 控制台写回，RL_MYSQL_* 接线）
-  enforcer.py     #   配置下发：渲染受管区块 → haproxy -c 校验 → 原子替换 → reload
+  cfgparse.py     #   从本机 haproxy.cfg 解析受管 frontend 清单 + 双文件轮询热更新
   tcshaper.py     #   限速下发：把限额落到本机网卡的 tc（HTB），按源端口分类
-  config.py       #   配置解析与校验（YAML 与数据库共用同一管线）
-  metricstore.py  #   监控数据分级落库与回查（1min×7天 / 5min×90天）
-  webconsole.py   #   内置 Web 控制台（带宽曲线 + 端口/限额/后端服务器管理）
+  config.py       #   YAML 配置解析与校验（接线 + quotas 限额登记）
+  webconsole.py   #   内置 Web 控制台（只读：带宽曲线 + 实例视图 + 日志）
   loop.py         #   1s 监控主循环（采集 → 超限判定 → 发布）
 tools/            # fake_haproxy.py（联调假节点，支持 unix / TCP）
-                  # bootstrap_db.py（把本机登记进配置库，幂等、只增不改）
                   # random_web.py（随机大小响应的模拟后端）、loadgen.py（可调并发压测）
                   # tc_check.py（限速检查：plan 干跑 / doctor 体检 / verify 核对）
-deploy/           # systemd（同机形态）、haproxy 骨架配置示例、
-                  # YAML 示例配置、mysql/init.sql（配置库建表+种子）
+deploy/           # systemd（同机形态）、haproxy 完整配置示例、YAML 示例配置
   docker/         #   node-entrypoint.sh（节点入口：环境预检 + haproxy + rl-limiter）、
-                  #   haproxy-base.cfg（compose 用的 global/defaults 骨架）
+                  #   haproxy-base.cfg（compose 用的完整 haproxy.cfg）、
+                  #   limiter-node.yaml（compose 用的节点 YAML）
   sysctl/         #   tune-kernel.sh（内核参数调优表：apply 调优 / check 体检 /
                   #   dump 出 sysctl.d 配置。初始化阶段自动跑）
   bare/           #   裸机部署：rl-limiter.sh（一键装机+体检）、systemd unit
-                  #   模板、rl-limiter.env 模板、只起 MySQL 的 compose
-docker-compose.yml # 一键演示：MySQL + 三台 Ubuntu 24.04 节点 + 模拟后端 + 压测
+                  #   模板、rl-limiter.env 模板
+docker-compose.yml      # 单节点环境（HAProxy + 同机 rl-limiter）
+docker-compose-demo.yml # 一键演示：三台节点 + 模拟后端 + 压测
 ```
 
 ## 核心思路一句话
 
-配置库是唯一数据源：一个 frontend = 一个监听端口 + 一个 tc 速率类 +
-一组后端服务器。rl-limiter 把监听端口与后端渲染进本机 haproxy.cfg 的受管
-区块并 reload，把限额下发到本机网卡的 tc 上，同一份限额同时作为超限告警
-基准——同源，因此不存在"库改了、数据面忘了改"的漂移。tc 把该端口全部连接
-的**总**下行速率硬限在限额内，存量长连接持续受控；上游流量靠 TCP 背压
-自然收敛。
-监控每秒采 `bytes_out`（前提 `option contstats`）算 10 秒滑动均值；
-rl-limiter 宕机不影响已下发的限速。
+haproxy.cfg 定义"有哪些监听端口、转发到哪"，YAML 的 quotas 按段名登记
+"每个端口限多少 Mbps"。一个 frontend = 一个监听端口 = 一个 tc 速率类；
+tc 把该端口全部连接的**总**下行速率硬限在限额内，存量长连接持续受控，
+上游流量靠 TCP 背压自然收敛。同一份限额同时是超限告警基准——同源，因此
+不存在"配置改了、数据面忘了改"的漂移。cfg 里有但未登记限额的端口**只
+监控不限速**。监控每秒采 `bytes_out`（前提 `option contstats`）算 10 秒
+滑动均值；rl-limiter 宕机不影响已下发的限速。
 
 ## 快速开始
 
 ```bash
 make install    # pip install -e ".[test]"
 make test       # 全量单元测试
-# 本地最小演示（假 HAProxy unix socket + standalone YAML）见 docs/03
+# 本地最小演示（假 HAProxy unix socket + YAML）见 docs/03
 
-make demo-up    # docker compose 一键演示：MySQL 配置 + 三台 Ubuntu 24.04
-                # 节点（每台 = HAProxy TCP L4 转发 + 内核 tc 限速 + 同机 rl-limiter）
+make demo-up    # docker compose 一键演示：三台 Ubuntu 24.04 节点（每台 =
+                # HAProxy TCP L4 转发 + 内核 tc 限速 + 同机 rl-limiter）
                 # + 随机大小响应后端 + 可调并发压测
                 # 每台节点各一个控制台：http://localhost:8090 / :8092 / :8093
 make demo-logs  # 观察各节点监控与 loadgen 分入口吞吐表格
-make demo-down  # 收场（含 MySQL 数据卷）
+make demo-down  # 收场
 ```
 
-**往已经装好 HAProxy 的机器上加 rl-limiter**（两个都跑在本机，只有配置库
-用 Docker）——见 [docs/09-裸机部署.md](docs/09-裸机部署.md)：
+**往已经装好 HAProxy 的机器上加 rl-limiter**（全部跑在本机，无任何容器/
+数据库依赖）——见 [docs/09-裸机部署.md](docs/09-裸机部署.md)：
 
 ```bash
-sudo BOOTSTRAP_BACKEND=10.0.0.21:9000 deploy/bare/rl-limiter.sh install
+sudo deploy/bare/rl-limiter.sh install
 deploy/bare/rl-limiter.sh check     # 体检：只看不改
 ```
 
-装机脚本**不碰你的 haproxy.cfg**（缺 stats socket 时只告诉你该加哪一行），
-起来之后会跑一遍 `tc_check.py verify` 逐条核对限速真的在生效。
+装机脚本**不碰你的 haproxy.cfg**（缺 stats socket / contstats 时只告诉你
+该加哪一行），起来之后会跑一遍 `tc_check.py verify` 逐条核对限速真的在
+生效。
 
-**配置来源二选一**：设置 `RL_MYSQL_HOST` 等环境变量时从 **MySQL** 读取
-并轮询热更新（Web 控制台写的也是它）；否则回落到 `-c` 指定的本地 YAML
-（standalone/开发用，此时控制台的写接口返回 409）。`RL_NODE_NAME` 指定
-本实例对应配置库里的哪个 HAProxy 实例——多台机器可共用一个配置库，各自
-只读写属于自己的行。
+**配置调整 SOP**（都是普通文件编辑，没有别的入口）：
 
-**配置下发**：设 `RL_APPLY_HAPROXY_CFG=<本机 haproxy.cfg 路径>` 启用。
-下发逻辑幂等且持续 reconcile（变更即触发 + 30s 兜底），所以手改 cfg 会被
-自动拉回——**配置漂移从"被动告警"变成"自动修复"**。不设则完全不写盘、
-不 reload，退化为只读监控。所需授权（cfg 目录可写、polkit/sudoers 授权
-reload）见 `deploy/systemd/rl-limiter.service` 文件头。
+- **改限额** → 改 YAML 的 `quotas` 段。5s 内热生效（`tc class change`，
+  不 reload，存量连接立刻按新限额跑）；
+- **改端口/后端** → 改 haproxy.cfg → `systemctl reload haproxy`。
+  rl-limiter 轮询到 cfg 内容变化后自动更新监控清单与 tc 分类。
 
 **内核参数**：节点初始化阶段（启动 HAProxy 之前）自动跑
 `deploy/sysctl/tune-kernel.sh`，把高并发/高带宽相关的 sysctl 抬到位，
@@ -130,23 +125,16 @@ reload）见 `deploy/systemd/rl-limiter.service` 文件头。
 `tune-kernel.sh check`，宿主机持久化用 `dump`；详见
 [docs/08-内核参数调优.md](docs/08-内核参数调优.md)。
 
-**Web 控制台**：`RL_CONSOLE_PORT` 启用，`RL_CONSOLE_BIND` 指定监听地址
-（默认 `127.0.0.1`）。控制台**无鉴权且带写接口**，放到内网必须配合
-防火墙/安全组限制来源。三个 tab：**实例**（整台 HAProxy 的连接/带宽/
-数据包视图）、**监听端口**（每个 frontend 的监控曲线 + 配置编辑）、
-**日志**。数据包与丢包取自本机网卡 `/proc/net/dev`（`RL_NIC` 指定网卡）
-——HAProxy 完全不统计数据包，因此它们是**整机口径**且无法按 frontend
-拆分；每条曲线的来源与口径见 [docs/05-监控视图.md](docs/05-监控视图.md)。
+**Web 控制台（只读）**：`RL_CONSOLE_PORT` 启用，`RL_CONSOLE_BIND` 指定
+监听地址（默认 `127.0.0.1`）。控制台**无鉴权**（暴露全量监控数据与运行
+日志），放到内网必须配合防火墙/安全组限制来源。三个 tab：**实例**（整台
+HAProxy 的连接/带宽/数据包视图）、**监听端口**（每个 frontend 的监控曲线
+与配置视图）、**日志**。实时曲线保留最近约 10 分钟（内存）；更久的历史
+回查请对接外部监控系统（Prometheus 等），本服务不落库。每条曲线的来源与
+口径见 [docs/05-监控视图.md](docs/05-监控视图.md)。
 
-**配后端服务器不用一台一台点**：编辑面板里有「批量填充」——把一列地址
-粘进去即可，名称按前缀（默认 `srv`）自动编号。地址支持 `10.0.0.5:9000`
-与末段区间 `10.0.0.20-24`；端口只填一个就套用到所有地址，也可以给一列
-一一对应（数量对不上**直接报错，不猜**）。往表格的「地址」「端口」格子
-里直接粘贴多行同样会自动展开成多行。
-
-**默认值不设限**：新建监听端口的限额默认 **50000 Mbps**（限速的配置单位
-一律是 Mbps——库、YAML、控制台三处同一个字段同一个单位），frontend 级
-`maxconn` 默认不设，HAProxy 骨架的 `maxconn`
-默认 100 万——**要限速/限并发时再显式往下调**，而不是让人在排查"为什么这么
-慢"时最后发现是某个默认值。100 万连接对应 400 万 fd，宿主机的
-`fs.nr_open` 得先抬上去，见 [docs/08](docs/08-内核参数调优.md)。
+**默认值不设限**：HAProxy 示例配置的 `maxconn` 默认 100 万——**要限并发
+时再显式往下调**，而不是让人在排查"为什么这么慢"时最后发现是某个默认值。
+100 万连接对应 400 万 fd，宿主机的 `fs.nr_open` 得先抬上去，见
+[docs/08](docs/08-内核参数调优.md)。限速的配置单位一律是 **Mbps**
+（quotas 里填 40 就是 40 Mbps，允许小数）。

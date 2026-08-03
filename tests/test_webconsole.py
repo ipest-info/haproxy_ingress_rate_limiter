@@ -1,5 +1,6 @@
-# tests.test_webconsole —— 控制台的 StatusHub（快照合成/订阅/概览）与
-# 写接口的应答契约。HTTP 层用 aiohttp 的测试工具直接打真实路由。
+# tests.test_webconsole —— 控制台的 StatusHub（快照合成/订阅/概览）。
+# 控制台是**只读**的（配置改文件，不走页面）；HTTP 层用 aiohttp 的
+# 测试工具直接打真实路由。
 
 from __future__ import annotations
 
@@ -10,9 +11,7 @@ from rl_limiter import model, webconsole
 
 
 def fe(name="fe_a", quota_mbps=8.0, port=8080):
-    return model.FrontendConfig(
-        name=name, bind_port=port, quota_mbps=quota_mbps,
-        servers=[model.ServerEntry(name="s1", address="10.0.0.1", port=80)])
+    return model.FrontendConfig(name=name, bind_port=port, quota_mbps=quota_mbps)
 
 
 def usage(name="fe_a", mean10=0.0, rate=0.0, conn=0, degraded=False):
@@ -104,12 +103,11 @@ def test_haproxy_view_reports_endpoint_and_health():
 
 
 def test_overview_exposes_frontend_config():
-    """界面的编辑表单以 overview 的 frontends 为初值。"""
+    """页面的配置视图（只读）以 overview 的 frontends 为数据源。"""
     o = hub().overview()
     f = o["frontends"]["fe_a"]
     assert f["bind_port"] == 8080 and f["quota_mbps"] == 8.0
     assert f["quota_bytes_per_s"] == 1_000_000
-    assert [s["name"] for s in f["servers"]] == ["s1"]
 
 
 def test_history_is_bounded():
@@ -128,34 +126,13 @@ def test_subscriber_drops_oldest_when_slow():
     assert q.qsize() == webconsole.SUBSCRIBER_QUEUE_DEPTH
 
 
-def test_record_enforce_tracks_success_and_failure():
-    h = hub()
-    assert h.overview()["enforce"] is None      # 未启用下发
-
-    class R:
-        def __init__(self, ok, changed, err="", fes=()):
-            self.ok, self.changed, self.error = ok, changed, err
-            self.frontends = list(fes)
-
-    h.record_enforce(R(True, True, fes=["fe_a"]))
-    e = h.overview()["enforce"]
-    assert e["enabled"] and e["ok"] and e["applied"] == ["fe_a"]
-    assert e["last_change_ts"] is not None
-
-    h.record_enforce(R(False, False, err="haproxy -c 挂了"))
-    e = h.overview()["enforce"]
-    assert not e["ok"] and "haproxy -c 挂了" in e["error"]
-    # 失败不该抹掉"上次成功下发的时间"，那是排障时的重要参照。
-    assert e["last_change_ts"] is not None
-
-
 # ---------------------------------------------------------------------------
 # HTTP 接口
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 async def client():
-    app = webconsole.build_app(hub(), webconsole.LogBuffer(), None,
+    app = webconsole.build_app(hub(), webconsole.LogBuffer(),
                                __import__("logging").getLogger("t"))
     async with TestClient(TestServer(app)) as c:
         yield c
@@ -168,15 +145,14 @@ async def test_overview_endpoint(client):
     assert "fe_a" in body["frontends"]
 
 
-async def test_write_endpoints_require_db_mode(client):
-    """纯 YAML 部署没有可写的配置源：写接口应 409 并说清原因，而不是
-    假装成功。"""
+async def test_no_write_routes(client):
+    """只读契约：控制台不提供任何配置写接口——配置的修改入口是
+    haproxy.cfg 与 YAML 文件本身。"""
     for method, path in (("put", "/api/frontends/fe_a"),
                          ("post", "/api/frontends"),
                          ("delete", "/api/frontends/fe_a")):
         r = await getattr(client, method)(path, data="{}")
-        assert r.status == 409, path
-        assert "MySQL" in (await r.json())["error"]
+        assert r.status in (404, 405), path
 
 
 async def test_index_declares_utf8(client):

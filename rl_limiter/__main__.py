@@ -1,17 +1,18 @@
 # rl_limiter.__main__ —— rl-limiter 服务入口（单 HAProxy 模型）。
 #
-# 一个实例管**一台**与它同机的 HAProxy，做两件事：
+# 一个实例管**一台**与它同机的 HAProxy。**haproxy.cfg 是负载均衡配置的
+# 唯一权威**：监听端口、模式、后端服务器都由运维直接写在 cfg 里，
+# rl-limiter 只**读** cfg（cfgparse）解析出受管 frontend 清单，与 YAML
+# 里登记的限额（quotas）合并后做两件事：
 #
-#   1. **监控**：每秒经本机 unix stats socket 采样各受管 frontend 的
-#      bytes_out，产出带宽视图（Web 控制台实时展示）并做持续超限告警；
-#   2. **下发**：把配置（监听端口、限额、后端服务器）渲染进本机
-#      haproxy.cfg 的受管区块并 reload，让 Web 界面上的改动立刻生效
-#      （由 RL_APPLY_HAPROXY_CFG 开启，见 enforcer 模块）。
+#   1. **限速**：把限额下发到本机网卡的内核 tc（HTB，按源端口分类）；
+#   2. **监控**：每秒经本机 unix stats socket 采样各 frontend 的
+#      bytes_out，产出带宽视图（Web 控制台实时展示）并做持续超限告警。
 #
-# 与配置来源断联时按最后一次加载的配置继续运行（fail-static）。
-#
-# RL_NODE_NAME 指定本实例对应配置库里的哪个 HAProxy 实例——多台机器可以
-# 共用一个配置库，各自只读写属于自己的行。
+# 配置来源只有本地 YAML（-c）+ haproxy.cfg 两个文件；运行期轮询两者，
+# 内容变化即热生效（cfg 改了 reload HAProxy 后，rl-limiter 的限速与
+# 监控清单自动跟上）。文件读不到时按最后一次加载的配置继续运行
+# （fail-static）。
 
 from __future__ import annotations
 
@@ -22,10 +23,9 @@ import os
 import signal
 import sys
 
+from . import cfgparse
 from . import config as configmod
-from . import dbconfig
-from . import enforcer as enforcermod
-from . import haproxy, metricstore, model
+from . import haproxy, model
 from . import netdev
 from . import tcshaper as tcmod
 from . import webconsole
@@ -42,29 +42,13 @@ try:
 except Exception:  # pragma: no cover - 未安装场景
     SERVICE_VERSION = "dev"
 
-# 本实例对应配置库 haproxy_instances 里的哪一行。多台机器共用一个配置库
-# 时靠它区分；数据库模式下必设，本地 YAML 模式忽略（YAML 自带 haproxy 段）。
-ENV_NODE_NAME = "RL_NODE_NAME"
-DEFAULT_INSTANCE = "haproxy"
-# Web 控制台监听地址。默认只绑回环：控制台**没有鉴权**且带写接口（改
-# 监听端口、改限额、改后端服务器、删 frontend），默认对外可达是不可
-# 接受的。要让同网段访问，由运维显式设成内网地址并配合防火墙/安全组
-# 限制来源。
+# Web 控制台监听地址。默认只绑回环；要让同网段访问，由运维显式设成
+# 内网地址并配合防火墙/安全组限制来源。
 ENV_CONSOLE_BIND = "RL_CONSOLE_BIND"
 DEFAULT_CONSOLE_BIND = "127.0.0.1"
 
-# 配置自动下发（同机部署才可能做到的事）：设为本机 haproxy.cfg 路径即
-# 启用——配置一改，本机 rl-limiter 立刻把监听端口/限额/后端服务器渲染进
-# cfg 的受管区块并 reload。不设则完全不写盘、不 reload，退化为只读监控。
-#
-# 这两项**只能来自本机环境变量，绝不从配置库读**：若 reload 命令可由库
-# 指定，拿到库写权限就等于在每台 HAProxy 上远程执行任意命令。
-ENV_APPLY_CFG = "RL_APPLY_HAPROXY_CFG"
-ENV_APPLY_RELOAD_CMD = "RL_APPLY_RELOAD_CMD"
-DEFAULT_RELOAD_CMD = "systemctl reload haproxy"
-# reconcile 兜底周期（秒）：变更是事件驱动的，这个只用来纠正手改 cfg
-# 与重试失败的应用。
-ENV_APPLY_PERIOD_S = "RL_APPLY_PERIOD_S"
+# tc reconcile 兜底周期（秒）：限额变更是事件驱动的即时下发，这个只用来
+# 纠正"有人手动改了 tc 规则"与重试失败的下发。
 DEFAULT_APPLY_PERIOD_S = 30.0
 
 # 限速网卡。限速由内核 tc 执行（见 tcshaper 模块），作用在这张网卡的
@@ -82,40 +66,33 @@ ENV_TC_IFACE = "RL_TC_IFACE"
 # 不设则跟随 RL_TC_IFACE；设为 "-" 表示禁用入向包统计。
 ENV_NIC = "RL_NIC"
 
-# 监控数据落库（90 天回查）。默认开启，仅在数据库配置模式下生效——落库表
-# 与配置表在同一个库里，纯 YAML 部署没有可写的地方。设为 0/false 关闭
-# （此时只有内存里最近 10 分钟的实时曲线，没有历史回查）。
-# 分级保留与容量实测见 docs/07-监控数据回查.md。
-ENV_METRICS_RETENTION = "RL_METRICS_RETENTION"
-
 
 def _summarize_frontends(frontends: list[model.FrontendConfig]) -> str:
     """把受管 frontend 清单压缩成单个日志字段，格式：
-    "fe_main@:8080,quota=40Mbps,servers=2;..."。
-    限额按配置口径的 Mbps 输出，与库/YAML/控制台里填的是同一个数。"""
+    "fe_main@:8080,quota=40Mbps;fe_tcp@:8081,quota=不限（仅监控）"。
+    限额按配置口径的 Mbps 输出，与 YAML/控制台里填的是同一个数。"""
     return ";".join(
-        f"{f.name}@{f.bind_spec},quota={f.quota_mbps}Mbps,"
-        f"mode={f.mode},servers={len(f.servers)}"
+        f"{f.name}@{f.bind_spec},"
+        f"quota={f.quota_mbps:g}Mbps" if f.limited else
+        f"{f.name}@{f.bind_spec},quota=不限（仅监控）"
         for f in frontends
     )
 
 
 async def _amain(cfg, log: logging.Logger,
-                 db_opts: dbconfig.MySQLOptions | None = None,
+                 yaml_path: str,
+                 boot_frontends: list[model.FrontendConfig],
                  console_port: int = 0,
                  logbuf: "webconsole.LogBuffer | None" = None,
-                 instance: str = DEFAULT_INSTANCE,
                  console_bind: str = DEFAULT_CONSOLE_BIND,
-                 enforcer: "enforcermod.HAProxyEnforcer | None" = None,
                  apply_period_s: float = DEFAULT_APPLY_PERIOD_S,
                  shaper: "tcmod.TcShaper | None" = None,
-                 nic: str = "",
-                 metrics_retention: bool = True) -> None:
+                 nic: str = "") -> None:
     """事件循环内的主体：组装组件、引导配置、并发运行监控循环与配置源。
 
-    db_opts 非 None 表示配置来自 MySQL（数据库配置模式，生产权威）：
-    额外运行一个数据库轮询任务，把配置变化经配置队列热应用到监控循环；
-    db_opts 为 None 时按引导时的本地 YAML 静态运行（standalone）。
+    boot_frontends 是启动时从 haproxy.cfg 解析并合并限额后的受管清单；
+    运行期由 cfgparse.watch 轮询 cfg 与 YAML，两者内容变化即经配置队列
+    热应用到监控循环（tc 限速与告警基准随之更新）。
 
     console_port 非 0 时启动内置 Web 控制台（实时观测，见 webconsole
     模块）：sampler 每拍向 StatusHub 发布一帧快照，配置热更经中继队列
@@ -148,47 +125,28 @@ async def _amain(cfg, log: logging.Logger,
             haproxy=cfg.haproxy,
             degraded_fn=lambda: col.degraded)
 
-    # 监控数据落库（90 天回查）。只在数据库模式下启用——落库表与配置表
-    # 在同一个库里，纯 YAML 部署没有可写的地方。
-    store = None
-    if db_opts is not None and metrics_retention:
-        store = metricstore.MetricStore(db_opts, instance, log)
-
-    # sampler 要同时喂给控制台（内存实时曲线）与落库（分级聚合）。落库只
-    # 做内存累加、不做 IO，因此这里多挂一个 sink 不会拖慢监控循环。
-    def sampler(now, usages, inst=None):
-        if hub is not None:
-            hub.record(now, usages, inst)
-        if store is not None:
-            store.record(now, usages, inst, ctl.quotas_view())
-    if hub is None and store is None:
-        sampler = None
-    # 配置下发启用时，监控循环每应用一份配置就 set 这个事件，enforcer
-    # 任务据此立刻把新配置写进本机 haproxy.cfg（见 enforcer 模块头）。
-    # 配置一变就叫醒"下发"类任务（写 cfg 的 enforcer、下发限速的 tcshaper）。
-    # **各持一个 Event**：任务醒来后会 clear 自己的事件，共用会让其中一个
-    # 漏掉变更（见 MonitorLoop.__init__ 的说明）。
-    cfg_applied = asyncio.Event() if enforcer is not None else None
+    # sampler：监控循环每拍喂给控制台（内存实时曲线）。
+    sampler = hub.record if hub is not None else None
+    # 配置一变就叫醒"下发"类任务（下发限速的 tcshaper）：监控循环每应用
+    # 一份配置就 set 这个事件。
     tc_applied = asyncio.Event() if shaper is not None else None
-    config_applied = [e for e in (cfg_applied, tc_applied) if e is not None]
+    config_applied = [e for e in (tc_applied,) if e is not None]
     ctl = MonitorLoop(col, sampler=sampler, log=log,
                       config_applied=config_applied)
 
-    # --- 启动引导（seed）：用加载到的配置（数据库或本地 YAML）构造首份
-    # 运行期配置直接喂给监控循环。数据库配置模式下引导配置的版本号取
-    # 内容校验和，并把它作为轮询任务的变更检测基准——首轮轮询读到同样
-    # 内容时不会再触发一次重复应用。
-    seed_version = (
-        dbconfig.config_checksum(cfg.frontends) if db_opts is not None else 0
-    )
-    seed_cfg = cfg.to_controller_config(seed_version)
+    # --- 启动引导（seed）：用启动时解析出的受管清单构造首份运行期配置
+    # 直接喂给监控循环。版本号取内容校验和，watch 以同一算法做变更检测
+    # 基准——首轮轮询读到同样内容时不会再触发一次重复应用。
+    seed_version = cfgparse.checksum(boot_frontends)
+    seed_cfg = model.ControllerConfig(version=seed_version,
+                                      frontends=list(boot_frontends))
     ctl.seed(seed_cfg)
     if hub is not None:
         hub.update_config(seed_cfg)
-    log.info("已用%s配置完成引导（监控单位=frontend） version=%s "
-             "frontends=%d detail=%s",
-             "数据库" if db_opts is not None else "本地静态",
-             seed_version, len(cfg.frontends), _summarize_frontends(cfg.frontends))
+    log.info("已用 haproxy.cfg + YAML 限额完成引导（监控单位=frontend） "
+             "version=%s frontends=%d detail=%s",
+             seed_version, len(boot_frontends),
+             _summarize_frontends(boot_frontends))
 
     # --- 信号处理：SIGINT/SIGTERM 触发优雅退出（记录信号名后取消任务）。
     stop = asyncio.Event()
@@ -204,18 +162,15 @@ async def _amain(cfg, log: logging.Logger,
         except NotImplementedError:  # pragma: no cover - 非 Unix 平台兜底
             signal.signal(sig, lambda *_a, _n=sig.name: _on_signal(_n))
 
-    # --- 并发运行：监控循环 + 配置源（数据库轮询）+ 可选的 Web 控制台。
-    # config_queue 是监控循环的配置入口（配置优先于 tick）：数据库模式下
-    # 由轮询任务投递内容变化；standalone（本地 YAML）没有运行期配置源，
-    # 传 None，循环按引导配置静态运行。
+    # --- 并发运行：监控循环 + 配置源（cfg/YAML 轮询）+ 可选的 Web 控制台。
+    # config_queue 是监控循环的配置入口（配置优先于 tick）：由 cfgparse
+    # 的轮询任务投递内容变化。
     tick_interval_s = getattr(cfg, "tick_interval_s", 1.0) or 1.0
     tasks: list[asyncio.Task] = []
 
-    source_queue: asyncio.Queue | None = None
-    if db_opts is not None:
-        source_queue = asyncio.Queue()
+    source_queue: asyncio.Queue = asyncio.Queue()
 
-    # 控制台需要跟随配置热更（限额参考线、分组展示）：在源队列与循环
+    # 控制台需要跟随配置热更（限额参考线、清单变化）：在源队列与循环
     # 之间加一级中继，把每份新配置先喂给 hub 再原样转投循环——配置视图
     # 与循环实际应用的内容出自同一份对象，永不发散。无控制台时直连。
     config_queue = source_queue
@@ -235,46 +190,31 @@ async def _amain(cfg, log: logging.Logger,
 
     tasks.append(asyncio.create_task(
         ctl.run(config_queue, tick_interval_s), name="monitor-loop"))
-    if db_opts is not None:
-        tasks.append(asyncio.create_task(
-            dbconfig.watch(db_opts, source_queue, cfg, log, instance),
-            name="db-config-watch"))
+    tasks.append(asyncio.create_task(
+        cfgparse.watch(cfg.haproxy.cfg_path, yaml_path, source_queue,
+                       boot_frontends, log),
+        name="cfg-watch"))
     if hub is not None:
         tasks.append(asyncio.create_task(
-            webconsole.run_console(console_port, hub, logbuf, db_opts, log,
-                                   bind=console_bind, instance=instance,
-                                   store=store),
+            webconsole.run_console(console_port, hub, logbuf, log,
+                                   bind=console_bind),
             name="web-console"))
-    if store is not None:
-        tasks.append(asyncio.create_task(
-            metricstore.run_metric_store(store, log), name="metric-store"))
-    if enforcer is not None and cfg_applied is not None:
-        # 目标配置取自监控循环当前生效的那一份。每次 reconcile 现取，
-        # 因此配置热更后拿到的必然是新值。
-        def _desired() -> list[model.FrontendConfig]:
-            return ctl.frontends()
-
-        tasks.append(asyncio.create_task(
-            enforcermod.run_enforcer(
-                enforcer, _desired, cfg_applied, log,
-                on_result=(hub.record_enforce if hub is not None else None),
-                period_s=apply_period_s),
-            name="cfg-enforcer"))
 
     if shaper is not None and tc_applied is not None:
-        # 限速任务与 cfg 下发任务各自独立 reconcile：一个失败不牵连另一个。
-        # 两者共享同一个"配置已更新"事件——asyncio.Event 是电平触发，
-        # 一次 set 能同时唤醒多个等待者。
+        # 限速下发：配置热更即时触发 + 周期 reconcile 兜底（纠正手改的
+        # tc 规则、重试失败的下发）。只对登记了限额的 frontend 建类。
         tasks.append(asyncio.create_task(
-            tcmod.run_shaper(shaper, lambda: ctl.frontends(), tc_applied,
-                             log, period_s=apply_period_s),
+            tcmod.run_shaper(
+                shaper,
+                lambda: [f for f in ctl.frontends() if f.limited],
+                tc_applied, log, period_s=apply_period_s),
             name="tc-shaper"))
 
     log.info("rl-limiter 服务已启动，监控循环开始运行 instance=%s "
-             "endpoint=%s apply=%s frontends=%d version=%s",
+             "endpoint=%s cfg=%s frontends=%d version=%s",
              cfg.haproxy.name, cfg.haproxy.endpoint(),
-             enforcer.cfg_path if enforcer is not None else "off",
-             len(cfg.frontends), SERVICE_VERSION)
+             cfg.haproxy.cfg_path,
+             len(boot_frontends), SERVICE_VERSION)
 
     # 等待退出信号；任一常驻任务意外结束（本应永续运行）也触发整体退出，
     # 交由 systemd Restart=always 拉起，比带着半残状态继续跑更安全。
@@ -285,14 +225,6 @@ async def _amain(cfg, log: logging.Logger,
         if t is not stop_task and t.exception() is not None:
             log.error("常驻任务异常退出，服务整体退出交由 systemd 拉起 "
                       "task=%s err=%s", t.get_name(), t.exception())
-    # 停机前把未关闭的监控桶写完（最多等几秒）。不做的话每次重启都会在
-    # 历史曲线上留一个缺口，见 MetricStore.flush。
-    if store is not None:
-        try:
-            await store.drain()
-        except Exception as e:
-            log.warning("停机时写出监控数据失败，已跳过 err=%s", e)
-
     for t in (stop_task, *tasks):
         t.cancel()
     await asyncio.gather(stop_task, *tasks, return_exceptions=True)
@@ -301,23 +233,23 @@ async def _amain(cfg, log: logging.Logger,
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="rl-limiter",
-        description="HAProxy 入口带宽限速与监控：管理本机 HAProxy 的监听"
-                    "端口、限额与后端服务器（写入 cfg 受管区块并 reload），"
-                    "并每秒采样各 frontend 的下行带宽做持续超限告警",
-        epilog="一个实例管一台同机的 HAProxy。RL_NODE_NAME 指定本实例"
-               "对应配置库里的哪个 HAProxy 实例（默认 haproxy）。"
-               "配置来源二选一：设置 RL_MYSQL_HOST（及 RL_MYSQL_PORT/USER/"
-               "PASSWORD/DB/POLL_S）后从 MySQL 数据库读取配置并轮询热更新；"
-               "未设置时回落到 -c 指定的本地 YAML 文件。"
-               "配置下发：设置 RL_APPLY_HAPROXY_CFG=<本机 haproxy.cfg 路径> "
-               "即启用（改配置后自动写入受管区块并 reload）。"
+        description="HAProxy 入口带宽限速与监控：以本机 haproxy.cfg 为负载"
+                    "均衡配置的唯一权威，解析出受管监听端口清单，把 YAML 里"
+                    "登记的限额下发到内核 tc（HTB，按源端口分类），并每秒"
+                    "采样各 frontend 的下行带宽做持续超限告警",
+        epilog="一个实例管一台同机的 HAProxy。配置来源是两个本地文件："
+               "-c 指定的 YAML（接线 + 限额 quotas）与其中 haproxy.cfg_path "
+               "指向的 haproxy.cfg（监听端口/模式，由运维直接编辑，"
+               "rl-limiter 只读不写）；运行期轮询两者，内容变化即热生效。"
+               "限速网卡用 RL_TC_IFACE 指定（默认取默认路由的出口网卡，"
+               "设 - 则关闭限速、只保留监控）。"
                "Web 控制台：设置 RL_CONSOLE_PORT 启用，RL_CONSOLE_BIND 指定"
-               "监听地址（默认 127.0.0.1——控制台无鉴权且带写接口）。"
-               "实例监控视图的数据包统计取自 /proc/net/dev，RL_NIC 指定网卡"
-               "（默认自动选默认路由的出口网卡，设 - 则禁用）。")
+               "监听地址（默认 127.0.0.1——控制台无鉴权）。"
+               "实例监控视图的入向数据包统计取自 /proc/net/dev，RL_NIC 指定"
+               "网卡（默认跟随限速网卡，设 - 则禁用）。")
     parser.add_argument(
         "-c", "--config", default="/etc/rl-limiter/config.yaml",
-        help="YAML 配置文件路径（默认 %(default)s；设置 RL_MYSQL_HOST 时忽略）")
+        help="YAML 配置文件路径（默认 %(default)s）")
     parser.add_argument(
         "--version", action="store_true", help="打印版本号后退出")
     args = parser.parse_args()
@@ -326,11 +258,9 @@ def main() -> None:
         print("rl-limiter", SERVICE_VERSION)
         return
 
-    # 日志先以 INFO 起步：数据库配置模式下"等待 MySQL 就绪"的重试告警
-    # 发生在配置加载完成之前，此时还不知道配置里的 log_level；加载成功后
-    # 再把根 logger 调到配置指定的级别。格式固定为"时间 级别 消息"三段；
-    # 消息本体统一为中文描述 + 英文 snake_case 的 key=value 键值对，便于
-    # grep 与日志采集系统按字段解析。
+    # 日志先以 INFO 起步，配置加载成功后再把根 logger 调到配置指定的级别。
+    # 格式固定为"时间 级别 消息"三段；消息本体统一为中文描述 + 英文
+    # snake_case 的 key=value 键值对，便于 grep 与日志采集系统按字段解析。
     logging.basicConfig(
         stream=sys.stderr,
         level=logging.INFO,
@@ -361,36 +291,6 @@ def main() -> None:
     console_bind = (os.environ.get(ENV_CONSOLE_BIND) or "").strip() \
         or DEFAULT_CONSOLE_BIND
 
-    # 本实例对应配置库里的哪个 HAProxy 实例（数据库模式下用它取行）。
-    instance = (os.environ.get(ENV_NODE_NAME) or "").strip() or DEFAULT_INSTANCE
-
-    # 配置自动下发：设了本机 haproxy.cfg 路径即启用。
-    apply_cfg = (os.environ.get(ENV_APPLY_CFG) or "").strip()
-    enforcer = None
-    apply_period_s = DEFAULT_APPLY_PERIOD_S
-    if apply_cfg:
-        if not os.path.isfile(apply_cfg):
-            print(f"rl-limiter: {ENV_APPLY_CFG} 指向的文件不存在: {apply_cfg}",
-                  file=sys.stderr)
-            raise SystemExit(1)
-        raw_period = (os.environ.get(ENV_APPLY_PERIOD_S) or "").strip()
-        if raw_period:
-            try:
-                apply_period_s = float(raw_period)
-            except ValueError:
-                print(f"rl-limiter: {ENV_APPLY_PERIOD_S} 必须是数字，"
-                      f"当前值 {raw_period!r}", file=sys.stderr)
-                raise SystemExit(1)
-            if apply_period_s <= 0:
-                print(f"rl-limiter: {ENV_APPLY_PERIOD_S} 必须为正数，"
-                      f"当前值 {apply_period_s}", file=sys.stderr)
-                raise SystemExit(1)
-        enforcer = enforcermod.HAProxyEnforcer(
-            apply_cfg,
-            (os.environ.get(ENV_APPLY_RELOAD_CMD) or "").strip()
-            or DEFAULT_RELOAD_CMD,
-            log)
-
     # 限速：内核 tc（见 tcshaper 模块）。默认启用——限速是本服务的核心
     # 职责，"静悄悄地没在限"是最不该出现的状态。显式设 RL_TC_IFACE=- 才
     # 关闭；网卡探测不出来直接启动失败，而不是装作在限速。
@@ -399,7 +299,7 @@ def main() -> None:
     raw_iface = (os.environ.get(ENV_TC_IFACE) or "").strip()
     if raw_iface == "-":
         print("rl-limiter: 已显式关闭 tc 限速（RL_TC_IFACE=-），本实例只做"
-              "监控与配置下发", file=sys.stderr)
+              "监控", file=sys.stderr)
     else:
         iface = tcmod.resolve_iface(raw_iface, log)
         if not iface:
@@ -413,40 +313,14 @@ def main() -> None:
         tc_iface = iface
         shaper = tcmod.TcShaper(iface, log)
 
-    # 配置来源判定：RL_MYSQL_HOST 已设置 → 数据库配置模式；否则本地 YAML。
+    # --- 配置加载：本地 YAML（接线 + 限额）。
     try:
-        db_opts = dbconfig.from_env()
-    except ValueError as e:
-        print(f"rl-limiter: {e}", file=sys.stderr)
-        raise SystemExit(1)
-
-    try:
-        if db_opts is not None:
-            # 启动加载单独跑一个事件循环：加载内含"等待数据库就绪"的重试，
-            # 与主循环生命周期无关，分开跑让失败路径干净退出。
-            cfg = asyncio.run(
-                dbconfig.load_service_config(db_opts, log, instance))
-        else:
-            cfg = configmod.load(args.config)
-    except KeyboardInterrupt:
-        # 等待数据库就绪的重试窗口（最长两分钟）里按 Ctrl-C 是常规操作，
-        # 必须干净退出；KeyboardInterrupt 是 BaseException，不加这条会
-        # 绕过下面的 except Exception 直接冲出 main 打印原始 traceback。
-        print("rl-limiter: 启动在配置加载阶段被中断（Ctrl-C），已退出",
-              file=sys.stderr)
-        raise SystemExit(130)
+        cfg = configmod.load(args.config)
     except FileNotFoundError as e:
-        # 配置文件不存在时，光报一个 errno 帮不上忙——真正的问题往往是
-        # "本该走数据库模式却没设 RL_MYSQL_HOST"，于是静默回落到了本地
-        # YAML 这条路上（容器里尤其常见）。把两条出路都点明。
         print(
             f"rl-limiter: 找不到配置文件 {args.config}（{e.strerror}）。\n"
-            f"  配置来源二选一：\n"
-            f"    - 数据库模式：设置 RL_MYSQL_HOST（及 RL_MYSQL_USER/"
-            f"PASSWORD/DB 等），此时 -c 会被忽略；\n"
-            f"    - 本地 YAML：用 -c 指向一份实际存在的配置文件"
-            f"（示例见 deploy/config/limiter.example.yaml）。\n"
-            f"  当前 RL_MYSQL_HOST 未设置，因此走的是本地 YAML 这条路。",
+            f"  用 -c 指向一份实际存在的 YAML 配置"
+            f"（示例见 deploy/config/limiter.example.yaml）。",
             file=sys.stderr)
         raise SystemExit(1)
     except Exception as e:
@@ -456,11 +330,23 @@ def main() -> None:
     level = getattr(logging, str(cfg.log_level).upper(), logging.INFO)
     logging.getLogger().setLevel(level)
 
-    config_source = db_opts.describe() if db_opts is not None else f"文件 {args.config}"
-
-    # 监控数据落库开关（默认开）。
-    raw_ret = (os.environ.get(ENV_METRICS_RETENTION) or "").strip().lower()
-    metrics_retention = raw_ret not in ("0", "false", "no", "off")
+    # --- 引导解析：haproxy.cfg 是负载均衡配置的唯一权威，启动时必须能
+    # 读到并解析出受管清单；读不到就启动失败，而不是带着空清单装作在跑。
+    # （运行期 cfg 短暂不可读走 fail-static，那是另一回事——见 cfgparse.watch。）
+    try:
+        boot_frontends = cfgparse.load_frontends(
+            cfg.haproxy.cfg_path, cfg.quotas, log)
+    except OSError as e:
+        print(
+            f"rl-limiter: 读不到 haproxy.cfg：{cfg.haproxy.cfg_path}（{e}）。\n"
+            f"  haproxy.cfg 是负载均衡配置的唯一权威，启动时必须可读；\n"
+            f"  请核对 YAML 里 haproxy.cfg_path 的路径与文件权限。",
+            file=sys.stderr)
+        raise SystemExit(1)
+    if not boot_frontends:
+        log.warning("haproxy.cfg 里没有解析到任何带监听端口的 frontend/"
+                    "listen——服务照常启动，之后 cfg 内容变化会被轮询接上 "
+                    "cfg_path=%s", cfg.haproxy.cfg_path)
 
     # 实例视图的**入向**包统计要采哪张网卡（"-" = 显式禁用）。出向的包/
     # 丢包由 tc 按 frontend 统计，不走这里。默认跟随限速网卡——两者本来
@@ -474,25 +360,25 @@ def main() -> None:
         nic = tc_iface or netdev.resolve_iface("", log)
 
     # 启动即输出完整配置摘要：现场排障时第一条要看的日志，可直接核对
-    # 受控节点清单、限额基准与配置来源。
+    # 受管清单、限额基准与两个配置文件的路径。
     log.info(
         "服务配置加载完成，以下为完整配置摘要（排障第一条要看的日志） "
-        "config_source=%s instance=%s endpoint=%s log_level=%s "
+        "yaml=%s cfg=%s instance=%s endpoint=%s log_level=%s "
         "tick_interval_s=%s frontends=%d detail=%s",
-        config_source,
+        args.config, cfg.haproxy.cfg_path,
         cfg.haproxy.name, cfg.haproxy.endpoint(),
         cfg.log_level,
         getattr(cfg, "tick_interval_s", 1.0),
-        len(cfg.frontends), _summarize_frontends(cfg.frontends),
+        len(boot_frontends), _summarize_frontends(boot_frontends),
     )
 
     try:
-        asyncio.run(_amain(cfg, log, db_opts,
+        asyncio.run(_amain(cfg, log,
+                           yaml_path=args.config,
+                           boot_frontends=boot_frontends,
                            console_port=console_port, logbuf=logbuf,
-                           instance=instance, console_bind=console_bind,
-                           enforcer=enforcer, apply_period_s=apply_period_s,
-                           shaper=shaper, nic=nic,
-                           metrics_retention=metrics_retention))
+                           console_bind=console_bind,
+                           shaper=shaper, nic=nic))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
     log.info("rl-limiter 服务已停止")

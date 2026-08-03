@@ -15,10 +15,9 @@
 # 基础镜像装两个组件，容器形态才和生产的单台 ECS 一致（同一个文件系统、
 # 同一个 /run/haproxy/admin.sock、同一份 systemd 式的进程共存关系）。
 #
-# HAProxy 版本：Ubuntu 24.04(noble) 主仓的 haproxy 是 2.8.x LTS，正好
-# 满足 shared bwlim 的下限要求（bwlim 2.7 实验、2.8 起正式）。构建时会
-# 打印实测版本并在低于 2.8 时**直接让构建失败**，避免"镜像建出来了、
-# 限速却静默失效"。
+# HAProxy 版本：Ubuntu 24.04(noble) 主仓的 haproxy 是 2.8.x LTS——
+# splice 与监控依赖的 stats 列都以 2.8 为准。构建时会打印实测版本并在
+# 低于 2.8 时**直接让构建失败**。
 #
 # Python 依赖装进独立 venv：Ubuntu 24.04 起系统 Python 受 PEP 668 保护
 # （pip 直接装会被拒），venv 既绕开该限制又不污染系统解释器，与生产上
@@ -42,8 +41,8 @@ RUN apt-get update \
         iproute2 \
     && rm -rf /var/lib/apt/lists/* \
     && haproxy -v \
-    # 版本闸门：本项目的受管区块用到 option splice-*（2.8 起稳定可用），
-    # 且监控依赖 h1_open_* 等 2.8 才有的 stats 列。
+    # 版本闸门：cfg 里用到 option splice-*（2.8 起稳定可用），且监控
+    # 依赖 h1_open_* 等 2.8 才有的 stats 列。
     && haproxy -v | head -1 | grep -Eq 'version 2\.(8|9)|version [3-9]\.' \
     && echo "haproxy 版本满足要求 (>=2.8)" \
     # 限速闸门：tc 必须在，且必须能解析 HTB——只装 iproute2 是不够的，
@@ -64,10 +63,9 @@ RUN python3 -m venv /opt/rl-limiter \
 ENV PATH=/opt/rl-limiter/bin:$PATH
 
 # /run/haproxy：unix stats socket（rl-limiter 同机只读采样）+ master pid
-#   （限额自动应用靠它给 master 发 SIGUSR2 触发 reload）。
-# /etc/rl-limiter：只读挂进来的 cfg 模板；入口脚本把它复制成
-#   /etc/haproxy/haproxy.cfg —— 那份必须**可写**，因为限额自动应用要
-#   原地改写它（bind mount 的单文件无法被 rename 覆盖，见入口脚本注释）。
+#   （改 cfg 后的 reload 靠它给 master 发 SIGUSR2——容器里没有 systemd）。
+# /etc/rl-limiter：只读挂进来的 cfg/YAML 模板；入口脚本把它们复制成
+#   容器内的普通文件（进容器改副本即可演示热生效，见入口脚本注释）。
 RUN mkdir -p /run/haproxy /etc/rl-limiter /etc/haproxy
 
 COPY deploy/docker/node-entrypoint.sh /usr/local/bin/node-entrypoint.sh

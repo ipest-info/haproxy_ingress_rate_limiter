@@ -1,23 +1,19 @@
 # rl_limiter.config —— 服务配置的解析与校验（服务的"启动契约"层）。
 #
-# 单 HAProxy 模型（v0.4 起）。服务配置提供三类信息：
-#   1. **本机 HAProxy 的接线**（haproxy 段）：stats socket 怎么连
-#      （本机 unix socket 或内网 TCP）、命令超时；
-#   2. **受管 frontend 清单**（frontends 段）：每个 frontend 的监听端口、
-#      限额（quota_mbps）、模式、超时、后端服务器列表。这份清单既是监控
-#      的判定基准，也是写进 haproxy.cfg 受管区块的**唯一数据源**——
-#      两者同源，v0.3 那种"库里改了、cfg 忘了改"的配置漂移不再可能；
+# 配置来源只有一个：**本地 YAML 文件**（-c 指定）。它提供三类信息：
+#   1. **本机 HAProxy 的接线**（haproxy 段）：stats socket 怎么连（本机
+#      unix socket 或内网 TCP）、命令超时，以及 **cfg_path**——本机
+#      haproxy.cfg 的路径。负载均衡配置（监听端口、模式、后端服务器）
+#      不在 YAML 里：**haproxy.cfg 才是它们的唯一权威**，rl-limiter 从
+#      cfg 直接解析受管 frontend 清单（见 cfgparse 模块）；
+#   2. **限额登记**（quotas 段）：frontend 名 → 限额（Mbps）。cfg 里
+#      存在、这里登记了限额的 frontend 参与限速（tc）与超限告警；未登记
+#      的只监控不限速；
 #   3. 服务级运行参数：log_level、tick_interval_s。
 #
-# 配置来源有两种，共用同一套解析/校验管线（from_raw）：
-#   - MySQL 数据库（dbconfig 模块，生产权威）：数据库各表的行被组装成
-#     与 YAML 解析结果同构的原始 dict 后走 from_raw——校验规则只写一遍，
-#     两种来源的错误信息与拒绝行为完全一致；
-#   - 本地 YAML 文件（load）：standalone / 开发联调。
-#
-# 单位约定：**限额的配置单位一律是 Mbps**（quota_mbps，200 = 200 Mbps，
-# 允许小数），数据库、YAML、控制台接口三个入口完全一致；内部统一换算为
-# bytes/s（换算点只有 model.FrontendConfig 的两个 property）。
+# 单位约定：**限额的配置单位一律是 Mbps**（40 = 40 Mbps，允许小数）；
+# 内部统一换算为 bytes/s（换算点只有 model.FrontendConfig 的两个
+# property）。
 #
 # 加载流程：读文件 → yaml.safe_load → 补默认值 → 校验。load 本身不打日志，
 # 成功日志由 main 统一输出；失败通过异常信息精确指出问题字段、当前值与
@@ -35,7 +31,7 @@ from . import model
 
 # 各键缺失时补上的默认值。与部署示例配置保持一致。
 DEFAULT_LOG_LEVEL = "info"
-# 快环 tick 周期（秒）：每秒采样/决策/执行一轮。
+# 快环 tick 周期（秒）：每秒采样一轮。
 DEFAULT_TICK_INTERVAL_S = 1.0
 # 单次 HAProxy runtime API 调用默认超时（毫秒）。500ms 远大于内网 TCP 的
 # 正常往返，又不至于拖住每秒一次的采样循环。
@@ -49,36 +45,25 @@ _LOG_LEVELS = ("debug", "info", "warn", "error")
 # "AF_UNIX path too long"，必须在启动校验里提前拦下。
 _UNIX_PATH_MAX = 107
 
-# HAProxy 的 proxy 名与 server 名允许的字符。收紧到这个集合有两个理由：
-# 一是 HAProxy 自身对 proxy 名就有限制（不能含空格等）；二是这些名字会被
-# 原样渲染进 haproxy.cfg 的受管区块，放任任意字符等于允许通过配置库往
-# 配置文件里注入任意指令（换行 + 任意配置行）。见 enforcer 的受管区块生成。
+# quotas 键（frontend 名）允许的字符：与 HAProxy proxy 名的约束一致，
+# 也保证日志/控制台里的名字可读且无歧义。
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-# 后端地址：IP 或主机名。同样会被渲染进 cfg，同样必须限制字符集。
-_ADDRESS_RE = re.compile(r"^[A-Za-z0-9._:-]{1,255}$")
-
-_MODES = ("tcp", "http")
-# HAProxy 支持的 balance 算法里，适用于本项目这种"一组等价后端"场景的子集。
-# 白名单而非黑名单：这个值同样直接进 cfg。
-_BALANCE_ALGOS = (
-    "roundrobin", "static-rr", "leastconn", "first", "source", "random",
-)
 
 
 @dataclass
 class ServiceConfig:
-    """一份完整的服务配置（本机 HAProxy + 它的受管 frontend 清单）。"""
+    """一份完整的服务配置（本机 HAProxy 接线 + 限额登记）。
+
+    注意 frontends **不在这里**：受管 frontend 清单来自 haproxy.cfg 的
+    解析（cfgparse.load_frontends），quotas 只是给其中一部分登记限额。
+    """
 
     log_level: str = DEFAULT_LOG_LEVEL
     tick_interval_s: float = DEFAULT_TICK_INTERVAL_S
-    # 本机 HAProxy 的接线（stats socket）。
+    # 本机 HAProxy 的接线（stats socket + cfg 路径）。
     haproxy: model.NodeConfig = field(default_factory=model.NodeConfig)
-    # 受管 frontend 清单。
-    frontends: list[model.FrontendConfig] = field(default_factory=list)
-
-    def to_controller_config(self, version: int = 0) -> model.ControllerConfig:
-        """转成投递给监控主循环的运行期配置。"""
-        return model.ControllerConfig(version=version, frontends=list(self.frontends))
+    # 限额登记：frontend 名 → 限额（Mbps，> 0）。
+    quotas: dict[str, float] = field(default_factory=dict)
 
 
 def load(path: str) -> ServiceConfig:
@@ -98,12 +83,7 @@ def load(path: str) -> ServiceConfig:
 
 
 def from_raw(raw: Any, source: str) -> ServiceConfig:
-    """把已解析的原始结构（YAML 或数据库行组装出的 dict）转为 ServiceConfig。
-
-    这是 YAML 与数据库两条来源的**唯一**汇合点：校验规则只写一遍，两种
-    来源的拒绝行为与错误信息完全一致。source 用于错误信息前缀（"配置文件
-    /etc/... " 或 "MySQL 配置库 ..."），让运维一眼看出是哪份配置写错了。
-    """
+    """把已解析的原始结构转为 ServiceConfig，统一补默认值与校验。"""
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
@@ -118,6 +98,15 @@ def from_raw(raw: Any, source: str) -> ServiceConfig:
 
 def _parse(raw: dict[str, Any]) -> ServiceConfig:
     """结构解析 + 默认值填充。只做类型转换，语义校验在 _validate。"""
+    # 旧形态（YAML 里带 frontends 段：监听端口/后端服务器/balance…）明确
+    # 拒绝并给出迁移指引：负载均衡配置已改为从 haproxy.cfg 直接读取，
+    # 静默忽略会让运维以为这些配置还生效着。
+    if "frontends" in raw:
+        raise ValueError(
+            "字段 'frontends' 已废弃——负载均衡配置（监听端口、模式、后端"
+            "服务器）以 haproxy.cfg 为唯一权威，rl-limiter 直接解析 cfg；"
+            "限额改在 'quotas' 段登记（frontend 名 → Mbps）")
+
     cfg = ServiceConfig()
 
     cfg.log_level = str(raw.get("log_level", DEFAULT_LOG_LEVEL)).strip().lower()
@@ -132,16 +121,17 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
 
     cfg.haproxy = _parse_haproxy(raw.get("haproxy") or {})
 
-    fronts_raw = raw.get("frontends") or []
-    if not isinstance(fronts_raw, list):
+    quotas_raw = raw.get("quotas") or {}
+    if not isinstance(quotas_raw, dict):
         raise ValueError(
-            f"frontends 必须是列表，实际是 {type(fronts_raw).__name__}")
-    for i, f in enumerate(fronts_raw):
-        if not isinstance(f, dict):
+            f"quotas 必须是键值映射（frontend 名 → 限额 Mbps），"
+            f"实际是 {type(quotas_raw).__name__}")
+    for name, v in quotas_raw.items():
+        try:
+            cfg.quotas[str(name).strip()] = float(v)
+        except (TypeError, ValueError):
             raise ValueError(
-                f"frontends[{i}] 结构错误：应为键值映射，"
-                f"实际是 {type(f).__name__}")
-        cfg.frontends.append(_parse_frontend(i, f))
+                f"quotas.{name} 必须是数字（Mbps），当前值 {v!r}") from None
     return cfg
 
 
@@ -173,77 +163,12 @@ def _parse_haproxy(h: Any) -> model.NodeConfig:
         port=port,
         timeout_s=timeout_ms / 1000.0,
         socket_path=str(h.get("socket_path", "") or "").strip(),
-    )
-
-
-def _int_field(d: dict[str, Any], key: str, default: int, where: str) -> int:
-    raw = d.get(key, default)
-    if raw is None or raw == "":
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        raise ValueError(f"{where}.{key} 必须是整数，当前值 {raw!r}") from None
-
-
-def _float_field(d: dict[str, Any], key: str, default: float, where: str) -> float:
-    """限额用得上：Mbps 允许小数（0.5 Mbps 这种小额度是真实需求）。"""
-    raw = d.get(key, default)
-    if raw is None or raw == "":
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        raise ValueError(f"{where}.{key} 必须是数字，当前值 {raw!r}") from None
-
-
-def _parse_frontend(i: int, f: dict[str, Any]) -> model.FrontendConfig:
-    where = f"frontends[{i}]"
-    name = str(f.get("name", "") or "").strip()
-
-    servers_raw = f.get("servers") or []
-    if not isinstance(servers_raw, list):
-        raise ValueError(
-            f"{where}.servers 必须是列表，实际是 {type(servers_raw).__name__}")
-    servers: list[model.ServerEntry] = []
-    for j, s in enumerate(servers_raw):
-        if not isinstance(s, dict):
-            raise ValueError(
-                f"{where}.servers[{j}] 结构错误：应为键值映射，"
-                f"实际是 {type(s).__name__}")
-        sw = f"{where}.servers[{j}]"
-        servers.append(model.ServerEntry(
-            name=str(s.get("name", "") or "").strip(),
-            address=str(s.get("address", "") or "").strip(),
-            port=_int_field(s, "port", 0, sw),
-            weight=_int_field(s, "weight", 100, sw),
-            check=bool(s.get("check", True)),
-            check_inter_ms=_int_field(s, "check_inter_ms", 2000, sw),
-        ))
-
-    return model.FrontendConfig(
-        name=name,
-        bind_port=_int_field(f, "bind_port", 0, where),
-        quota_mbps=_float_field(f, "quota_mbps", 0.0, where),
-        bind_address=str(f.get("bind_address", "") or "").strip(),
-        mode=str(f.get("mode", "tcp") or "tcp").strip().lower(),
-        maxconn=_int_field(f, "maxconn", 0, where),
-        balance=str(f.get("balance", "roundrobin") or "roundrobin").strip().lower(),
-        timeout_connect_ms=_int_field(f, "timeout_connect_ms", 5000, where),
-        timeout_client_ms=_int_field(f, "timeout_client_ms", 50000, where),
-        timeout_server_ms=_int_field(f, "timeout_server_ms", 50000, where),
-        servers=servers,
+        cfg_path=str(h.get("cfg_path", "") or "").strip(),
     )
 
 
 def _validate(cfg: ServiceConfig) -> None:
-    """语义校验。任何一条不通过都抛 ValueError，信息里点名字段、当前值与原因。
-
-    校验的严格程度是刻意的：这些值会被渲染进 haproxy.cfg 并 reload，
-    一个坏值就能让整台机器的入口挂掉。宁可启动失败，也不要写出一份
-    HAProxy 起不来的配置（虽然 enforcer 还有 `haproxy -c` 这道闸，但
-    在这里拒绝能给出远比 HAProxy 报错更易懂的中文原因）。
-    """
+    """语义校验。任何一条不通过都抛 ValueError，信息里点名字段、当前值与原因。"""
     if cfg.log_level not in _LOG_LEVELS:
         raise ValueError(
             f"log_level 取值非法: {cfg.log_level!r}，"
@@ -262,114 +187,31 @@ def _validate(cfg: ServiceConfig) -> None:
 
     _validate_haproxy(cfg.haproxy)
 
-    if not cfg.frontends:
-        # 没有受管 frontend 时服务无事可做：既没有要监控的对象，受管区块
-        # 也会被生成成空的（等于删掉全部监听端口）。这多半是配置写漏了。
-        raise ValueError(
-            "frontends 不能为空——至少要有一个受管 frontend"
-            "（监听端口 + 限额 + 后端服务器）")
-
-    seen_names: dict[str, int] = {}
-    seen_ports: dict[tuple[str, int], str] = {}
-    for i, f in enumerate(cfg.frontends):
-        where = f"frontends[{i}]"
-        if not _NAME_RE.match(f.name):
+    for name, mbps in cfg.quotas.items():
+        if not _NAME_RE.match(name):
             raise ValueError(
-                f"{where}: name 非法（当前值 {f.name!r}）——只允许字母、数字、"
-                f"点、下划线、连字符，长度 1-64。该名字会被原样写进 "
-                f"haproxy.cfg，放宽字符集等于允许往配置文件注入任意指令")
-        if f.name in seen_names:
+                f"quotas 的键 {name!r} 非法——应为 haproxy.cfg 里的 "
+                f"frontend/listen 段名（字母、数字、点、下划线、连字符，"
+                f"长度 1-64）")
+        if mbps <= 0:
             raise ValueError(
-                f"{where}: frontend 名 {f.name!r} 与 "
-                f"frontends[{seen_names[f.name]}] 重复——名字要与 stats 里的 "
-                f"pxname 一一对应，重名会让采样数据张冠李戴")
-        seen_names[f.name] = i
-
-        if f.bind_port < 1 or f.bind_port > 65535:
+                f"quotas.{name} 必须为正数（当前值 {mbps!r}）——它既是下发"
+                f"给内核 tc 的类速率，也是超限告警基准；不想限速就删掉这行"
+                f"（cfg 里的段默认只监控不限速），别写 0")
+        if mbps * 1_000_000 / 8 < 1:
             raise ValueError(
-                f"{where} ({f.name}): bind_port 必须在 1-65535 范围内，"
-                f"当前值 {f.bind_port!r}")
-        key = (f.bind_address, f.bind_port)
-        if key in seen_ports:
-            raise ValueError(
-                f"{where} ({f.name}): 监听地址端口 {f.bind_spec} 与 frontend "
-                f"{seen_ports[key]!r} 冲突——两个 frontend 绑同一个端口会让 "
-                f"HAProxy 启动失败")
-        seen_ports[key] = f.name
-
-        if f.quota_mbps <= 0:
-            raise ValueError(
-                f"{where} ({f.name}): quota_mbps 必须为正数（当前值 "
-                f"{f.quota_mbps!r}）——它既是下发给内核 tc 的类速率，"
-                f"也是超限告警基准；tc 也不接受 rate 0")
-        if f.quota_bytes_per_sec < 1:
-            raise ValueError(
-                f"{where} ({f.name}): quota_mbps={f.quota_mbps} 太小"
-                f"（换算成 bytes/s 后不足 1），tc 会拒绝这个速率")
-
-        if f.mode not in _MODES:
-            raise ValueError(
-                f"{where} ({f.name}): mode 取值非法 {f.mode!r}，"
-                f"可选 {'/'.join(_MODES)}")
-        if f.balance not in _BALANCE_ALGOS:
-            raise ValueError(
-                f"{where} ({f.name}): balance 取值非法 {f.balance!r}，"
-                f"可选 {'/'.join(_BALANCE_ALGOS)}")
-        if f.maxconn < 0:
-            raise ValueError(
-                f"{where} ({f.name}): maxconn 不能为负，当前值 {f.maxconn!r}")
-        for tname in ("timeout_connect_ms", "timeout_client_ms",
-                      "timeout_server_ms"):
-            tv = getattr(f, tname)
-            if tv <= 0:
-                raise ValueError(
-                    f"{where} ({f.name}): {tname} 必须为正数，当前值 {tv!r}")
-
-        if not f.servers:
-            raise ValueError(
-                f"{where} ({f.name}): servers 不能为空——没有后端服务器的 "
-                f"frontend 会把所有请求返回 503")
-        seen_srv: dict[str, int] = {}
-        for j, s in enumerate(f.servers):
-            sw = f"{where}.servers[{j}]"
-            if not _NAME_RE.match(s.name):
-                raise ValueError(
-                    f"{sw}: name 非法（当前值 {s.name!r}）——只允许字母、数字、"
-                    f"点、下划线、连字符，长度 1-64")
-            if s.name in seen_srv:
-                raise ValueError(
-                    f"{sw}: server 名 {s.name!r} 在 frontend {f.name!r} 内与 "
-                    f"servers[{seen_srv[s.name]}] 重复")
-            seen_srv[s.name] = j
-            if not _ADDRESS_RE.match(s.address):
-                raise ValueError(
-                    f"{sw} ({s.name}): address 非法（当前值 {s.address!r}）——"
-                    f"只允许字母、数字、点、冒号、下划线、连字符。该值会被"
-                    f"原样写进 haproxy.cfg")
-            if s.port < 1 or s.port > 65535:
-                raise ValueError(
-                    f"{sw} ({s.name}): port 必须在 1-65535 范围内，"
-                    f"当前值 {s.port!r}")
-            if s.weight < 0 or s.weight > 256:
-                raise ValueError(
-                    f"{sw} ({s.name}): weight 必须在 0-256 范围内"
-                    f"（HAProxy 的取值范围），当前值 {s.weight!r}")
-            if s.check_inter_ms <= 0:
-                raise ValueError(
-                    f"{sw} ({s.name}): check_inter_ms 必须为正数，"
-                    f"当前值 {s.check_inter_ms!r}")
+                f"quotas.{name}={mbps} 太小（换算成 bytes/s 后不足 1），"
+                f"tc 会拒绝这个速率")
 
 
 def _validate_haproxy(n: model.NodeConfig) -> None:
-    """校验本机 HAProxy 的接线段（采样通道二选一）。"""
+    """校验本机 HAProxy 的接线段（采样通道二选一 + cfg 路径）。"""
     if not _NAME_RE.match(n.name):
         raise ValueError(
             f"haproxy.name 非法（当前值 {n.name!r}）——只允许字母、数字、"
             f"点、下划线、连字符，长度 1-64")
     # 采样通道二选一：本机 unix socket（同机部署）或内网 TCP（远程观测）。
-    # 两者都给会产生"到底连哪个"的二义（同机部署里 socket_path 与一个
-    # 陈旧的 host:port 并存，是最容易采错对象的配错法），一个都不给则
-    # 根本无法接线——两种情况都必须在启动时拦下。
+    # 两者都给会产生"到底连哪个"的二义，一个都不给则根本无法接线。
     if n.socket_path and (n.host or n.port):
         raise ValueError(
             f"haproxy: socket_path 与 host/port 只能二选一（当前 "
@@ -401,3 +243,14 @@ def _validate_haproxy(n: model.NodeConfig) -> None:
             f"（{len(n.socket_path.encode('utf-8'))} 字节，上限 "
             f"{_UNIX_PATH_MAX}）——unix socket 路径长度受内核 sun_path 限制，"
             f"请换用更短的路径（如 /run/haproxy/admin.sock）")
+
+    # cfg_path：受管 frontend 清单的来源，必填。存在性/可读性在引导时
+    # 检查（cfgparse.load_frontends 直接读），这里只拦结构性错误。
+    if not n.cfg_path:
+        raise ValueError(
+            "haproxy: cfg_path 不能为空——受管 frontend 清单（监听端口、"
+            "模式）从本机 haproxy.cfg 直接解析而来，必须给出它的路径"
+            "（如 /etc/haproxy/haproxy.cfg）")
+    if not n.cfg_path.startswith("/"):
+        raise ValueError(
+            f"haproxy: cfg_path 必须是绝对路径（当前值 {n.cfg_path!r}）")

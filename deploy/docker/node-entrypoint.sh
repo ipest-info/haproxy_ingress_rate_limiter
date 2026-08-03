@@ -12,7 +12,7 @@
 #      FD 不够则 HAProxy 根本起不来；
 #   2. 起 HAProxy，等它把 unix stats socket 建出来——rl-limiter 启动
 #      即采样，socket 还没出现会白白刷一轮采样失败告警；
-#   3. 再起 rl-limiter（RL_NODE_NAME 指定本机节点名，只采本机）；
+#   3. 再起 rl-limiter（-c 指定本机 YAML 配置，只采本机）；
 #   4. 任一进程退出就整体退出（对齐 systemd Restart=always 的语义：
 #      带着半残状态继续跑比重启更危险），由 compose 的 restart 策略拉起；
 #   5. 转发 SIGTERM/SIGINT 给两个子进程，docker stop 能干净收场。
@@ -24,8 +24,7 @@ set -euo pipefail
 # loadgen 等**只借用它的 Python 环境**的服务复用。后者在 compose 里用
 # `command:` 指定要跑的程序，而 `command:` 覆盖的是 CMD、**不是
 # ENTRYPOINT**——没有这个分支，它们会连同 haproxy 一起被拉起来，且因为
-# 没有 RL_NODE_NAME / RL_MYSQL_HOST / cfg 模板而反复失败重启，症状是
-#   ENTRYPOINT 启动 rl-limiter（同机模式）node=<未设置>
+# 没有 cfg/YAML 模板而反复失败重启，症状是
 #   rl-limiter: [Errno 2] No such file or directory: '/etc/rl-limiter/config.yaml'
 # 而真正该跑的 random_web.py / loadgen.py 一次都没执行。
 if [ "$#" -gt 0 ]; then
@@ -33,13 +32,15 @@ if [ "$#" -gt 0 ]; then
 fi
 
 # 只读挂进来的配置模板 → 复制成容器内可写的真实配置。
-# 为什么要复制：限额自动应用（rl-limiter 的 enforcer）要**原地改写**
-# haproxy.cfg，而 compose 的单文件 bind mount 既是只读的、也无法被
-# rename 覆盖（临时文件+rename 是原子写的必要手段，跨挂载点会失败）。
-# 复制一份到容器自己的文件系统后，形态就和生产上"cfg 是本机一个普通
-# 文件"完全一致了。
+# 为什么要复制：演示的玩法就是"进容器改 cfg / 改 YAML 看热生效"，而
+# compose 的单文件 bind mount 是只读的、也无法被编辑器的原子替换覆盖
+# （rename 跨挂载点会失败，sed -i 会换 inode 让容器看到旧文件）。复制
+# 一份到容器自己的文件系统后，形态就和生产上"都是本机普通文件"一致了。
+# rl-limiter 对两份文件都**只读**（轮询内容做热更新），从不改写它们。
 HAPROXY_TEMPLATE=${HAPROXY_TEMPLATE:-/etc/rl-limiter/haproxy-template.cfg}
 HAPROXY_CFG=${HAPROXY_CFG:-/etc/haproxy/haproxy.cfg}
+RL_YAML_TEMPLATE=${RL_YAML_TEMPLATE:-/etc/rl-limiter/config-template.yaml}
+RL_YAML=${RL_YAML:-/etc/rl-limiter/config.yaml}
 HAPROXY_SOCK=${HAPROXY_SOCK:-/run/haproxy/admin.sock}
 HAPROXY_PIDFILE=${HAPROXY_PIDFILE:-/run/haproxy/master.pid}
 SOCK_WAIT_S=${SOCK_WAIT_S:-30}
@@ -62,13 +63,13 @@ if [ -f "$HAPROXY_TEMPLATE" ]; then
 elif [ -f "$LEGACY_CFG" ] && [ "$LEGACY_CFG" != "$HAPROXY_CFG" ]; then
     cp "$LEGACY_CFG" "$HAPROXY_CFG"
     log "警告：用的是旧版挂载点 $LEGACY_CFG。请把 compose 里的挂载改成" \
-        "$HAPROXY_TEMPLATE（限额自动应用要求 cfg 可写，只读单文件 bind" \
-        "mount 无法被原子替换）"
+        "$HAPROXY_TEMPLATE（复制成本机普通文件后才能进容器改配置演示" \
+        "热生效，只读单文件 bind mount 做不到）"
 elif [ -f "$HAPROXY_CFG" ]; then
     # 注意：Ubuntu 的 haproxy 包**自带**一份 /etc/haproxy/haproxy.cfg，
     # 所以这条分支很容易在"忘了挂模板"时静默命中——haproxy 会正常起来、
     # stats socket 也有（发行版默认配置里就有那一行），看着一切正常，
-    # 实际却没有任何限速。下面的 bwlim 自检就是为这种情况准备的。
+    # 实际却没有演示的监听端口，rl-limiter 也解析不到任何 frontend。
     log "未挂载模板，沿用镜像内已有的配置 cfg=$HAPROXY_CFG" \
         "（若非有意为之，请检查 compose 是否挂了 $HAPROXY_TEMPLATE）"
 else
@@ -81,6 +82,17 @@ else
     exit 1
 fi
 
+# rl-limiter 的 YAML 配置：同样从模板复制（理由同上——演示要能进容器
+# 改 quotas 看热生效）。没挂模板但容器里已有一份也放行（自定义镜像）。
+if [ -f "$RL_YAML_TEMPLATE" ]; then
+    cp "$RL_YAML_TEMPLATE" "$RL_YAML"
+    log "已从模板生成 rl-limiter 配置 template=$RL_YAML_TEMPLATE yaml=$RL_YAML"
+elif [ ! -f "$RL_YAML" ]; then
+    log "致命：找不到 rl-limiter 的 YAML 配置。compose 应把它挂在" \
+        "$RL_YAML_TEMPLATE（参考 deploy/docker/limiter-node.yaml）"
+    exit 1
+fi
+
 # 可选：就地覆盖 global 里的 maxconn / maxpipes。
 #
 # 为什么需要它：模板里的默认值按"**默认不该成为限制**"给到 100 万连接，
@@ -89,7 +101,7 @@ fi
 # 于是演示环境用这两个变量把量级降下来——**降的是演示，不是默认值**，
 # 模板本身仍然是那份可以直接抄去生产的骨架。
 #
-# 只改 global 段里的这两条指令；受管区块由 rl-limiter 渲染，互不相干。
+# 只改 global 段里的这两条指令，别的一个字节不动。
 override_directive() {
     local name=$1 val=$2
     if ! grep -qE "^[[:space:]]*$name[[:space:]]+[0-9]+" "$HAPROXY_CFG"; then
@@ -140,7 +152,7 @@ tc_selfcheck() {
     return 0
 }
 if [ "${RL_TC_IFACE:-}" = "-" ]; then
-    log "警告：已显式关闭 tc 限速（RL_TC_IFACE=-），本节点只做监控与配置下发"
+    log "警告：已显式关闭 tc 限速（RL_TC_IFACE=-），本节点只做监控"
 elif ! tc_selfcheck; then
     exit 1
 fi
@@ -195,8 +207,8 @@ fd_preflight || exit 1
 log "启动 HAProxy cfg=$HAPROXY_CFG"
 haproxy -W -db -f "$HAPROXY_CFG" &
 HAPROXY_PID=$!
-# 自己写 master pid：`-p` 在 -db 模式下不落盘，而限额自动应用要靠它
-# 定位该给谁发 SIGUSR2（容器里没有 systemctl reload haproxy）。
+# 自己写 master pid：`-p` 在 -db 模式下不落盘，而"改 cfg 后 reload"要
+# 靠它定位该给谁发 SIGUSR2（容器里没有 systemctl reload haproxy）。
 echo "$HAPROXY_PID" > "$HAPROXY_PIDFILE"
 
 # 等 stats socket 就绪：这是 rl-limiter 的采样入口，没它启动就是白转。
@@ -217,8 +229,8 @@ while [ ! -S "$HAPROXY_SOCK" ]; do
 done
 log "HAProxy stats socket 已就绪 sock=$HAPROXY_SOCK waited_s=$waited"
 
-log "启动 rl-limiter（同机模式）node=${RL_NODE_NAME:-<未设置>}"
-rl-limiter &
+log "启动 rl-limiter（同机模式）yaml=$RL_YAML"
+rl-limiter -c "$RL_YAML" &
 RL_PID=$!
 
 terminate() {

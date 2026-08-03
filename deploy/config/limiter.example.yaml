@@ -1,25 +1,30 @@
-# rl-limiter 本地 YAML 配置示例（standalone/开发用；安装到
-# /etc/rl-limiter/config.yaml）。生产推荐用 MySQL 配置库（设置
-# RL_MYSQL_HOST 即启用，见 docs/03 §2.1），两种来源走同一套校验管线。
+# rl-limiter YAML 配置示例（安装到 /etc/rl-limiter/config.yaml，-c 指定）。
 #
 # 架构要点（单 HAProxy 模型）：一个 rl-limiter 实例管**一台**与它同机的
-# HAProxy。这份配置描述的就是那台 HAProxy：怎么连它的 stats socket，
-# 以及它上面有哪些受管 frontend（监听端口 + 限额 + 后端服务器）。
+# HAProxy。**haproxy.cfg 是负载均衡配置的唯一权威**——监听端口、模式、
+# 后端服务器由运维直接写在 cfg 里并自行 reload；rl-limiter 只**读** cfg
+# （cfg_path），解析出 frontend/listen 清单，与下面 quotas 登记的限额
+# 合并后：
+#   - 把限额下发到本机网卡的内核 tc（HTB，按监听端口分类）——真实限速；
+#   - 每秒经 stats socket 采样各 frontend 的带宽，做持续超限告警。
 #
-# frontends 这份清单是**唯一数据源**：
-#   - 监控侧按它判定各 frontend 是否超限；
-#   - 下发侧（启用 RL_APPLY_HAPROXY_CFG 后）按它渲染 haproxy.cfg 的
-#     受管区块并 reload。
-# 两者同源，因此不存在"配置改了、数据面忘了改"的漂移。
+# 这份 YAML 因此只有三类内容：
+#   1. haproxy 段——本机 HAProxy 的接线（stats socket + cfg 路径）；
+#   2. quotas 段——限额登记（frontend 名 → Mbps）；
+#   3. 运行参数（log_level、tick_interval_s）。
 #
-# 单位约定：**限额一律用 Mbps**（quota_mbps，40 = 40 Mbps，允许小数），
-# 服务内部统一换算为 bytes/s（唯一换算点在 model.FrontendConfig）。
+# 热更新：运行期轮询本文件与 haproxy.cfg 的内容（默认 5s），quotas 或
+# cfg 内容变化即热生效（改 cfg 后记得 reload HAProxy；rl-limiter 会自动
+# 跟上）。haproxy 接线段与 log_level 启动时定型，改了需重启本服务。
+#
+# 单位约定：**限额一律用 Mbps**（40 = 40 Mbps，允许小数），服务内部统一
+# 换算为 bytes/s（唯一换算点在 model.FrontendConfig）。
 
 log_level: info                 # debug | info | warn | error
 tick_interval_s: 1.0            # 采样节拍（秒）；只支持 1.0，见校验说明
 
 # ---------------------------------------------------------------------------
-# 本机 HAProxy 的 stats socket 接线（只读采样用）。重启生效。
+# 本机 HAProxy 的接线。重启生效。
 #
 # 采样通道二选一（校验强制恰好给一种）：
 #   - socket_path（**同机部署，推荐**）：本机 unix stats socket 绝对路径。
@@ -28,53 +33,32 @@ tick_interval_s: 1.0            # 采样节拍（秒）；只支持 1.0，见校
 #     不占任何网络端口，访问权由文件属主/属组控制。
 #   - host + port（远程只读观测）：内网 TCP stats socket。
 #       stats socket ipv4@<内网IP>:9999 level user
-#     注意这种形态下**无法下发配置**（改 cfg + reload 必须在本机做）。
+#     注意这种形态下 rl-limiter 不在 HAProxy 本机，**无法做 tc 限速**
+#     （tc 作用在本机网卡上），一般只用于纯监控。
+#
+# cfg_path 必填：受管 frontend 清单（监听端口、模式）从这份 cfg 解析。
+# 采样还要求 cfg 的 defaults 段带 `option contstats`——否则长连接的字节
+# 数只在会话结束时一次性入账，秒级带宽曲线会脉冲式跳变。
 # ---------------------------------------------------------------------------
 haproxy:
-  name: haproxy                 # 实例名；数据库模式下须与 RL_NODE_NAME 一致
+  name: haproxy                 # 实例名（日志/控制台展示用）
   socket_path: /run/haproxy/admin.sock
+  cfg_path: /etc/haproxy/haproxy.cfg
   timeout_ms: 500               # 单次 runtime API 命令超时（连接 + 读写）
   # 远程观测形态改用（与 socket_path 二选一，不可混填）：
   # host: 10.0.0.11
   # port: 9999
 
 # ---------------------------------------------------------------------------
-# 受管 frontend 清单：每项 = 一个监听端口 + 一个 shared bwlim 速率桶 +
-# 一组后端服务器。启用配置下发后，这里的每一项会被渲染成 haproxy.cfg
-# 受管区块里的一个 listen 段。
+# 限额登记：frontend 名（= haproxy.cfg 里 frontend/listen 段的名字）→
+# 限额（Mbps，> 0）。
+#
+#   - cfg 里有、这里登记了 → 限速（tc）+ 监控 + 超限告警；
+#   - cfg 里有、这里没登记 → **只监控不限速**（启动时会 warn 一次）；
+#   - 这里登记、cfg 里没有 → 该条目被忽略并 warn（段被删了或名字拼错）。
+#
+# 不想限速就删掉那一行，别写 0（0 会被校验拒绝）。
 # ---------------------------------------------------------------------------
-frontends:
-  - name: fe_main               # = stats 里的 pxname，也是 cfg 里的段名；全局唯一
-    bind_address: ""            # 留空 = 所有地址（HAProxy 的 `bind :port`）
-    bind_port: 8080
-    mode: tcp                   # tcp | http
-    quota_mbps: 40              # 限额（Mbps）。既是下发给内核 tc 的
-                                # limit（真实限速 = 该值 ÷ 8 bytes/s），
-                                # 也是超限告警基准——同源，不会漂移
-    maxconn: 0                  # 资源保护水位（0 = 不写该指令，沿用 global）；
-                                # 不是限速手段。**默认不设**——默认值不该成为
-                                # 限制，真要护资源时再显式给一个值
-    balance: roundrobin         # roundrobin|static-rr|leastconn|first|source|random
-    timeout_connect_ms: 5000
-    timeout_client_ms: 50000
-    timeout_server_ms: 50000
-    servers:                    # 后端服务器（至少一个）
-      - name: web1
-        address: 10.0.0.21
-        port: 9000
-        weight: 100             # 0-256
-        check: true             # 主动健康检查
-        check_inter_ms: 2000
-      - name: web2
-        address: 10.0.0.22
-        port: 9000
-
-  # 第二个监听端口的例子（HTTP 模式、更小的限额）。
-  - name: fe_api
-    bind_address: 127.0.0.1     # 只监听回环
-    bind_port: 8081
-    mode: http
-    quota_mbps: 8               # 8 Mbps
-    balance: leastconn
-    servers:
-      - {name: api1, address: 10.0.0.31, port: 8000}
+quotas:
+  fe_main: 40                   # 40 Mbps
+  fe_api: 8                     # 8 Mbps

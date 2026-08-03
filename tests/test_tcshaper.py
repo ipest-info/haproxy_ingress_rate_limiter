@@ -23,9 +23,7 @@ IFACE = "eth0"
 
 
 def fe(name="fe_main", port=8080, quota=40.0):   # quota 单位 = Mbps
-    return model.FrontendConfig(
-        name=name, bind_port=port, quota_mbps=quota,
-        servers=[model.ServerEntry(name="s1", address="10.0.0.1", port=80)])
+    return model.FrontendConfig(name=name, bind_port=port, quota_mbps=quota)
 
 
 class FakeTc:

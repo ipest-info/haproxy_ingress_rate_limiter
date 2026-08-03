@@ -59,13 +59,11 @@
 #
 # ## 安全边界
 #
-# 与 enforcer 同源的考虑：本模块会以 root（或 CAP_NET_ADMIN）执行 tc 命令，
-# 因此
+# 本模块会以 root（或 CAP_NET_ADMIN）执行 tc 命令，因此
 #   - **命令一律用 argv 列表拼装，绝不拼 shell 字符串**，配置里的值（端口、
 #     限额）在进入 argv 之前全部过整数校验，不存在注入面；
-#   - 网卡名只来自本机环境变量/自动探测，**绝不从配置库读**；
-#   - 空清单拒绝执行（与 enforcer 一致）：那意味着"把所有限速撤掉"，是事故
-#     而不是配置操作。
+#   - 网卡名只来自本机环境变量/自动探测，绝不从配置文件读；
+#   - 空清单拒绝执行：那意味着"把所有限速撤掉"，是事故而不是配置操作。
 
 from __future__ import annotations
 
@@ -130,7 +128,7 @@ class TcError(RuntimeError):
 
 @dataclass
 class TcResult:
-    """一次 reconcile 的结果，语义与 enforcer.ApplyResult 对齐。"""
+    """一次 reconcile 的结果。"""
 
     ok: bool
     changed: bool
@@ -461,8 +459,8 @@ def parse_filter_minors(out: str) -> set[int]:
 class TcShaper:
     """把受管 frontend 的限额落到本机网卡的 tc 上（幂等 reconcile）。
 
-    与 enforcer 的分工：enforcer 负责把监听端口/后端服务器写进 haproxy.cfg
-    （不再写任何限速指令），本模块负责限速。两者互不依赖，各自幂等。
+    与 haproxy.cfg 的分工：监听端口/后端服务器由运维直接写在 cfg 里
+    （cfg 不含任何限速指令），限速全部由本模块的 tc 规则承担。
     """
 
     def __init__(self, iface: str, log: logging.Logger | None = None,
@@ -678,8 +676,8 @@ async def run_shaper(shaper: TcShaper,
                      period_s: float = 30.0) -> None:
     """常驻任务：配置一变就下发 tc，另有周期性兜底 reconcile。
 
-    与 enforcer 的 run_enforcer 同构：事件驱动保证"改完立刻生效"，周期兜底
-    负责纠正有人手工动过 tc（`tc qdisc del` 之类）造成的漂移。
+    事件驱动保证"改完立刻生效"，周期兜底负责纠正有人手工动过 tc
+    （`tc qdisc del` 之类）造成的漂移。
     """
     while True:
         try:

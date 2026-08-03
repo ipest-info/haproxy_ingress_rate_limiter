@@ -1,15 +1,14 @@
-# rl_limiter.webconsole —— 内置 Web 控制台：实时观测 + 配置管理。
+# rl_limiter.webconsole —— 内置 Web 控制台：**只读**实时观测。
 #
 # 设计取向：
 #
 #   - 观测侧零额外采集：监控循环每拍本就产出各 frontend 的速率/均值/
 #     连接数，控制台只是把这份内存数据经 StatusHub 留存最近几分钟并以
 #     SSE 推给页面——不引入第二条采集链路；
-#   - 配置侧写库不写内存：所有修改（监听端口、限额、后端服务器）写入
-#     MySQL（配置唯一事实源），由 dbconfig.watch 的既有轮询链路热生效，
-#     再由 enforcer 渲染进本机 haproxy.cfg 并 reload。因此在界面上改完
-#     即真正生效，不需要人工再动配置文件。未启用数据库配置模式（纯 YAML
-#     部署）时写接口返回 409 说明原因；
+#   - 控制台**不提供任何写接口**：负载均衡配置的唯一权威是本机
+#     haproxy.cfg（运维直接编辑 + reload），限额登记在本地 YAML 的
+#     quotas 段；两个文件都由 cfgparse.watch 轮询热生效。要改配置就改
+#     文件——控制台只负责让你看清"改了之后发生了什么"；
 #   - 日志经进程内环形缓冲（LogBuffer 挂在根 logger 上）曝光最近若干条，
 #     页面增量拉取；生产量级的持久化检索交给外部日志系统，不在此造轮子；
 #   - "限速生效证据"：页面上把 实时速率 / 10s 均值（计费口径）/ 限额
@@ -19,8 +18,8 @@
 # 绑回环（127.0.0.1），要放到内网必须由运维显式设 RL_CONSOLE_BIND 并配合
 # 防火墙/安全组限制来源；绑非回环地址时会打一条 warning 留痕。
 #
-# 单 HAProxy 模型：每台 HAProxy 各有一个控制台，管理并展示本机的全部
-# 受管 frontend。
+# 单 HAProxy 模型：每台 HAProxy 各有一个控制台，展示本机的全部受管
+# frontend。
 
 from __future__ import annotations
 
@@ -34,7 +33,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from . import dbconfig, model
+from . import model
 
 # 快照留存拍数：1s 一拍即约 10 分钟窗口，页面刷新后能立即回填完整曲线。
 HISTORY_TICKS = 600
@@ -134,9 +133,6 @@ class StatusHub:
         self._version_fn = version_fn
         # 本机 HAProxy 的接线视图（启动时定型，与 RuntimeClient 一致）。
         self._haproxy = haproxy or model.NodeConfig()
-        # 配置自动下发的最近一次结果（None = 未启用该能力）。页面据此
-        # 区分"改完就已经生效"与"改完还等人工同步数据面"。
-        self._enforce: dict | None = None
         # 采样是否处于降级（collector.degraded 闭包）。
         self._degraded_fn = degraded_fn if degraded_fn is not None else (lambda: False)
         self._history: collections.deque[dict[str, Any]] = collections.deque(
@@ -148,25 +144,8 @@ class StatusHub:
 
     # ---- 配置与数据注入 ----
 
-    def record_enforce(self, result) -> None:
-        """记录一次配置下发的结果（enforcer 每轮 reconcile 后回调）。
-
-        页面靠它回答运维最关心的那个问题：我刚在这儿改的配置，**数据面
-        到底生效了没有**。失败时把原因原样带出来——这时数据面还在按旧
-        配置跑，不说清楚就会以为已经改好了。
-        """
-        self._enforce = {
-            "enabled": True,
-            "ok": result.ok,
-            "error": result.error,
-            "last_change_ts": time.time() if result.changed else (
-                (self._enforce or {}).get("last_change_ts")),
-            "applied": list(result.frontends) if result.changed else (
-                (self._enforce or {}).get("applied") or []),
-        }
-
     def update_config(self, cfg: model.ControllerConfig) -> None:
-        """记录当前生效的受管 frontend 配置（界面的编辑表单以它为初值）。"""
+        """记录当前生效的受管 frontend 配置（页面的配置视图，只读）。"""
         self._fe_config = {f.name: f.to_dict() for f in cfg.frontends}
         # 换算好的 bytes/s 一并给出：图表的限额参考线用它，避免前端各处
         # 重复做 ÷8，单位换算只在服务端一处。
@@ -248,10 +227,9 @@ class StatusHub:
         return {
             "service_version": self._service_version,
             "config_version": self._version_fn(),
-            # None = 未启用配置自动下发（改配置后仍需人工改 cfg + reload）。
-            "enforce": self._enforce,
             "uptime_s": time.time() - self._started,
-            # 各受管 frontend 的完整配置：界面的编辑表单以它为初值。
+            # 各受管 frontend 的当前配置视图（来自 haproxy.cfg + YAML
+            # 限额的解析结果，只读）。
             "frontends": self._fe_config,
             "haproxy": self._haproxy_view(),
             "latest": self._history[-1] if self._history else None,
@@ -268,16 +246,12 @@ def _json_error(status: int, message: str) -> web.Response:
 def build_app(
     hub: StatusHub,
     logbuf: LogBuffer,
-    db_opts: dbconfig.MySQLOptions | None,
     log: logging.Logger,
-    instance: str = "haproxy",
-    store=None,
 ) -> web.Application:
-    """组装控制台的 aiohttp 应用（静态页 + 只读 API + 配置管理 API）。
+    """组装控制台的 aiohttp 应用（静态页 + 只读 API）。
 
-    instance 是本实例在配置库里对应的 HAProxy 实例名：写接口只会改属于
-    自己的那些行，一个配置库服务多台机器时互不越界。
-    """
+    没有写接口：配置的修改入口是 haproxy.cfg 与 YAML 两个文件本身
+    （见模块头注释）。"""
 
     index_html = (_STATIC_DIR / "index.html").read_bytes()
 
@@ -294,34 +268,6 @@ def build_app(
 
     async def handle_history(_request: web.Request) -> web.Response:
         return web.json_response({"snapshots": hub.history()})
-
-    async def handle_metrics(request: web.Request) -> web.Response:
-        """历史回查：/api/metrics?scope=&from=&to=[&bucket_s=]
-
-        与 /api/history 的分工：那个读**内存**里最近 10 分钟的 1 秒粒度，
-        这个读**库**里的分级聚合（1 分钟 × 7 天 / 5 分钟 × 90 天）。
-        不给 bucket_s 时按区间自动选层，见 metricstore.pick_tier。
-        """
-        if store is None:
-            return _json_error(
-                409, "未启用监控数据落库（需要数据库配置模式，见 "
-                     "docs/07-监控数据回查.md）；实时曲线请用 /api/history")
-        q = request.query
-        try:
-            now = int(time.time())
-            start = int(q.get("from") or (now - 3600))
-            end = int(q.get("to") or now)
-            bucket = int(q["bucket_s"]) if q.get("bucket_s") else None
-        except ValueError:
-            return _json_error(400, "from/to/bucket_s 必须是整数（unix 秒）")
-        if end <= start:
-            return _json_error(400, "to 必须大于 from")
-        try:
-            return web.json_response(
-                await store.query(q.get("scope", ""), start, end, bucket))
-        except Exception as e:
-            log.warning("监控数据回查失败 err=%s", e)
-            return _json_error(502, f"查询失败：{e}")
 
     async def handle_logs(request: web.Request) -> web.Response:
         try:
@@ -359,84 +305,12 @@ def build_app(
             hub.unsubscribe(q)
         return resp
 
-    # ---- 配置管理（写 MySQL，经轮询热生效）----
-
-    def _mutation_note(extra: str = "") -> str:
-        poll = db_opts.poll_interval_s if db_opts is not None else 0
-        note = f"已写入数据库，将在一个轮询周期（约 {poll:g}s）内热生效"
-        return note + (f"；{extra}" if extra else "")
-
-    def _require_db() -> web.Response | None:
-        if db_opts is None:
-            return _json_error(
-                409,
-                "当前实例使用本地 YAML 配置（未设置 RL_MYSQL_HOST），"
-                "控制台配置管理依赖 MySQL 配置源，请改用数据库配置模式")
-        return None
-
-    async def _mutate(request: web.Request, action,
-                      allow_empty_body: bool = False,
-                      note_extra: str = "") -> web.Response:
-        """写接口公共骨架：DB 模式检查 → 解析 JSON → 执行 → 统一应答/报错。"""
-        denied = _require_db()
-        if denied is not None:
-            return denied
-        try:
-            body = await request.content.read(MAX_BODY_BYTES)
-            if allow_empty_body and not body.strip():
-                payload = None  # DELETE 类端点：无请求体是常态
-            else:
-                try:
-                    payload = json.loads(body)
-                except ValueError as e:
-                    raise ValueError(f"请求体不是合法的 JSON: {e}") from None
-            await action(payload)
-        except ValueError as e:
-            return _json_error(400, str(e))
-        except Exception as e:
-            log.warning("控制台写库失败 path=%s err=%s", request.path, e)
-            return _json_error(502, f"写入数据库失败：{e}")
-        log.info("控制台已写入配置变更 path=%s", request.path)
-        return web.json_response({"ok": True, "note": _mutation_note(note_extra)})
-
-    async def handle_upsert_frontend(request: web.Request) -> web.Response:
-        """新建或整体更新一个受管 frontend（连同它的后端服务器列表）。
-
-        界面上编辑的是"这个监听端口连同它的后端"这一整体，因此接口也按
-        整体提交：服务端在一个事务里替换该 frontend 的全部 server 行，
-        不会出现"改了一半"被轮询读到的中间态。
-        """
-        async def action(payload):
-            await dbconfig.upsert_frontend(db_opts, instance, payload)
-        return await _mutate(
-            request, action,
-            note_extra="随后由本机 rl-limiter 写入 haproxy.cfg 受管区块并 "
-                       "reload，数据面即时生效")
-
-    async def handle_delete_frontend(request: web.Request) -> web.Response:
-        name = request.match_info["name"]
-
-        async def action(_payload):
-            await dbconfig.delete_frontend(db_opts, instance, name)
-        return await _mutate(
-            request, action, allow_empty_body=True,
-            note_extra="该监听端口将在下一次 reload 后停止服务")
-
     app = web.Application(client_max_size=MAX_BODY_BYTES)
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/overview", handle_overview)
     app.router.add_get("/api/history", handle_history)
     app.router.add_get("/api/logs", handle_logs)
-    # 历史回查（落库的分级聚合）。/api/history 是内存里的实时曲线，两者
-    # 路径与语义都分开，免得有人拿 history 去查昨天。
-    app.router.add_get("/api/metrics", handle_metrics)
     app.router.add_get("/api/stream", handle_stream)
-    # 受管 frontend 的增删改：监听端口、模式、限额、超时、后端服务器。
-    # PUT 用同一个 upsert 语义（存在即整体更新，不存在即新建），界面上
-    # "新增"与"保存"因此走同一条路径，少一类边界情况。
-    app.router.add_put("/api/frontends/{name}", handle_upsert_frontend)
-    app.router.add_post("/api/frontends", handle_upsert_frontend)
-    app.router.add_delete("/api/frontends/{name}", handle_delete_frontend)
     return app
 
 
@@ -444,31 +318,26 @@ async def run_console(
     port: int,
     hub: StatusHub,
     logbuf: LogBuffer,
-    db_opts: dbconfig.MySQLOptions | None,
     log: logging.Logger,
     bind: str = "127.0.0.1",
-    instance: str = "haproxy",
-    store=None,
 ) -> None:
     """常驻任务：启动控制台 HTTP 服务并挂起到被取消，取消时干净回收。
 
-    bind 默认只绑回环：控制台无鉴权且带写接口，默认对外可达不可接受
-    （由 RL_CONSOLE_BIND 显式放开，见 __main__）。绑到非回环地址时打一条
-    warning，让"我以为它只在本机"的误配在日志里留痕。
+    bind 默认只绑回环：控制台虽是只读，但暴露的是全量运行状态与日志，
+    默认对外可达不可接受（由 RL_CONSOLE_BIND 显式放开，见 __main__）。
+    绑到非回环地址时打一条 warning，让"我以为它只在本机"的误配在日志里
+    留痕。
     """
-    runner = web.AppRunner(
-        build_app(hub, logbuf, db_opts, log, instance, store), access_log=None)
+    runner = web.AppRunner(build_app(hub, logbuf, log), access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, bind, port)
     await site.start()
-    log.info(
-        "Web 控制台已启动（实时观测 + 配置管理） bind=%s port=%d db_mode=%s",
-        bind, port, db_opts is not None)
+    log.info("Web 控制台已启动（只读实时观测） bind=%s port=%d", bind, port)
     if bind not in ("127.0.0.1", "::1", "localhost"):
         log.warning(
-            "Web 控制台绑定在非回环地址上，而控制台**没有任何鉴权**且提供"
-            "写接口（改登记限额/改挂载点/删环境）——请确认该地址只在内网"
-            "且已由防火墙/安全组限制来源 bind=%s port=%d", bind, port)
+            "Web 控制台绑定在非回环地址上，而控制台**没有任何鉴权**"
+            "（暴露全量监控数据与运行日志）——请确认该地址只在内网且已由"
+            "防火墙/安全组限制来源 bind=%s port=%d", bind, port)
     try:
         await asyncio.Event().wait()  # 挂起至任务被取消
     finally:

@@ -4,10 +4,9 @@
 # 已经在生产机上了。所以把"能靠静态检查抓住的"都钉在这里：
 #   1. unit 模板里的每个 @占位符@ 脚本都替换了（漏一个 systemd 会拒绝
 #      加载，或者更糟——把字面量 "@VENV@/bin/rl-limiter" 当路径）；
-#   2. unit 必须带 CAP_NET_ADMIN（限速换成 tc 之后这是硬前提，少了它
-#      服务起不来，而旧版 unit 的注释还写着"无需 CAP_NET_ADMIN"）；
-#   3. bootstrap 对已有配置只增不改（用 INSERT IGNORE，不是 REPLACE）——
-#      重跑装机脚本把运维调好的限额冲回默认值是不可接受的故障。
+#   2. unit 必须带 CAP_NET_ADMIN（tc 限速的硬前提，少了它服务起不来）；
+#   3. 脚本绝不改写别人的 haproxy.cfg——它是负载均衡配置的唯一权威，
+#      归运维手工编辑。
 
 from __future__ import annotations
 
@@ -17,15 +16,12 @@ import shutil
 import subprocess
 
 import pytest
-import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BARE = ROOT / "deploy/bare"
 SCRIPT = BARE / "rl-limiter.sh"
 UNIT_IN = BARE / "rl-limiter.service.in"
 ENV_EXAMPLE = BARE / "rl-limiter.env.example"
-COMPOSE = BARE / "docker-compose.mysql.yml"
-BOOTSTRAP = ROOT / "tools/bootstrap_db.py"
 
 
 # ---------------------------------------------------------------------------
@@ -47,11 +43,10 @@ def test_every_placeholder_in_the_unit_is_substituted():
 
 
 def test_unit_grants_net_admin_for_tc():
-    """限速已经从 HAProxy bwlim 换成内核 tc（docs/06），tc 要操作网络设备。
+    """限速由内核 tc 执行（docs/06），tc 要操作网络设备。
 
     没有 CAP_NET_ADMIN 服务直接起不来——这是刻意的，"静默地没在限速"比
-    起不来危险得多。旧版 unit 的注释里还写着"无需 CAP_NET_ADMIN"，那是
-    bwlim 时代的说法。
+    起不来危险得多。
     """
     unit = UNIT_IN.read_text(encoding="utf-8")
     assert "AmbientCapabilities=CAP_NET_ADMIN" in unit
@@ -60,20 +55,27 @@ def test_unit_grants_net_admin_for_tc():
     assert "无需 CAP_NET_ADMIN" not in unit
 
 
-def test_unit_can_write_the_haproxy_config_directory():
-    """ProtectSystem=strict 会把 /etc 整个挂只读。配置下发要在 cfg 所在
-    **目录**里建临时文件再 rename（原子替换），所以放开的必须是目录。"""
+def test_unit_is_fully_read_only():
+    """rl-limiter 只读 cfg/YAML、不写任何文件（cfg 归运维手工编辑）。
+    unit 因此可以全只读——出现 ReadWritePaths 说明有人又把写盘能力
+    加回来了，这与"cfg 是唯一权威、服务只读"的架构相悖。"""
     unit = UNIT_IN.read_text(encoding="utf-8")
     assert "ProtectSystem=strict" in unit
-    assert re.search(r"^ReadWritePaths=@HAPROXY_CFG_DIR@", unit, re.M)
+    assert not re.search(r"^ReadWritePaths", unit, re.M)
 
 
 def test_unit_does_not_hard_require_haproxy():
     """haproxy 挂了 rl-limiter 只是采不到数（打 degraded 告警），不该被
-    连坐停掉——那会让监控和限速一起消失。所以只能 After，不能 Requires。"""
+    连坐停掉——那会让监控和限速调整一起消失。所以只能 After，不能 Requires。"""
     unit = UNIT_IN.read_text(encoding="utf-8")
     assert "After=" in unit and "haproxy.service" in unit
     assert not re.search(r"^Requires=.*haproxy", unit, re.M)
+
+
+def test_unit_passes_yaml_config_path():
+    """ExecStart 必须带 -c 指向 YAML 配置——它是 quotas 与接线的来源。"""
+    unit = UNIT_IN.read_text(encoding="utf-8")
+    assert re.search(r"^ExecStart=.*rl-limiter -c @CONF_DIR@/config\.yaml", unit, re.M)
 
 
 # ---------------------------------------------------------------------------
@@ -85,86 +87,21 @@ def test_env_example_only_uses_real_env_vars():
     配置**静默不生效**——本项目最不能接受的故障形态。"""
     text = ENV_EXAMPLE.read_text(encoding="utf-8")
     used = set(re.findall(r"^#?\s*(RL_[A-Z_]+)=", text, re.M))
-    src = "\n".join((ROOT / "rl_limiter" / f).read_text(encoding="utf-8")
-                    for f in ("__main__.py", "dbconfig.py"))
+    src = (ROOT / "rl_limiter" / "__main__.py").read_text(encoding="utf-8")
     known = set(re.findall(r'"(RL_[A-Z_]+)"', src))
     unknown = used - known
     assert not unknown, f"模板里这些变量代码不认：{sorted(unknown)}"
 
 
+def test_env_example_has_no_mysql_vars():
+    """MySQL 配置源已删除：模板里再出现 RL_MYSQL_* 就是回归。"""
+    assert "RL_MYSQL" not in ENV_EXAMPLE.read_text(encoding="utf-8")
+
+
 def test_env_example_defaults_to_loopback_console():
-    """控制台无鉴权且带写接口，模板给的默认值必须是回环。"""
+    """控制台无鉴权（暴露全量监控与日志），模板给的默认值必须是回环。"""
     text = ENV_EXAMPLE.read_text(encoding="utf-8")
     assert re.search(r"^RL_CONSOLE_BIND=127\.0\.0\.1", text, re.M)
-
-
-# ---------------------------------------------------------------------------
-# 只起 MySQL 的 compose
-# ---------------------------------------------------------------------------
-
-def test_mysql_compose_has_only_the_database():
-    """裸机形态下 HAProxy 与 rl-limiter 都在本机跑，这份 compose 里
-    **只该有数据库**。多一个服务就说明形态又混回去了。"""
-    doc = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
-    assert list(doc["services"]) == ["mysql"]
-
-
-def test_mysql_port_is_bound_to_loopback_only():
-    """库里存着各 frontend 的限额，没有任何理由暴露到网外；rl-limiter
-    与它同机，走 127.0.0.1 即可。"""
-    doc = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
-    for spec in doc["services"]["mysql"]["ports"]:
-        assert str(spec).startswith("127.0.0.1:"), f"端口 {spec} 没绑回环"
-
-
-def test_mysql_compose_loads_the_same_init_sql():
-    """建表语句只有一份。演示环境和裸机环境用不同的 schema 迟早会漂。"""
-    doc = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
-    mounts = doc["services"]["mysql"]["volumes"]
-    assert any("mysql/init.sql" in str(m) for m in mounts), mounts
-
-
-# ---------------------------------------------------------------------------
-# bootstrap：只增不改
-# ---------------------------------------------------------------------------
-
-def test_bootstrap_never_overwrites_existing_frontends():
-    """**这条是硬要求**：限额是运维在控制台上调出来的值，重跑装机脚本
-    把它冲回默认值是不可接受的故障。所以 frontend 与后端服务器一律用
-    INSERT IGNORE；只有实例接线信息（socket 路径）才 upsert。"""
-    src = BOOTSTRAP.read_text(encoding="utf-8")
-    assert "INSERT IGNORE INTO haproxy_frontends" in src
-    assert "INSERT IGNORE INTO haproxy_servers" in src
-    # 这两张表上绝不能出现覆盖式写法
-    for danger in ("REPLACE INTO haproxy_frontends", "REPLACE INTO haproxy_servers"):
-        assert danger not in src
-    assert "ON DUPLICATE KEY UPDATE" in src.split("haproxy_frontends")[0], \
-        "实例行应该 upsert（接线信息以本机为准）"
-
-
-@pytest.mark.parametrize("spec,expect", [
-    ("10.0.0.21:9000", ("10.0.0.21", 9000)),
-    ("web.internal:8080", ("web.internal", 8080)),
-    ("[fd00::5]:9000", ("fd00::5", 9000)),
-])
-def test_backend_spec_parsing(spec, expect):
-    import importlib.util
-    spec_ = importlib.util.spec_from_file_location("bs", BOOTSTRAP)
-    m = importlib.util.module_from_spec(spec_)
-    spec_.loader.exec_module(m)
-    assert m.parse_backend(spec) == expect
-
-
-@pytest.mark.parametrize("spec", ["10.0.0.21", "10.0.0.21:0", "10.0.0.21:99999", ":9000"])
-def test_bad_backend_spec_is_rejected(spec):
-    """裸 IPv6 里全是冒号，猜错的后果是流量打到不存在的后端——宁可报错。"""
-    import argparse
-    import importlib.util
-    spec_ = importlib.util.spec_from_file_location("bs", BOOTSTRAP)
-    m = importlib.util.module_from_spec(spec_)
-    spec_.loader.exec_module(m)
-    with pytest.raises(argparse.ArgumentTypeError):
-        m.parse_backend(spec)
 
 
 # ---------------------------------------------------------------------------
@@ -178,12 +115,18 @@ def test_script_parses():
 
 
 def test_script_never_rewrites_the_users_haproxy_config():
-    """本机 HAProxy 是既有的生产配置。脚本只能**读**它（查 stats socket），
-    绝不能改——受管区块由 rl-limiter 自己按标记渲染，那是另一回事。"""
+    """本机 HAProxy 是既有的生产配置，也是负载均衡配置的唯一权威。脚本
+    只能**读**它（查 stats socket / 解析校验），绝不能改。"""
     src = SCRIPT.read_text(encoding="utf-8")
     # 找所有对 haproxy.cfg 的写操作痕迹
     for danger in ("> \"$cfg\"", ">\"$cfg\"", "sed -i", "tee "):
-        # sed -i 只允许出现在生成 unit 的地方（那是我们自己的文件）
         for line in src.splitlines():
             if danger in line and "haproxy" in line.lower():
                 pytest.fail(f"脚本疑似在改 haproxy 配置：{line.strip()}")
+
+
+def test_script_has_no_mysql_leftovers():
+    """配置库已删除：脚本里再出现 mysql/bootstrap_db 就是回归。"""
+    src = SCRIPT.read_text(encoding="utf-8").lower()
+    assert "mysql" not in src
+    assert "bootstrap_db" not in src

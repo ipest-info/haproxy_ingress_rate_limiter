@@ -1,30 +1,35 @@
 #!/usr/bin/env bash
 # deploy/bare/rl-limiter.sh —— 裸机部署 rl-limiter 的一键脚本。
 #
-# 形态：**HAProxy 与 rl-limiter 都直接跑在本机**（不进容器），只有配置库
-# 用 Docker 起。前提是本机 HAProxy 已经装好并在跑——本脚本不碰它的安装，
-# 也**不会重写它的 haproxy.cfg**（只在缺 stats socket 时告诉你该加哪一行）。
+# 形态：**HAProxy 与 rl-limiter 都直接跑在本机**（不进容器，也没有任何
+# 数据库）。前提是本机 HAProxy 已经装好并在跑——本脚本不碰它的安装，
+# 也**绝不改写 haproxy.cfg**（缺 stats socket 时只告诉你该加哪一行）。
+#
+# 配置只有两个本机文件：
+#   /etc/haproxy/haproxy.cfg      —— 负载均衡配置的**唯一权威**（监听端口、
+#                                    后端服务器；运维直接编辑 + reload）
+#   /etc/rl-limiter/config.yaml   —— rl-limiter 的接线 + 限额登记（quotas）
+# 两份文件的内容都被 rl-limiter 轮询（5s），改了即热生效（cfg 改完记得
+# reload haproxy）。
 #
 # 用法：
 #   ./rl-limiter.sh install     装 + 起（幂等，可反复跑）
 #   ./rl-limiter.sh check       体检：只看不改，有问题时退出码 1
 #   ./rl-limiter.sh start|stop|restart|status|logs
-#   ./rl-limiter.sh mysql-up|mysql-down   起/停配置库容器
-#   ./rl-limiter.sh uninstall   卸载（保留配置库与 /etc/rl-limiter）
+#   ./rl-limiter.sh uninstall   卸载（保留 /etc/rl-limiter）
 #
 # install 干这些事，每一步都会说清楚做了什么：
 #   1. 前置检查：python3 ≥ 3.11、haproxy 已装、tc 可用、内核有 HTB、systemd
 #   2. 建专用用户 rl-limiter 并加入 haproxy 组（读 stats socket 靠属组）
 #   3. venv 装到 /opt/rl-limiter
-#   4. 配置文件 /etc/rl-limiter/rl-limiter.env（已存在则**不覆盖**）
-#   5. 起配置库容器并等就绪；把本机登记进库、确保至少有一个 frontend
-#   6. 授权：haproxy 配置目录可写 + polkit 允许 reload haproxy
-#   7. 内核参数调优（裸机上全都能设，不像容器里那样受限）
-#   8. 装 systemd unit → daemon-reload → enable --now
-#   9. 起来之后**逐项核对**：进程在不在、socket 通不通、tc 类建了没
+#   4. 配置文件 /etc/rl-limiter/{config.yaml,rl-limiter.env}（已存在则**不覆盖**）
+#   5. 校验配置能真实加载（YAML + haproxy.cfg 解析各过一遍）
+#   6. 内核参数调优（裸机上全都能设，不像容器里那样受限）
+#   7. 装 systemd unit → daemon-reload → enable --now
+#   8. 起来之后**逐项核对**：进程在不在、socket 通不通、tc 类建了没
 #
 # 设计约束（和本项目其它地方一致）：
-#   - 已有的东西一概不覆盖（配置文件、库里的限额、别人的 haproxy.cfg）；
+#   - 已有的东西一概不覆盖（配置文件、别人的 haproxy.cfg）；
 #   - 每一步做完都**读回来确认**，不靠"命令返回 0"当成功；
 #   - 缺什么就说缺什么、该执行什么命令，不静默降级。
 
@@ -37,16 +42,9 @@ REPO=$(cd "$HERE/../.." && pwd)
 RL_USER=${RL_USER:-rl-limiter}
 VENV=${VENV:-/opt/rl-limiter}
 CONF_DIR=${CONF_DIR:-/etc/rl-limiter}
+YAML_FILE="$CONF_DIR/config.yaml"
 ENV_FILE="$CONF_DIR/rl-limiter.env"
 UNIT=/etc/systemd/system/rl-limiter.service
-POLKIT_RULE=/etc/polkit-1/rules.d/50-rl-limiter-haproxy.rules
-COMPOSE_FILE="$HERE/docker-compose.mysql.yml"
-
-# 初始 frontend（只在库里还没有时创建；已有的一个字节都不碰）。
-BOOTSTRAP_FRONTEND=${BOOTSTRAP_FRONTEND:-fe_main}
-BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-8080}
-BOOTSTRAP_QUOTA_MBPS=${BOOTSTRAP_QUOTA_MBPS:-1000}
-BOOTSTRAP_BACKEND=${BOOTSTRAP_BACKEND:-}
 
 ok()   { printf '  [ok]   %s\n' "$*"; }
 warn() { printf '  [warn] %s\n' "$*"; }
@@ -56,16 +54,6 @@ die()  { printf '\n致命：%s\n' "$*" >&2; exit 1; }
 
 need_root() {
     [ "$(id -u)" -eq 0 ] || die "这一步需要 root：sudo $0 $*"
-}
-
-compose() {
-    if docker compose version >/dev/null 2>&1; then
-        docker compose -f "$COMPOSE_FILE" "$@"
-    elif command -v docker-compose >/dev/null 2>&1; then
-        docker-compose -f "$COMPOSE_FILE" "$@"
-    else
-        die "找不到 docker compose。配置库要用 Docker 起（见 $COMPOSE_FILE）"
-    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -120,8 +108,6 @@ preflight() {
 
     command -v systemctl >/dev/null 2>&1 && ok "systemd 可用" || {
         bad "找不到 systemctl，本脚本按 systemd 部署"; fail=1; }
-    command -v docker >/dev/null 2>&1 && ok "docker 可用（配置库要用）" || {
-        bad "找不到 docker —— 配置库跑在容器里"; fail=1; }
 
     return $fail
 }
@@ -144,9 +130,22 @@ check_stats_socket() {
              stats socket /run/haproxy/admin.sock mode 660 level user
 
          本脚本**不会替你改 haproxy.cfg**：那是你的生产配置，
-         受管区块之外的内容我们一个字节都不碰。
+         我们一个字节都不碰。
 EOF
     return 1
+}
+
+# contstats：不开的话 TCP 长连接的 bytes_out 只在会话结束时一次性入账，
+# 秒级带宽曲线全是脉冲，监控数据不可用。同样只提示不代改。
+check_contstats() {
+    local cfg=$1
+    [ -r "$cfg" ] || return 0
+    if grep -qE '^[[:space:]]*option[[:space:]]+contstats' "$cfg"; then
+        ok "haproxy.cfg 里有 option contstats（长连接的秒级带宽依赖它）"
+    else
+        warn "haproxy.cfg 里没找到 option contstats——TCP 长连接的带宽曲线"
+        warn "  会脉冲式跳变。请在 defaults 段加：option contstats"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -186,16 +185,24 @@ install_venv() {
 install_conf() {
     step "配置文件"
     mkdir -p "$CONF_DIR"
+    if [ -f "$YAML_FILE" ]; then
+        # 已有配置一概不覆盖——里面是运维调过的限额。
+        ok "$YAML_FILE 已存在，保持不动"
+    else
+        cp "$REPO/deploy/config/limiter.example.yaml" "$YAML_FILE"
+        chmod 640 "$YAML_FILE"
+        chgrp "$RL_USER" "$YAML_FILE" 2>/dev/null || true
+        ok "已生成 $YAML_FILE（示例配置）"
+        warn "**先编辑它**：cfg_path/socket_path 指向本机实际路径，"
+        warn "quotas 按 haproxy.cfg 里的段名登记限额，再继续。"
+    fi
     if [ -f "$ENV_FILE" ]; then
-        # 已有配置一概不覆盖——里面是运维填过的库密码、网卡名这些东西。
         ok "$ENV_FILE 已存在，保持不动"
     else
         cp "$HERE/rl-limiter.env.example" "$ENV_FILE"
         chmod 640 "$ENV_FILE"
         chgrp "$RL_USER" "$ENV_FILE" 2>/dev/null || true
-        ok "已生成 $ENV_FILE（含库密码，权限 640）"
-        warn "**先编辑它**（至少确认 RL_NODE_NAME 与库里一致、"
-        warn "RL_MYSQL_PASSWORD 对得上），再继续。"
+        ok "已生成 $ENV_FILE（网卡/控制台等本机环境变量）"
     fi
 }
 
@@ -206,49 +213,43 @@ env_get() {
     sed -n "s/^[[:space:]]*${key}=//p" "$ENV_FILE" | tail -1 | tr -d '"'"'"
 }
 
-grant_perms() {
-    step "授权"
-    local cfg dir
-    cfg=$(env_get RL_APPLY_HAPROXY_CFG)
-    if [ -z "$cfg" ]; then
-        warn "未启用配置自动下发（RL_APPLY_HAPROXY_CFG 为空），跳过 cfg 授权"
-        return 0
-    fi
-    dir=$(dirname "$cfg")
-    # **目录**要可写而不只是文件：原子替换要在同目录建临时文件再 rename，
-    # 跨挂载点的 rename 会失败。
-    if [ -d "$dir" ]; then
-        chgrp "$RL_USER" "$dir" "$cfg" 2>/dev/null || true
-        chmod g+w "$dir" 2>/dev/null || true
-        [ -f "$cfg" ] && chmod g+w "$cfg" 2>/dev/null
-        if sudo -u "$RL_USER" test -w "$dir"; then
-            ok "$dir 对 $RL_USER 可写（原子替换需要目录权限，不只是文件）"
-        else
-            bad "$dir 对 $RL_USER 仍不可写 —— 配置下发会一直失败"
-        fi
-    else
-        warn "目录 $dir 不存在，跳过"
-    fi
+# 从 YAML 配置里取 haproxy 段的一个标量字段（cfg_path/socket_path）。
+yaml_get() {
+    local key=$1
+    "$VENV/bin/python" - "$YAML_FILE" "$key" <<'PY' 2>/dev/null
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+print(((d.get("haproxy") or {}).get(sys.argv[2]) or ""))
+PY
+}
 
-    # reload haproxy：用 polkit 而不是 sudo。走 sudo 就必须把 unit 里的
-    # NoNewPrivileges 放开，而那类失败只体现在"配置没生效"上，很难联想到。
-    if [ -d /etc/polkit-1/rules.d ]; then
-        cat >"$POLKIT_RULE" <<EOF
-// 由 deploy/bare/rl-limiter.sh 生成：只允许 $RL_USER reload haproxy 这一件事。
-polkit.addRule(function(action, subject) {
-    if (action.id == "org.freedesktop.systemd1.manage-units" &&
-        action.lookup("unit") == "haproxy.service" &&
-        action.lookup("verb") == "reload" &&
-        subject.user == "$RL_USER") {
-        return polkit.Result.YES;
-    }
-});
-EOF
-        ok "已装 polkit 规则（仅允许 $RL_USER reload haproxy）：$POLKIT_RULE"
+# 配置能不能真实加载：YAML 校验 + haproxy.cfg 解析各过一遍。
+# 在装 unit 之前做——配置有问题时"装好了但起不来 + 重启循环"比这里的
+# 一条报错难排查得多。
+validate_conf() {
+    step "配置校验"
+    local out
+    if out=$("$VENV/bin/python" - "$YAML_FILE" <<'PY' 2>&1
+import logging, sys
+from rl_limiter import cfgparse, config
+cfg = config.load(sys.argv[1])
+fes = cfgparse.load_frontends(cfg.haproxy.cfg_path, cfg.quotas,
+                              logging.getLogger("check"))
+limited = [f for f in fes if f.limited]
+print(f"frontends={len(fes)} limited={len(limited)} "
+      f"detail={';'.join(f'{f.name}:{f.quota_mbps:g}Mbps' if f.limited else f'{f.name}:仅监控' for f in fes)}")
+PY
+    ); then
+        ok "配置可加载：$out"
+        case "$out" in
+            "frontends=0 "*)
+                warn "haproxy.cfg 里没解析到任何带监听端口的 frontend/listen——"
+                warn "  服务能起，但什么都不会监控/限速。检查 cfg_path 对不对。" ;;
+        esac
     else
-        warn "没有 /etc/polkit-1/rules.d，改用 sudoers。**同时要把 unit 里的"
-        warn "NoNewPrivileges 改成 no**，否则 sudo 提权会被内核直接拒绝："
-        warn "  $RL_USER ALL=(root) NOPASSWD: /usr/bin/systemctl reload haproxy"
+        bad "配置加载失败："
+        printf '%s\n' "$out" | sed 's/^/         /'
+        return 1
     fi
 }
 
@@ -268,63 +269,14 @@ tune_kernel() {
 
 install_unit() {
     step "systemd unit"
-    local cfg dir
-    cfg=$(env_get RL_APPLY_HAPROXY_CFG)
-    dir=${cfg:+$(dirname "$cfg")}
-    dir=${dir:-/etc/haproxy}
     sed -e "s|@VENV@|$VENV|g" \
         -e "s|@USER@|$RL_USER|g" \
         -e "s|@ENVFILE@|$ENV_FILE|g" \
-        -e "s|@HAPROXY_CFG_DIR@|$dir|g" \
+        -e "s|@CONF_DIR@|$CONF_DIR|g" \
         "$HERE/rl-limiter.service.in" >"$UNIT" || die "生成 unit 失败"
     grep -q '@' "$UNIT" && warn "unit 里还有没替换的占位符，检查 $UNIT"
     systemctl daemon-reload
-    ok "已装 $UNIT（ReadWritePaths=$dir，带 CAP_NET_ADMIN）"
-}
-
-bootstrap_db() {
-    step "配置库"
-    compose up -d || die "起配置库容器失败"
-    ok "配置库容器已启动（$(basename "$COMPOSE_FILE")）"
-
-    local node backend_args=()
-    node=$(env_get RL_NODE_NAME); node=${node:-hap-1}
-    if [ -n "$BOOTSTRAP_BACKEND" ]; then
-        # 逗号分隔的 地址:端口 列表
-        local IFS=,
-        for b in $BOOTSTRAP_BACKEND; do backend_args+=(--backend "$b"); done
-    fi
-
-    # 环境变量从 env 文件读，跟服务本身用同一份接线参数。
-    set -a; . "$ENV_FILE"; set +a
-    if [ ${#backend_args[@]} -gt 0 ]; then
-        "$VENV/bin/python" "$REPO/tools/bootstrap_db.py" \
-            --instance "$node" \
-            --socket "$(haproxy_socket_path)" \
-            --frontend "$BOOTSTRAP_FRONTEND" --port "$BOOTSTRAP_PORT" \
-            --quota-mbps "$BOOTSTRAP_QUOTA_MBPS" "${backend_args[@]}" \
-            || die "登记配置库失败"
-    else
-        "$VENV/bin/python" "$REPO/tools/bootstrap_db.py" \
-            --instance "$node" --socket "$(haproxy_socket_path)" || {
-            echo
-            echo "库里这个实例名下还没有 frontend，rl-limiter 会拒绝启动。"
-            echo "给一个初始 frontend 再跑一次即可，例如："
-            echo "  BOOTSTRAP_BACKEND=10.0.0.21:9000 $0 install"
-            echo "（也可以调 BOOTSTRAP_FRONTEND / BOOTSTRAP_PORT /"
-            echo "  BOOTSTRAP_QUOTA_MBPS；这些只在新建时用，不会覆盖已有配置）"
-            exit 1
-        }
-    fi
-}
-
-# 从本机 haproxy.cfg 里读出 stats socket 路径；读不到用默认值。
-haproxy_socket_path() {
-    local cfg p
-    cfg=$(env_get RL_APPLY_HAPROXY_CFG); cfg=${cfg:-/etc/haproxy/haproxy.cfg}
-    p=$(sed -nE 's/^[[:space:]]*stats[[:space:]]+socket[[:space:]]+(\/[^[:space:]]+).*/\1/p' \
-        "$cfg" 2>/dev/null | head -1)
-    echo "${p:-/run/haproxy/admin.sock}"
+    ok "已装 $UNIT（全只读 + CAP_NET_ADMIN）"
 }
 
 # ---------------------------------------------------------------------------
@@ -341,13 +293,15 @@ verify() {
         return 1
     fi
 
-    local sock; sock=$(haproxy_socket_path)
-    [ -S "$sock" ] && ok "HAProxy stats socket 存在（$sock）" || {
-        bad "找不到 stats socket $sock —— 采样会一直失败"; fail=1; }
+    local sock; sock=$(yaml_get socket_path)
+    if [ -n "$sock" ]; then
+        [ -S "$sock" ] && ok "HAProxy stats socket 存在（$sock）" || {
+            bad "找不到 stats socket $sock —— 采样会一直失败"; fail=1; }
+    fi
 
     local iface; iface=$(env_get RL_TC_IFACE)
     if [ "$iface" = "-" ]; then
-        warn "限速已被显式关闭（RL_TC_IFACE=-），只做监控与配置下发"
+        warn "限速已被显式关闭（RL_TC_IFACE=-），只做监控"
     else
         # 真正要确认的是"tc 队列树建起来了"，而不是"进程活着"。
         sleep 3
@@ -355,14 +309,15 @@ verify() {
                 ${iface:+-i "$iface"} 2>/dev/null; then
             ok "tc 限速已按配置生效"
         else
-            bad "tc 核对未通过（上面有逐条说明）。限速可能没在工作"
+            bad "tc 核对未通过（上面有逐条说明）。限速可能没在工作。"
+            bad "  注意：quotas 全空（只监控）时没有 tc 类，属正常"
             fail=1
         fi
     fi
 
     local port; port=$(env_get RL_CONSOLE_PORT)
     local bind; bind=$(env_get RL_CONSOLE_BIND); bind=${bind:-127.0.0.1}
-    [ -n "$port" ] && ok "控制台：http://${bind}:${port}"
+    [ -n "$port" ] && ok "控制台（只读）：http://${bind}:${port}"
     return $fail
 }
 
@@ -375,11 +330,11 @@ cmd_install() {
     ensure_user
     install_venv
     install_conf
-    local hcfg; hcfg=$(env_get RL_APPLY_HAPROXY_CFG)
-    check_stats_socket "${hcfg:-/etc/haproxy/haproxy.cfg}" \
+    local hcfg; hcfg=$(yaml_get cfg_path); hcfg=${hcfg:-/etc/haproxy/haproxy.cfg}
+    check_stats_socket "$hcfg" \
         || warn "stats socket 这项没过，服务起来后会一直报采样失败"
-    bootstrap_db
-    grant_perms
+    check_contstats "$hcfg"
+    validate_conf || die "配置有问题，改好 $YAML_FILE / cfg_path 后重跑 install"
     tune_kernel
     install_unit
 
@@ -388,9 +343,10 @@ cmd_install() {
     verify
     local rc=$?
     step "完成"
-    echo "  配置：  $ENV_FILE（改完 systemctl restart rl-limiter）"
-    echo "  日志：  journalctl -u rl-limiter -f"
-    echo "  体检：  $0 check"
+    echo "  限额配置：$YAML_FILE（改 quotas 5s 内热生效，无需重启）"
+    echo "  负载均衡：$hcfg（改完 systemctl reload haproxy，rl-limiter 自动跟上）"
+    echo "  日志：    journalctl -u rl-limiter -f"
+    echo "  体检：    $0 check"
     return $rc
 }
 
@@ -399,12 +355,17 @@ cmd_check() {
     local fail=$?
     step "已安装的东西"
     [ -x "$VENV/bin/rl-limiter" ] && ok "venv: $VENV" || { bad "没装 venv"; fail=1; }
-    [ -f "$ENV_FILE" ] && ok "配置: $ENV_FILE" || { bad "没有 $ENV_FILE"; fail=1; }
+    [ -f "$YAML_FILE" ] && ok "配置: $YAML_FILE" || { bad "没有 $YAML_FILE"; fail=1; }
+    [ -f "$ENV_FILE" ] && ok "环境: $ENV_FILE" || { bad "没有 $ENV_FILE"; fail=1; }
     [ -f "$UNIT" ] && ok "unit: $UNIT" || { bad "没装 systemd unit"; fail=1; }
     systemctl is-active --quiet rl-limiter && ok "服务正在运行" || {
         warn "服务未运行（$0 start）"; }
-    local hcfg; hcfg=$(env_get RL_APPLY_HAPROXY_CFG)
-    check_stats_socket "${hcfg:-/etc/haproxy/haproxy.cfg}" || fail=1
+    if [ -x "$VENV/bin/rl-limiter" ] && [ -f "$YAML_FILE" ]; then
+        local hcfg; hcfg=$(yaml_get cfg_path); hcfg=${hcfg:-/etc/haproxy/haproxy.cfg}
+        check_stats_socket "$hcfg" || fail=1
+        check_contstats "$hcfg"
+        validate_conf || fail=1
+    fi
     step "内核参数"
     "$REPO/deploy/sysctl/tune-kernel.sh" check || fail=1
     return $fail
@@ -418,15 +379,12 @@ case "${1:-}" in
     restart)   need_root restart; systemctl restart rl-limiter && verify ;;
     status)    systemctl status rl-limiter --no-pager ;;
     logs)      journalctl -u rl-limiter -f ;;
-    mysql-up)  compose up -d && compose ps ;;
-    mysql-down) compose down ;;
     uninstall)
         need_root uninstall
         systemctl disable --now rl-limiter >/dev/null 2>&1
-        rm -f "$UNIT" "$POLKIT_RULE"
+        rm -f "$UNIT"
         systemctl daemon-reload
         echo "已卸载服务。**以下东西刻意保留**，要清请手工来："
-        echo "  配置库容器与数据卷：$0 mysql-down（加 -v 才删数据）"
         echo "  配置文件：$CONF_DIR"
         echo "  venv：    $VENV"
         echo "  网卡上的 tc 限速队列树：tc qdisc del dev <网卡> root"

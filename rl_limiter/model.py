@@ -1,27 +1,22 @@
 # rl_limiter.model —— 全服务共享的领域类型（"词汇表"层）。
 #
-# 架构背景（v0.4 起的单 HAProxy 模型）：一个 rl-limiter 实例管**一台**
-# 与它同机的 HAProxy。限速由**内核 tc（HTB）**执行（见 rl_limiter.tcshaper）；
-# rl-limiter 负责两件事：
-#   1. 监控——每秒经本机 unix stats socket 采样各受管 frontend 的
-#      bytes_out，对照限额做持续超限告警；
-#   2. 下发——把配置（监听端口、限额、后端服务器）渲染进 haproxy.cfg 的
-#      受管区块并 reload，让改动即时生效。
+# 架构背景（单 HAProxy 模型）：一个 rl-limiter 实例管**一台**与它同机的
+# HAProxy。**haproxy.cfg 是负载均衡配置的唯一权威**（监听端口、模式、
+# 后端服务器都由运维直接写在 cfg 里）；rl-limiter 只**读** cfg（见
+# rl_limiter.cfgparse）解析出各 frontend 的名字/端口/模式，与 YAML 里
+# 登记的限额合并后做两件事：
+#   1. 限速——由**内核 tc（HTB）**执行（见 rl_limiter.tcshaper），按
+#      源端口把各 frontend 的出向流量压在限额内；
+#   2. 监控——每秒经本机 unix stats socket 采样各 frontend 的
+#      bytes_out，对照限额做持续超限告警。
 #
 # **监控与限速的单位都是 frontend**：一个 frontend = 一个监听端口 +
-# 一个 tc 速率类 + 一组后端服务器。tc 按**源端口**分类，而源端口就是该
-# frontend 的监听端口，因此这个对应关系是天然的，也不存在"跨 frontend
-# 的总限额"这种东西。
-#
-# 历史包袱说明：v0.3 及以前有"节点 / 业务环境（env）"两层分组，用于一个
-# 集中服务监控多台 HAProxy。改为同机部署后一个实例只对一台 HAProxy 负责，
-# 那两层分组失去意义，已整体移除（EnvQuota/EnvUsage/Target/env_groups
-# 及 envs、env_targets 两张表）。对应的旧版本见 tag v0.3.0-colocated。
+# 一个 tc 速率类。tc 按**源端口**分类，而源端口就是该 frontend 的监听
+# 端口，因此这个对应关系是天然的。
 #
 # 单位约定（非常重要，混淆会带来 8 倍误差）：
-#   - **配置的限额单位一律是 Mbps**（`quota_mbps`，允许小数）。数据库、
-#     本地 YAML、控制台接口三个配置入口用的都是这一个字段、这一个单位，
-#     不存在"这里填 bit/s、那里填 Mbps"的分裂。40 就是 40 Mbps。
+#   - **配置的限额单位一律是 Mbps**（`quota_mbps`，允许小数）。40 就是
+#     40 Mbps。
 #   - 内部所有速率一律为「字节每秒」（bytes/s，float）。HAProxy stats 的
 #     bytes_out 本身就是字节计数，内部保持字节口径避免反复换算。
 #   - 换算只在 FrontendConfig 的两个 property 里发生
@@ -153,69 +148,33 @@ class NicStat:
 
 
 @dataclass(slots=True)
-class ServerEntry:
-    """受管 frontend 背后的一台后端服务器（haproxy.cfg 里的一行 server）。
-
-    字段刻意只覆盖"标准化 Web 界面"需要的那几项：地址、端口、权重、
-    健康检查。更冷门的 server 参数（ssl、sni、cookie…）不在受管区块的
-    表达能力内——需要时应把该 frontend 从受管区块移出、改为手写。
-    """
-
-    name: str                    # server 条目名（同一 frontend 内唯一）
-    address: str                 # 后端地址（IP 或可解析的主机名）
-    port: int                    # 后端端口
-    weight: int = 100            # 负载权重；balance 算法按它分配
-    check: bool = True           # 是否启用主动健康检查
-    check_inter_ms: int = 2000   # 健康检查间隔（毫秒），check 为真时才写入
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name, "address": self.address, "port": self.port,
-            "weight": self.weight, "check": self.check,
-            "check_inter_ms": self.check_inter_ms,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ServerEntry":
-        return cls(
-            name=str(d["name"]), address=str(d["address"]), port=int(d["port"]),
-            weight=int(d.get("weight", 100)),
-            check=bool(d.get("check", True)),
-            check_inter_ms=int(d.get("check_inter_ms", 2000)),
-        )
-
-
-@dataclass(slots=True)
 class FrontendConfig:
-    """一个受管 frontend：监听端口 + 限速 + 后端服务器清单。
+    """一个受管 frontend 的运行期视图：监听端口 + 限额。
 
-    对应 haproxy.cfg 受管区块里的一个 `listen` 段（listen 而非
-    frontend+backend 分写，是因为本项目里两者一一对应，合成一段能让
-    生成的配置更短、也更贴近 stats 里的 pxname）。
-
-quota_mbps 同时是两件事的依据：下发到内核 tc 的类速率（真实限速），
-    以及监控侧的超限告警基准。两者同源，因此 v0.3 那种"库里改了、数据面
-    忘了改"的配置漂移在本模型下不可能发生。
+    名字/端口/模式来自 haproxy.cfg 的解析（cfgparse），限额来自 YAML 的
+    quotas 登记。quota_mbps 同时是两件事的依据：下发到内核 tc 的类速率
+    （真实限速），以及监控侧的超限告警基准——两者同源，不会漂移。
+    quota_mbps == 0 表示"只监控不限速"（cfg 里有这个段、但 YAML 未登记
+    限额）：不建 tc 类、不做超限判定。
     """
 
     name: str                       # frontend 名（= stats 里的 pxname，全局唯一）
-    bind_port: int                  # 监听端口
-    quota_mbps: float               # 限额（Mbps），**配置的唯一单位**，允许小数
-    bind_address: str = ""          # 监听地址；空 = 所有地址（HAProxy 的 `bind :port`）
-    mode: str = "tcp"               # tcp | http
-    maxconn: int = 0                # 0 = 不写该指令，沿用 global/defaults
-    balance: str = "roundrobin"     # 后端负载均衡算法
-    timeout_connect_ms: int = 5000
-    timeout_client_ms: int = 50000
-    timeout_server_ms: int = 50000
-    servers: list[ServerEntry] = field(default_factory=list)
+    bind_port: int                  # 监听端口（tc 按它分类）
+    quota_mbps: float = 0.0         # 限额（Mbps）；0 = 只监控不限速
+    bind_address: str = ""          # 监听地址；空 = 所有地址
+    mode: str = "tcp"               # tcp | http（活跃/空闲连接的算法依据）
+
+    @property
+    def limited(self) -> bool:
+        """该 frontend 是否参与限速（登记了正限额）。"""
+        return self.quota_mbps > 0
 
     @property
     def quota_bits_per_sec(self) -> int:
         """Mbps → bit/s。tc 的 rate 参数用 bit，这里换过去。
 
         取整到整数 bit/s：tc 本身也只接受整数，留小数只会让"配置里写的"和
-        "实际下发的"对不上。0.0000001 Mbps 这种输入由校验拦掉，不在这里兜。
+        "实际下发的"对不上。
         """
         return int(round(self.quota_mbps * 1_000_000))
 
@@ -230,7 +189,7 @@ quota_mbps 同时是两件事的依据：下发到内核 tc 的类速率（真�
 
     @property
     def bind_spec(self) -> str:
-        """haproxy.cfg 里 `bind` 指令的参数形态。"""
+        """监听端点的人类可读形态（日志/控制台展示用）。"""
         return f"{self.bind_address}:{self.bind_port}" if self.bind_address \
             else f":{self.bind_port}"
 
@@ -241,12 +200,6 @@ quota_mbps 同时是两件事的依据：下发到内核 tc 的类速率（真�
             "bind_port": self.bind_port,
             "quota_mbps": self.quota_mbps,
             "mode": self.mode,
-            "maxconn": self.maxconn,
-            "balance": self.balance,
-            "timeout_connect_ms": self.timeout_connect_ms,
-            "timeout_client_ms": self.timeout_client_ms,
-            "timeout_server_ms": self.timeout_server_ms,
-            "servers": [s.to_dict() for s in self.servers],
         }
 
     @classmethod
@@ -254,15 +207,9 @@ quota_mbps 同时是两件事的依据：下发到内核 tc 的类速率（真�
         return cls(
             name=str(d["name"]),
             bind_port=int(d["bind_port"]),
-            quota_mbps=float(d["quota_mbps"]),
+            quota_mbps=float(d.get("quota_mbps", 0.0) or 0.0),
             bind_address=str(d.get("bind_address", "") or ""),
             mode=str(d.get("mode", "tcp")),
-            maxconn=int(d.get("maxconn", 0) or 0),
-            balance=str(d.get("balance", "roundrobin")),
-            timeout_connect_ms=int(d.get("timeout_connect_ms", 5000)),
-            timeout_client_ms=int(d.get("timeout_client_ms", 50000)),
-            timeout_server_ms=int(d.get("timeout_server_ms", 50000)),
-            servers=[ServerEntry.from_dict(s) for s in (d.get("servers") or [])],
         )
 
 
@@ -353,8 +300,8 @@ class InstanceUsage:
 class ControllerConfig:
     """投递给监控主循环的运行期配置文档（业务配置的内存形态）。
 
-    version 是配置版本号：数据库模式下取内容校验和，本地 YAML 模式恒为 0。
-    控制台展示它，便于核对热更新是否已到位。
+    version 是配置内容（cfg 解析结果 + 限额）的校验和，控制台展示它，
+    便于核对 haproxy.cfg / 限额变更的热更新是否已到位。
     """
 
     version: int = 0
@@ -402,11 +349,12 @@ class NodeConfig:
     即够；配置下发走的是文件 + reload，与 stats socket 无关。
     """
 
-    name: str = "haproxy"    # 本机 HAProxy 的标识名（多机共用配置库时区分用）
+    name: str = "haproxy"    # 本机 HAProxy 的标识名（日志/控制台展示用）
     host: str = ""           # 内网地址（TCP 形态）
     port: int = 0            # TCP stats socket 端口（TCP 形态）
     timeout_s: float = 0.5   # 单次 runtime API 命令超时（连接 + 读写）
     socket_path: str = ""    # 本机 unix stats socket 路径（同机形态）
+    cfg_path: str = ""       # 本机 haproxy.cfg 路径（受管 frontend 清单的来源）
 
     @property
     def is_unix(self) -> bool:

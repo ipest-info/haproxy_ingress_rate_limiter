@@ -10,7 +10,8 @@
 #           内核有没有 HTB），缺哪个说哪个。容器入口脚本做的是同一套检查。
 #   verify  运行中：读回网卡上的实际状态，与配置逐条核对，不一致就指出来。
 #
-# 用法（配置来源与 rl-limiter 一致：设了 RL_MYSQL_HOST 走数据库，否则 -c）：
+# 用法（配置来源与 rl-limiter 一致：-c 指定 YAML，受管清单解析自其中
+# cfg_path 指向的 haproxy.cfg，限额取 quotas 段）：
 #
 #   python3 tools/tc_check.py plan   -c /etc/rl-limiter/config.yaml -i eth0
 #   python3 tools/tc_check.py doctor -i eth0
@@ -29,13 +30,19 @@ import sys
 # 只是它们不需要导这个包）。
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from rl_limiter import cfgparse  # noqa: E402
 from rl_limiter import config as configmod  # noqa: E402
 from rl_limiter import tcshaper as T  # noqa: E402
 
 
 def _load_frontends(path: str):
+    """与 rl-limiter 同一条加载链：YAML（接线 + quotas）→ 解析
+    haproxy.cfg → 合并限额。tc 只关心登记了限额的那些。"""
+    import logging
     cfg = configmod.load(path)
-    return cfg.frontends
+    fes = cfgparse.load_frontends(cfg.haproxy.cfg_path, cfg.quotas,
+                                  logging.getLogger("tc_check"))
+    return [f for f in fes if f.limited]
 
 
 def cmd_plan(args) -> int:
