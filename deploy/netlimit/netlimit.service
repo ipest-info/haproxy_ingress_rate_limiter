@@ -1,0 +1,38 @@
+# 本机全网限速：开机把整机出向限额下发到内核 tc。
+#
+# 安装：
+#   pip install /path/to/repo          # 或 pip install -e .
+#   cp deploy/netlimit/netlimit.conf.example /etc/netlimit.conf   # 改 NETLIMIT_MBPS
+#   cp deploy/netlimit/netlimit.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now netlimit.service netlimit.timer
+#
+# 为什么是 oneshot + RemainAfterExit：限速是内核状态，不是一个要常驻的
+# 进程。下发完就退出，限速继续生效——**这个服务挂了不影响已经生效的限速**。
+#
+# 为什么还要配套一个 timer：见 netlimit.timer 的说明，一句话是"后插的
+# 网卡不会自己被限住"。
+[Unit]
+Description=本机全网出向限速（内核 tc）
+Documentation=file:///usr/share/doc/netlimit/11-整机全网限速.md
+# 网络配好之后再下发：网卡还没起来时自动发现会一张都发现不到。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/netlimit.conf
+# 不在这里拼参数：netlimit 自己读 NETLIMIT_* 环境变量（见 netlimit/cli.py
+# 的 apply_env_defaults）。systemd 没法表达"这个变量为空时就整个不要
+# --rate 这个参数"，硬拼的话空值会变成 `--rate ''` 这种东西。
+#
+# 因此 NETLIMIT_MBPS 留空时这条命令的含义就是**不限速**（会把已有的限速
+# 拆掉），与配置文件里的注释完全一致。
+ExecStart=/usr/local/bin/netlimit apply
+# 停服务时**不**自动拆限速：机器上的限速不该因为一次 systemctl stop 就
+# 消失（那等于悄悄放开了带宽）。要关就显式跑 `netlimit off`。
+ExecStop=/bin/true
+
+[Install]
+WantedBy=multi-user.target

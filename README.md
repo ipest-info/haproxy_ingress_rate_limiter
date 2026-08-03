@@ -39,6 +39,7 @@
 | [docs/04-DockerCompose演示.md](docs/04-DockerCompose演示.md) | docker compose 一键演示（MySQL + 三台 Ubuntu 24.04 节点 + Web 控制台 + 可调并发压测） |
 | [docs/05-监控视图.md](docs/05-监控视图.md) | 监控视图：每条曲线的数据来源与口径 |
 | [docs/06-tc限速方案.md](docs/06-tc限速方案.md) | **限速为什么从 HAProxy bwlim 换成内核 tc**：实测依据、映射方式、行为差异，以及尚未验证的部分 |
+| [docs/11-整机全网限速.md](docs/11-整机全网限速.md) | **`netlimit`：给这台机器的全部出向流量限一个总额度**（与 HAProxy/LVS 无关的独立工具）。单网卡多 IP / 多网卡多 IP 都能对，多网卡经 IFB 聚合成一份额度 |
 | [docs/07-监控数据回查.md](docs/07-监控数据回查.md) | **90 天回查怎么存怎么查**：分级保留、聚合语义、真实 MariaDB 上的容量与耗时实测 |
 | [docs/08-内核参数调优.md](docs/08-内核参数调优.md) | **让瓶颈落在 maxconn 而不是内核默认值上**：初始化阶段的 sysctl 调优与 FD 预检、哪些容器里改不动、怎么验证真的生效 |
 
@@ -66,6 +67,11 @@ deploy/           # systemd（同机形态）、haproxy 骨架配置示例、
                   #   haproxy-base.cfg（compose 用的 global/defaults 骨架）
   sysctl/         #   tune-kernel.sh（内核参数调优表：apply 调优 / check 体检 /
                   #   dump 出 sysctl.d 配置。初始化阶段自动跑）
+netlimit/         # **本机全网限速**（独立工具，与 rl_limiter 不共享任何代码）
+  discover.py     #   本机网卡与 IP 的发现：该限哪几张网卡（单/多网卡、多 IP）
+  plan.py         #   把"整机限多少"翻译成 tc 命令（单网卡直挂 / 多网卡经 IFB 聚合）
+  tc.py           #   跑命令、读回实况、收敛
+  cli.py          #   status / doctor / plan / apply / off
 docker-compose.yml # 一键演示：MySQL + 三台 Ubuntu 24.04 节点 + 模拟后端 + 压测
 ```
 

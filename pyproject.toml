@@ -20,9 +20,11 @@ test = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 rl-limiter = "rl_limiter.__main__:main"
+# 本机全网限速。与 rl-limiter 没有任何代码/配置共享，可以单独拿走。
+netlimit = "netlimit.cli:main"
 
 [tool.setuptools]
-packages = ["rl_limiter"]
+packages = ["rl_limiter", "netlimit"]
 
 [tool.setuptools.package-data]
 # Web 控制台的静态页面随包分发（webconsole 按包内相对路径读取）。
