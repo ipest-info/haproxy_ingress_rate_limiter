@@ -19,7 +19,7 @@
 #   ./rl-limiter.sh uninstall   卸载（保留 /etc/rl-limiter）
 #
 # install 干这些事，每一步都会说清楚做了什么：
-#   1. 前置检查：python3 ≥ 3.11、haproxy 已装、tc 可用、内核有 HTB、systemd
+#   1. 前置检查：python3 ≥ 3.9、haproxy 已装、tc 可用、内核有 HTB、systemd
 #   2. 建专用用户 rl-limiter 并加入 haproxy 组（读 stats socket 靠属组）
 #   3. venv 装到 /opt/rl-limiter
 #   4. 配置文件 /etc/rl-limiter/{config.yaml,rl-limiter.env}（已存在则**不覆盖**）
@@ -65,16 +65,16 @@ preflight() {
     local fail=0 quiet=${1:-}
     [ -n "$quiet" ] || step "前置检查"
 
-    # Python：本项目要求 3.11+（asyncio 的 TaskGroup 等）
+    # Python：最低 3.9（生产存量机器还有 3.9；推荐 3.11+）。
     if ! command -v python3 >/dev/null 2>&1; then
         bad "找不到 python3"; fail=1
     else
         local pv
         pv=$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')
-        if python3 -c 'import sys;sys.exit(0 if sys.version_info>=(3,11) else 1)'; then
+        if python3 -c 'import sys;sys.exit(0 if sys.version_info>=(3,9) else 1)'; then
             ok "python3 $pv"
         else
-            bad "python3 $pv 太旧，需要 ≥ 3.11"; fail=1
+            bad "python3 $pv 太旧，需要 ≥ 3.9"; fail=1
         fi
     fi
     python3 -c 'import venv' 2>/dev/null && ok "python3-venv 可用" || {

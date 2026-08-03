@@ -138,7 +138,8 @@ while IFS='|' read -r key mode want why; do
 
     # netns 里不存在 = 这项根本不是命名空间化的，只有宿主机全局一份。
     if [ ! -e "$p" ]; then
-        blocked=$((blocked + 1)); blocked_keys="$blocked_keys $key=$want"
+        blocked=$((blocked + 1)); blocked_keys="${blocked_keys}${key}=${want}
+"
         log "调不动 $key（本环境不存在该 sysctl；它不随 network namespace 隔离，只能在宿主机设）"
         continue
     fi
@@ -152,7 +153,8 @@ while IFS='|' read -r key mode want why; do
     fi
 
     if [ "$MODE" = check ]; then
-        blocked=$((blocked + 1)); blocked_keys="$blocked_keys $key=$want"
+        blocked=$((blocked + 1)); blocked_keys="${blocked_keys}${key}=${want}
+"
         log "未达标 $key 当前=$cur 期望=$tgt"
         continue
     fi
@@ -166,7 +168,8 @@ while IFS='|' read -r key mode want why; do
         raised=$((raised + 1))
         log "已调整 $key $cur -> $got"
     else
-        blocked=$((blocked + 1)); blocked_keys="$blocked_keys $key=$want"
+        blocked=$((blocked + 1)); blocked_keys="${blocked_keys}${key}=${want}
+"
         log "调不动 $key 当前=$cur 期望=$tgt（本环境只读）"
     fi
 done <<<"$TUNABLES"
@@ -176,9 +179,14 @@ log "内核参数：已达标 $ok 项、本次调整 $raised 项、无法在此�
 if [ "$blocked" -gt 0 ]; then
     log "上面这些**必须在宿主机上**设置（容器内的 network namespace 对它们只读，"
     log "或者它们根本不随 namespace 隔离）。宿主机执行："
-    for kv in $blocked_keys; do
+    # 多值 sysctl（ip_local_port_range、tcp_rmem…）的值里带空格，必须按行
+    # 迭代——按空格拆会生成 `sysctl -w 65535="65535"` 这种坏命令。
+    while IFS= read -r kv; do
+        [ -n "$kv" ] || continue
         log "    sysctl -w ${kv%%=*}=\"${kv#*=}\""
-    done
+    done <<EOF_KEYS
+$(printf '%b' "$blocked_keys")
+EOF_KEYS
     log "要持久化：把 $0 dump 的输出放进 /etc/sysctl.d/99-rl-limiter.conf 再 sysctl --system"
     log "不设也能跑，只是高并发/高带宽下会先撞上内核默认值而不是撞上 HAProxy 的上限。"
     [ "$MODE" = check ] && exit 1

@@ -102,7 +102,7 @@ LEAF_QDISC = "fq_codel"
 PROC_EPHEMERAL_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
 
 
-@dataclass(slots=True)
+@dataclass(**model.SLOTS)
 class TcClassStat:
     """单个 HTB 类的统计（= 单个 frontend 的出方向实况）。
 

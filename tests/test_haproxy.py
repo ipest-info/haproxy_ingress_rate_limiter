@@ -102,9 +102,11 @@ async def test_exec_cmd_permission_denied_raises():
 
 async def test_exec_cmd_timeout():
     # 服务端收到命令后既不回包也不关连接：客户端必须在 timeout_s 内放弃。
+    # 断言 asyncio.TimeoutError 而非内置 TimeoutError：3.11 起两者是同一个
+    # 类，但 3.9/3.10 上 wait_for 抛的是前者（本项目最低支持 3.9）。
     async with fake_haproxy(lambda cmd: None) as srv:
         c = RuntimeClient("127.0.0.1", srv.port, timeout_s=0.1)
-        with pytest.raises(TimeoutError):
+        with pytest.raises(asyncio.TimeoutError):
             await c.exec_cmd("show stat -1 1 -1")
 
 

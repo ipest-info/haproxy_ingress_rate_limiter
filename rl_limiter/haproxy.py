@@ -118,20 +118,20 @@ class RuntimeClient:
         错误前缀则抛 CommandError（回包原文在异常属性上，便于上层记录）；
         其余回包原样返回，由调用方按命令语义解析。
 
-        超时用 asyncio.timeout 统一覆盖整个过程——连接、写命令、读回包
+        超时用 asyncio.wait_for 统一覆盖整个过程——连接、写命令、读回包
         共享同一个截止时刻，asyncio 的取消机制天然能唤醒阻塞中的读写，
-        无需哨兵协程。
+        无需哨兵协程。（不用 3.11 才有的 asyncio.timeout：生产存量机器
+        还有 Python 3.9。）
         """
         start = time.monotonic()
-        # timeout <= 0 时传 None：asyncio.timeout(None) 即"无超时"。
-        budget = self._timeout_s if self._timeout_s > 0 else None
-        async with asyncio.timeout(budget):
+
+        async def _exchange() -> bytes:
             reader, writer = await self._open()
             try:
                 writer.write((cmd + "\n").encode())
                 await writer.drain()
                 # 读到 EOF 为止：服务端执行完命令即关闭连接。
-                raw = await reader.read(-1)
+                return await reader.read(-1)
             finally:
                 writer.close()
                 # 对端往往已先关闭；wait_closed 的次生错误不应污染主流程。
@@ -139,6 +139,10 @@ class RuntimeClient:
                     await writer.wait_closed()
                 except (ConnectionError, OSError):
                     pass
+
+        # timeout <= 0 时传 None：wait_for(None) 即"无超时"。
+        budget = self._timeout_s if self._timeout_s > 0 else None
+        raw = await asyncio.wait_for(_exchange(), budget)
 
         out = raw.decode("utf-8", errors="replace").strip()
         self._log.debug(

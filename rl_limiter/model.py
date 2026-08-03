@@ -25,11 +25,17 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
+# dataclass 的 slots 参数 3.10 才有；3.9 上退化为普通 dataclass——只影响
+# 每实例的内存占用与属性拼写检查，不影响任何行为。本项目最低支持 3.9
+# （生产存量机器还有 3.9），推荐 3.11+（Ubuntu 24.04 自带 3.12）。
+SLOTS: dict = {"slots": True} if sys.version_info >= (3, 10) else {}
 
-@dataclass(slots=True)
+
+@dataclass(**SLOTS)
 class FrontendStat:
     """从 HAProxy 的 `show stat` 采样得到的单个 frontend 行（原始累计值）。
 
@@ -98,7 +104,7 @@ class FrontendStat:
         return 0
 
 
-@dataclass(slots=True)
+@dataclass(**SLOTS)
 class InstanceStat:
     """从 HAProxy 的 `show info` 采样得到的进程级指标（原始值）。
 
@@ -121,7 +127,7 @@ class InstanceStat:
     uptime_s: int = 0
 
 
-@dataclass(slots=True)
+@dataclass(**SLOTS)
 class NicStat:
     """从 /proc/net/dev 采样得到的网卡计数器（原始累计值）。
 
@@ -147,7 +153,7 @@ class NicStat:
     tx_errs: int = 0
 
 
-@dataclass(slots=True)
+@dataclass(**SLOTS)
 class FrontendConfig:
     """一个受管 frontend 的运行期视图：监听端口 + 限额。
 
@@ -213,7 +219,7 @@ class FrontendConfig:
         )
 
 
-@dataclass(slots=True)
+@dataclass(**SLOTS)
 class FrontendUsage:
     """采集器每个 tick（1s）为单个受管 frontend 产出的用量视图。
 
@@ -257,7 +263,7 @@ class FrontendUsage:
     degraded: bool = False
 
 
-@dataclass(slots=True)
+@dataclass(**SLOTS)
 class InstanceUsage:
     """采集器每个 tick 产出的**整台 HAProxy** 的用量视图。
 
@@ -296,7 +302,7 @@ class InstanceUsage:
     degraded: bool = False       # 采样失联，本 tick 是陈旧值
 
 
-@dataclass(slots=True)
+@dataclass(**SLOTS)
 class ControllerConfig:
     """投递给监控主循环的运行期配置文档（业务配置的内存形态）。
 
@@ -317,7 +323,7 @@ class ControllerConfig:
 
 
 
-@dataclass(slots=True)
+@dataclass(**SLOTS)
 class NodeConfig:
     """本机 HAProxy 的连接配置（基础设施配置，启动时定型）。
 

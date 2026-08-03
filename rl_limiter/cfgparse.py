@@ -50,7 +50,7 @@ _BIND_PORT_RE = re.compile(r":(\d+)$")
 WATCH_INTERVAL_S = 5.0
 
 
-@dataclass(slots=True)
+@dataclass(**model.SLOTS)
 class ParsedSection:
     """haproxy.cfg 里一个 frontend/listen 段的解析结果。"""
 
