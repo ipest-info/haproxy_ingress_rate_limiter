@@ -183,9 +183,7 @@ services:
     # 本机 tc 压在自己的限额内、互不影响。
     command: >-
       python3 tools/loadgen.py
-      --target http://node1:8080/
-      --target http://node2:8080/
-      --target http://node3:8080/
+      --target http://node1:8080/,http://node2:8080/,http://node3:8080/
       --control-port 8081
     environment:
       # 初始并发：LOADGEN_CONCURRENCY=32 docker compose up -d 即可改；
