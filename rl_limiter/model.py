@@ -315,18 +315,6 @@ class ControllerConfig:
         """全部受管 frontend 名，供采集器过滤 `show stat` 的行。"""
         return {f.name for f in self.frontends}
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "version": self.version,
-            "frontends": [f.to_dict() for f in self.frontends],
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ControllerConfig":
-        return cls(
-            version=int(d.get("version", 0)),
-            frontends=[FrontendConfig.from_dict(f) for f in (d.get("frontends") or [])],
-        )
 
 
 @dataclass(slots=True)

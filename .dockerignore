@@ -2,16 +2,17 @@
 .gitignore
 docs
 tests
-# 注意：deploy/ 不可整体排除——deploy/docker/Dockerfile.node 需要
-# COPY deploy/docker/node-entrypoint.sh。只排掉与镜像构建无关的子目录。
+# 注意：deploy/ 不可整体排除——Dockerfile 需要 COPY
+# deploy/docker/node-entrypoint.sh 与 deploy/sysctl/tune-kernel.sh。
+# 只排掉与镜像构建无关的子目录。
 deploy/config
-deploy/mysql
 deploy/systemd
-deploy/tc
 deploy/haproxy
+deploy/bare
 Makefile
 README.md
 docker-compose.yml
+docker-compose-demo.yml
 Dockerfile
 **/__pycache__
 *.egg-info

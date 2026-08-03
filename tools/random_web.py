@@ -7,8 +7,8 @@
 # 让 HAProxy frontend 的 bytes_out 产生足够真实的波动供 rl-limiter 采样。
 #
 # 另有 /big 端点：**大文件下载**场景（长连接、单个响应流式传输数百 MB、
-# 在限速下要下载很久），供验证 shared bwlim 对长连接的持续限速与限额
-# 调整（reload + hard-stop-after）对在途下载的影响。大小默认
+# 在限速下要下载很久），供验证 tc 对长连接的持续限速、以及限额调整
+# （tc class change，即时换挡不断连）对在途下载的影响。大小默认
 # --big-bytes（512 MiB），可用 ?bytes=N 按请求覆盖（有上限钳制）。
 #
 # 实现要点：

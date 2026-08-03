@@ -172,16 +172,7 @@ button {
   transition: background .12s, border-color .12s;
 }
 button:hover:not(:disabled) { background: var(--surface-2); }
-button.primary {
-  background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 550;
-}
-button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
-button.ghost { border-color: transparent; background: transparent; color: var(--text-secondary); }
-button.ghost:hover:not(:disabled) { background: var(--surface-2); }
-button.danger { color: var(--critical); border-color: transparent; background: transparent; }
-button.danger:hover:not(:disabled) { background: rgba(207,58,58,.10); }
 button:disabled { opacity: .45; cursor: not-allowed; }
-button.sm { padding: 3px 9px; font-size: 12px; }
 
 input, select {
   font: inherit; font-size: 13px; padding: 6px 9px; border-radius: 7px;

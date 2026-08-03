@@ -43,8 +43,6 @@ LOG_BUFFER_SIZE = 1000
 LOGS_PAGE_LIMIT = 500
 # SSE 订阅队列深度：消费慢时丢最旧一帧（页面只关心最新状态）。
 SUBSCRIBER_QUEUE_DEPTH = 5
-# 调参请求体上限。
-MAX_BODY_BYTES = 64 * 1024
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -138,7 +136,7 @@ class StatusHub:
         self._history: collections.deque[dict[str, Any]] = collections.deque(
             maxlen=HISTORY_TICKS)
         self._subs: set[asyncio.Queue] = set()
-        # frontend 名 → 该 frontend 的完整配置视图（界面表单的初值）。
+        # frontend 名 → 该 frontend 的配置视图（页面只读展示用）。
         self._fe_config: dict[str, dict[str, Any]] = {}
         self._started = time.time()
 
@@ -239,10 +237,6 @@ class StatusHub:
         return list(self._history)
 
 
-def _json_error(status: int, message: str) -> web.Response:
-    return web.json_response({"error": message}, status=status)
-
-
 def build_app(
     hub: StatusHub,
     logbuf: LogBuffer,
@@ -305,7 +299,7 @@ def build_app(
             hub.unsubscribe(q)
         return resp
 
-    app = web.Application(client_max_size=MAX_BODY_BYTES)
+    app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/overview", handle_overview)
     app.router.add_get("/api/history", handle_history)
