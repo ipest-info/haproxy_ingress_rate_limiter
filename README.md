@@ -11,7 +11,8 @@
    的总速率被硬性压在限额内，与连接数、单连接快慢无关。改限额走
    `tc class change`，**不 reload、存量连接立刻跟上**；
 2. **监控**：每秒经**本机 unix stats socket** 采样各 frontend 的下行带宽，
-   产出实时曲线（内置只读 Web 控制台）并做持续超限告警。
+   产出实时曲线（内置只读 Web 控制台 + Prometheus `/metrics`）、按分钟
+   落盘到本地 JSONL 日志（历史回查/计费对账），并做持续超限告警。
 
 配置来源只有两个本地文件（**没有数据库**）：haproxy.cfg + rl-limiter 的
 YAML（`-c` 指定：stats socket 接线、cfg 路径、quotas 限额）。运行期轮询
@@ -113,7 +114,8 @@ deploy/bare/rl-limiter.sh check     # 体检：只看不改
 **配置调整 SOP**（都是普通文件编辑，没有别的入口）：
 
 - **改限额** → 改 YAML 的 `quotas` 段。5s 内热生效（`tc class change`，
-  不 reload，存量连接立刻按新限额跑）；
+  不 reload，存量连接立刻按新限额跑）；**写 0 = 显式不限速**（撤掉该
+  端口的 tc 类；全部为 0/清空时整棵限速队列树被拆掉）；
 - **改端口/后端** → 改 haproxy.cfg → `systemctl reload haproxy`。
   rl-limiter 轮询到 cfg 内容变化后自动更新监控清单与 tc 分类。
 
@@ -129,9 +131,19 @@ deploy/bare/rl-limiter.sh check     # 体检：只看不改
 监听地址（默认 `127.0.0.1`）。控制台**无鉴权**（暴露全量监控数据与运行
 日志），放到内网必须配合防火墙/安全组限制来源。三个 tab：**实例**（整台
 HAProxy 的连接/带宽/数据包视图）、**监听端口**（每个 frontend 的监控曲线
-与配置视图）、**日志**。实时曲线保留最近约 10 分钟（内存）；更久的历史
-回查请对接外部监控系统（Prometheus 等），本服务不落库。每条曲线的来源与
-口径见 [docs/05-监控视图.md](docs/05-监控视图.md)。
+与配置视图）、**日志**。每条曲线的来源与口径见
+[docs/05-监控视图.md](docs/05-监控视图.md)。
+
+**监控数据的三个出口**（同一拍、同一份数据）：
+
+- **实时曲线**：控制台内存环形缓冲，最近约 10 分钟；
+- **Prometheus 抓取**：控制台同端口的 `GET /metrics`（文本 exposition
+  格式，frontend/instance 两级 gauge），接进已有的 Prometheus/Grafana
+  即得长期存储与告警；
+- **本地日志落盘**：设 `RL_METRICS_LOG=<文件路径>` 启用——分钟粒度
+  JSONL（avg/max/mean10_max/超限秒数，限额随行），按天轮转、默认保留
+  90 天（`RL_METRICS_LOG_DAYS`），重启不丢、可 grep、可被日志采集系统
+  直接摄取。
 
 **默认值不设限**：HAProxy 示例配置的 `maxconn` 默认 100 万——**要限并发
 时再显式往下调**，而不是让人在排查"为什么这么慢"时最后发现是某个默认值。

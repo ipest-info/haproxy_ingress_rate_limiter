@@ -237,6 +237,106 @@ class StatusHub:
         return list(self._history)
 
 
+def _prom_escape(v: str) -> str:
+    return v.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+
+
+def render_prometheus(hub: StatusHub) -> str:
+    """把 StatusHub 的最新状态渲染成 Prometheus 文本格式。
+
+    指标命名遵循 prometheus 惯例（bytes_per_second 等单位后缀）；速率
+    一律 bytes/s（应用层口径，与控制台/告警/落盘日志一致）。启动后还没
+    采到第一拍时只输出服务级指标——空值比编造的 0 诚实。
+    """
+    o = hub.overview()
+    lines: list[str] = []
+
+    def m(name: str, value, help_: str = "", labels: dict | None = None):
+        if help_:
+            lines.append(f"# HELP {name} {help_}")
+            lines.append(f"# TYPE {name} gauge")
+        lab = ""
+        if labels:
+            lab = "{" + ",".join(
+                f'{k}="{_prom_escape(str(v))}"' for k, v in labels.items()) + "}"
+        lines.append(f"{name}{lab} {value}")
+
+    m("rl_limiter_info", 1, "服务元信息（值恒为 1，信息在标签里）",
+      {"version": o["service_version"], "haproxy": o["haproxy"]["name"]})
+    m("rl_limiter_config_version", o["config_version"], "当前配置的内容校验和")
+    m("rl_limiter_uptime_seconds", round(o["uptime_s"], 1), "服务运行秒数")
+    m("rl_limiter_haproxy_degraded", int(o["haproxy"]["degraded"]),
+      "采样是否失联（1=失联，此时各速率为陈旧值）")
+
+    # 限额来自配置视图（即便该 frontend 这一拍没有采样行也要暴露）。
+    first = True
+    for name, f in sorted((o.get("frontends") or {}).items()):
+        m("rl_limiter_frontend_quota_bytes_per_second", f["quota_bytes_per_s"],
+          "登记限额（bytes/s；0=不限速）" if first else "", {"frontend": name})
+        first = False
+
+    latest = o.get("latest")
+    if latest:
+        fe_metrics = [
+            ("rate_bytes_per_s", "rl_limiter_frontend_rate_bytes_per_second",
+             "实时下行速率"),
+            ("mean10_bytes_per_s", "rl_limiter_frontend_mean10_bytes_per_second",
+             "10 秒滑动均值（计费/超限口径）"),
+            ("rate_in_bytes_per_s", "rl_limiter_frontend_rate_in_bytes_per_second",
+             "实时上行速率"),
+            ("conn", "rl_limiter_frontend_connections", "并发连接数"),
+            ("active_conns", "rl_limiter_frontend_active_connections", "活跃连接数"),
+            ("idle_conns", "rl_limiter_frontend_idle_connections", "空闲连接数"),
+            ("conn_new_ps", "rl_limiter_frontend_new_connections_per_second",
+             "每秒新建连接数"),
+            ("conn_denied_ps", "rl_limiter_frontend_denied_per_second",
+             "每秒被拒绝连接数"),
+            ("pkts_out_ps", "rl_limiter_frontend_tc_packets_out_per_second",
+             "tc 队列每秒流出包数（链路层）"),
+            ("drop_out_ps", "rl_limiter_frontend_tc_drops_per_second",
+             "tc 队列每秒丢包数（被限速丢弃）"),
+            ("overlimit_ps", "rl_limiter_frontend_tc_overlimits_per_second",
+             "tc 每秒触发限速次数"),
+            ("over", "rl_limiter_frontend_over_quota", "瞬时超限标记（mean10>限额）"),
+            ("degraded", "rl_limiter_frontend_degraded", "该 frontend 采样是否失联"),
+        ]
+        units = latest.get("units") or {}
+        for key, pname, help_ in fe_metrics:
+            first = True
+            for name in sorted(units):
+                v = units[name].get(key)
+                if v is None:
+                    continue
+                m(pname, int(v) if isinstance(v, bool) else v,
+                  help_ if first else "", {"frontend": name})
+                first = False
+
+        inst = latest.get("instance") or {}
+        inst_metrics = [
+            ("conn", "rl_limiter_instance_connections", "整机并发连接数"),
+            ("max_conn", "rl_limiter_instance_max_connections", "进程连接上限"),
+            ("conn_new_ps", "rl_limiter_instance_new_connections_per_second",
+             "整机每秒新建连接数"),
+            ("rate_in_bytes_per_s", "rl_limiter_instance_rate_in_bytes_per_second",
+             "整机上行速率（HAProxy 口径）"),
+            ("rate_out_bytes_per_s", "rl_limiter_instance_rate_out_bytes_per_second",
+             "整机下行速率（HAProxy 口径）"),
+            ("nic_rate_in_bytes_per_s", "rl_limiter_nic_rate_in_bytes_per_second",
+             "网卡入向速率（链路层、整机）"),
+            ("nic_rate_out_bytes_per_s", "rl_limiter_nic_rate_out_bytes_per_second",
+             "网卡出向速率（链路层、整机）"),
+            ("pkts_in_ps", "rl_limiter_nic_packets_in_per_second", "网卡每秒入包数"),
+            ("drop_in_ps", "rl_limiter_nic_drops_in_per_second", "网卡每秒入向丢包数"),
+            ("idle_pct", "rl_limiter_haproxy_idle_percent", "HAProxy 自报空闲率"),
+        ]
+        for key, pname, help_ in inst_metrics:
+            v = inst.get(key)
+            if v is not None:
+                m(pname, v, help_)
+
+    return "\n".join(lines) + "\n"
+
+
 def build_app(
     hub: StatusHub,
     logbuf: LogBuffer,
@@ -262,6 +362,16 @@ def build_app(
 
     async def handle_history(_request: web.Request) -> web.Response:
         return web.json_response({"snapshots": hub.history()})
+
+    async def handle_metrics(_request: web.Request) -> web.Response:
+        """Prometheus 文本 exposition 格式的当前值（/metrics）。
+
+        数据取自 StatusHub 的最新一拍快照——与控制台曲线同源，不另起
+        采集链路。全部是 gauge：速率本就是每秒口径，累计量在采集侧已经
+        差分过，counter 反而没有对应的原始值。
+        """
+        return web.Response(text=render_prometheus(hub),
+                            content_type="text/plain", charset="utf-8")
 
     async def handle_logs(request: web.Request) -> web.Response:
         try:
@@ -305,6 +415,9 @@ def build_app(
     app.router.add_get("/api/history", handle_history)
     app.router.add_get("/api/logs", handle_logs)
     app.router.add_get("/api/stream", handle_stream)
+    # Prometheus 抓取端点：与只读 API 同一个监听面（同样的安全边界——
+    # 默认回环，放内网靠防火墙）。
+    app.router.add_get("/metrics", handle_metrics)
     return app
 
 

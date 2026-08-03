@@ -133,9 +133,11 @@ def build_frontends(
     """把解析出的段与 YAML 登记的限额合并成受管 frontend 清单。
 
     合并规则：
-      - cfg 里有、quotas 里也有 → 限速 + 监控（quota_mbps > 0）；
+      - cfg 里有、quotas 里登记了正限额 → 限速 + 监控；
       - cfg 里有、quotas 里没有 → **只监控不限速**（quota_mbps=0，
         不建 tc 类、不做超限判定），warn 一次提示未登记限额；
+      - cfg 里有、quotas 里**显式写 0** → 同样只监控不限速，但这是
+        运维的明确决定，不再 warn；
       - quotas 里有、cfg 里没有 → warn 一次（多半是 cfg 里删了段、或
         名字拼错），该限额条目被忽略。
     名为 stats 的段与没有 bind 的段直接跳过（监控/限速都无从谈起）。

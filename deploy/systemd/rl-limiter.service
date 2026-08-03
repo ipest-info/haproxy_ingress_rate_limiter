@@ -45,6 +45,9 @@ Type=simple
 # 要让内网访问必须显式设 RL_CONSOLE_BIND 并用防火墙/安全组限制来源。
 # Environment=RL_CONSOLE_PORT=8090
 # Environment=RL_CONSOLE_BIND=10.0.0.11
+# 监控数据落盘（分钟粒度 JSONL，按天轮转；/metrics 是实时值，这里是历史）。
+# 目录由下面的 LogsDirectory 自动创建并授权。
+Environment=RL_METRICS_LOG=/var/log/rl-limiter/metrics.jsonl
 ExecStart=/usr/local/bin/rl-limiter -c /etc/rl-limiter/config.yaml
 Restart=always
 RestartSec=2
@@ -56,8 +59,9 @@ SupplementaryGroups=haproxy
 # 同时在 BoundingSet 里）。
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
-# 本服务对文件系统只有读需求（YAML + haproxy.cfg + stats socket），
-# 全程不写盘，可以全只读、无需任何 ReadWritePaths。
+# 文件系统只放开一处：监控数据落盘目录（LogsDirectory 自动创建
+# /var/log/rl-limiter 并授权）。配置文件（YAML/haproxy.cfg）仍然只读。
+LogsDirectory=rl-limiter
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

@@ -65,6 +65,9 @@ services:
       HAPROXY_MAXCONN: "1000000"
       HAPROXY_MAXPIPES: "1000000"
       RL_CONSOLE_PORT: "8090"
+      # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
+      # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
+      RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
       # 演示需要从宿主机打开控制台，故绑 0.0.0.0；宿主机侧只映射到回环
       # （下方 ports）。生产默认是 127.0.0.1，控制台无鉴权，切勿裸奔。
       RL_CONSOLE_BIND: 0.0.0.0

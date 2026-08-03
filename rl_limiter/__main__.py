@@ -25,7 +25,7 @@ import sys
 
 from . import cfgparse
 from . import config as configmod
-from . import haproxy, model
+from . import haproxy, metricslog, model
 from . import netdev
 from . import tcshaper as tcmod
 from . import webconsole
@@ -66,6 +66,12 @@ ENV_TC_IFACE = "RL_TC_IFACE"
 # 不设则跟随 RL_TC_IFACE；设为 "-" 表示禁用入向包统计。
 ENV_NIC = "RL_NIC"
 
+# 监控数据落盘：设为本地文件路径即启用（JSONL，分钟粒度，按天轮转，
+# 见 metricslog 模块）。不设 = 不落盘，只有内存实时曲线。
+ENV_METRICS_LOG = "RL_METRICS_LOG"
+# 落盘文件的保留天数（按天轮转后删除更旧的）。
+ENV_METRICS_LOG_DAYS = "RL_METRICS_LOG_DAYS"
+
 
 def _summarize_frontends(frontends: list[model.FrontendConfig]) -> str:
     """把受管 frontend 清单压缩成单个日志字段，格式：
@@ -87,7 +93,8 @@ async def _amain(cfg, log: logging.Logger,
                  console_bind: str = DEFAULT_CONSOLE_BIND,
                  apply_period_s: float = DEFAULT_APPLY_PERIOD_S,
                  shaper: "tcmod.TcShaper | None" = None,
-                 nic: str = "") -> None:
+                 nic: str = "",
+                 mlog: "metricslog.MetricsLog | None" = None) -> None:
     """事件循环内的主体：组装组件、引导配置、并发运行监控循环与配置源。
 
     boot_frontends 是启动时从 haproxy.cfg 解析并合并限额后的受管清单；
@@ -125,14 +132,26 @@ async def _amain(cfg, log: logging.Logger,
             haproxy=cfg.haproxy,
             degraded_fn=lambda: col.degraded)
 
-    # sampler：监控循环每拍喂给控制台（内存实时曲线）。
-    sampler = hub.record if hub is not None else None
+    # sampler：监控循环每拍喂给控制台（内存实时曲线）与监控数据落盘器
+    # （分钟粒度 JSONL）——同一拍、同一份数据，两个出口。
+    sinks = [x.record for x in (hub, mlog) if x is not None]
+    if not sinks:
+        sampler = None
+    elif len(sinks) == 1:
+        sampler = sinks[0]
+    else:
+        def sampler(now, usages, instance=None):
+            for sink in sinks:
+                sink(now, usages, instance)
     # 配置一变就叫醒"下发"类任务（下发限速的 tcshaper）：监控循环每应用
     # 一份配置就 set 这个事件。
     tc_applied = asyncio.Event() if shaper is not None else None
     config_applied = [e for e in (tc_applied,) if e is not None]
     ctl = MonitorLoop(col, sampler=sampler, log=log,
                       config_applied=config_applied)
+    if mlog is not None:
+        # 落盘行里的限额要取"采样当时"的值：延迟经 ctl 取当前受管清单。
+        mlog.set_quotas_fn(metricslog.quotas_from_frontends(ctl.frontends))
 
     # --- 启动引导（seed）：用启动时解析出的受管清单构造首份运行期配置
     # 直接喂给监控循环。版本号取内容校验和，watch 以同一算法做变更检测
@@ -228,6 +247,9 @@ async def _amain(cfg, log: logging.Logger,
     for t in (stop_task, *tasks):
         t.cancel()
     await asyncio.gather(stop_task, *tasks, return_exceptions=True)
+    if mlog is not None:
+        # 把最后一个未满的分钟也写出去，然后关闭文件句柄。
+        mlog.close()
 
 
 def main() -> None:
@@ -244,7 +266,10 @@ def main() -> None:
                "限速网卡用 RL_TC_IFACE 指定（默认取默认路由的出口网卡，"
                "设 - 则关闭限速、只保留监控）。"
                "Web 控制台：设置 RL_CONSOLE_PORT 启用，RL_CONSOLE_BIND 指定"
-               "监听地址（默认 127.0.0.1——控制台无鉴权）。"
+               "监听地址（默认 127.0.0.1——控制台无鉴权）；控制台同端口的 "
+               "/metrics 提供 Prometheus 抓取。"
+               "监控数据落盘：设 RL_METRICS_LOG=<文件路径> 启用（分钟粒度 "
+               "JSONL，按天轮转，RL_METRICS_LOG_DAYS 定保留天数，默认 90）。"
                "实例监控视图的入向数据包统计取自 /proc/net/dev，RL_NIC 指定"
                "网卡（默认跟随限速网卡，设 - 则禁用）。")
     parser.add_argument(
@@ -348,6 +373,32 @@ def main() -> None:
                     "listen——服务照常启动，之后 cfg 内容变化会被轮询接上 "
                     "cfg_path=%s", cfg.haproxy.cfg_path)
 
+    # 监控数据落盘（可选）：设 RL_METRICS_LOG=<文件路径> 即启用。
+    mlog = None
+    raw_mlog = (os.environ.get(ENV_METRICS_LOG) or "").strip()
+    if raw_mlog:
+        raw_days = (os.environ.get(ENV_METRICS_LOG_DAYS) or "").strip()
+        try:
+            mlog_days = int(raw_days) if raw_days else metricslog.DEFAULT_RETENTION_DAYS
+        except ValueError:
+            print(f"rl-limiter: {ENV_METRICS_LOG_DAYS} 必须是整数，"
+                  f"当前值 {raw_days!r}", file=sys.stderr)
+            raise SystemExit(1)
+        if mlog_days < 1:
+            print(f"rl-limiter: {ENV_METRICS_LOG_DAYS} 必须 ≥ 1，"
+                  f"当前值 {mlog_days}", file=sys.stderr)
+            raise SystemExit(1)
+        try:
+            mlog = metricslog.MetricsLog(raw_mlog, log, retention_days=mlog_days)
+        except OSError as e:
+            print(f"rl-limiter: 打不开监控数据落盘文件 {raw_mlog}（{e}）。\n"
+                  f"  请确认目录存在且服务用户可写（systemd 部署时 unit 里的 "
+                  f"LogsDirectory=rl-limiter 会自动创建 /var/log/rl-limiter）。",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        log.info("监控数据落盘已启用（分钟粒度 JSONL，按天轮转） path=%s "
+                 "retention_days=%d", raw_mlog, mlog_days)
+
     # 实例视图的**入向**包统计要采哪张网卡（"-" = 显式禁用）。出向的包/
     # 丢包由 tc 按 frontend 统计，不走这里。默认跟随限速网卡——两者本来
     # 就该是同一张（客户端流量进出的那张），分开设只会给人配错的机会。
@@ -378,7 +429,7 @@ def main() -> None:
                            boot_frontends=boot_frontends,
                            console_port=console_port, logbuf=logbuf,
                            console_bind=console_bind,
-                           shaper=shaper, nic=nic))
+                           shaper=shaper, nic=nic, mlog=mlog))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
     log.info("rl-limiter 服务已停止")

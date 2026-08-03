@@ -125,6 +125,16 @@ def test_unregistered_frontend_warns_once(caplog):
                     if "只监控不限速" in r.getMessage()]) == n
 
 
+def test_explicit_zero_quota_is_silent_monitor_only(caplog):
+    """quotas 显式写 0 = 运维确认过的不限速：行为与未登记相同（不建 tc
+    类），但**不再告警**——告警是给"忘了登记"准备的。"""
+    with caplog.at_level(logging.WARNING, logger="t.cfgparse"):
+        fes = {f.name: f for f in build({"fe_main": 40, "fe_api": 0,
+                                         "fe_edge": 0})}
+    assert not fes["fe_api"].limited and not fes["fe_edge"].limited
+    assert not [r for r in caplog.records if "只监控不限速" in r.getMessage()]
+
+
 def test_orphan_quota_warns_and_is_ignored(caplog):
     with caplog.at_level(logging.WARNING, logger="t.cfgparse"):
         fes = build({"fe_gone": 40})

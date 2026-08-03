@@ -61,14 +61,20 @@ def test_empty_quotas_is_valid(tmp_path):
     assert cfg.quotas == {}
 
 
+def test_explicit_zero_quota_means_unlimited(tmp_path):
+    """quota 显式写 0 = 确认不限速（撤掉该端口的 tc 类），必须被接受——
+    这是"临时解除限速但保留登记行"的正规写法。"""
+    cfg = load_from(tmp_path, minimal(quotas="{fe_a: 0}"))
+    assert cfg.quotas == {"fe_a": 0.0}
+
+
 # ---------------------------------------------------------------------------
 # 拒绝路径
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("text,match", [
     (minimal(quotas="{'fe bad': 8}"), r"quotas 的键"),
-    (minimal(quotas="{fe_a: 0}"), r"quotas.fe_a 必须为正数"),
-    (minimal(quotas="{fe_a: -1}"), r"quotas.fe_a 必须为正数"),
+    (minimal(quotas="{fe_a: -1}"), r"quotas.fe_a 不能为负数"),
     (minimal(quotas="{fe_a: 0.000004}"), r"太小"),
     (minimal(quotas="{fe_a: abc}"), r"quotas.fe_a 必须是数字"),
     (minimal(quotas="[fe_a]"), r"quotas 必须是键值映射"),

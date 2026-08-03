@@ -154,8 +154,8 @@ class FrontendConfig:
     名字/端口/模式来自 haproxy.cfg 的解析（cfgparse），限额来自 YAML 的
     quotas 登记。quota_mbps 同时是两件事的依据：下发到内核 tc 的类速率
     （真实限速），以及监控侧的超限告警基准——两者同源，不会漂移。
-    quota_mbps == 0 表示"只监控不限速"（cfg 里有这个段、但 YAML 未登记
-    限额）：不建 tc 类、不做超限判定。
+    quota_mbps == 0 表示"只监控不限速"（YAML 未登记限额，或显式登记为
+    0——后者是运维确认过的不限速）：不建 tc 类、不做超限判定。
     """
 
     name: str                       # frontend 名（= stats 里的 pxname，全局唯一）

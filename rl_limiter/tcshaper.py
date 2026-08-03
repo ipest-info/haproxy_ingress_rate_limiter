@@ -63,7 +63,9 @@
 #   - **命令一律用 argv 列表拼装，绝不拼 shell 字符串**，配置里的值（端口、
 #     限额）在进入 argv 之前全部过整数校验，不存在注入面；
 #   - 网卡名只来自本机环境变量/自动探测，绝不从配置文件读；
-#   - 空清单拒绝执行：那意味着"把所有限速撤掉"，是事故而不是配置操作。
+#   - 空清单 = **显式撤掉全部限速**（quotas 清空/全部设为 0）：拆掉整棵
+#     队列树、网卡恢复默认 qdisc。这是配置操作而不是事故——配置层保证
+#     "读不到配置"走 fail-static，绝不会以空清单的样子到达这里。
 
 from __future__ import annotations
 
@@ -245,11 +247,9 @@ def _check_shapeable(frontends: list[model.FrontendConfig]) -> None:
 
     这些值会被交给以 root 执行的 tc，虽然全部是整数、不存在注入面，但
     越界的值会让 tc 报出难懂的错误，不如在这里给出人话。
+
+    空清单是合法输入（显式撤掉全部限速），由 reconcile 单独处理。
     """
-    if not frontends:
-        raise TcError(
-            "受管 frontend 清单为空：那意味着撤掉全部限速，是事故而不是"
-            "配置操作，已拒绝执行")
     seen: set[int] = set()
     for f in frontends:
         if not (1 <= f.bind_port <= 65535):
@@ -545,6 +545,29 @@ class TcShaper:
             _check_shapeable(frontends)
         except TcError as e:
             return TcResult(ok=False, changed=False, error=str(e))
+
+        # 空清单 = 显式撤掉全部限速（quotas 清空/全部设为 0）：拆掉整棵
+        # 队列树，网卡恢复默认 qdisc（mq/fq 等）。只在网卡上确实有**我们
+        # 的 HTB 树**时才动手——classes 只匹配 `class htb`，别人的 qdisc
+        # 不会被误拆；首次启动本就没有树时什么都不做。
+        if not frontends:
+            try:
+                classes, _, _ = await self.observe()
+            except Exception:
+                classes = {}
+            if not classes:
+                return TcResult(ok=True, changed=False)
+            try:
+                await self._tc(["tc", "qdisc", "del", "dev", self.iface, "root"])
+            except TcError as e:
+                self._log.warning(
+                    "撤掉 tc 限速队列树失败，下一轮兜底重试 iface=%s err=%s",
+                    self.iface, e)
+                return TcResult(ok=False, changed=False, error=str(e))
+            self._log.warning(
+                "已撤掉本机网卡的 tc 限速队列树（quotas 已清空/全部设为"
+                "不限速），网卡恢复默认 qdisc iface=%s", self.iface)
+            return TcResult(ok=True, changed=True, action="teardown")
 
         names = sorted(f.name for f in frontends)
         self._warn_ephemeral(frontends)

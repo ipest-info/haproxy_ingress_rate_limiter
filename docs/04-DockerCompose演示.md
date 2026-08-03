@@ -133,6 +133,17 @@ curl http://localhost:8090/api/overview            # 最新状态 + 配置视图
 curl http://localhost:8090/api/history             # 最近 10 分钟逐拍快照
 curl -N http://localhost:8090/api/stream           # SSE 实时流（每拍一帧）
 curl http://localhost:8090/api/logs?after=0        # 日志增量拉取
+curl http://localhost:8090/metrics                 # Prometheus 抓取端点
+```
+
+监控数据另有**分钟粒度的本地落盘**（`RL_METRICS_LOG`，compose 里已
+开）——历史回查不依赖控制台内存：
+
+```bash
+docker compose exec node1 tail -3 /var/log/rl-limiter/metrics.jsonl
+# {"ts":1785723600,"kind":"frontend","samples":60,"rate_avg":4998321.0,
+#  "rate_max":5312400.0,...,"name":"fe_main","mean10_max":5003210.0,
+#  "quota":5000000.0,"over_s":0,"degraded_s":0}
 ```
 
 安全提示：控制台**无鉴权**（暴露全量监控数据与运行日志）。默认只绑
@@ -207,6 +218,10 @@ docker compose exec node1 tc class show dev eth0
 INFO 检测到 haproxy.cfg / 限额配置变化，已提交监控循环热生效 version=... frontends=1
 INFO tc 限速已按配置就地调整（rate-change，未重建队列树） ...
 ```
+
+**解除限速**：把限额改成 `0`（显式不限速）同样 ≤5s 生效——该端口的
+tc 类被撤掉、吞吐立刻放开；全部改 0 时整棵队列树被拆掉（`tc qdisc
+show dev eth0` 恢复默认）。
 
 观察：loadgen 表格里 node1 行**立刻**降到 ≈20 Mbps（在途大文件下载
 不断线、直接换挡），其余两台不受影响。**反向调大同理**——吞吐立即回升，

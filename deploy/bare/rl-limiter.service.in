@@ -42,8 +42,11 @@ CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 
 # ---- 加固 ---------------------------------------------------------------
-# 本服务对文件系统只有读需求（YAML 配置 + haproxy.cfg + stats socket），
-# 全程不写盘，ProtectSystem=strict 可以全只读、无需任何 ReadWritePaths。
+# 本服务对文件系统只有一处写需求：监控数据落盘（RL_METRICS_LOG，JSONL）。
+# 用 LogsDirectory 让 systemd 自动创建 /var/log/rl-limiter 并授权写入——
+# ProtectSystem=strict 全只读的前提下这是唯一放开的目录，无需
+# ReadWritePaths。配置文件（YAML/haproxy.cfg）仍然只读。
+LogsDirectory=rl-limiter
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

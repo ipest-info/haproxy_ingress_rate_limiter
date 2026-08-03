@@ -163,12 +163,31 @@ def test_parse_tolerates_empty_output():
 # 拒绝执行的边界
 # ---------------------------------------------------------------------------
 
-async def test_empty_list_refused_without_touching_kernel():
-    """空清单 = 撤掉全部限速。那是事故不是配置操作，且必须**一条命令都不发**。"""
-    sh, fake = shaper()
+async def test_empty_list_with_no_tree_is_noop():
+    """空清单 = 显式撤掉全部限速（quotas 清空/全部设为 0）。网卡上本来
+    就没有我们的树时什么都不做——首次启动 + 全不限速的正常形态。"""
+    sh, fake = shaper()          # 空状态 = 没有 HTB 树
     res = await sh.reconcile([])
-    assert not res.ok and "撤掉全部限速" in res.error
-    assert fake.calls == []
+    assert res.ok and not res.changed
+    # 只允许读状态（show），绝不该有任何写命令。
+    assert all("show" in c for c in fake.calls)
+
+
+async def test_empty_list_tears_down_existing_tree():
+    """网卡上有我们的 HTB 树、清单收缩到空：拆掉整棵树，恢复默认 qdisc。"""
+    sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile([])
+    assert res.ok and res.changed and res.action == "teardown"
+    dels = [c for c in fake.calls if "del" in c]
+    assert dels == [["tc", "qdisc", "del", "dev", IFACE, "root"]]
+
+
+async def test_empty_list_teardown_failure_is_reported():
+    """拆树失败要如实报错（下一轮兜底重试），不能装作已经不限速了。"""
+    sh, fake = shaper(classes=CLASSES_OK, filters=FILTERS_OK,
+                      fail_on=("qdisc del",))
+    res = await sh.reconcile([])
+    assert not res.ok and res.error
 
 
 async def test_port_colliding_with_default_class_refused():

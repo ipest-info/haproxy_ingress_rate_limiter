@@ -132,8 +132,10 @@ def test_subscriber_drops_oldest_when_slow():
 
 @pytest.fixture
 async def client():
-    app = webconsole.build_app(hub(), webconsole.LogBuffer(),
+    h = hub()
+    app = webconsole.build_app(h, webconsole.LogBuffer(),
                                __import__("logging").getLogger("t"))
+    app["hub"] = h          # 测试里要往里灌样本
     async with TestClient(TestServer(app)) as c:
         yield c
 
@@ -174,6 +176,32 @@ async def test_sse_declares_utf8(client):
     assert r.headers["Content-Type"].startswith("text/event-stream")
     assert "charset=utf-8" in r.headers["Content-Type"]
     r.close()
+
+
+async def test_prometheus_metrics_endpoint(client):
+    """/metrics：Prometheus 文本格式，frontend/instance 两级指标齐全，
+    与控制台曲线同源（都取自 StatusHub 的最新一拍）。"""
+    r = await client.get("/metrics")
+    assert r.status == 200
+    assert r.headers["Content-Type"].startswith("text/plain")
+    body = await r.text()
+    assert 'rl_limiter_info{' in body
+    # 限额来自配置视图：fe_a 登记 8 Mbps = 1_000_000 bytes/s。
+    assert ('rl_limiter_frontend_quota_bytes_per_second{frontend="fe_a"} '
+            "1000000.0") in body
+    # HELP/TYPE 注释要在（Prometheus 解析器靠它识别指标）。
+    assert "# TYPE rl_limiter_frontend_quota_bytes_per_second gauge" in body
+
+
+async def test_metrics_carries_latest_sample(client):
+    """采过样之后，速率与超限标记跟着最新一拍走。"""
+    h = client.app["hub"]
+    h.record(1.0, [usage(rate=500.0, mean10=2_000_000, conn=7)])
+    body = await (await client.get("/metrics")).text()
+    assert 'rl_limiter_frontend_rate_bytes_per_second{frontend="fe_a"} 500.0' in body
+    assert 'rl_limiter_frontend_connections{frontend="fe_a"} 7' in body
+    # mean10 2M > 限额 1M → over=1（与控制台的超限徽标同一判定）。
+    assert 'rl_limiter_frontend_over_quota{frontend="fe_a"} 1' in body
 
 
 async def test_json_endpoints_declare_utf8(client):

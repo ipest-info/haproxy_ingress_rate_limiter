@@ -48,6 +48,11 @@ def _load_frontends(path: str):
 def cmd_plan(args) -> int:
     """只打印将要执行的 tc 命令，绝不执行。"""
     fes = _load_frontends(args.config)
+    if not fes:
+        print("# quotas 未登记任何正限额（全部不限速）。")
+        print("# rl-limiter 会撤掉队列树（若存在）：")
+        print(f"  tc qdisc del dev {args.iface} root")
+        return 0
     try:
         T._check_shapeable(fes)
     except T.TcError as e:
@@ -117,6 +122,16 @@ def cmd_verify(args) -> int:
     want = T.desired_rates(fes)
 
     print(f"网卡 {args.iface} 实况核对：")
+    if not fes:
+        # 全部不限速：网卡上不该有我们的 HTB 树。
+        if classes:
+            print(f"  [FAIL] quotas 未登记任何正限额，但网卡上还有限速类 "
+                  f"{sorted(classes)} —— rl-limiter 会在下一轮撤掉；一直在"
+                  f"说明服务没在跑")
+            return 1
+        print("  [ok]   quotas 未登记任何正限额（全部不限速），网卡上也"
+              "没有限速队列树，一致")
+        return 0
     bad_default = 0
     if T.DEFAULT_CLASS_MINOR not in classes:
         print(f"  [FAIL] 没有兜底类 1:{T.DEFAULT_CLASS_MINOR} —— 队列树多半"

@@ -7,8 +7,10 @@
 #      不在 YAML 里：**haproxy.cfg 才是它们的唯一权威**，rl-limiter 从
 #      cfg 直接解析受管 frontend 清单（见 cfgparse 模块）；
 #   2. **限额登记**（quotas 段）：frontend 名 → 限额（Mbps）。cfg 里
-#      存在、这里登记了限额的 frontend 参与限速（tc）与超限告警；未登记
-#      的只监控不限速；
+#      存在、这里登记了正限额的 frontend 参与限速（tc）与超限告警；
+#      未登记的只监控不限速（启动会 warn 一次提醒）；**显式写 0 表示
+#      "确认不限速"**——语义与不登记相同，但不再提醒，且清单收缩到
+#      全 0/全空时会把网卡上的 tc 队列树整个撤掉；
 #   3. 服务级运行参数：log_level、tick_interval_s。
 #
 # 单位约定：**限额的配置单位一律是 Mbps**（40 = 40 Mbps，允许小数）；
@@ -62,7 +64,7 @@ class ServiceConfig:
     tick_interval_s: float = DEFAULT_TICK_INTERVAL_S
     # 本机 HAProxy 的接线（stats socket + cfg 路径）。
     haproxy: model.NodeConfig = field(default_factory=model.NodeConfig)
-    # 限额登记：frontend 名 → 限额（Mbps，> 0）。
+    # 限额登记：frontend 名 → 限额（Mbps，≥ 0；0 = 显式不限速）。
     quotas: dict[str, float] = field(default_factory=dict)
 
 
@@ -193,15 +195,14 @@ def _validate(cfg: ServiceConfig) -> None:
                 f"quotas 的键 {name!r} 非法——应为 haproxy.cfg 里的 "
                 f"frontend/listen 段名（字母、数字、点、下划线、连字符，"
                 f"长度 1-64）")
-        if mbps <= 0:
+        if mbps < 0:
             raise ValueError(
-                f"quotas.{name} 必须为正数（当前值 {mbps!r}）——它既是下发"
-                f"给内核 tc 的类速率，也是超限告警基准；不想限速就删掉这行"
-                f"（cfg 里的段默认只监控不限速），别写 0")
-        if mbps * 1_000_000 / 8 < 1:
+                f"quotas.{name} 不能为负数（当前值 {mbps!r}）——正数是限额"
+                f"（Mbps），0 表示显式不限速（撤掉该端口的 tc 限速类）")
+        if 0 < mbps * 1_000_000 / 8 < 1:
             raise ValueError(
                 f"quotas.{name}={mbps} 太小（换算成 bytes/s 后不足 1），"
-                f"tc 会拒绝这个速率")
+                f"tc 会拒绝这个速率；要不限速请写 0")
 
 
 def _validate_haproxy(n: model.NodeConfig) -> None:
