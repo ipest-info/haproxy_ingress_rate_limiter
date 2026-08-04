@@ -15,8 +15,9 @@
    落盘到本地 JSONL 日志（历史回查/计费对账），并做持续超限告警。
 
 限额除了直接编辑 YAML，也可在控制台页面上改，或调用带令牌鉴权的写 API
-（`RL_API_TOKEN`）：支持每个 frontend 的限额与**整张网卡的总限速**
-（`nic_quota_mbps`，tc 层级模式），修改回写 YAML 后数秒内热生效。
+（`RL_API_TOKEN`）：支持每个 frontend 的限额与**实例总限速**
+（`instance_quota_mbps`，tc 层级模式，罩全部 frontend 出向流量合计；
+SSH/系统流量不受影响），修改回写 YAML 后数秒内热生效。
 
 配置来源只有两个本地文件（**没有数据库**）：haproxy.cfg + rl-limiter 的
 YAML（`-c` 指定：stats socket 接线、cfg 路径、quotas 限额）。运行期轮询
@@ -125,9 +126,10 @@ deploy/bare/rl-limiter.sh check     # 体检：只看不改
   5s 内热生效（`tc class change`，不 reload，存量连接立刻按新限额跑；
   经 API 修改会立即触发重读，不等轮询）；**写 0 = 显式不限速**（撤掉该
   端口的 tc 类；全部为 0/清空且未设总限速时整棵限速队列树被拆掉）；
-- **改网卡总限速** → YAML 的 `nic_quota_mbps` / 控制台实例页 /
-  `PUT /api/nic-quota`。设置后 tc 切换为层级模式：整卡出向合计不超过
-  总限速，各端口限额仍各自生效；0 = 取消（回到平铺模式）；
+- **改实例总限速** → YAML 的 `instance_quota_mbps` / 控制台实例页 /
+  `PUT /api/instance-quota`。设置后 tc 切换为层级模式：本机 HAProxy
+  **全部 frontend**（含未登记限额的）出向合计不超过总限速，各端口限额
+  仍各自生效，SSH/系统流量不在总闸内；0 = 取消（回到平铺模式）；
 - **改端口/后端** → 改 haproxy.cfg → `systemctl reload haproxy`。
   rl-limiter 轮询到 cfg 内容变化后自动更新监控清单与 tc 分类
   （**这一类没有页面/API 入口**：haproxy.cfg 只归运维手工编辑）。
@@ -144,7 +146,7 @@ deploy/bare/rl-limiter.sh check     # 体检：只看不改
 （默认 `127.0.0.1`）。**读接口无鉴权**（暴露全量监控数据与运行日志），
 放到内网必须配合防火墙/安全组限制来源；**写接口（改限额）必须带令牌**
 （`RL_API_TOKEN`，不设则写接口整体 403、页面退化为只读）。三个 tab：
-**实例**（整台 HAProxy 的连接/带宽/数据包视图 + 网卡总限速编辑）、
+**实例**（整台 HAProxy 的连接/带宽/数据包视图 + 实例总限速编辑）、
 **监听端口**（每个 frontend 的监控曲线、配置视图与限额编辑）、**日志**。
 每条曲线的来源与口径见 [docs/05-监控视图.md](docs/05-监控视图.md)。
 

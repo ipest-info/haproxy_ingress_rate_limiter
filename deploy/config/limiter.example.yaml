@@ -11,15 +11,15 @@
 # 这份 YAML 因此只有四类内容：
 #   1. haproxy 段——本机 HAProxy 的接线（stats socket + cfg 路径）；
 #   2. quotas 段——限额登记（frontend 名 → Mbps）；
-#   3. nic_quota_mbps——可选的网卡总限速；
+#   3. instance_quota_mbps——可选的实例总限速；
 #   4. 运行参数（log_level、tick_interval_s）。
 #
 # 热更新：运行期轮询本文件与 haproxy.cfg 的内容（默认 5s），quotas/
-# nic_quota_mbps 或 cfg 内容变化即热生效（改 cfg 后记得 reload HAProxy；
+# instance_quota_mbps 或 cfg 内容变化即热生效（改 cfg 后记得 reload HAProxy；
 # rl-limiter 会自动跟上）。haproxy 接线段与 log_level 启动时定型，改了
 # 需重启本服务。
 #
-# 除了直接编辑本文件，限额（quotas / nic_quota_mbps）也可以经控制台页面
+# 除了直接编辑本文件，限额（quotas / instance_quota_mbps）也可以经控制台页面
 # 或带鉴权的写 API 修改（需设 RL_API_TOKEN，见 docs/03）——那条路最终
 # 也是回写到这份文件（**手写注释会丢**，YAML 数据往返的限制）。
 #
@@ -70,13 +70,15 @@ quotas:
   fe_api: 8                     # 8 Mbps
 
 # ---------------------------------------------------------------------------
-# 网卡总限速（可选，Mbps）：整张限速网卡出方向的总闸。
+# 实例总限速（可选，Mbps）：本机 HAProxy 全部 frontend 出向流量合计的
+# 总闸。
 #
-# 设置后 tc 切换为**层级模式**：所有流量（各受管端口 + SSH/监控等未受管
-# 流量）合计不超过它，各 frontend 自己的限额仍各自生效（单端口上限 =
-# min(自身限额, 总限速)）。各端口限额合计超过总限速的 90% 时，超卖部分
-# 按比例分担带宽（HTB 的保证值缩放，见 docs/06）。
+# 设置后 tc 切换为**层级模式**：所有 frontend（含未在 quotas 里登记、
+# 只监控的段）合计不超过它，各 frontend 自己的限额仍各自生效（单端口
+# 上限 = min(自身限额, 总限速)）；SSH/监控等系统流量**不在**总闸内、
+# 不受影响。各端口限额合计超过总限速时，超卖部分按比例分担带宽（HTB
+# 的保证值缩放，见 docs/06）。
 #
 # 不写或写 0 = 不限（平铺模式，只按端口各限各的）。
 # ---------------------------------------------------------------------------
-# nic_quota_mbps: 800
+# instance_quota_mbps: 800

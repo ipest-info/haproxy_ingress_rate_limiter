@@ -89,8 +89,8 @@ class MonitorLoop:
         self._quotas: dict[str, float] = {}
         # 当前生效的受管 frontend 配置，供下发任务取用（见 frontends()）。
         self._frontends: list[model.FrontendConfig] = []
-        # 网卡总限速（Mbps；0 = 不限），随配置热更。
-        self._nic_quota_mbps: float = 0.0
+        # 实例总限速（Mbps；0 = 不限），随配置热更。
+        self._instance_quota_mbps: float = 0.0
         # frontend 名 → 超限滞回状态。
         self._over: dict[str, _OverState] = {}
         # 每次应用配置后被 set 的信号量，供"下发"类任务（下发限速的
@@ -116,9 +116,9 @@ class MonitorLoop:
         return self._version
 
     @property
-    def nic_quota_mbps(self) -> float:
-        """当前网卡总限速（Mbps；0 = 不限），tc 下发任务每轮现取。"""
-        return self._nic_quota_mbps
+    def instance_quota_mbps(self) -> float:
+        """当前实例总限速（Mbps；0 = 不限），tc 下发任务每轮现取。"""
+        return self._instance_quota_mbps
 
     def frontends(self) -> list[model.FrontendConfig]:
         """当前生效的受管 frontend 配置。
@@ -142,7 +142,7 @@ class MonitorLoop:
         基准，最后记录版本号。调用方保证串行（seed 在 run 之前，run 内单
         任务），组件间不会看到半新半旧的配置。"""
         self._frontends = list(cfg.frontends)
-        self._nic_quota_mbps = getattr(cfg, "nic_quota_mbps", 0.0)
+        self._instance_quota_mbps = getattr(cfg, "instance_quota_mbps", 0.0)
         self._collector.set_managed(cfg.names())
         self._quotas = cfg.quotas()
         # 已下线 frontend 的滞回状态一并丢弃；限额变化的保留计数（判定基准

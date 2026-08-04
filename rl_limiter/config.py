@@ -6,8 +6,8 @@
 #      haproxy.cfg 的路径。负载均衡配置（监听端口、模式、后端服务器）
 #      不在 YAML 里：**haproxy.cfg 才是它们的唯一权威**，rl-limiter 从
 #      cfg 直接解析受管 frontend 清单（见 cfgparse 模块）；
-#   2. **限额登记**（quotas 段 + nic_quota_mbps）：frontend 名 → 限额
-#      （Mbps），以及可选的**网卡总限速**。cfg 里
+#   2. **限额登记**（quotas 段 + instance_quota_mbps）：frontend 名 →
+#      限额（Mbps），以及可选的**实例总限速**。cfg 里
 #      存在、这里登记了正限额的 frontend 参与限速（tc）与超限告警；
 #      未登记的只监控不限速（启动会 warn 一次提醒）；**显式写 0 表示
 #      "确认不限速"**——语义与不登记相同，但不再提醒，且清单收缩到
@@ -63,10 +63,10 @@ class ServiceConfig:
 
     log_level: str = DEFAULT_LOG_LEVEL
     tick_interval_s: float = DEFAULT_TICK_INTERVAL_S
-    # 网卡总限速（Mbps；0 = 不限）。作用在整张限速网卡的出方向上：所有
-    # 流量（含未受管端口与兜底类）合计不超过它。tc 侧实现见 tcshaper
-    # 的层级模式。
-    nic_quota_mbps: float = 0.0
+    # 实例总限速（Mbps；0 = 不限）。罩住本机 HAProxy **全部 frontend**
+    # 的出向流量合计（含只监控未登记限额的段）；SSH/监控/系统流量不在
+    # 总闸之内、不受影响。tc 侧实现见 tcshaper 的层级模式。
+    instance_quota_mbps: float = 0.0
     # 本机 HAProxy 的接线（stats socket + cfg 路径）。
     haproxy: model.NodeConfig = field(default_factory=model.NodeConfig)
     # 限额登记：frontend 名 → 限额（Mbps，≥ 0；0 = 显式不限速）。
@@ -113,6 +113,13 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
             "字段 'frontends' 已废弃——负载均衡配置（监听端口、模式、后端"
             "服务器）以 haproxy.cfg 为唯一权威，rl-limiter 直接解析 cfg；"
             "限额改在 'quotas' 段登记（frontend 名 → Mbps）")
+    # 旧字段名显式拒绝：静默忽略会让运维以为总限速还生效着。
+    if "nic_quota_mbps" in raw:
+        raise ValueError(
+            "字段 'nic_quota_mbps' 已更名为 'instance_quota_mbps'，且语义"
+            "从「整张网卡的总限速」改为「HAProxy 实例的总限速」：总闸只"
+            "罩全部 frontend 的出向流量合计（含未登记限额的段），SSH/"
+            "监控等系统流量不再受影响——请改用新字段名")
 
     cfg = ServiceConfig()
 
@@ -126,12 +133,13 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
             f"tick_interval_s 必须是数字，当前值 {tick_raw!r}"
         ) from None
 
-    nic_raw = raw.get("nic_quota_mbps", 0) or 0
+    inst_raw = raw.get("instance_quota_mbps", 0) or 0
     try:
-        cfg.nic_quota_mbps = float(nic_raw)
+        cfg.instance_quota_mbps = float(inst_raw)
     except (TypeError, ValueError):
         raise ValueError(
-            f"nic_quota_mbps 必须是数字（Mbps），当前值 {nic_raw!r}") from None
+            f"instance_quota_mbps 必须是数字（Mbps），"
+            f"当前值 {inst_raw!r}") from None
 
     cfg.haproxy = _parse_haproxy(raw.get("haproxy") or {})
 
@@ -201,14 +209,15 @@ def _validate(cfg: ServiceConfig) -> None:
 
     _validate_haproxy(cfg.haproxy)
 
-    if cfg.nic_quota_mbps < 0:
+    if cfg.instance_quota_mbps < 0:
         raise ValueError(
-            f"nic_quota_mbps 不能为负数（当前值 {cfg.nic_quota_mbps!r}）"
-            f"——正数是整张网卡的总限速（Mbps），0 表示不限")
-    if 0 < cfg.nic_quota_mbps * 1_000_000 / 8 < 1:
+            f"instance_quota_mbps 不能为负数"
+            f"（当前值 {cfg.instance_quota_mbps!r}）"
+            f"——正数是本机 HAProxy 实例的总限速（Mbps），0 表示不限")
+    if 0 < cfg.instance_quota_mbps * 1_000_000 / 8 < 1:
         raise ValueError(
-            f"nic_quota_mbps={cfg.nic_quota_mbps} 太小（换算成 bytes/s 后"
-            f"不足 1），tc 会拒绝这个速率；要不限就写 0")
+            f"instance_quota_mbps={cfg.instance_quota_mbps} 太小（换算成 "
+            f"bytes/s 后不足 1），tc 会拒绝这个速率；要不限就写 0")
 
     for name, mbps in cfg.quotas.items():
         if not _NAME_RE.match(name):

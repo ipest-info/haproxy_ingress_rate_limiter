@@ -5,8 +5,8 @@
 #   - 观测侧零额外采集：监控循环每拍本就产出各 frontend 的速率/均值/
 #     连接数，控制台只是把这份内存数据经 StatusHub 留存最近几分钟并以
 #     SSE 推给页面——不引入第二条采集链路；
-#   - **写接口只覆盖限额**（quotas 里的单个 frontend 限额、网卡总限速
-#     nic_quota_mbps），回写到 YAML 后经 cfgparse.watch 热生效（写完
+#   - **写接口只覆盖限额**（quotas 里的单个 frontend 限额、实例总限速
+#     instance_quota_mbps），回写到 YAML 后经 cfgparse.watch 热生效（写完
 #     poke 一下，不等轮询周期）。负载均衡配置的唯一权威仍是本机
 #     haproxy.cfg（运维直接编辑 + reload），控制台永远不写它；接线/
 #     log_level 这类要重启才生效的字段也不开放；
@@ -143,8 +143,8 @@ class StatusHub:
         self._subs: set[asyncio.Queue] = set()
         # frontend 名 → 该 frontend 的配置视图（页面只读展示用）。
         self._fe_config: dict[str, dict[str, Any]] = {}
-        # 网卡总限速（Mbps；0 = 不限）。随配置热更。
-        self._nic_quota_mbps = 0.0
+        # 实例总限速（Mbps；0 = 不限）。随配置热更。
+        self._instance_quota_mbps = 0.0
         self._started = time.time()
 
     # ---- 配置与数据注入 ----
@@ -156,7 +156,7 @@ class StatusHub:
         # 重复做 ÷8，单位换算只在服务端一处。
         for name, d in self._fe_config.items():
             d["quota_bytes_per_s"] = d["quota_mbps"] * 1e6 / 8.0
-        self._nic_quota_mbps = getattr(cfg, "nic_quota_mbps", 0.0)
+        self._instance_quota_mbps = getattr(cfg, "instance_quota_mbps", 0.0)
 
     def _haproxy_view(self) -> dict[str, Any]:
         """本机 HAProxy 视图：接线 + 采样健康。"""
@@ -253,9 +253,9 @@ class StatusHub:
             # 各受管 frontend 的当前配置视图（来自 haproxy.cfg + YAML
             # 限额的解析结果，只读）。
             "frontends": self._fe_config,
-            # 网卡总限速（Mbps；0 = 不限）与换算好的 bytes/s（图表参考线）。
-            "nic_quota_mbps": self._nic_quota_mbps,
-            "nic_quota_bytes_per_s": self._nic_quota_mbps * 1e6 / 8.0,
+            # 实例总限速（Mbps；0 = 不限）与换算好的 bytes/s（图表参考线）。
+            "instance_quota_mbps": self._instance_quota_mbps,
+            "instance_quota_bytes_per_s": self._instance_quota_mbps * 1e6 / 8.0,
             "haproxy": self._haproxy_view(),
             "latest": self._history[-1] if self._history else None,
         }
@@ -294,9 +294,9 @@ def render_prometheus(hub: StatusHub) -> str:
     m("rl_limiter_uptime_seconds", round(o["uptime_s"], 1), "服务运行秒数")
     m("rl_limiter_haproxy_degraded", int(o["haproxy"]["degraded"]),
       "采样是否失联（1=失联，此时各速率为陈旧值）")
-    m("rl_limiter_nic_quota_bytes_per_second",
-      o.get("nic_quota_bytes_per_s", 0),
-      "网卡总限速（bytes/s；0=不限）")
+    m("rl_limiter_instance_quota_bytes_per_second",
+      o.get("instance_quota_bytes_per_s", 0),
+      "实例总限速（bytes/s；0=不限，罩全部 frontend 出向流量合计）")
 
     # 限额来自配置视图（即便该 frontend 这一拍没有采样行也要暴露）。
     first = True
@@ -541,7 +541,7 @@ def build_app(
         return web.json_response({"ok": True, "frontend": name,
                                   "removed": removed})
 
-    async def handle_put_nic_quota(request: web.Request) -> web.Response:
+    async def handle_put_instance_quota(request: web.Request) -> web.Response:
         denied = _authorized(request)
         if denied is not None:
             return denied
@@ -552,30 +552,30 @@ def build_app(
         async with write_lock:
             try:
                 await asyncio.to_thread(
-                    configstore.set_nic_quota, yaml_path, quota)
+                    configstore.set_instance_quota, yaml_path, quota)
             except ValueError as e:
                 return web.json_response({"error": str(e)}, status=400)
         if poke is not None:
             poke.set()
-        log.warning("写 API 已修改网卡总限速并回写 YAML nic_quota=%gMbps "
-                    "yaml=%s", quota, yaml_path)
-        return web.json_response({"ok": True, "nic_quota_mbps": quota})
+        log.warning("写 API 已修改实例总限速并回写 YAML "
+                    "instance_quota=%gMbps yaml=%s", quota, yaml_path)
+        return web.json_response({"ok": True, "instance_quota_mbps": quota})
 
-    async def handle_delete_nic_quota(request: web.Request) -> web.Response:
+    async def handle_delete_instance_quota(request: web.Request) -> web.Response:
         denied = _authorized(request)
         if denied is not None:
             return denied
         async with write_lock:
             try:
                 await asyncio.to_thread(
-                    configstore.set_nic_quota, yaml_path, 0.0)
+                    configstore.set_instance_quota, yaml_path, 0.0)
             except ValueError as e:
                 return web.json_response({"error": str(e)}, status=400)
         if poke is not None:
             poke.set()
-        log.warning("写 API 已取消网卡总限速（恢复不限）并回写 YAML "
+        log.warning("写 API 已取消实例总限速（恢复不限）并回写 YAML "
                     "yaml=%s", yaml_path)
-        return web.json_response({"ok": True, "nic_quota_mbps": 0})
+        return web.json_response({"ok": True, "instance_quota_mbps": 0})
 
     app = web.Application()
     app.router.add_get("/", handle_index)
@@ -589,8 +589,9 @@ def build_app(
     if yaml_path:
         app.router.add_put("/api/quotas/{name}", handle_put_quota)
         app.router.add_delete("/api/quotas/{name}", handle_delete_quota)
-        app.router.add_put("/api/nic-quota", handle_put_nic_quota)
-        app.router.add_delete("/api/nic-quota", handle_delete_nic_quota)
+        app.router.add_put("/api/instance-quota", handle_put_instance_quota)
+        app.router.add_delete("/api/instance-quota",
+                              handle_delete_instance_quota)
     return app
 
 

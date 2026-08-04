@@ -50,7 +50,7 @@ AmbientCapabilities=CAP_NET_ADMIN
 #   1. 监控数据落盘目录（LogsDirectory 自动创建 /var/log/rl-limiter
 #      并授权写入）；
 #   2. 自身配置目录（ReadWritePaths）——控制台/写 API 修改限额要把
-#      quotas/nic_quota_mbps 回写到 config.yaml（临时文件 + 原子替换，
+#      quotas/instance_quota_mbps 回写到 config.yaml（临时文件 + 原子替换，
 #      所以需要目录写权限）。不用写 API 的话可以删掉这行，配置就回到
 #      完全只读。
 # haproxy.cfg 在任何形态下都只读：rl-limiter 不改 cfg、不 reload haproxy。

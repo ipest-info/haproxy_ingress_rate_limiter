@@ -87,8 +87,8 @@ curl -s http://127.0.0.1:8090/api/overview
       "quota_bytes_per_s": 5000000.0
     }
   },
-  "nic_quota_mbps": 800.0,          // 网卡总限速（0 = 不限）
-  "nic_quota_bytes_per_s": 100000000.0,
+  "instance_quota_mbps": 800.0,     // 实例总限速（0 = 不限）
+  "instance_quota_bytes_per_s": 100000000.0,
   "haproxy": {
     "name": "haproxy",
     "endpoint": "/run/haproxy/admin.sock",
@@ -190,7 +190,7 @@ data: ...
 | `rl_limiter_config_version` | 配置内容校验和 |
 | `rl_limiter_uptime_seconds` | 运行秒数 |
 | `rl_limiter_haproxy_degraded` | 采样失联（1=失联，各速率为陈旧值） |
-| `rl_limiter_nic_quota_bytes_per_second` | 网卡总限速（0=不限） |
+| `rl_limiter_instance_quota_bytes_per_second` | 实例总限速（0=不限，罩全部 frontend 出向流量合计） |
 | `rl_limiter_frontend_quota_bytes_per_second{frontend}` | 登记限额（0=不限速） |
 | `rl_limiter_frontend_rate_bytes_per_second{frontend}` | 实时下行速率 |
 | `rl_limiter_frontend_mean10_bytes_per_second{frontend}` | 10s 均值（计费/超限口径） |
@@ -235,7 +235,7 @@ data: ...
 ## 5. 写接口（修改限额）
 
 四个端点，全部需要令牌（§2）。**能改的只有限额**：单 frontend 的
-quota 与网卡总限速。负载均衡配置（监听端口、后端服务器）**没有任何写
+quota 与实例总限速。负载均衡配置（监听端口、后端服务器）**没有任何写
 接口**——那以本机 haproxy.cfg 为唯一权威，只归运维手工编辑。
 
 写入行为（四个端点相同）：
@@ -301,10 +301,11 @@ curl -X DELETE -H "X-API-Token: $TOKEN" \
 { "ok": true, "frontend": "fe_main", "removed": true }
 ```
 
-### 5.3 `PUT /api/nic-quota` — 设置网卡总限速
+### 5.3 `PUT /api/instance-quota` — 设置实例总限速
 
-整张限速网卡出方向的总闸：所有流量（各受管端口 + SSH/监控等未受管
-流量）合计不超过它；各 frontend 自己的限额仍各自生效（单端口上限 =
+本机 HAProxy **全部 frontend** 出向流量合计的总闸（含未在 quotas 里
+登记限额、只监控的段——它们也被总闸罩住）；SSH/监控等系统流量**不在**
+总闸内、不受影响。各 frontend 自己的限额仍各自生效（单端口上限 =
 min(自身限额, 总限速)）。tc 侧切换为层级模式，原理与超卖时的带宽分配
 规则见 [06-tc限速方案.md §3.1](06-tc限速方案.md)。
 
@@ -314,26 +315,26 @@ min(自身限额, 总限速)）。tc 侧切换为层级模式，原理与超卖�
 curl -X PUT \
      -H "X-API-Token: $TOKEN" -H "Content-Type: application/json" \
      -d '{"quota_mbps": 800}' \
-     http://127.0.0.1:8090/api/nic-quota
+     http://127.0.0.1:8090/api/instance-quota
 ```
 
 成功 `200`：
 
 ```json
-{ "ok": true, "nic_quota_mbps": 800.0 }
+{ "ok": true, "instance_quota_mbps": 800.0 }
 ```
 
 注意：监听在 **65535** 端口的 frontend 无法参与限速（其 tc classid 与
 总限速的聚合类冲突，限速下发会整体拒绝并在日志报错）；正常业务端口
 不受影响。
 
-### 5.4 `DELETE /api/nic-quota` — 取消网卡总限速
+### 5.4 `DELETE /api/instance-quota` — 取消实例总限速
 
 等价于 `PUT {"quota_mbps": 0}`：回到平铺模式（只按端口各限各的）。
 无请求体。成功 `200`：
 
 ```json
-{ "ok": true, "nic_quota_mbps": 0 }
+{ "ok": true, "instance_quota_mbps": 0 }
 ```
 
 ---

@@ -3,7 +3,7 @@
 # 这是全项目**唯一**会写配置文件的地方，而且只写 rl-limiter 自己的 YAML
 # （-c 指定的那份）——haproxy.cfg 仍然绝对只读，"rl-limiter 不改 cfg、
 # 不 reload haproxy"的承诺不变。能改的只有限额类字段：quotas 里的单个
-# frontend 限额、网卡总限速 nic_quota_mbps。接线字段（haproxy 段）、
+# frontend 限额、实例总限速 instance_quota_mbps。接线字段（haproxy 段）、
 # log_level 这些**不开放**给 API——它们改了要重启进程，属于运维操作。
 #
 # ## 写入方式：整份重写 + 原子替换
@@ -130,11 +130,11 @@ def remove_quota(path: str, name: str) -> bool:
     return True
 
 
-def set_nic_quota(path: str, quota_mbps: float) -> None:
-    """设置网卡总限速（Mbps；0 = 不限，等价于删掉该字段）。"""
+def set_instance_quota(path: str, quota_mbps: float) -> None:
+    """设置实例总限速（Mbps；0 = 不限，等价于删掉该字段）。"""
     raw = _load_raw(path)
     if quota_mbps:
-        raw["nic_quota_mbps"] = quota_mbps
+        raw["instance_quota_mbps"] = quota_mbps
     else:
-        raw.pop("nic_quota_mbps", None)
+        raw.pop("instance_quota_mbps", None)
     _write_atomic(path, raw)

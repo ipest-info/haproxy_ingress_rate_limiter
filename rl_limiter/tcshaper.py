@@ -85,11 +85,13 @@ DEFAULT_CLASS_MINOR = 1
 # 兜底类的速率。取一个远高于任何真实网卡的值 = 实际不构成约束。
 DEFAULT_CLASS_RATE_BPS = 100_000_000_000  # 100 Gbit/s
 
-# 网卡总限速（层级模式）的聚合父类次要号。设了 nic_quota 时所有叶子类
-# （各端口类 + 兜底类）都挂在它下面，父类 rate=ceil=总限速——HTB 的
-# 硬约束是"子类 rate 之和 ≤ 父类 rate"时聚合吞吐 ≤ 父类 ceil，构建时
-# 会按此缩放各子类的保证值（见 _nic_rebuild_cmds）。
-NIC_PARENT_MINOR = 0xFFFF
+# 实例总限速（层级模式）的聚合父类次要号。设了 instance_quota 时**全部
+# frontend** 的端口类（含未登记限额、只监控的段）都挂在它下面，父类
+# rate=ceil=总限速；兜底类（SSH/监控等未受管流量）留在 root 下线速放行
+# ——总闸只罩 HAProxy 实例自己的出向流量。HTB 的硬约束是"子类 rate 之
+# 和 ≤ 父类 rate"时聚合吞吐 ≤ 父类 ceil，构建时会按此缩放各子类的保证
+# 值（见 instance_layout）。
+INSTANCE_PARENT_MINOR = 0xFFFF
 
 # burst：HTB 令牌桶的深度。太小则达不到设定速率（每个调度周期都被卡住），
 # 太大则限速在短时间尺度上形同虚设。取"10 毫秒的额度"是常见工程取值，
@@ -240,34 +242,50 @@ def _htb_rate_ceil_args(rate_bits_per_s: int, ceil_bits_per_s: int) -> list[str]
     ]
 
 
-def nic_layout(frontends: list[model.FrontendConfig],
-               nic_bits: int) -> tuple[dict[int, tuple[int, int]], tuple[int, int]]:
-    """层级模式的速率规划：返回 (端口→(rate,ceil), 兜底类的(rate,ceil))。
+# 保证值的下限（bit/s）。tc 拒绝 0 速率的类，给个象征性的底。
+MIN_GUARANTEE_BITS = 8
+
+
+def instance_layout(frontends: list[model.FrontendConfig],
+                    instance_bits: int) -> dict[int, tuple[int, int]]:
+    """层级模式的速率规划：返回 端口→(rate 保证值, ceil 上限)。
+
+    **全部** frontend 都在内——未登记限额（quota 0）的段也建类挂进
+    总闸，否则它们的流量落到兜底类里逃出实例限速，"实例总限速"就名不
+    副实了。兜底类（SSH/监控等非 HAProxy 流量）不在这里：它挂在 root
+    下线速放行，不占实例额度。
 
     HTB 的聚合上限只有在"子类 rate（保证值）之和 ≤ 父类 rate"时才成立
     ——子类在自身 rate 以内发包**不需要**向父类借令牌，保证值超卖的话
     聚合吞吐可以突破父类 ceil。因此：
 
-      - 各端口的保证值 = 自身限额，但合计超过总限速的 90% 时按比例缩小
-        （留 10% 给兜底类的保证值——SSH/监控不能被饿死）；
-      - 端口的 ceil = min(自身限额, 总限速)：单端口上限仍是自己的限额；
-      - 兜底类拿走剩余保证值，ceil = 总限速（未受管流量最多吃满总限速）。
+      - 登记了限额的端口：保证值 = 自身限额，合计超预算时按比例缩小
+        （预算 = 总限速 − 未登记端口的保底之和，通常就是 100%）；
+        ceil = min(自身限额, 总限速)——单端口上限仍是自己的限额；
+      - 未登记限额的端口：均分剩余保证值（付费限额优先拿保证），
+        ceil = 总限速——不设限的段最多吃满整个实例额度。
     """
-    quotas = {f.bind_port: int(f.quota_bytes_per_sec) * 8 for f in frontends}
-    total = sum(quotas.values())
-    budget = int(nic_bits * 0.9)
+    limited = {f.bind_port: int(f.quota_bytes_per_sec) * 8
+               for f in frontends if f.limited}
+    unlimited = sorted(f.bind_port for f in frontends if not f.limited)
+    budget = max(MIN_GUARANTEE_BITS,
+                 instance_bits - MIN_GUARANTEE_BITS * len(unlimited))
+    total = sum(limited.values())
     scale = (budget / total) if total > budget else 1.0
     ports: dict[int, tuple[int, int]] = {}
-    guaranteed = 0
-    for port, q in quotas.items():
-        rate = max(8, int(q * scale))
-        ceil = min(q, nic_bits)
-        rate = min(rate, ceil)
+    used = 0
+    for port, q in limited.items():
+        ceil = min(q, instance_bits)
+        rate = min(max(MIN_GUARANTEE_BITS, int(q * scale)), ceil)
         ports[port] = (rate, ceil)
-        guaranteed += rate
-    default_rate = max(nic_bits - guaranteed, max(8, int(nic_bits * 0.05)))
-    default_rate = min(default_rate, nic_bits)
-    return ports, (default_rate, nic_bits)
+        used += rate
+    if unlimited:
+        leftover = max(instance_bits - used,
+                       MIN_GUARANTEE_BITS * len(unlimited))
+        share = max(MIN_GUARANTEE_BITS, leftover // len(unlimited))
+        for port in unlimited:
+            ports[port] = (share, instance_bits)
+    return ports
 
 
 def classid_for(port: int) -> str:
@@ -292,13 +310,16 @@ def classid_for(port: int) -> str:
     return f"{ROOT_HANDLE}{port:x}"
 
 
-def _check_shapeable(frontends: list[model.FrontendConfig]) -> None:
+def _check_shapeable(frontends: list[model.FrontendConfig],
+                     allow_unlimited: bool = False) -> None:
     """进入 argv 之前的最后一道校验。
 
     这些值会被交给以 root 执行的 tc，虽然全部是整数、不存在注入面，但
     越界的值会让 tc 报出难懂的错误，不如在这里给出人话。
 
     空清单是合法输入（显式撤掉全部限速），由 reconcile 单独处理。
+    allow_unlimited：实例总限速（层级模式）下未登记限额（quota 0）的
+    frontend 也要进总闸建类，此时放行 quota 0；平铺模式不该出现。
     """
     seen: set[int] = set()
     for f in frontends:
@@ -309,14 +330,16 @@ def _check_shapeable(frontends: list[model.FrontendConfig]) -> None:
                 f"frontend {f.name} 监听在 {DEFAULT_CLASS_MINOR} 端口，与 tc "
                 f"兜底类的 classid 冲突（classid 次要号直接取端口，见模块头）。"
                 f"换一个端口即可")
-        if f.bind_port == NIC_PARENT_MINOR:
+        if f.bind_port == INSTANCE_PARENT_MINOR:
             raise TcError(
-                f"frontend {f.name} 监听在 {NIC_PARENT_MINOR} 端口，与网卡"
-                f"总限速的聚合类 classid 冲突。换一个端口即可")
+                f"frontend {f.name} 监听在 {INSTANCE_PARENT_MINOR} 端口，与"
+                f"实例总限速的聚合类 classid 冲突。换一个端口即可")
         if f.bind_port in seen:
             raise TcError(f"监听端口 {f.bind_port} 被多个 frontend 使用，"
                           f"无法按端口分类限速")
         seen.add(f.bind_port)
+        if not f.limited and allow_unlimited:
+            continue
         if int(f.quota_bytes_per_sec) < 1:
             raise TcError(f"frontend {f.name} 的限额 {f.quota_mbps} Mbps "
                           f"不足 1 字节/秒，无法整形")
@@ -396,30 +419,30 @@ def _filter_cmds(iface: str, port: int, cid: str) -> list[tuple[list[str], bool]
     ]
 
 
-def _nic_rebuild_cmds(iface: str,
-                      frontends: list[model.FrontendConfig],
-                      nic_bits: int) -> list[tuple[list[str], bool]]:
-    """层级模式（设了网卡总限速）的整树重建命令序列。
+def _instance_rebuild_cmds(iface: str,
+                           frontends: list[model.FrontendConfig],
+                           instance_bits: int) -> list[tuple[list[str], bool]]:
+    """层级模式（设了实例总限速）的整树重建命令序列。
 
-    结构：root htb default=兜底 → 聚合父类 1:ffff（rate=ceil=总限速）→
-    {兜底类 1:1, 各端口类}。速率规划见 nic_layout。
+    结构：root htb default=兜底 → {兜底类 1:1（线速，不整形——SSH/监控
+    等非 HAProxy 流量不占实例额度）, 聚合父类 1:ffff（rate=ceil=实例
+    总限速）→ 各端口类（全部 frontend，含未登记限额的）}。
+    速率规划见 instance_layout。
     """
-    ports, (def_rate, def_ceil) = nic_layout(frontends, nic_bits)
-    parent_cid = classid_for(NIC_PARENT_MINOR)
+    ports = instance_layout(frontends, instance_bits)
+    parent_cid = classid_for(INSTANCE_PARENT_MINOR)
     cmds: list[tuple[list[str], bool]] = [
         (["tc", "qdisc", "del", "dev", iface, "root"], False),
         (["tc", "qdisc", "add", "dev", iface, "root", "handle", ROOT_HANDLE,
           "htb", "default", str(DEFAULT_CLASS_MINOR)], True),
-        # 聚合父类：整张网卡出方向的总闸。
+        # 兜底类：与平铺模式完全一样，挂 root、线速放行——实例限速
+        # 刻意**不**罩它（把总限速设小也永远不会把自己的 SSH 卡死）。
         (["tc", "class", "add", "dev", iface, "parent", ROOT_HANDLE,
-          "classid", parent_cid, "htb", *_htb_rate_args(nic_bits)], True),
-        # 兜底类挂在父类下：未受管流量共享总限速的剩余额度。
-        (["tc", "class", "add", "dev", iface, "parent", parent_cid,
           "classid", classid_for(DEFAULT_CLASS_MINOR), "htb",
-          *_htb_rate_ceil_args(def_rate, def_ceil)], True),
-        (["tc", "qdisc", "add", "dev", iface,
-          "parent", classid_for(DEFAULT_CLASS_MINOR),
-          "handle", f"{DEFAULT_CLASS_MINOR:x}0f:", LEAF_QDISC], False),
+          *_htb_rate_args(DEFAULT_CLASS_RATE_BPS)], True),
+        # 聚合父类：本机 HAProxy 全部 frontend 出向流量的总闸。
+        (["tc", "class", "add", "dev", iface, "parent", ROOT_HANDLE,
+          "classid", parent_cid, "htb", *_htb_rate_args(instance_bits)], True),
     ]
     for f in sorted(frontends, key=lambda x: x.bind_port):
         port = f.bind_port
@@ -503,7 +526,7 @@ def parse_class_cbursts(out: str) -> dict[int, int]:
 def parse_class_ceils(out: str) -> dict[int, int]:
     """解析 `tc class show`：classid 次要号 → ceil（bit/s）。
 
-    层级模式（网卡总限速）下比对的是 ceil 而不是 rate——各类的 rate 是
+    层级模式（实例总限速）下比对的是 ceil 而不是 rate——各类的 rate 是
     按比例缩放出来的"保证值"，会随别的 frontend 增删而变；ceil 才稳定
     等于 min(自身限额, 总限速)。
     """
@@ -613,7 +636,7 @@ class TcShaper:
 
         cburst 也要读回来——它才是 ceil 那一路的桶。只比速率的话，从漏给
         cburst 的旧版本升上来时会判定"一致"，坏的桶就一直留着（见
-        _htb_rate_args 里那次事故）。ceil 是层级模式（网卡总限速）比对
+        _htb_rate_args 里那次事故）。ceil 是层级模式（实例总限速）比对
         用的：那种模式下各类的 rate 是缩放出来的保证值，真正等于限额的
         是 ceil。
         """
@@ -662,33 +685,36 @@ class TcShaper:
             return {}
 
     async def reconcile(self, frontends: list[model.FrontendConfig],
-                        nic_quota_bits: int = 0) -> TcResult:
+                        instance_quota_bits: int = 0) -> TcResult:
         """把网卡上的限速状态收敛到配置描述的样子。
 
-        nic_quota_bits > 0 时进入**层级模式**：整树挂在一个 rate=ceil=
-        总限速的聚合父类下（见 _nic_rebuild_cmds）。层级模式下任何差异
-        都走整树重建——各类的保证值是按比例缩放的，改任何一个 frontend
-        的限额都会牵动其它类，逐个 class change 反而容易改出中间态。
+        instance_quota_bits > 0 时进入**层级模式**：全部端口类挂在一个
+        rate=ceil=实例总限速的聚合父类下（见 _instance_rebuild_cmds），
+        此时 frontends 应包含**全部** frontend（含未登记限额的段——它们
+        也要进总闸）。层级模式下任何差异都走整树重建——各类的保证值是
+        按比例缩放的，改任何一个 frontend 的限额都会牵动其它类，逐个
+        class change 反而容易改出中间态。
 
-        平铺模式（nic_quota_bits == 0）三条路径，按"对流量的打扰程度"
-        从小到大：
+        平铺模式（instance_quota_bits == 0）三条路径，按"对流量的打扰
+        程度"从小到大：
           1. 完全一致 → 什么都不做；
           2. 结构一致、只有速率不同 → `tc class change`，**不打断任何连接**；
           3. 结构不一致（新增/删除 frontend、树被人手工改过、首次运行）
              → 整棵重建。重建期间有一个极短的窗口不整形，这是必要代价。
         """
         try:
-            _check_shapeable(frontends)
+            _check_shapeable(frontends,
+                             allow_unlimited=bool(instance_quota_bits))
         except TcError as e:
             return TcResult(ok=False, changed=False, error=str(e))
 
-        # 空清单且没有网卡总限速 = 显式撤掉全部限速（quotas 清空/全部设
+        # 空清单且没有实例总限速 = 显式撤掉全部限速（quotas 清空/全部设
         # 为 0）：拆掉整棵队列树，网卡恢复默认 qdisc（mq/fq 等）。只在
         # 网卡上确实有**我们的 HTB 树**时才动手——classes 只匹配
         # `class htb`，别人的 qdisc 不会被误拆；首次启动本就没有树时什么
-        # 都不做。设了 nic_quota 时即使清单为空也**不拆**：总限速本身
-        # 就要求树在（聚合父类 + 兜底类），走下面的层级分支。
-        if not frontends and not nic_quota_bits:
+        # 都不做。设了实例总限速时即使清单为空也**不拆**：总闸本身要求
+        # 树在（聚合父类 + 兜底类），走下面的层级分支。
+        if not frontends and not instance_quota_bits:
             try:
                 classes, _, _, _ = await self.observe()
             except Exception:
@@ -715,9 +741,10 @@ class TcShaper:
             self._log.warning("读取 tc 当前状态失败，按重建处理 err=%s", e)
             classes, cbursts, filtered, ceils = {}, {}, set(), {}
 
-        if nic_quota_bits:
-            return await self._reconcile_nic(frontends, nic_quota_bits, names,
-                                             classes, cbursts, filtered, ceils)
+        if instance_quota_bits:
+            return await self._reconcile_instance(
+                frontends, instance_quota_bits, names,
+                classes, cbursts, filtered, ceils)
 
         want = desired_rates(frontends)
         # 从层级模式切回平铺时聚合父类 0xffff 会留在 classes 里，落进
@@ -777,32 +804,36 @@ class TcShaper:
                 "iface=%s err=%s", self.iface, e)
             return TcResult(ok=False, changed=False, frontends=names, error=str(e))
 
-    async def _reconcile_nic(self, frontends: list[model.FrontendConfig],
-                             nic_bits: int, names: list[str],
-                             classes: dict[int, int], cbursts: dict[int, int],
-                             filtered: set[int],
-                             ceils: dict[int, int]) -> TcResult:
+    async def _reconcile_instance(self, frontends: list[model.FrontendConfig],
+                                  instance_bits: int, names: list[str],
+                                  classes: dict[int, int],
+                                  cbursts: dict[int, int],
+                                  filtered: set[int],
+                                  ceils: dict[int, int]) -> TcResult:
         """层级模式的收敛：一致就不动，任何差异都整树重建。
 
         比对的是 **ceil**（等于 min(限额, 总限速)，稳定）加 rate（缩放
-        出来的保证值——nic_layout 是确定性的，同一份配置算出的 rate 每
-        次都一样，所以也能精确比）。cburst 只判偏小，理由同平铺模式。
+        出来的保证值——instance_layout 是确定性的，同一份配置算出的
+        rate 每次都一样，所以也能精确比）。cburst 只判偏小，理由同平铺
+        模式。兜底类按平铺口径核（线速 + cburst）：从旧版"网卡总限速"
+        树升级上来时它的 rate 是缩放值，正好判不一致触发重建换到新结构。
         """
-        ports_layout, (def_rate, def_ceil) = nic_layout(frontends, nic_bits)
+        ports_layout = instance_layout(frontends, instance_bits)
         want_ports = set(ports_layout)
-        have_ports = set(classes) - {DEFAULT_CLASS_MINOR, NIC_PARENT_MINOR}
+        have_ports = set(classes) - {DEFAULT_CLASS_MINOR,
+                                     INSTANCE_PARENT_MINOR}
         consistent = (
             DEFAULT_CLASS_MINOR in classes
-            and NIC_PARENT_MINOR in classes
+            and INSTANCE_PARENT_MINOR in classes
             and have_ports == want_ports
             and filtered == want_ports
-            and classes.get(NIC_PARENT_MINOR) == nic_bits
-            and ceils.get(NIC_PARENT_MINOR) == nic_bits
-            and classes.get(DEFAULT_CLASS_MINOR) == def_rate
-            and ceils.get(DEFAULT_CLASS_MINOR) == def_ceil
-            and not _cburst_too_small(cbursts.get(NIC_PARENT_MINOR), nic_bits)
+            and classes.get(INSTANCE_PARENT_MINOR) == instance_bits
+            and ceils.get(INSTANCE_PARENT_MINOR) == instance_bits
+            and classes.get(DEFAULT_CLASS_MINOR) == DEFAULT_CLASS_RATE_BPS
+            and not _cburst_too_small(cbursts.get(INSTANCE_PARENT_MINOR),
+                                      instance_bits)
             and not _cburst_too_small(cbursts.get(DEFAULT_CLASS_MINOR),
-                                      def_ceil)
+                                      DEFAULT_CLASS_RATE_BPS)
         )
         if consistent:
             for port, (rate, ceil) in ports_layout.items():
@@ -814,25 +845,25 @@ class TcShaper:
             return TcResult(ok=True, changed=False, frontends=names)
 
         try:
-            for argv, fatal in _nic_rebuild_cmds(self.iface, frontends,
-                                                 nic_bits):
+            for argv, fatal in _instance_rebuild_cmds(self.iface, frontends,
+                                                      instance_bits):
                 await self._tc(argv, fatal=fatal)
         except TcError as e:
             self._log.error(
                 "tc 层级限速下发失败，**限速可能未按新配置生效**，将在下一轮"
-                "重试 iface=%s nic_quota=%dbit err=%s",
-                self.iface, nic_bits, e)
+                "重试 iface=%s instance_quota=%dbit err=%s",
+                self.iface, instance_bits, e)
             return TcResult(ok=False, changed=False, frontends=names,
                             error=str(e))
         self._log.warning(
-            "已重建本机网卡的 tc 层级限速队列树（网卡总限速 %dbit，数据面"
+            "已重建本机网卡的 tc 层级限速队列树（实例总限速 %dbit，数据面"
             "已按新配置整形） iface=%s frontends=%s",
-            nic_bits, self.iface,
+            instance_bits, self.iface,
             ";".join(f"{f.name}@:{f.bind_port}"
                      f"={ports_layout[f.bind_port][0]}/"
                      f"{ports_layout[f.bind_port][1]}bit"
                      for f in sorted(frontends, key=lambda x: x.bind_port))
-            or "(无受管 frontend，仅总限速)")
+            or "(无 frontend，仅总闸)")
         return TcResult(ok=True, changed=True, frontends=names,
                         action="rebuild")
 
@@ -905,13 +936,14 @@ async def run_shaper(shaper: TcShaper,
     事件驱动保证"改完立刻生效"，周期兜底负责纠正有人手工动过 tc
     （`tc qdisc del` 之类）造成的漂移。
 
-    desired_fn() 返回 (受管 frontend 清单, 网卡总限速 bit/s)——后者为 0
-    表示平铺模式（不设总限速）。
+    desired_fn() 返回 (frontend 清单, 实例总限速 bit/s)。后者为 0 时是
+    平铺模式，清单应只含登记了限额的段；> 0 时是层级模式，清单应含
+    **全部** frontend（未登记限额的段也要进总闸）。
     """
     while True:
         try:
-            frontends, nic_bits = desired_fn()
-            res = await shaper.reconcile(frontends, nic_bits)
+            frontends, inst_bits = desired_fn()
+            res = await shaper.reconcile(frontends, inst_bits)
             if on_result is not None:
                 on_result(res)
         except asyncio.CancelledError:

@@ -6,10 +6,10 @@
 <link rel="icon" href="data:,">
 <style>
 /* 单 HAProxy 模型的控制台。三个 tab：
-     实例   —— 整台 HAProxy 的连接/带宽视图 + 网卡总限速；
+     实例   —— 整台 HAProxy 的连接/带宽视图 + 实例总限速；
      监听端口 —— 每个 frontend 一张卡片：监控曲线、配置视图与限额编辑；
      日志   —— 进程内环形缓冲的最近若干条。
-   能改的只有**限额**（各 frontend 的 quota 与网卡总限速）：修改经带
+   能改的只有**限额**（各 frontend 的 quota 与实例总限速）：修改经带
    令牌鉴权的写 API 回写到 YAML 后热生效。负载均衡配置（监听端口/后端）
    仍以 haproxy.cfg 为唯一权威，页面绝不提供它的写入口。
 
@@ -198,7 +198,7 @@ input:focus, select:focus {
 .lv-ERROR, .lv-CRITICAL { color: var(--critical); }
 .lv-DEBUG { color: var(--text-muted); }
 
-/* ---- 限额编辑（frontend 卡片 / 网卡总限速卡） ---- */
+/* ---- 限额编辑（frontend 卡片 / 实例总限速卡） ---- */
 .quota-edit {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   margin-left: auto;
@@ -284,20 +284,21 @@ input:focus, select:focus {
 
     <div class="card">
       <div class="card-head">
-        <span class="card-title">网卡总限速</span>
-        <span class="tag" id="nic-quota-cur">–</span>
+        <span class="card-title">实例总限速</span>
+        <span class="tag" id="inst-quota-cur">–</span>
         <span class="quota-edit">
           <span class="hint">Mbps，0 = 不限</span>
-          <input id="nic-quota-input" type="number" min="0" step="any" placeholder="Mbps">
-          <button id="nic-quota-save">保存</button>
-          <button id="nic-quota-clear" title="等价于写 0：撤掉总限速，回到平铺模式">取消总限速</button>
+          <input id="inst-quota-input" type="number" min="0" step="any" placeholder="Mbps">
+          <button id="inst-quota-save">保存</button>
+          <button id="inst-quota-clear" title="等价于写 0：撤掉总限速，回到平铺模式">取消总限速</button>
         </span>
       </div>
       <div class="card-body">
-        <div class="hint">整张限速网卡出方向的总闸：设置后 tc 切换为层级模式，
-          所有流量（含各受管端口与 SSH/监控等未受管流量）合计不超过它，
-          各 frontend 自己的限额仍各自生效。修改经写 API 回写 YAML 后
-          数秒内热生效——需先在页头填入 API 令牌（RL_API_TOKEN）。</div>
+        <div class="hint">本机 HAProxy **全部** frontend 出向流量合计的总闸
+          （含未登记限额、只监控的段）：设置后 tc 切换为层级模式，各
+          frontend 自己的限额仍各自生效；SSH/监控等系统流量**不在**总闸内、
+          不受影响。修改经写 API 回写 YAML 后数秒内热生效——需先在页头
+          填入 API 令牌（RL_API_TOKEN）。</div>
       </div>
     </div>
 
@@ -367,7 +368,7 @@ const state = {
   instBuf: [],               // 实例视图的样本环形缓冲
   instCharts: [],
   windowS: 300, logAfter: 0, logLevel: "INFO", tab: "instance",
-  nicDirty: false,           // 网卡总限速输入框：用户动过后不再自动回填
+  instDirty: false,          // 实例总限速输入框：用户动过后不再自动回填
 };
 const LEVELS = {DEBUG:10, INFO:20, WARNING:30, ERROR:40, CRITICAL:50};
 // 缓冲上限：1 秒一拍，服务端只留 10 分钟历史，客户端留够 20 分钟即可。
@@ -801,12 +802,12 @@ async function loadOverview() {
   const up = Math.floor(o.uptime_s || 0);
   $("#uptime").textContent = up >= 3600
     ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
-  const nq = o.nic_quota_mbps || 0;
-  $("#nic-quota-cur").textContent = nq ? nq + " Mbps" : "不限";
+  const iq = o.instance_quota_mbps || 0;
+  $("#inst-quota-cur").textContent = iq ? iq + " Mbps" : "不限";
   // 与 frontend 卡片的 qDirty 同一套规则：用户动过就不再自动回填。
-  const nIn = $("#nic-quota-input");
-  if (!state.nicDirty && document.activeElement !== nIn)
-    nIn.value = nq || "";
+  const iIn = $("#inst-quota-input");
+  if (!state.instDirty && document.activeElement !== iIn)
+    iIn.value = iq || "";
   if (o.latest && o.latest.instance) updateInstance(o.latest.instance);
 
   const names = Object.keys(o.frontends || {}).sort();
@@ -864,26 +865,26 @@ $("#window-sel").onchange = (e) => {
   state.windowS = parseInt(e.target.value, 10);
   redrawAll();
 };
-$("#nic-quota-input").addEventListener("input", () => { state.nicDirty = true; });
-$("#nic-quota-save").onclick = async () => {
-  const el = $("#nic-quota-input");
+$("#inst-quota-input").addEventListener("input", () => { state.instDirty = true; });
+$("#inst-quota-save").onclick = async () => {
+  const el = $("#inst-quota-input");
   const v = parseFloat(el.value);
   if (el.value.trim() === "" || !isFinite(v) || v < 0) {
-    toast("网卡总限速必须是 ≥ 0 的数字（Mbps；0 = 不限）", true);
+    toast("实例总限速必须是 ≥ 0 的数字（Mbps；0 = 不限）", true);
     return;
   }
-  const r = await apiWrite("PUT", "/api/nic-quota", {quota_mbps: v});
+  const r = await apiWrite("PUT", "/api/instance-quota", {quota_mbps: v});
   if (r) {
-    state.nicDirty = false;
-    afterWrite(v ? "网卡总限速已设为 " + v + " Mbps（tc 层级模式）"
-                 : "网卡总限速已取消（不限，回到平铺模式）");
+    state.instDirty = false;
+    afterWrite(v ? "实例总限速已设为 " + v + " Mbps（tc 层级模式）"
+                 : "实例总限速已取消（不限，回到平铺模式）");
   }
 };
-$("#nic-quota-clear").onclick = async () => {
-  const r = await apiWrite("DELETE", "/api/nic-quota");
+$("#inst-quota-clear").onclick = async () => {
+  const r = await apiWrite("DELETE", "/api/instance-quota");
   if (r) {
-    state.nicDirty = false;
-    afterWrite("网卡总限速已取消（不限，回到平铺模式）");
+    state.instDirty = false;
+    afterWrite("实例总限速已取消（不限，回到平铺模式）");
   }
 };
 $("#log-level").onchange = (e) => {

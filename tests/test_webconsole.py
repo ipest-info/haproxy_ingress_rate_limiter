@@ -155,7 +155,7 @@ async def test_no_write_routes_without_yaml_path(client):
                          ("post", "/api/frontends"),
                          ("delete", "/api/frontends/fe_a"),
                          ("put", "/api/quotas/fe_a"),
-                         ("put", "/api/nic-quota")):
+                         ("put", "/api/instance-quota")):
         r = await getattr(client, method)(path, data="{}")
         assert r.status in (404, 405), path
 
@@ -251,10 +251,10 @@ quotas:
 """
 
 
-def hub_with_nic(nic=0.0):
+def hub_with_instance_quota(inst=0.0):
     h = webconsole.StatusHub("test", version_fn=lambda: 1)
     h.update_config(model.ControllerConfig(
-        version=1, frontends=[fe()], nic_quota_mbps=nic))
+        version=1, frontends=[fe()], instance_quota_mbps=inst))
     return h
 
 
@@ -362,14 +362,16 @@ async def test_delete_quota(wclient):
     assert not wclient.app["poke"].is_set()
 
 
-async def test_put_and_delete_nic_quota(wclient):
-    r = await wclient.put("/api/nic-quota", json={"quota_mbps": 800},
+async def test_put_and_delete_instance_quota(wclient):
+    r = await wclient.put("/api/instance-quota", json={"quota_mbps": 800},
                           headers=auth())
     assert r.status == 200
-    assert configmod.load(str(wclient.app["yml"])).nic_quota_mbps == 800.0
-    r = await wclient.delete("/api/nic-quota", headers=auth())
+    assert (configmod.load(str(wclient.app["yml"])).instance_quota_mbps
+            == 800.0)
+    r = await wclient.delete("/api/instance-quota", headers=auth())
     assert r.status == 200
-    assert configmod.load(str(wclient.app["yml"])).nic_quota_mbps == 0.0
+    assert (configmod.load(str(wclient.app["yml"])).instance_quota_mbps
+            == 0.0)
 
 
 async def test_read_endpoints_need_no_token(wclient):
@@ -379,12 +381,12 @@ async def test_read_endpoints_need_no_token(wclient):
         assert r.status == 200, path
 
 
-def test_overview_carries_nic_quota():
-    o = hub_with_nic(800.0).overview()
-    assert o["nic_quota_mbps"] == 800.0
-    assert o["nic_quota_bytes_per_s"] == 100_000_000.0
+def test_overview_carries_instance_quota():
+    o = hub_with_instance_quota(800.0).overview()
+    assert o["instance_quota_mbps"] == 800.0
+    assert o["instance_quota_bytes_per_s"] == 100_000_000.0
 
 
-def test_metrics_carries_nic_quota():
-    body = webconsole.render_prometheus(hub_with_nic(800.0))
-    assert "rl_limiter_nic_quota_bytes_per_second 100000000.0" in body
+def test_metrics_carries_instance_quota():
+    body = webconsole.render_prometheus(hub_with_instance_quota(800.0))
+    assert "rl_limiter_instance_quota_bytes_per_second 100000000.0" in body

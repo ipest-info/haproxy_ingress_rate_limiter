@@ -63,14 +63,14 @@ def test_remove_quota(yml):
     assert yml.read_text(encoding="utf-8") == before
 
 
-def test_set_and_clear_nic_quota(yml):
-    configstore.set_nic_quota(str(yml), 800)
-    assert reload_cfg(yml).nic_quota_mbps == 800.0
+def test_set_and_clear_instance_quota(yml):
+    configstore.set_instance_quota(str(yml), 800)
+    assert reload_cfg(yml).instance_quota_mbps == 800.0
     # 0 = 不限：直接删字段而不是留一个 0（与"不写"同义，文件更干净）。
-    configstore.set_nic_quota(str(yml), 0)
-    assert reload_cfg(yml).nic_quota_mbps == 0.0
+    configstore.set_instance_quota(str(yml), 0)
+    assert reload_cfg(yml).instance_quota_mbps == 0.0
     raw = yaml.safe_load(yml.read_text(encoding="utf-8"))
-    assert "nic_quota_mbps" not in raw
+    assert "instance_quota_mbps" not in raw
 
 
 def test_rewrite_keeps_other_fields_and_notes_comment_loss(yml):

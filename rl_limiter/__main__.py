@@ -162,16 +162,17 @@ async def _amain(cfg, log: logging.Logger,
     # --- 启动引导（seed）：用启动时解析出的受管清单构造首份运行期配置
     # 直接喂给监控循环。版本号取内容校验和，watch 以同一算法做变更检测
     # 基准——首轮轮询读到同样内容时不会再触发一次重复应用。
-    seed_version = cfgparse.checksum(boot_frontends, cfg.nic_quota_mbps)
+    seed_version = cfgparse.checksum(boot_frontends,
+                                     cfg.instance_quota_mbps)
     seed_cfg = model.ControllerConfig(version=seed_version,
                                       frontends=list(boot_frontends),
-                                      nic_quota_mbps=cfg.nic_quota_mbps)
+                                      instance_quota_mbps=cfg.instance_quota_mbps)
     ctl.seed(seed_cfg)
     if hub is not None:
         hub.update_config(seed_cfg)
     log.info("已用 haproxy.cfg + YAML 限额完成引导（监控单位=frontend） "
-             "version=%s frontends=%d nic_quota=%gMbps detail=%s",
-             seed_version, len(boot_frontends), cfg.nic_quota_mbps,
+             "version=%s frontends=%d instance_quota=%gMbps detail=%s",
+             seed_version, len(boot_frontends), cfg.instance_quota_mbps,
              _summarize_frontends(boot_frontends))
 
     # --- 信号处理：SIGINT/SIGTERM 触发优雅退出（记录信号名后取消任务）。
@@ -223,7 +224,7 @@ async def _amain(cfg, log: logging.Logger,
     tasks.append(asyncio.create_task(
         cfgparse.watch(cfg.haproxy.cfg_path, yaml_path, source_queue,
                        boot_frontends, log,
-                       boot_nic_quota_mbps=cfg.nic_quota_mbps,
+                       boot_instance_quota_mbps=cfg.instance_quota_mbps,
                        poke=cfg_poke),
         name="cfg-watch"))
     if hub is not None:
@@ -238,13 +239,19 @@ async def _amain(cfg, log: logging.Logger,
 
     if shaper is not None and tc_applied is not None:
         # 限速下发：配置热更即时触发 + 周期 reconcile 兜底（纠正手改的
-        # tc 规则、重试失败的下发）。只对登记了限额的 frontend 建类；
-        # 设了网卡总限速时走层级模式（见 tcshaper._nic_rebuild_cmds）。
+        # tc 规则、重试失败的下发）。平铺模式只对登记了限额的 frontend
+        # 建类；设了实例总限速则**全部** frontend 都进总闸（未登记限额
+        # 的段也要被总闸罩住，见 tcshaper.instance_layout）。
+        def _tc_desired():
+            inst_bits = int(ctl.instance_quota_mbps * 1_000_000)
+            fes = list(ctl.frontends())
+            if not inst_bits:
+                fes = [f for f in fes if f.limited]
+            return fes, inst_bits
+
         tasks.append(asyncio.create_task(
             tcmod.run_shaper(
-                shaper,
-                lambda: ([f for f in ctl.frontends() if f.limited],
-                         int(ctl.nic_quota_mbps * 1_000_000)),
+                shaper, _tc_desired,
                 tc_applied, log, period_s=apply_period_s),
             name="tc-shaper"))
 
@@ -448,13 +455,13 @@ def main() -> None:
     log.info(
         "服务配置加载完成，以下为完整配置摘要（排障第一条要看的日志） "
         "yaml=%s cfg=%s instance=%s endpoint=%s log_level=%s "
-        "tick_interval_s=%s nic_quota=%s frontends=%d detail=%s",
+        "tick_interval_s=%s instance_quota=%s frontends=%d detail=%s",
         args.config, cfg.haproxy.cfg_path,
         cfg.haproxy.name, cfg.haproxy.endpoint(),
         cfg.log_level,
         getattr(cfg, "tick_interval_s", 1.0),
-        (f"{cfg.nic_quota_mbps:g}Mbps" if cfg.nic_quota_mbps
-         else "不限（未设网卡总限速）"),
+        (f"{cfg.instance_quota_mbps:g}Mbps" if cfg.instance_quota_mbps
+         else "不限（未设实例总限速）"),
         len(boot_frontends), _summarize_frontends(boot_frontends),
     )
 
