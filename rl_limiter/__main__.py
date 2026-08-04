@@ -72,6 +72,11 @@ ENV_METRICS_LOG = "RL_METRICS_LOG"
 # 落盘文件的保留天数（按天轮转后删除更旧的）。
 ENV_METRICS_LOG_DAYS = "RL_METRICS_LOG_DAYS"
 
+# 写 API 的鉴权令牌（控制台/API 修改限额用，见 webconsole 模块）。
+# 不设 = 写接口整体 403（只读部分照常）。改限速影响生产流量，绝不允许
+# "没配令牌就人人可改"。
+ENV_API_TOKEN = "RL_API_TOKEN"
+
 
 def _summarize_frontends(frontends: list[model.FrontendConfig]) -> str:
     """把受管 frontend 清单压缩成单个日志字段，格式：
@@ -94,7 +99,8 @@ async def _amain(cfg, log: logging.Logger,
                  apply_period_s: float = DEFAULT_APPLY_PERIOD_S,
                  shaper: "tcmod.TcShaper | None" = None,
                  nic: str = "",
-                 mlog: "metricslog.MetricsLog | None" = None) -> None:
+                 mlog: "metricslog.MetricsLog | None" = None,
+                 api_token: str = "") -> None:
     """事件循环内的主体：组装组件、引导配置、并发运行监控循环与配置源。
 
     boot_frontends 是启动时从 haproxy.cfg 解析并合并限额后的受管清单；
@@ -156,15 +162,16 @@ async def _amain(cfg, log: logging.Logger,
     # --- 启动引导（seed）：用启动时解析出的受管清单构造首份运行期配置
     # 直接喂给监控循环。版本号取内容校验和，watch 以同一算法做变更检测
     # 基准——首轮轮询读到同样内容时不会再触发一次重复应用。
-    seed_version = cfgparse.checksum(boot_frontends)
+    seed_version = cfgparse.checksum(boot_frontends, cfg.nic_quota_mbps)
     seed_cfg = model.ControllerConfig(version=seed_version,
-                                      frontends=list(boot_frontends))
+                                      frontends=list(boot_frontends),
+                                      nic_quota_mbps=cfg.nic_quota_mbps)
     ctl.seed(seed_cfg)
     if hub is not None:
         hub.update_config(seed_cfg)
     log.info("已用 haproxy.cfg + YAML 限额完成引导（监控单位=frontend） "
-             "version=%s frontends=%d detail=%s",
-             seed_version, len(boot_frontends),
+             "version=%s frontends=%d nic_quota=%gMbps detail=%s",
+             seed_version, len(boot_frontends), cfg.nic_quota_mbps,
              _summarize_frontends(boot_frontends))
 
     # --- 信号处理：SIGINT/SIGTERM 触发优雅退出（记录信号名后取消任务）。
@@ -207,25 +214,37 @@ async def _amain(cfg, log: logging.Logger,
             name="console-config-relay"))
         config_queue = relay_queue
 
+    # 写 API 改完 YAML 后 set 这个事件，叫醒 cfgparse.watch 立即重读——
+    # 不用等下一个 5s 轮询周期，页面上的修改近乎即时生效。
+    cfg_poke = asyncio.Event()
+
     tasks.append(asyncio.create_task(
         ctl.run(config_queue, tick_interval_s), name="monitor-loop"))
     tasks.append(asyncio.create_task(
         cfgparse.watch(cfg.haproxy.cfg_path, yaml_path, source_queue,
-                       boot_frontends, log),
+                       boot_frontends, log,
+                       boot_nic_quota_mbps=cfg.nic_quota_mbps,
+                       poke=cfg_poke),
         name="cfg-watch"))
     if hub is not None:
         tasks.append(asyncio.create_task(
-            webconsole.run_console(console_port, hub, logbuf, log,
-                                   bind=console_bind),
+            webconsole.run_console(
+                console_port, hub, logbuf, log, bind=console_bind,
+                yaml_path=yaml_path, api_token=api_token,
+                # 写限额前校验段名存在：以当前 cfg 解析出的清单为准。
+                known_frontends_fn=lambda: {f.name for f in ctl.frontends()},
+                poke=cfg_poke),
             name="web-console"))
 
     if shaper is not None and tc_applied is not None:
         # 限速下发：配置热更即时触发 + 周期 reconcile 兜底（纠正手改的
-        # tc 规则、重试失败的下发）。只对登记了限额的 frontend 建类。
+        # tc 规则、重试失败的下发）。只对登记了限额的 frontend 建类；
+        # 设了网卡总限速时走层级模式（见 tcshaper._nic_rebuild_cmds）。
         tasks.append(asyncio.create_task(
             tcmod.run_shaper(
                 shaper,
-                lambda: [f for f in ctl.frontends() if f.limited],
+                lambda: ([f for f in ctl.frontends() if f.limited],
+                         int(ctl.nic_quota_mbps * 1_000_000)),
                 tc_applied, log, period_s=apply_period_s),
             name="tc-shaper"))
 
@@ -324,6 +343,11 @@ def main() -> None:
         logging.getLogger().addHandler(logbuf)
     console_bind = (os.environ.get(ENV_CONSOLE_BIND) or "").strip() \
         or DEFAULT_CONSOLE_BIND
+    api_token = (os.environ.get(ENV_API_TOKEN) or "").strip()
+    if console_port and not api_token:
+        log.warning("未配置 %s：控制台/API 的写接口（修改限额）整体 403 "
+                    "禁用，只读观测不受影响；要启用请在环境变量里设置令牌"
+                    "后重启", ENV_API_TOKEN)
 
     # 限速：内核 tc（见 tcshaper 模块）。默认启用——限速是本服务的核心
     # 职责，"静悄悄地没在限"是最不该出现的状态。显式设 RL_TC_IFACE=- 才
@@ -424,11 +448,13 @@ def main() -> None:
     log.info(
         "服务配置加载完成，以下为完整配置摘要（排障第一条要看的日志） "
         "yaml=%s cfg=%s instance=%s endpoint=%s log_level=%s "
-        "tick_interval_s=%s frontends=%d detail=%s",
+        "tick_interval_s=%s nic_quota=%s frontends=%d detail=%s",
         args.config, cfg.haproxy.cfg_path,
         cfg.haproxy.name, cfg.haproxy.endpoint(),
         cfg.log_level,
         getattr(cfg, "tick_interval_s", 1.0),
+        (f"{cfg.nic_quota_mbps:g}Mbps" if cfg.nic_quota_mbps
+         else "不限（未设网卡总限速）"),
         len(boot_frontends), _summarize_frontends(boot_frontends),
     )
 
@@ -438,7 +464,8 @@ def main() -> None:
                            boot_frontends=boot_frontends,
                            console_port=console_port, logbuf=logbuf,
                            console_bind=console_bind,
-                           shaper=shaper, nic=nic, mlog=mlog))
+                           shaper=shaper, nic=nic, mlog=mlog,
+                           api_token=api_token))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
     log.info("rl-limiter 服务已停止")

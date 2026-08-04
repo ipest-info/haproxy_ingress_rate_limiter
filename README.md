@@ -11,8 +11,12 @@
    的总速率被硬性压在限额内，与连接数、单连接快慢无关。改限额走
    `tc class change`，**不 reload、存量连接立刻跟上**；
 2. **监控**：每秒经**本机 unix stats socket** 采样各 frontend 的下行带宽，
-   产出实时曲线（内置只读 Web 控制台 + Prometheus `/metrics`）、按分钟
+   产出实时曲线（内置 Web 控制台 + Prometheus `/metrics`）、按分钟
    落盘到本地 JSONL 日志（历史回查/计费对账），并做持续超限告警。
+
+限额除了直接编辑 YAML，也可在控制台页面上改，或调用带令牌鉴权的写 API
+（`RL_API_TOKEN`）：支持每个 frontend 的限额与**整张网卡的总限速**
+（`nic_quota_mbps`，tc 层级模式），修改回写 YAML 后数秒内热生效。
 
 配置来源只有两个本地文件（**没有数据库**）：haproxy.cfg + rl-limiter 的
 YAML（`-c` 指定：stats socket 接线、cfg 路径、quotas 限额）。运行期轮询
@@ -57,7 +61,8 @@ rl_limiter/       # Python 3.11 + asyncio 服务（与 HAProxy 同机）
   cfgparse.py     #   从本机 haproxy.cfg 解析受管 frontend 清单 + 双文件轮询热更新
   tcshaper.py     #   限速下发：把限额落到本机网卡的 tc（HTB），按源端口分类
   config.py       #   YAML 配置解析与校验（接线 + quotas 限额登记）
-  webconsole.py   #   内置 Web 控制台（只读：带宽曲线 + 实例视图 + 日志）
+  webconsole.py   #   内置 Web 控制台（带宽曲线 + 实例视图 + 日志 + 限额编辑/写 API）
+  configstore.py  #   写 API 的 YAML 回写（整份校验 + 原子替换，唯一写配置的地方）
   loop.py         #   1s 监控主循环（采集 → 超限判定 → 发布）
 tools/            # fake_haproxy.py（联调假节点，支持 unix / TCP）
                   # random_web.py（随机大小响应的模拟后端）、loadgen.py（可调并发压测）
@@ -111,13 +116,20 @@ deploy/bare/rl-limiter.sh check     # 体检：只看不改
 该加哪一行），起来之后会跑一遍 `tc_check.py verify` 逐条核对限速真的在
 生效。
 
-**配置调整 SOP**（都是普通文件编辑，没有别的入口）：
+**配置调整 SOP**：
 
-- **改限额** → 改 YAML 的 `quotas` 段。5s 内热生效（`tc class change`，
-  不 reload，存量连接立刻按新限额跑）；**写 0 = 显式不限速**（撤掉该
-  端口的 tc 类；全部为 0/清空时整棵限速队列树被拆掉）；
+- **改限额** → 三条等价入口，最终都是 YAML 的 `quotas` 段：直接编辑
+  文件；控制台页面（frontend 卡片右上角）；写 API
+  `PUT /api/quotas/<段名>`（页面与 API 需 `RL_API_TOKEN`，见 docs/03）。
+  5s 内热生效（`tc class change`，不 reload，存量连接立刻按新限额跑；
+  经 API 修改会立即触发重读，不等轮询）；**写 0 = 显式不限速**（撤掉该
+  端口的 tc 类；全部为 0/清空且未设总限速时整棵限速队列树被拆掉）；
+- **改网卡总限速** → YAML 的 `nic_quota_mbps` / 控制台实例页 /
+  `PUT /api/nic-quota`。设置后 tc 切换为层级模式：整卡出向合计不超过
+  总限速，各端口限额仍各自生效；0 = 取消（回到平铺模式）；
 - **改端口/后端** → 改 haproxy.cfg → `systemctl reload haproxy`。
-  rl-limiter 轮询到 cfg 内容变化后自动更新监控清单与 tc 分类。
+  rl-limiter 轮询到 cfg 内容变化后自动更新监控清单与 tc 分类
+  （**这一类没有页面/API 入口**：haproxy.cfg 只归运维手工编辑）。
 
 **内核参数**：节点初始化阶段（启动 HAProxy 之前）自动跑
 `deploy/sysctl/tune-kernel.sh`，把高并发/高带宽相关的 sysctl 抬到位，
@@ -127,12 +139,13 @@ deploy/bare/rl-limiter.sh check     # 体检：只看不改
 `tune-kernel.sh check`，宿主机持久化用 `dump`；详见
 [docs/08-内核参数调优.md](docs/08-内核参数调优.md)。
 
-**Web 控制台（只读）**：`RL_CONSOLE_PORT` 启用，`RL_CONSOLE_BIND` 指定
-监听地址（默认 `127.0.0.1`）。控制台**无鉴权**（暴露全量监控数据与运行
-日志），放到内网必须配合防火墙/安全组限制来源。三个 tab：**实例**（整台
-HAProxy 的连接/带宽/数据包视图）、**监听端口**（每个 frontend 的监控曲线
-与配置视图）、**日志**。每条曲线的来源与口径见
-[docs/05-监控视图.md](docs/05-监控视图.md)。
+**Web 控制台**：`RL_CONSOLE_PORT` 启用，`RL_CONSOLE_BIND` 指定监听地址
+（默认 `127.0.0.1`）。**读接口无鉴权**（暴露全量监控数据与运行日志），
+放到内网必须配合防火墙/安全组限制来源；**写接口（改限额）必须带令牌**
+（`RL_API_TOKEN`，不设则写接口整体 403、页面退化为只读）。三个 tab：
+**实例**（整台 HAProxy 的连接/带宽/数据包视图 + 网卡总限速编辑）、
+**监听端口**（每个 frontend 的监控曲线、配置视图与限额编辑）、**日志**。
+每条曲线的来源与口径见 [docs/05-监控视图.md](docs/05-监控视图.md)。
 
 **监控数据的三个出口**（同一拍、同一份数据）：
 

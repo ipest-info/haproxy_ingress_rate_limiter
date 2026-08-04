@@ -261,3 +261,50 @@ async def test_watch_warns_on_wiring_change(tmp_path, caplog):
         await run_watch_once(cfg_file, yaml_file, boot, rounds=10)
         await change
     assert [r for r in caplog.records if "请重启" in r.getMessage()]
+
+
+def test_checksum_is_nic_quota_sensitive():
+    """网卡总限速参与内容身份：只改 nic_quota_mbps 也必须触发一次热更
+    （tc 要切层级模式），版本号不变的话监控循环会把它当同一份配置。"""
+    a = model.FrontendConfig(name="fe_a", bind_port=1, quota_mbps=8)
+    assert cfgparse.checksum([a]) != cfgparse.checksum([a], 100.0)
+    assert cfgparse.checksum([a], 100.0) == cfgparse.checksum([a], 100.0)
+
+
+async def test_watch_poke_triggers_immediate_reread(tmp_path):
+    """写 API 回写 YAML 后 set poke 事件：watch 不等轮询周期立即重读。
+    轮询间隔故意设得很长——没有 poke 的话本测试必然超时。"""
+    cfg_file = tmp_path / "haproxy.cfg"
+    cfg_file.write_text("listen fe_main\n    bind :8080\n", encoding="utf-8")
+    yaml_file = write_yaml(tmp_path, cfg_file)
+    boot = cfgparse.load_frontends(str(cfg_file), {"fe_main": 40}, log)
+
+    q: asyncio.Queue = asyncio.Queue()
+    poke = asyncio.Event()
+    task = asyncio.create_task(cfgparse.watch(
+        str(cfg_file), str(yaml_file), q, boot, log,
+        interval_s=30.0, poke=poke))
+    try:
+        await asyncio.sleep(0.05)          # 等 watch 进入等待
+        write_yaml(tmp_path, cfg_file, quotas_line="fe_main: 20")
+        poke.set()
+        got = await asyncio.wait_for(q.get(), 2)
+        assert got.frontends[0].quota_mbps == 20
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_watch_pushes_on_nic_quota_change(tmp_path):
+    """只改 nic_quota_mbps（quotas/cfg 都没动）也要推出一份新配置。"""
+    cfg_file = tmp_path / "haproxy.cfg"
+    cfg_file.write_text("listen fe_main\n    bind :8080\n", encoding="utf-8")
+    yaml_file = write_yaml(tmp_path, cfg_file)
+    boot = cfgparse.load_frontends(str(cfg_file), {"fe_main": 40}, log)
+
+    yaml_file.write_text(
+        f"nic_quota_mbps: 500\nhaproxy:\n  socket_path: /run/h.sock\n"
+        f"  cfg_path: {cfg_file}\nquotas:\n  fe_main: 40\n", encoding="utf-8")
+    got = await run_watch_once(cfg_file, yaml_file, boot)
+    assert got and got[-1].nic_quota_mbps == 500.0

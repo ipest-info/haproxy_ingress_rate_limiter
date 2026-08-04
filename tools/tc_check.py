@@ -37,27 +37,39 @@ from rl_limiter import tcshaper as T  # noqa: E402
 
 def _load_frontends(path: str):
     """与 rl-limiter 同一条加载链：YAML（接线 + quotas）→ 解析
-    haproxy.cfg → 合并限额。tc 只关心登记了限额的那些。"""
+    haproxy.cfg → 合并限额。tc 只关心登记了限额的那些。
+
+    返回 (受管 frontend 清单, 网卡总限速 bit/s；0 = 未设)。
+    """
     import logging
     cfg = configmod.load(path)
     fes = cfgparse.load_frontends(cfg.haproxy.cfg_path, cfg.quotas,
                                   logging.getLogger("tc_check"))
-    return [f for f in fes if f.limited]
+    return [f for f in fes if f.limited], int(cfg.nic_quota_mbps * 1_000_000)
 
 
 def cmd_plan(args) -> int:
     """只打印将要执行的 tc 命令，绝不执行。"""
-    fes = _load_frontends(args.config)
-    if not fes:
-        print("# quotas 未登记任何正限额（全部不限速）。")
-        print("# rl-limiter 会撤掉队列树（若存在）：")
-        print(f"  tc qdisc del dev {args.iface} root")
-        return 0
+    fes, nic_bits = _load_frontends(args.config)
     try:
         T._check_shapeable(fes)
     except T.TcError as e:
         print(f"配置无法整形：{e}", file=sys.stderr)
         return 1
+    if nic_bits:
+        # 层级模式：任何差异都整树重建，没有"只改限额"的快路径。
+        print(f"# 网卡 {args.iface}，网卡总限速 {nic_bits} bit/s，"
+              f"共 {len(fes)} 个受管 frontend（层级模式）")
+        print("# 首次运行 / 任何配置变化时执行以下序列（重建整棵队列树）：")
+        for argv, fatal in T._nic_rebuild_cmds(args.iface, fes, nic_bits):
+            note = "" if fatal else "    # 失败不致命"
+            print("  " + " ".join(argv) + note)
+        return 0
+    if not fes:
+        print("# quotas 未登记任何正限额（全部不限速），也未设网卡总限速。")
+        print("# rl-limiter 会撤掉队列树（若存在）：")
+        print(f"  tc qdisc del dev {args.iface} root")
+        return 0
 
     print(f"# 网卡 {args.iface}，共 {len(fes)} 个受管 frontend")
     print("# 首次运行 / 结构变化时执行以下序列（重建整棵队列树）：")
@@ -116,12 +128,14 @@ def cmd_doctor(args) -> int:
 
 def cmd_verify(args) -> int:
     """读回网卡实况，与配置逐条核对。"""
-    fes = _load_frontends(args.config)
+    fes, nic_bits = _load_frontends(args.config)
     sh = T.TcShaper(args.iface)
-    classes, cbursts, filtered = asyncio.run(sh.observe())
+    classes, cbursts, filtered, ceils = asyncio.run(sh.observe())
     want = T.desired_rates(fes)
 
     print(f"网卡 {args.iface} 实况核对：")
+    if nic_bits:
+        return _verify_nic(fes, nic_bits, classes, cbursts, filtered, ceils)
     if not fes:
         # 全部不限速：网卡上不该有我们的 HTB 树。
         if classes:
@@ -182,6 +196,80 @@ def cmd_verify(args) -> int:
               f"多半是删掉的 frontend 残留，下一轮 reconcile 会清掉")
 
     print("核对结论：" + ("与配置一致" if bad == 0 else f"**{bad} 项不一致，限速未按配置生效**"))
+    return 0 if bad == 0 else 1
+
+
+def _verify_nic(fes, nic_bits: int, classes, cbursts, filtered, ceils) -> int:
+    """层级模式（设了网卡总限速）的实况核对。
+
+    这种模式下各类的 rate 是缩放出来的保证值，真正等于限额的是 **ceil**
+    ——核对口径与 TcShaper._reconcile_nic 完全一致。
+    """
+    ports_layout, (def_rate, def_ceil) = T.nic_layout(fes, nic_bits)
+    bad = 0
+    got = classes.get(T.NIC_PARENT_MINOR)
+    if got is None:
+        print(f"  [FAIL] 没有聚合父类 {T.classid_for(T.NIC_PARENT_MINOR)} —— "
+              f"**网卡总限速未生效**（rl-limiter 没在跑？或 tc 下发失败）")
+        return 1
+    if ceils.get(T.NIC_PARENT_MINOR) != nic_bits:
+        print(f"  [FAIL] 聚合父类 ceil 不符：配置 {nic_bits} bit/s，"
+              f"实际 {ceils.get(T.NIC_PARENT_MINOR)} bit/s")
+        bad += 1
+    elif T._cburst_too_small(cbursts.get(T.NIC_PARENT_MINOR), nic_bits):
+        print(f"  [FAIL] 聚合父类 cburst 只有 "
+              f"{cbursts.get(T.NIC_PARENT_MINOR)} 字节 —— "
+              f"**整卡吞吐会远低于总限速**（见 docs/06 §9）")
+        bad += 1
+    else:
+        print(f"  [ok]   聚合父类在位，网卡总限速 {nic_bits} bit/s")
+
+    if T.DEFAULT_CLASS_MINOR not in classes:
+        print(f"  [FAIL] 没有兜底类 1:{T.DEFAULT_CLASS_MINOR} —— "
+              f"未受管流量（SSH/监控）没有去处")
+        bad += 1
+    elif ceils.get(T.DEFAULT_CLASS_MINOR) != def_ceil:
+        print(f"  [FAIL] 兜底类 ceil 不符：期望 {def_ceil} bit/s，"
+              f"实际 {ceils.get(T.DEFAULT_CLASS_MINOR)} bit/s")
+        bad += 1
+    else:
+        print(f"  [ok]   兜底类在位（保证 {def_rate} bit/s，"
+              f"上限 {def_ceil} bit/s）")
+
+    by_port = {f.bind_port: f for f in fes}
+    for port in sorted(ports_layout):
+        f = by_port[port]
+        rate, ceil = ports_layout[port]
+        if port not in classes:
+            print(f"  [FAIL] {f.name} (:{port}) 没有对应的限速类 —— "
+                  f"**该端口未被单独限速**")
+            bad += 1
+        elif ceils.get(port) != ceil:
+            print(f"  [FAIL] {f.name} (:{port}) 上限不符："
+                  f"期望 ceil {ceil} bit/s，实际 {ceils.get(port)} bit/s")
+            bad += 1
+        elif port not in filtered:
+            print(f"  [FAIL] {f.name} (:{port}) 有限速类但**没有分类规则**，"
+                  f"流量不会进这个类 —— 等于没限速")
+            bad += 1
+        elif T._cburst_too_small(cbursts.get(port), ceil):
+            print(f"  [FAIL] {f.name} (:{port}) cburst 只有 "
+                  f"{cbursts.get(port)} 字节，应约 "
+                  f"{T.burst_bytes(ceil / 8)} —— **实际吞吐会远低于限额**")
+            bad += 1
+        else:
+            print(f"  [ok]   {f.name} (:{port}) 保证 {rate} / "
+                  f"上限 {ceil} bit/s，分类规则在位")
+
+    extra = (set(classes) - {T.DEFAULT_CLASS_MINOR, T.NIC_PARENT_MINOR}
+             - set(ports_layout))
+    for port in sorted(extra):
+        print(f"  [warn] 网卡上有配置里没有的限速类 {T.classid_for(port)}"
+              f"（端口 {port}）—— 多半是删掉的 frontend 残留，"
+              f"下一轮 reconcile 会清掉")
+
+    print("核对结论：" + ("与配置一致" if bad == 0
+                          else f"**{bad} 项不一致，限速未按配置生效**"))
     return 0 if bad == 0 else 1
 
 

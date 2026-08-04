@@ -1,22 +1,26 @@
-# rl_limiter.webconsole —— 内置 Web 控制台：**只读**实时观测。
+# rl_limiter.webconsole —— 内置 Web 控制台：实时观测 + 限额写 API。
 #
 # 设计取向：
 #
 #   - 观测侧零额外采集：监控循环每拍本就产出各 frontend 的速率/均值/
 #     连接数，控制台只是把这份内存数据经 StatusHub 留存最近几分钟并以
 #     SSE 推给页面——不引入第二条采集链路；
-#   - 控制台**不提供任何写接口**：负载均衡配置的唯一权威是本机
-#     haproxy.cfg（运维直接编辑 + reload），限额登记在本地 YAML 的
-#     quotas 段；两个文件都由 cfgparse.watch 轮询热生效。要改配置就改
-#     文件——控制台只负责让你看清"改了之后发生了什么"；
+#   - **写接口只覆盖限额**（quotas 里的单个 frontend 限额、网卡总限速
+#     nic_quota_mbps），回写到 YAML 后经 cfgparse.watch 热生效（写完
+#     poke 一下，不等轮询周期）。负载均衡配置的唯一权威仍是本机
+#     haproxy.cfg（运维直接编辑 + reload），控制台永远不写它；接线/
+#     log_level 这类要重启才生效的字段也不开放；
 #   - 日志经进程内环形缓冲（LogBuffer 挂在根 logger 上）曝光最近若干条，
 #     页面增量拉取；生产量级的持久化检索交给外部日志系统，不在此造轮子；
 #   - "限速生效证据"：页面上把 实时速率 / 10s 均值（计费口径）/ 限额
 #     画在同一条时间轴上——曲线被压在限额线下即是效果本身。
 #
-# 安全边界：控制台无鉴权，定位与 HAProxy 的 stats socket 相同。默认只
-# 绑回环（127.0.0.1），要放到内网必须由运维显式设 RL_CONSOLE_BIND 并配合
-# 防火墙/安全组限制来源；绑非回环地址时会打一条 warning 留痕。
+# 安全边界：**读接口无鉴权**（定位与 HAProxy 的 stats socket 相同），
+# 默认只绑回环（127.0.0.1），要放到内网必须由运维显式设 RL_CONSOLE_BIND
+# 并配合防火墙/安全组限制来源；绑非回环地址时会打一条 warning 留痕。
+# **写接口必须带令牌**（环境变量 RL_API_TOKEN，请求头 Authorization:
+# Bearer <token> 或 X-API-Token）；令牌未配置时写接口整体 403——改限速
+# 是影响生产流量的操作，"没配令牌就人人可改"不可接受。
 #
 # 单 HAProxy 模型：每台 HAProxy 各有一个控制台，展示本机的全部受管
 # frontend。
@@ -25,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hmac
 import json
 import logging
 import time
@@ -33,7 +38,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from . import model
+from . import configstore, model
 
 # 快照留存拍数：1s 一拍即约 10 分钟窗口，页面刷新后能立即回填完整曲线。
 HISTORY_TICKS = 600
@@ -138,6 +143,8 @@ class StatusHub:
         self._subs: set[asyncio.Queue] = set()
         # frontend 名 → 该 frontend 的配置视图（页面只读展示用）。
         self._fe_config: dict[str, dict[str, Any]] = {}
+        # 网卡总限速（Mbps；0 = 不限）。随配置热更。
+        self._nic_quota_mbps = 0.0
         self._started = time.time()
 
     # ---- 配置与数据注入 ----
@@ -149,6 +156,7 @@ class StatusHub:
         # 重复做 ÷8，单位换算只在服务端一处。
         for name, d in self._fe_config.items():
             d["quota_bytes_per_s"] = d["quota_mbps"] * 1e6 / 8.0
+        self._nic_quota_mbps = getattr(cfg, "nic_quota_mbps", 0.0)
 
     def _haproxy_view(self) -> dict[str, Any]:
         """本机 HAProxy 视图：接线 + 采样健康。"""
@@ -245,6 +253,9 @@ class StatusHub:
             # 各受管 frontend 的当前配置视图（来自 haproxy.cfg + YAML
             # 限额的解析结果，只读）。
             "frontends": self._fe_config,
+            # 网卡总限速（Mbps；0 = 不限）与换算好的 bytes/s（图表参考线）。
+            "nic_quota_mbps": self._nic_quota_mbps,
+            "nic_quota_bytes_per_s": self._nic_quota_mbps * 1e6 / 8.0,
             "haproxy": self._haproxy_view(),
             "latest": self._history[-1] if self._history else None,
         }
@@ -283,6 +294,9 @@ def render_prometheus(hub: StatusHub) -> str:
     m("rl_limiter_uptime_seconds", round(o["uptime_s"], 1), "服务运行秒数")
     m("rl_limiter_haproxy_degraded", int(o["haproxy"]["degraded"]),
       "采样是否失联（1=失联，此时各速率为陈旧值）")
+    m("rl_limiter_nic_quota_bytes_per_second",
+      o.get("nic_quota_bytes_per_s", 0),
+      "网卡总限速（bytes/s；0=不限）")
 
     # 限额来自配置视图（即便该 frontend 这一拍没有采样行也要暴露）。
     first = True
@@ -357,11 +371,21 @@ def build_app(
     hub: StatusHub,
     logbuf: LogBuffer,
     log: logging.Logger,
+    yaml_path: str = "",
+    api_token: str = "",
+    known_frontends_fn: Callable[[], set] | None = None,
+    poke: "asyncio.Event | None" = None,
 ) -> web.Application:
-    """组装控制台的 aiohttp 应用（静态页 + 只读 API）。
+    """组装控制台的 aiohttp 应用（静态页 + 只读 API + 限额写 API）。
 
-    没有写接口：配置的修改入口是 haproxy.cfg 与 YAML 两个文件本身
-    （见模块头注释）。"""
+    写 API 只在 yaml_path 非空时挂载（测试/极简形态可以只要只读部分），
+    且每个请求都要过令牌校验：api_token 为空 = 未配置 RL_API_TOKEN，
+    所有写请求 403——绝不允许"没配令牌就人人可改限速"。
+
+    known_frontends_fn 返回当前 haproxy.cfg 里解析到的段名集合，用来
+    拒绝给不存在的 frontend 登记限额（多半是拼错了名字；写进去也只会
+    被 cfgparse 忽略并 warn，不如在门口就说清楚）。
+    """
 
     index_html = (_STATIC_DIR / "index.html").read_bytes()
 
@@ -427,6 +451,132 @@ def build_app(
             hub.unsubscribe(q)
         return resp
 
+    # ---- 写 API（限额修改，带令牌鉴权，回写 YAML）----
+
+    # 服务内写操作串行化：整份读-改-写不可交叠，否则并发 PUT 会互相
+    # 覆盖对方刚写进去的键。
+    write_lock = asyncio.Lock()
+
+    def _authorized(request: web.Request) -> "web.Response | None":
+        """令牌校验。通过返回 None，否则返回该直接回给客户端的响应。"""
+        if not api_token:
+            return web.json_response(
+                {"error": "未配置 RL_API_TOKEN，写接口已禁用——在服务的"
+                          "环境变量里设置令牌后重启即可启用"},
+                status=403)
+        got = ""
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            got = auth[len("Bearer "):].strip()
+        if not got:
+            got = request.headers.get("X-API-Token", "").strip()
+        # 常数时间比较：令牌校验不能给旁路计时留缝。
+        if not got or not hmac.compare_digest(got, api_token):
+            return web.json_response(
+                {"error": "令牌缺失或不正确（请求头 Authorization: "
+                          "Bearer <token> 或 X-API-Token: <token>）"},
+                status=401)
+        return None
+
+    async def _read_quota_body(request: web.Request) -> float:
+        """解析写请求体 {"quota_mbps": <数字>}，非法时抛 ValueError。"""
+        try:
+            body = await request.json()
+        except Exception:
+            raise ValueError("请求体必须是 JSON（{\"quota_mbps\": <数字>}）")
+        if not isinstance(body, dict) or "quota_mbps" not in body:
+            raise ValueError("请求体缺少字段 quota_mbps")
+        v = body["quota_mbps"]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"quota_mbps 必须是数字（Mbps），"
+                             f"当前值 {v!r}")
+        return float(v)
+
+    async def handle_put_quota(request: web.Request) -> web.Response:
+        denied = _authorized(request)
+        if denied is not None:
+            return denied
+        name = request.match_info["name"]
+        try:
+            quota = await _read_quota_body(request)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        known = known_frontends_fn() if known_frontends_fn is not None else None
+        if known is not None and name not in known:
+            return web.json_response(
+                {"error": f"haproxy.cfg 里没有名为 {name!r} 的 frontend/"
+                          f"listen 段（是不是拼错了？）。当前解析到的段："
+                          f"{sorted(known)}"},
+                status=400)
+        async with write_lock:
+            try:
+                await asyncio.to_thread(
+                    configstore.set_quota, yaml_path, name, quota)
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
+        if poke is not None:
+            poke.set()
+        log.warning("写 API 已修改限额并回写 YAML（cfg 轮询即将热生效） "
+                    "frontend=%s quota=%gMbps yaml=%s",
+                    name, quota, yaml_path)
+        return web.json_response({"ok": True, "frontend": name,
+                                  "quota_mbps": quota})
+
+    async def handle_delete_quota(request: web.Request) -> web.Response:
+        denied = _authorized(request)
+        if denied is not None:
+            return denied
+        name = request.match_info["name"]
+        async with write_lock:
+            try:
+                removed = await asyncio.to_thread(
+                    configstore.remove_quota, yaml_path, name)
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
+        if removed and poke is not None:
+            poke.set()
+        if removed:
+            log.warning("写 API 已删除限额登记（该 frontend 回到只监控不"
+                        "限速） frontend=%s yaml=%s", name, yaml_path)
+        return web.json_response({"ok": True, "frontend": name,
+                                  "removed": removed})
+
+    async def handle_put_nic_quota(request: web.Request) -> web.Response:
+        denied = _authorized(request)
+        if denied is not None:
+            return denied
+        try:
+            quota = await _read_quota_body(request)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        async with write_lock:
+            try:
+                await asyncio.to_thread(
+                    configstore.set_nic_quota, yaml_path, quota)
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
+        if poke is not None:
+            poke.set()
+        log.warning("写 API 已修改网卡总限速并回写 YAML nic_quota=%gMbps "
+                    "yaml=%s", quota, yaml_path)
+        return web.json_response({"ok": True, "nic_quota_mbps": quota})
+
+    async def handle_delete_nic_quota(request: web.Request) -> web.Response:
+        denied = _authorized(request)
+        if denied is not None:
+            return denied
+        async with write_lock:
+            try:
+                await asyncio.to_thread(
+                    configstore.set_nic_quota, yaml_path, 0.0)
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
+        if poke is not None:
+            poke.set()
+        log.warning("写 API 已取消网卡总限速（恢复不限）并回写 YAML "
+                    "yaml=%s", yaml_path)
+        return web.json_response({"ok": True, "nic_quota_mbps": 0})
+
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/overview", handle_overview)
@@ -436,6 +586,11 @@ def build_app(
     # Prometheus 抓取端点：与只读 API 同一个监听面（同样的安全边界——
     # 默认回环，放内网靠防火墙）。
     app.router.add_get("/metrics", handle_metrics)
+    if yaml_path:
+        app.router.add_put("/api/quotas/{name}", handle_put_quota)
+        app.router.add_delete("/api/quotas/{name}", handle_delete_quota)
+        app.router.add_put("/api/nic-quota", handle_put_nic_quota)
+        app.router.add_delete("/api/nic-quota", handle_delete_nic_quota)
     return app
 
 
@@ -445,22 +600,32 @@ async def run_console(
     logbuf: LogBuffer,
     log: logging.Logger,
     bind: str = "127.0.0.1",
+    yaml_path: str = "",
+    api_token: str = "",
+    known_frontends_fn: Callable[[], set] | None = None,
+    poke: "asyncio.Event | None" = None,
 ) -> None:
     """常驻任务：启动控制台 HTTP 服务并挂起到被取消，取消时干净回收。
 
-    bind 默认只绑回环：控制台虽是只读，但暴露的是全量运行状态与日志，
-    默认对外可达不可接受（由 RL_CONSOLE_BIND 显式放开，见 __main__）。
-    绑到非回环地址时打一条 warning，让"我以为它只在本机"的误配在日志里
-    留痕。
+    bind 默认只绑回环：控制台暴露的是全量运行状态与日志，且写接口能改
+    限速，默认对外可达不可接受（由 RL_CONSOLE_BIND 显式放开，见
+    __main__）。绑到非回环地址时打一条 warning，让"我以为它只在本机"的
+    误配在日志里留痕。写 API 的参数含义见 build_app。
     """
-    runner = web.AppRunner(build_app(hub, logbuf, log), access_log=None)
+    runner = web.AppRunner(
+        build_app(hub, logbuf, log, yaml_path=yaml_path, api_token=api_token,
+                  known_frontends_fn=known_frontends_fn, poke=poke),
+        access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, bind, port)
     await site.start()
-    log.info("Web 控制台已启动（只读实时观测） bind=%s port=%d", bind, port)
+    log.info("Web 控制台已启动 bind=%s port=%d 写API=%s", bind, port,
+             ("已启用（令牌鉴权）" if yaml_path and api_token
+              else "已禁用（未配置 RL_API_TOKEN）" if yaml_path
+              else "未挂载"))
     if bind not in ("127.0.0.1", "::1", "localhost"):
         log.warning(
-            "Web 控制台绑定在非回环地址上，而控制台**没有任何鉴权**"
+            "Web 控制台绑定在非回环地址上，而**读接口没有任何鉴权**"
             "（暴露全量监控数据与运行日志）——请确认该地址只在内网且已由"
             "防火墙/安全组限制来源 bind=%s port=%d", bind, port)
     try:

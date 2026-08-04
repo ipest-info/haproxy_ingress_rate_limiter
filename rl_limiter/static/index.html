@@ -5,12 +5,13 @@
      于是每次打开页面都在控制台留一条 404 —— 排障时那条无关的红字很干扰。 -->
 <link rel="icon" href="data:,">
 <style>
-/* 单 HAProxy 模型的**只读**控制台。三个 tab：
-     实例   —— 整台 HAProxy 的连接/带宽视图；
-     监听端口 —— 每个 frontend 一张卡片：监控曲线与配置视图；
+/* 单 HAProxy 模型的控制台。三个 tab：
+     实例   —— 整台 HAProxy 的连接/带宽视图 + 网卡总限速；
+     监听端口 —— 每个 frontend 一张卡片：监控曲线、配置视图与限额编辑；
      日志   —— 进程内环形缓冲的最近若干条。
-   配置的修改入口是文件本身（haproxy.cfg + YAML 限额），页面不提供
-   任何写操作。
+   能改的只有**限额**（各 frontend 的 quota 与网卡总限速）：修改经带
+   令牌鉴权的写 API 回写到 YAML 后热生效。负载均衡配置（监听端口/后端）
+   仍以 haproxy.cfg 为唯一权威，页面绝不提供它的写入口。
 
    监控视图的分组照 docs/05-监控视图.md 落地，并且**只画有真实数据源的
    曲线**。拿不到的指标既不画空图、也不在页面上长篇解释为什么没有——
@@ -197,10 +198,34 @@ input:focus, select:focus {
 .lv-ERROR, .lv-CRITICAL { color: var(--critical); }
 .lv-DEBUG { color: var(--text-muted); }
 
+/* ---- 限额编辑（frontend 卡片 / 网卡总限速卡） ---- */
+.quota-edit {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-left: auto;
+}
+.quota-edit input { width: 110px; text-align: right; }
+.quota-edit .hint { white-space: nowrap; }
+
+/* ---- 令牌输入（页头） ---- */
+#api-token { width: 150px; padding: 4px 8px; font-size: 12px; }
+
+/* ---- toast：写 API 的结果反馈 ---- */
+#toast {
+  position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+  max-width: min(620px, calc(100vw - 40px));
+  padding: 10px 16px; border-radius: 9px; font-size: 13px;
+  background: var(--text-primary); color: var(--surface-1);
+  box-shadow: var(--shadow); z-index: 99;
+  opacity: 0; pointer-events: none; transition: opacity .18s;
+}
+#toast.on { opacity: 1; }
+#toast.err { background: var(--critical); color: #fff; }
+
 @media (max-width: 720px) {
   .f-name, .f-addr, .f-quota, .f-bal, .f-mode, .f-num, .f-port,
   .f-pfx, .f-bad, .f-bpt, .f-bac { width: 100%; }
   .tabs { top: 0; position: static; }
+  .quota-edit { margin-left: 0; width: 100%; }
 }
 </style>
 
@@ -213,6 +238,11 @@ input:focus, select:focus {
   <span class="meta">配置版本 <b id="cfg-version">–</b></span>
   <span class="meta">运行 <b id="uptime">–</b></span>
   <span class="meta">v<b id="svc-version">–</b></span>
+  <!-- 写 API 的令牌（RL_API_TOKEN）。留在 localStorage 里，只随写请求
+       的头部发出；不填则页面纯只读。 -->
+  <input id="api-token" type="password" placeholder="API 令牌（写操作用）"
+         autocomplete="off" title="RL_API_TOKEN 的值；改限额时随请求头发送。不填则页面只读">
+
   <span class="meta">窗口
     <select id="window-sel" style="width:auto;display:inline-block;padding:3px 6px">
       <option value="60">1 分钟</option>
@@ -253,6 +283,25 @@ input:focus, select:focus {
     </div>
 
     <div class="card">
+      <div class="card-head">
+        <span class="card-title">网卡总限速</span>
+        <span class="tag" id="nic-quota-cur">–</span>
+        <span class="quota-edit">
+          <span class="hint">Mbps，0 = 不限</span>
+          <input id="nic-quota-input" type="number" min="0" step="any" placeholder="Mbps">
+          <button id="nic-quota-save">保存</button>
+          <button id="nic-quota-clear" title="等价于写 0：撤掉总限速，回到平铺模式">取消总限速</button>
+        </span>
+      </div>
+      <div class="card-body">
+        <div class="hint">整张限速网卡出方向的总闸：设置后 tc 切换为层级模式，
+          所有流量（含各受管端口与 SSH/监控等未受管流量）合计不超过它，
+          各 frontend 自己的限额仍各自生效。修改经写 API 回写 YAML 后
+          数秒内热生效——需先在页头填入 API 令牌（RL_API_TOKEN）。</div>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-head"><span class="card-title">连接视图</span>
         <span class="hint">来源：HAProxy <code>show info</code> + 全部 frontend 汇总</span></div>
       <div class="card-body"><div class="chart-grid" id="i-conn-charts"></div></div>
@@ -269,9 +318,11 @@ input:focus, select:focus {
   <!-- ============ 监听端口视图 ============ -->
   <section class="tabpage" id="page-frontend">
     <div id="frontends"></div>
-    <div class="hint" style="padding:2px 4px">监听端口清单来自本机 haproxy.cfg 的解析，
-      限额来自 YAML 的 quotas 段；要调整就改这两个文件（cfg 改完 reload HAProxy），
-      本页面为只读视图。</div>
+    <div class="hint" style="padding:2px 4px">监听端口清单来自本机 haproxy.cfg 的解析
+      （要增删端口/后端请改 cfg 并 reload HAProxy，页面不提供入口）；
+      限额存放在 YAML 的 quotas 段——在卡片右上角修改（0 = 显式不限速，
+      "删除登记"= 回到只监控不限速），经写 API 回写 YAML 后数秒内热生效，
+      需先在页头填入 API 令牌（RL_API_TOKEN）。</div>
   </section>
 
   <!-- ============ 日志 ============ -->
@@ -291,6 +342,8 @@ input:focus, select:focus {
     </div>
   </section>
 </div></main>
+
+<div id="toast"></div>
 
 <script>
 const $ = (s, el) => (el || document).querySelector(s);
@@ -321,6 +374,59 @@ const BUF_MAX = 1200;
 
 
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name);
+
+// ============================================================ 写 API
+// 令牌留在 localStorage：控制台每次打开不用重填。它只随写请求的头部
+// 发出，读接口从不带它。
+const tokenInput = $("#api-token");
+tokenInput.value = localStorage.getItem("rl_api_token") || "";
+tokenInput.addEventListener("change", () =>
+  localStorage.setItem("rl_api_token", tokenInput.value.trim()));
+
+let toastTimer = null;
+function toast(msg, isErr) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "on" + (isErr ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ""; }, isErr ? 6000 : 3000);
+}
+
+// 写 API 调用：PUT/DELETE + 令牌头；失败时把服务端的中文错误原样弹出
+// ——那些信息（"没有这个段名"、"未配置令牌"）就是给人看的。
+async function apiWrite(method, url, body) {
+  const token = tokenInput.value.trim();
+  if (!token) {
+    toast("请先在页头填入 API 令牌（服务端环境变量 RL_API_TOKEN 的值）", true);
+    return null;
+  }
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method,
+      headers: {"X-API-Token": token, "Content-Type": "application/json"},
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (e) {
+    toast("请求失败：" + e, true);
+    return null;
+  }
+  let j = {};
+  try { j = await resp.json(); } catch (e) {}
+  if (!resp.ok) {
+    toast(j.error || (method + " " + url + " 失败（HTTP " + resp.status + "）"), true);
+    return null;
+  }
+  return j;
+}
+
+// 修改成功的统一收尾：提示 + 尽快刷新配置视图（回写→轮询→热生效有
+// 数秒延迟，多刷几次让页面尽快跟上）。
+function afterWrite(msg) {
+  toast(msg + "——已回写 YAML，数秒内热生效");
+  setTimeout(loadOverview, 1200);
+  setTimeout(loadOverview, 4000);
+}
 
 // ============================================================ 图表
 // 一个通用的多序列时间序列图：所有监控视图（实例的、frontend 的）都用它，
@@ -511,6 +617,12 @@ function ensureCard(name) {
       <span class="tag fe-mode"></span>
       <span class="tag alert fe-over" hidden>超限</span>
       <span class="tag warn fe-degraded" hidden>采样失联</span>
+      <span class="quota-edit">
+        <span class="hint">限额 Mbps，0 = 不限</span>
+        <input class="fe-quota-in" type="number" min="0" step="any" placeholder="Mbps">
+        <button class="fe-quota-save">保存</button>
+        <button class="fe-quota-del" title="从 quotas 里删除登记：回到只监控不限速（启动时会 warn 提醒）">删除登记</button>
+      </span>
     </div>
     <div class="card-body">
       <div class="stats">
@@ -571,6 +683,27 @@ function ensureCard(name) {
       ],
     }),
   ];
+  // 限额编辑：保存 = PUT /api/quotas/<名>（0 也是合法值：显式不限速）；
+  // 删除登记 = DELETE（该 frontend 回到只监控不限速）。
+  const qIn = $(".fe-quota-in", card);
+  $(".fe-quota-save", card).onclick = async () => {
+    const v = parseFloat(qIn.value);
+    if (qIn.value.trim() === "" || !isFinite(v) || v < 0) {
+      toast("限额必须是 ≥ 0 的数字（Mbps；0 = 显式不限速）", true);
+      return;
+    }
+    const r = await apiWrite("PUT",
+      "/api/quotas/" + encodeURIComponent(name), {quota_mbps: v});
+    if (r) afterWrite(name + " 的限额已改为 " +
+      (v ? v + " Mbps" : "0（显式不限速）"));
+  };
+  $(".fe-quota-del", card).onclick = async () => {
+    const r = await apiWrite("DELETE",
+      "/api/quotas/" + encodeURIComponent(name));
+    if (r) afterWrite(r.removed
+      ? name + " 的限额登记已删除（回到只监控不限速）"
+      : name + " 本来就没有限额登记，无需改动");
+  };
   state.fes.set(name, fe);
   return fe;
 }
@@ -580,6 +713,11 @@ function updateCard(fe, u) {
   $(".fe-name", c).textContent = fe.name;
   $(".fe-bind", c).textContent = (conf.bind_address || "*") + ":" + (conf.bind_port ?? "?");
   $(".fe-mode", c).textContent = conf.mode || "tcp";
+  // 编辑框跟随当前配置值，但正在输入时绝不覆盖（10s 一刷的 overview
+  // 会打断人打到一半的数字）。
+  const qIn = $(".fe-quota-in", c);
+  if (document.activeElement !== qIn && conf.quota_mbps !== undefined)
+    qIn.value = conf.quota_mbps;
   if (!u) return;
   const set = (sel, v, unit) =>
     $(sel, c).innerHTML = esc(v) + (unit ? `<small>${unit}</small>` : "");
@@ -650,6 +788,10 @@ async function loadOverview() {
   const up = Math.floor(o.uptime_s || 0);
   $("#uptime").textContent = up >= 3600
     ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
+  const nq = o.nic_quota_mbps || 0;
+  $("#nic-quota-cur").textContent = nq ? nq + " Mbps" : "不限";
+  const nIn = $("#nic-quota-input");
+  if (document.activeElement !== nIn) nIn.value = nq || "";
   if (o.latest && o.latest.instance) updateInstance(o.latest.instance);
 
   const names = Object.keys(o.frontends || {}).sort();
@@ -706,6 +848,21 @@ for (const b of $$(".tabs button")) b.onclick = () => switchTab(b.dataset.tab);
 $("#window-sel").onchange = (e) => {
   state.windowS = parseInt(e.target.value, 10);
   redrawAll();
+};
+$("#nic-quota-save").onclick = async () => {
+  const el = $("#nic-quota-input");
+  const v = parseFloat(el.value);
+  if (el.value.trim() === "" || !isFinite(v) || v < 0) {
+    toast("网卡总限速必须是 ≥ 0 的数字（Mbps；0 = 不限）", true);
+    return;
+  }
+  const r = await apiWrite("PUT", "/api/nic-quota", {quota_mbps: v});
+  if (r) afterWrite(v ? "网卡总限速已设为 " + v + " Mbps（tc 层级模式）"
+                      : "网卡总限速已取消（不限，回到平铺模式）");
+};
+$("#nic-quota-clear").onclick = async () => {
+  const r = await apiWrite("DELETE", "/api/nic-quota");
+  if (r) afterWrite("网卡总限速已取消（不限，回到平铺模式）");
 };
 $("#log-level").onchange = (e) => {
   state.logLevel = e.target.value;

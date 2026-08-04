@@ -306,7 +306,9 @@ async def test_high_ports_produce_ids_tc_will_accept():
     "invalid class ID / invalid qdisc ID"。
     """
     import re as _re
-    ports = [2, 80, 443, 8080, 9999, 10000, 14223, 65535]
+    # 65535 不在列表里：0xffff 是网卡总限速聚合类的 classid，监听在
+    # 65535 端口的 frontend 会被 _check_shapeable 拒绝（有专门的测试）。
+    ports = [2, 80, 443, 8080, 9999, 10000, 14223, 65534]
     sh, fake = shaper()
     await sh.reconcile([fe(f"fe{p}", port=p) for p in ports])
     ids = set()
@@ -564,3 +566,164 @@ def test_parse_size_handles_tc_1024_based_units():
     assert not T._cburst_too_small(5000192, 4_000_000_000)
     assert T._cburst_too_small(1600, 4_000_000_000)
     assert T._cburst_too_small(None, 4_000_000_000)
+
+
+# ---------------------------------------------------------------------------
+# 网卡总限速（层级模式）
+# ---------------------------------------------------------------------------
+
+NIC = 100_000_000        # 100 Mbps，测试里的网卡总限速
+
+
+async def test_port_65535_refused_conflicts_with_nic_parent():
+    """0xffff 是网卡总限速聚合类的 classid，监听在 65535 端口的 frontend
+    必须被拒绝——即便本次没设总限速：一旦运维日后设上，两者会撞在同一个
+    classid 上，且表现为"总限速吞吐诡异"这种极难排查的形态。"""
+    sh, fake = shaper()
+    res = await sh.reconcile([fe(port=65535)])
+    assert not res.ok and "65535" in res.error
+    assert fake.mutations() == []
+
+
+def test_nic_layout_plain_fit():
+    """合计限额没超预算（90% 总限速）时不缩放：各端口保证值 = 自身限额，
+    ceil = min(限额, 总限速)；兜底类拿走剩余保证值，ceil = 总限速。"""
+    ports, (dr, dc) = T.nic_layout([fe(port=8080, quota=40.0)], NIC)
+    assert ports == {8080: (40_000_000, 40_000_000)}
+    assert dr == NIC - 40_000_000     # 剩余保证值全给兜底类
+    assert dc == NIC
+
+
+def test_nic_layout_scales_down_when_overcommitted():
+    """HTB 的硬约束：子类保证值之和 ≤ 父类 rate 时聚合吞吐才 ≤ 父类
+    ceil。合计限额超过 90% 预算时按比例缩小保证值——但 ceil 不动，
+    单端口上限仍是自己的限额。"""
+    fes = [fe("a", port=8080, quota=80.0), fe("b", port=9090, quota=80.0)]
+    ports, (dr, dc) = T.nic_layout(fes, NIC)
+    r_a, c_a = ports[8080]
+    r_b, c_b = ports[9090]
+    # 缩放后合计保证值 ≤ 90% 预算，且兜底类至少拿 5%。
+    assert r_a + r_b <= int(NIC * 0.9)
+    assert r_a == r_b                      # 等额限额等比缩放
+    assert c_a == c_b == 80_000_000        # ceil 不缩放
+    assert dr >= int(NIC * 0.05)           # SSH/监控不能被饿死
+    assert dc == NIC
+
+
+def test_nic_layout_ceil_capped_by_nic():
+    """单个 frontend 的限额超过总限速时，ceil 被压到总限速——树内任何
+    类都不该许诺一个整卡都到不了的速率。"""
+    ports, _ = T.nic_layout([fe(port=8080, quota=200.0)], NIC)
+    assert ports[8080][1] == NIC
+
+
+def test_nic_layout_empty_frontends():
+    """没有受管 frontend 时兜底类拿走全部总限速。"""
+    ports, (dr, dc) = T.nic_layout([], NIC)
+    assert ports == {}
+    assert (dr, dc) == (NIC, NIC)
+
+
+def test_parse_class_ceils():
+    """层级模式比对的是 ceil：rate 是缩放出来的保证值，会随别的
+    frontend 增删而变，ceil 才稳定等于 min(限额, 总限速)。"""
+    out = ("class htb 1:ffff root prio 0 rate 100Mbit ceil 100Mbit "
+           "burst 125000b cburst 125000b\n"
+           "class htb 1:1f90 parent 1:ffff prio 0 rate 36Mbit ceil 40Mbit "
+           "burst 45000b cburst 50000b\n")
+    assert T.parse_class_ceils(out) == {0xFFFF: NIC, 8080: 40_000_000}
+
+
+async def test_nic_mode_builds_hierarchy_from_scratch():
+    """首次运行：整树重建——root(default=1) → 聚合父类 1:ffff
+    （rate=ceil=总限速）→ {兜底类 1:1, 端口类}，端口类挂在父类下。"""
+    sh, fake = shaper()
+    res = await sh.reconcile([fe(port=8080, quota=40.0)], NIC)
+    assert res.ok and res.changed and res.action == "rebuild"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    # 聚合父类：挂在 root 下，rate=ceil=总限速。
+    assert any("parent 1: classid 1:ffff htb" in c
+               and f"rate {NIC}bit" in c and f"ceil {NIC}bit" in c
+               for c in cmds), cmds
+    # 兜底类与端口类都挂在父类 1:ffff 下（不再直接挂 root）。
+    assert any("parent 1:ffff classid 1:1 htb" in c for c in cmds), cmds
+    assert any("parent 1:ffff classid 1:1f90 htb" in c
+               and "ceil 40000000bit" in c for c in cmds), cmds
+    # 分类规则 IPv4/IPv6 都在。
+    assert any("protocol ip" in c and "sport 8080" in c for c in cmds)
+    assert any("protocol ipv6" in c and "sport 8080" in c for c in cmds)
+
+
+async def test_nic_mode_empty_frontends_keeps_tree():
+    """设了总限速时即使没有任何受管 frontend 也**不拆树**：总限速本身
+    要求聚合父类与兜底类在位（未受管流量也要被总闸管住）。"""
+    sh, fake = shaper()
+    res = await sh.reconcile([], NIC)
+    assert res.ok and res.changed and res.action == "rebuild"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    assert any("classid 1:ffff htb" in c for c in cmds)
+    assert any("parent 1:ffff classid 1:1 htb" in c for c in cmds)
+
+
+# 与 nic_layout([fe(8080, 40)], NIC) 一致的网卡实况（tc 输出口径）：
+# 父类 rate=ceil=100Mbit；兜底类 rate=60Mbit ceil=100Mbit；
+# 端口类 rate=ceil=40Mbit。burst = 10ms 额度。
+NIC_CLASSES_OK = """\
+class htb 1:ffff root prio 0 rate 100Mbit ceil 100Mbit burst 125000b cburst 125000b
+class htb 1:1 parent 1:ffff leaf 10f: prio 0 rate 60Mbit ceil 100Mbit burst 75000b cburst 125000b
+class htb 1:1f90 parent 1:ffff leaf 1f90: prio 0 rate 40Mbit ceil 40Mbit burst 50000b cburst 50000b
+"""
+
+
+async def test_nic_mode_consistent_state_is_noop():
+    """网卡实况与层级规划完全一致时一条变更命令都不发——否则每 30s
+    重建一次，限速被反复推倒重来。"""
+    sh, fake = shaper(classes=NIC_CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile([fe(port=8080, quota=40.0)], NIC)
+    assert res.ok and not res.changed
+    assert fake.mutations() == []
+
+
+async def test_nic_mode_quota_change_rebuilds_not_rate_change():
+    """层级模式下改任何限额都整树重建：各类的保证值按比例联动，逐个
+    class change 会经过"父子约束被破坏"的中间态。"""
+    sh, fake = shaper(classes=NIC_CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile([fe(port=8080, quota=80.0)], NIC)
+    assert res.ok and res.changed and res.action == "rebuild"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    assert not any("class change" in c for c in cmds), "层级模式没有快路径"
+
+
+async def test_nic_quota_change_rebuilds():
+    """总限速本身变了同样重建（父类 ceil 与全部保证值都要重算）。"""
+    sh, fake = shaper(classes=NIC_CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile([fe(port=8080, quota=40.0)], NIC * 2)
+    assert res.ok and res.changed and res.action == "rebuild"
+
+
+async def test_removing_nic_quota_falls_back_to_flat_rebuild():
+    """取消总限速（层级树还在网卡上）→ 平铺模式发现多出来的 1:ffff
+    类 → 整树重建回平铺结构。"""
+    sh, fake = shaper(classes=NIC_CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile([fe(port=8080, quota=40.0)])     # nic=0
+    assert res.ok and res.changed and res.action == "rebuild"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    # 平铺重建：端口类直接挂 root，没有聚合父类。
+    assert any("parent 1: classid 1:1f90 htb" in c for c in cmds), cmds
+    assert not any("classid 1:ffff" in c for c in cmds), cmds
+
+
+async def test_teardown_requires_both_empty_and_no_nic():
+    """拆树只发生在"清单空 **且** 未设总限速"：设着总限速时空清单走
+    层级重建（见上），两者都空才撤。"""
+    sh, fake = shaper(classes=NIC_CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile([], 0)
+    assert res.ok and res.changed and res.action == "teardown"
+    assert [" ".join(c) for c in fake.mutations()] == [
+        f"tc qdisc del dev {IFACE} root"]
+
+
+async def test_nic_mode_failure_reports_not_ok():
+    sh, fake = shaper(fail_on=("class add",))
+    res = await sh.reconcile([fe(port=8080, quota=40.0)], NIC)
+    assert not res.ok and res.error

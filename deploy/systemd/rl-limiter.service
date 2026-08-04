@@ -41,10 +41,13 @@ Type=simple
 # 限速网卡：不设则自动取默认路由的出口网卡；多网卡机器必须显式指定
 # （两网卡部署指向客户端侧那张，见 docs/06 第 6 节）。
 # Environment=RL_TC_IFACE=eth0
-# 内置 Web 控制台（只读监控）。控制台**无鉴权**，默认只绑 127.0.0.1；
-# 要让内网访问必须显式设 RL_CONSOLE_BIND 并用防火墙/安全组限制来源。
+# 内置 Web 控制台。**读接口无鉴权**，默认只绑 127.0.0.1；要让内网访问
+# 必须显式设 RL_CONSOLE_BIND 并用防火墙/安全组限制来源。
 # Environment=RL_CONSOLE_PORT=8090
 # Environment=RL_CONSOLE_BIND=10.0.0.11
+# 写 API（页面/API 修改限额）的令牌：不设则写接口整体 403（页面只读）。
+# 生成随机值：openssl rand -hex 24
+# Environment=RL_API_TOKEN=
 # 监控数据落盘（分钟粒度 JSONL，按天轮转；/metrics 是实时值，这里是历史）。
 # 目录由下面的 LogsDirectory 自动创建并授权。
 Environment=RL_METRICS_LOG=/var/log/rl-limiter/metrics.jsonl
@@ -63,9 +66,14 @@ SupplementaryGroups=haproxy
 # 同时在 BoundingSet 里）。
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
-# 文件系统只放开一处：监控数据落盘目录（LogsDirectory 自动创建
-# /var/log/rl-limiter 并授权）。配置文件（YAML/haproxy.cfg）仍然只读。
+# 文件系统只放开两处：监控数据落盘目录（LogsDirectory 自动创建
+# /var/log/rl-limiter 并授权），以及自身配置目录（ReadWritePaths）——
+# 控制台/写 API 修改限额要把 quotas/nic_quota_mbps 回写到 config.yaml
+# （临时文件 + 原子替换，需要目录写权限；目录与文件的属组要给运行用户，
+# 见 docs/09）。不用写 API 可删掉 ReadWritePaths，配置回到完全只读。
+# haproxy.cfg 在任何形态下都只读：rl-limiter 不改 cfg、不 reload haproxy。
 LogsDirectory=rl-limiter
+ReadWritePaths=/etc/rl-limiter
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

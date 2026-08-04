@@ -46,11 +46,16 @@ CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 
 # ---- 加固 ---------------------------------------------------------------
-# 本服务对文件系统只有一处写需求：监控数据落盘（RL_METRICS_LOG，JSONL）。
-# 用 LogsDirectory 让 systemd 自动创建 /var/log/rl-limiter 并授权写入——
-# ProtectSystem=strict 全只读的前提下这是唯一放开的目录，无需
-# ReadWritePaths。配置文件（YAML/haproxy.cfg）仍然只读。
+# ProtectSystem=strict 全只读，只放开两处：
+#   1. 监控数据落盘目录（LogsDirectory 自动创建 /var/log/rl-limiter
+#      并授权写入）；
+#   2. 自身配置目录（ReadWritePaths）——控制台/写 API 修改限额要把
+#      quotas/nic_quota_mbps 回写到 config.yaml（临时文件 + 原子替换，
+#      所以需要目录写权限）。不用写 API 的话可以删掉这行，配置就回到
+#      完全只读。
+# haproxy.cfg 在任何形态下都只读：rl-limiter 不改 cfg、不 reload haproxy。
 LogsDirectory=rl-limiter
+ReadWritePaths=@CONF_DIR@
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

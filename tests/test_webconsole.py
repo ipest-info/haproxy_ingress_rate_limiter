@@ -147,12 +147,15 @@ async def test_overview_endpoint(client):
     assert "fe_a" in body["frontends"]
 
 
-async def test_no_write_routes(client):
-    """只读契约：控制台不提供任何配置写接口——配置的修改入口是
-    haproxy.cfg 与 YAML 文件本身。"""
+async def test_no_write_routes_without_yaml_path(client):
+    """不给 yaml_path 时（测试/极简形态）连写路由都不挂载：负载均衡
+    配置（frontends 本体）在任何形态下都没有写接口——那以 haproxy.cfg
+    为唯一权威。"""
     for method, path in (("put", "/api/frontends/fe_a"),
                          ("post", "/api/frontends"),
-                         ("delete", "/api/frontends/fe_a")):
+                         ("delete", "/api/frontends/fe_a"),
+                         ("put", "/api/quotas/fe_a"),
+                         ("put", "/api/nic-quota")):
         r = await getattr(client, method)(path, data="{}")
         assert r.status in (404, 405), path
 
@@ -227,3 +230,161 @@ async def test_json_endpoints_declare_utf8(client):
     for path in ("/api/overview", "/api/logs", "/api/history"):
         r = await client.get(path)
         assert r.charset == "utf-8", path
+
+
+# ---------------------------------------------------------------------------
+# 写 API（限额修改：令牌鉴权 + YAML 回写 + poke 热生效）
+# ---------------------------------------------------------------------------
+
+import asyncio
+
+from rl_limiter import config as configmod
+
+TOKEN = "test-token-123"
+
+BASE_YAML = """\
+haproxy:
+  socket_path: /run/haproxy/admin.sock
+  cfg_path: /etc/haproxy/haproxy.cfg
+quotas:
+  fe_a: 8
+"""
+
+
+def hub_with_nic(nic=0.0):
+    h = webconsole.StatusHub("test", version_fn=lambda: 1)
+    h.update_config(model.ControllerConfig(
+        version=1, frontends=[fe()], nic_quota_mbps=nic))
+    return h
+
+
+@pytest.fixture
+async def wclient(tmp_path):
+    """带写 API 的控制台：真实 YAML 文件 + 令牌 + poke 事件。"""
+    yml = tmp_path / "config.yaml"
+    yml.write_text(BASE_YAML, encoding="utf-8")
+    poke = asyncio.Event()
+    h = hub()
+    app = webconsole.build_app(
+        h, webconsole.LogBuffer(), __import__("logging").getLogger("t"),
+        yaml_path=str(yml), api_token=TOKEN,
+        known_frontends_fn=lambda: {"fe_a", "fe_b"}, poke=poke)
+    app["yml"], app["poke"], app["hub"] = yml, poke, h
+    async with TestClient(TestServer(app)) as c:
+        yield c
+
+
+def auth(token=TOKEN):
+    return {"X-API-Token": token}
+
+
+async def test_write_requires_token(wclient):
+    """没带令牌/带错令牌 → 401，文件一个字节不动。"""
+    before = wclient.app["yml"].read_text(encoding="utf-8")
+    r = await wclient.put("/api/quotas/fe_a", json={"quota_mbps": 20})
+    assert r.status == 401
+    r = await wclient.put("/api/quotas/fe_a", json={"quota_mbps": 20},
+                          headers=auth("wrong"))
+    assert r.status == 401
+    assert wclient.app["yml"].read_text(encoding="utf-8") == before
+    assert not wclient.app["poke"].is_set()
+
+
+async def test_write_disabled_without_configured_token(tmp_path):
+    """服务端未配置 RL_API_TOKEN → 写接口整体 403（错误信息说明怎么
+    启用），绝不允许"没配令牌就人人可改"。"""
+    yml = tmp_path / "config.yaml"
+    yml.write_text(BASE_YAML, encoding="utf-8")
+    app = webconsole.build_app(
+        hub(), webconsole.LogBuffer(), __import__("logging").getLogger("t"),
+        yaml_path=str(yml), api_token="")
+    async with TestClient(TestServer(app)) as c:
+        r = await c.put("/api/quotas/fe_a", json={"quota_mbps": 20},
+                        headers=auth())
+        assert r.status == 403
+        assert "RL_API_TOKEN" in (await r.json())["error"]
+
+
+async def test_put_quota_writes_yaml_and_pokes(wclient):
+    r = await wclient.put("/api/quotas/fe_a", json={"quota_mbps": 20},
+                          headers=auth())
+    assert r.status == 200
+    cfg = configmod.load(str(wclient.app["yml"]))
+    assert cfg.quotas["fe_a"] == 20.0
+    assert wclient.app["poke"].is_set(), "回写后必须 poke，热生效不等轮询"
+
+
+async def test_put_quota_accepts_bearer_header(wclient):
+    r = await wclient.put("/api/quotas/fe_a", json={"quota_mbps": 30},
+                          headers={"Authorization": f"Bearer {TOKEN}"})
+    assert r.status == 200
+    assert configmod.load(str(wclient.app["yml"])).quotas["fe_a"] == 30.0
+
+
+async def test_put_quota_zero_is_explicit_unlimited(wclient):
+    r = await wclient.put("/api/quotas/fe_a", json={"quota_mbps": 0},
+                          headers=auth())
+    assert r.status == 200
+    assert configmod.load(str(wclient.app["yml"])).quotas["fe_a"] == 0.0
+
+
+async def test_put_quota_unknown_frontend_rejected(wclient):
+    """cfg 里没有的段名 → 400 并列出现有段名：写进去也只会被 cfgparse
+    忽略并 warn，不如在门口就说清楚（多半是拼错了）。"""
+    before = wclient.app["yml"].read_text(encoding="utf-8")
+    r = await wclient.put("/api/quotas/fe_typo", json={"quota_mbps": 20},
+                          headers=auth())
+    assert r.status == 400
+    body = await r.json()
+    assert "fe_typo" in body["error"] and "fe_a" in body["error"]
+    assert wclient.app["yml"].read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize("body", [
+    {"quota_mbps": -1},          # 校验链拒绝（负数）
+    {"quota_mbps": "abc"},       # 不是数字
+    {"quota_mbps": True},        # bool 不是数字
+    {},                          # 缺字段
+])
+async def test_put_quota_bad_body_rejected(wclient, body):
+    r = await wclient.put("/api/quotas/fe_a", json=body, headers=auth())
+    assert r.status == 400
+
+
+async def test_delete_quota(wclient):
+    r = await wclient.delete("/api/quotas/fe_a", headers=auth())
+    assert r.status == 200 and (await r.json())["removed"] is True
+    assert configmod.load(str(wclient.app["yml"])).quotas == {}
+    # 再删一次：没登记，removed=False，也不 poke。
+    wclient.app["poke"].clear()
+    r = await wclient.delete("/api/quotas/fe_a", headers=auth())
+    assert (await r.json())["removed"] is False
+    assert not wclient.app["poke"].is_set()
+
+
+async def test_put_and_delete_nic_quota(wclient):
+    r = await wclient.put("/api/nic-quota", json={"quota_mbps": 800},
+                          headers=auth())
+    assert r.status == 200
+    assert configmod.load(str(wclient.app["yml"])).nic_quota_mbps == 800.0
+    r = await wclient.delete("/api/nic-quota", headers=auth())
+    assert r.status == 200
+    assert configmod.load(str(wclient.app["yml"])).nic_quota_mbps == 0.0
+
+
+async def test_read_endpoints_need_no_token(wclient):
+    """读接口不受令牌影响（读的安全边界是绑定地址 + 防火墙）。"""
+    for path in ("/api/overview", "/api/history", "/metrics", "/"):
+        r = await wclient.get(path)
+        assert r.status == 200, path
+
+
+def test_overview_carries_nic_quota():
+    o = hub_with_nic(800.0).overview()
+    assert o["nic_quota_mbps"] == 800.0
+    assert o["nic_quota_bytes_per_s"] == 100_000_000.0
+
+
+def test_metrics_carries_nic_quota():
+    body = webconsole.render_prometheus(hub_with_nic(800.0))
+    assert "rl_limiter_nic_quota_bytes_per_second 100000000.0" in body

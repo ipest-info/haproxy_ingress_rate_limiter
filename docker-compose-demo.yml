@@ -87,6 +87,9 @@ services:
       # 演示需要从宿主机打开控制台，故绑 0.0.0.0；宿主机侧只映射到回环
       # （下方 ports）。生产默认是 127.0.0.1，控制台无鉴权，切勿裸奔。
       RL_CONSOLE_BIND: 0.0.0.0
+      # 写 API（页面/API 改限额）的演示令牌。生产上请生成随机值
+      # （openssl rand -hex 24），不设则写接口整体 403、页面只读。
+      RL_API_TOKEN: demo-token
     ports:
       - "8080:8080"              # hap-1 / fe_main（宿主机可 curl 体验限速）
       - "127.0.0.1:8090:8090"    # hap-1 的控制台
@@ -132,6 +135,9 @@ services:
       # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
       RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
       RL_CONSOLE_BIND: 0.0.0.0
+      # 写 API（页面/API 改限额）的演示令牌。生产上请生成随机值
+      # （openssl rand -hex 24），不设则写接口整体 403、页面只读。
+      RL_API_TOKEN: demo-token
     ports:
       - "8082:8080"              # hap-2 / fe_main
       - "127.0.0.1:8092:8090"    # hap-2 的控制台
@@ -177,6 +183,9 @@ services:
       # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
       RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
       RL_CONSOLE_BIND: 0.0.0.0
+      # 写 API（页面/API 改限额）的演示令牌。生产上请生成随机值
+      # （openssl rand -hex 24），不设则写接口整体 403、页面只读。
+      RL_API_TOKEN: demo-token
     ports:
       - "8083:8080"              # hap-3 / fe_main
       - "127.0.0.1:8093:8090"    # hap-3 的控制台

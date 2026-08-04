@@ -217,17 +217,20 @@ def load_frontends(cfg_path: str, quotas: dict[str, float],
     return build_frontends(parse_haproxy_cfg(text), quotas, log, _warned)
 
 
-def canonical(frontends: list[model.FrontendConfig]) -> str:
+def canonical(frontends: list[model.FrontendConfig],
+              nic_quota_mbps: float = 0.0) -> str:
     """配置内容的精确身份（变更检测用字符串比较，不经哈希）。"""
-    return ";".join(
+    body = ";".join(
         f"{f.name}|{f.bind_address}|{f.bind_port}|{f.mode}|{f.quota_mbps:g}"
         for f in sorted(frontends, key=lambda x: x.name)
     )
+    return f"{body};nic:{nic_quota_mbps:g}"
 
 
-def checksum(frontends: list[model.FrontendConfig]) -> int:
+def checksum(frontends: list[model.FrontendConfig],
+             nic_quota_mbps: float = 0.0) -> int:
     """内容校验和：充当配置版本号（控制台展示/核对用）。"""
-    return zlib.crc32(canonical(frontends).encode("utf-8"))
+    return zlib.crc32(canonical(frontends, nic_quota_mbps).encode("utf-8"))
 
 
 async def watch(
@@ -237,6 +240,8 @@ async def watch(
     boot_frontends: list[model.FrontendConfig],
     log: logging.Logger,
     interval_s: float = WATCH_INTERVAL_S,
+    boot_nic_quota_mbps: float = 0.0,
+    poke: "asyncio.Event | None" = None,
 ) -> None:
     """常驻任务：轮询 haproxy.cfg 与 YAML 配置文件，内容变化就把新
     ControllerConfig 投入 queue（监控循环热应用，tc/告警基准随之更新）。
@@ -252,11 +257,20 @@ async def watch(
     """
     from . import config as configmod  # 延迟导入避免环形依赖
 
-    last = canonical(boot_frontends)
+    last = canonical(boot_frontends, boot_nic_quota_mbps)
     warned: set[str] = set()
     last_yaml_rest: tuple | None = None
     while True:
-        await asyncio.sleep(interval_s)
+        # poke 事件让写接口（控制台/API 改完配置文件后）立即触发一轮
+        # 轮询，不必干等下一个周期。
+        if poke is None:
+            await asyncio.sleep(interval_s)
+        else:
+            try:
+                await asyncio.wait_for(poke.wait(), timeout=interval_s)
+            except asyncio.TimeoutError:
+                pass
+            poke.clear()
         try:
             svc = configmod.load(yaml_path)
             quotas = dict(svc.quotas)
@@ -278,7 +292,7 @@ async def watch(
                 "接线等）：这些字段在进程启动时定型，热更新不生效，请重启 "
                 "rl-limiter")
 
-        cur = canonical(frontends)
+        cur = canonical(frontends, svc.nic_quota_mbps)
         if cur == last:
             continue
         last = cur
@@ -286,7 +300,9 @@ async def watch(
         warned.clear()
         version = zlib.crc32(cur.encode("utf-8"))
         queue.put_nowait(model.ControllerConfig(
-            version=version, frontends=frontends))
+            version=version, frontends=frontends,
+            nic_quota_mbps=svc.nic_quota_mbps))
         log.info(
             "检测到 haproxy.cfg / 限额配置变化，已提交监控循环热生效 "
-            "version=%s frontends=%d", version, len(frontends))
+            "version=%s frontends=%d nic_quota=%s", version, len(frontends),
+            f"{svc.nic_quota_mbps:g}Mbps" if svc.nic_quota_mbps else "不限")

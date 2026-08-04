@@ -185,12 +185,19 @@ install_venv() {
 install_conf() {
     step "配置文件"
     mkdir -p "$CONF_DIR"
+    # 目录属组给服务用户并放开组写：控制台/写 API 改限额是"临时文件 +
+    # 原子替换"，需要**目录**的写权限（unit 里配套 ReadWritePaths）。
+    chgrp "$RL_USER" "$CONF_DIR" 2>/dev/null || true
+    chmod 2770 "$CONF_DIR" 2>/dev/null || chmod 770 "$CONF_DIR"
     if [ -f "$YAML_FILE" ]; then
-        # 已有配置一概不覆盖——里面是运维调过的限额。
-        ok "$YAML_FILE 已存在，保持不动"
+        # 已有配置一概不覆盖——里面是运维调过的限额。属组/权限仍然校正
+        # （老版本装出来的是 640 root:root，写 API 无法回写）。
+        chgrp "$RL_USER" "$YAML_FILE" 2>/dev/null || true
+        chmod 660 "$YAML_FILE"
+        ok "$YAML_FILE 已存在，保持不动（已校正属组/权限）"
     else
         cp "$REPO/deploy/config/limiter.example.yaml" "$YAML_FILE"
-        chmod 640 "$YAML_FILE"
+        chmod 660 "$YAML_FILE"
         chgrp "$RL_USER" "$YAML_FILE" 2>/dev/null || true
         ok "已生成 $YAML_FILE（示例配置）"
         warn "**先编辑它**：cfg_path/socket_path 指向本机实际路径，"

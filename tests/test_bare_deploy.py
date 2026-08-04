@@ -55,13 +55,16 @@ def test_unit_grants_net_admin_for_tc():
     assert "无需 CAP_NET_ADMIN" not in unit
 
 
-def test_unit_is_fully_read_only():
-    """rl-limiter 只读 cfg/YAML、不写任何文件（cfg 归运维手工编辑）。
-    unit 因此可以全只读——出现 ReadWritePaths 说明有人又把写盘能力
-    加回来了，这与"cfg 是唯一权威、服务只读"的架构相悖。"""
+def test_unit_write_access_is_own_config_dir_only():
+    """文件系统写权限的边界：ProtectSystem=strict 全只读，唯一的
+    ReadWritePaths 是**自己的配置目录**（写 API 回写 quotas/
+    nic_quota_mbps 用）。绝不能出现 haproxy 的路径——"rl-limiter 不改
+    cfg、不 reload haproxy"是架构承诺，unit 层面必须钉死。"""
     unit = UNIT_IN.read_text(encoding="utf-8")
     assert "ProtectSystem=strict" in unit
-    assert not re.search(r"^ReadWritePaths", unit, re.M)
+    rwp = re.findall(r"^ReadWritePaths=(.+)$", unit, re.M)
+    assert rwp == ["@CONF_DIR@"], f"ReadWritePaths 只许放开自身配置目录：{rwp}"
+    assert "haproxy" not in " ".join(rwp)
 
 
 def test_unit_does_not_hard_require_haproxy():

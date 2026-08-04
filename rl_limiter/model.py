@@ -312,6 +312,9 @@ class ControllerConfig:
 
     version: int = 0
     frontends: list[FrontendConfig] = field(default_factory=list)
+    # 网卡总限速（Mbps；0 = 不限）。整张限速网卡出方向的合计上限，
+    # 与各 frontend 的限额相互独立（生效值 = min(自身限额, 总限速)）。
+    nic_quota_mbps: float = 0.0
 
     def quotas(self) -> dict[str, float]:
         """frontend 名 → 限额（bytes/s），供超限判定使用。"""

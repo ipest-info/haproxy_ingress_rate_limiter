@@ -187,3 +187,34 @@ def test_quota_survives_the_dict_round_trip():
     again = model.FrontendConfig.from_dict(fe.to_dict())
     assert again == fe
     assert again.quota_bits_per_sec == fe.quota_bits_per_sec
+
+
+# ---------------------------------------------------------------------------
+# 网卡总限速（nic_quota_mbps）
+# ---------------------------------------------------------------------------
+
+def test_nic_quota_default_zero(tmp_path):
+    """不写 = 不限（平铺模式），这是既有部署升级上来的默认形态。"""
+    assert load_from(tmp_path, minimal()).nic_quota_mbps == 0.0
+
+
+def test_nic_quota_parsed(tmp_path):
+    cfg = load_from(tmp_path, minimal(extra="nic_quota_mbps: 800\n"))
+    assert cfg.nic_quota_mbps == 800.0
+
+
+def test_nic_quota_zero_explicit(tmp_path):
+    """显式写 0 = 不限，与不写等价（写 API 取消总限速时会直接删字段，
+    但手写 0 也必须合法）。"""
+    cfg = load_from(tmp_path, minimal(extra="nic_quota_mbps: 0\n"))
+    assert cfg.nic_quota_mbps == 0.0
+
+
+@pytest.mark.parametrize("text,match", [
+    (minimal(extra="nic_quota_mbps: -1\n"), r"nic_quota_mbps 不能为负数"),
+    (minimal(extra="nic_quota_mbps: 0.000004\n"), r"太小"),
+    (minimal(extra="nic_quota_mbps: abc\n"), r"nic_quota_mbps 必须是数字"),
+])
+def test_nic_quota_rejections(tmp_path, text, match):
+    with pytest.raises(ValueError, match=match):
+        load_from(tmp_path, text)
