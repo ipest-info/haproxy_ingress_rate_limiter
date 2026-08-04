@@ -47,6 +47,7 @@ YAML（`-c` 指定：stats socket 接线、cfg 路径、quotas 限额）。运�
 | [docs/04-DockerCompose演示.md](docs/04-DockerCompose演示.md) | docker compose 一键演示（三台 Ubuntu 24.04 节点 + Web 控制台 + 可调并发压测） |
 | [docs/05-监控视图.md](docs/05-监控视图.md) | 监控视图：每条曲线的数据来源与口径 |
 | [docs/06-tc限速方案.md](docs/06-tc限速方案.md) | **限速为什么从 HAProxy bwlim 换成内核 tc**：实测依据、映射方式、行为差异，以及尚未验证的部分 |
+| [docs/07-API文档.md](docs/07-API文档.md) | **HTTP API 参考（面向第三方开发）**：监控数据读接口（overview/history/SSE//metrics/logs）与限额写接口（令牌鉴权），字段口径、错误码、集成示例 |
 | [docs/08-内核参数调优.md](docs/08-内核参数调优.md) | **让瓶颈落在 maxconn 而不是内核默认值上**：初始化阶段的 sysctl 调优与 FD 预检、哪些容器里改不动、怎么验证真的生效 |
 | [docs/09-裸机部署.md](docs/09-裸机部署.md) | **HAProxy 已装好的机器上怎么加 rl-limiter**：一键装机脚本、两份配置文件、权限的由来 |
 
