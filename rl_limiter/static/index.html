@@ -367,6 +367,7 @@ const state = {
   instBuf: [],               // 实例视图的样本环形缓冲
   instCharts: [],
   windowS: 300, logAfter: 0, logLevel: "INFO", tab: "instance",
+  nicDirty: false,           // 网卡总限速输入框：用户动过后不再自动回填
 };
 const LEVELS = {DEBUG:10, INFO:20, WARNING:30, ERROR:40, CRITICAL:50};
 // 缓冲上限：1 秒一拍，服务端只留 10 分钟历史，客户端留够 20 分钟即可。
@@ -636,7 +637,7 @@ function ensureCard(name) {
       <div class="chart-grid fe-charts"></div>
     </div>`;
   $("#frontends").appendChild(card);
-  fe = {name, buf: [], conf: null, card, charts: []};
+  fe = {name, buf: [], conf: null, card, charts: [], qDirty: false};
   const grid = $(".fe-charts", card), pts = () => fe.buf;
   fe.charts = [
     makeChart(grid, {
@@ -685,7 +686,12 @@ function ensureCard(name) {
   ];
   // 限额编辑：保存 = PUT /api/quotas/<名>（0 也是合法值：显式不限速）；
   // 删除登记 = DELETE（该 frontend 回到只监控不限速）。
+  //
+  // qDirty：用户动过输入框后置位，updateCard（每秒随 SSE 跑）不再回填
+  // ——只靠"是否聚焦"防覆盖不够：点步进箭头/中途点别处都会失焦，正打
+  // 的数字会立刻被刷回当前值。保存/删除成功后清掉，恢复跟随配置。
   const qIn = $(".fe-quota-in", card);
+  qIn.addEventListener("input", () => { fe.qDirty = true; });
   $(".fe-quota-save", card).onclick = async () => {
     const v = parseFloat(qIn.value);
     if (qIn.value.trim() === "" || !isFinite(v) || v < 0) {
@@ -694,15 +700,21 @@ function ensureCard(name) {
     }
     const r = await apiWrite("PUT",
       "/api/quotas/" + encodeURIComponent(name), {quota_mbps: v});
-    if (r) afterWrite(name + " 的限额已改为 " +
-      (v ? v + " Mbps" : "0（显式不限速）"));
+    if (r) {
+      fe.qDirty = false;
+      afterWrite(name + " 的限额已改为 " +
+        (v ? v + " Mbps" : "0（显式不限速）"));
+    }
   };
   $(".fe-quota-del", card).onclick = async () => {
     const r = await apiWrite("DELETE",
       "/api/quotas/" + encodeURIComponent(name));
-    if (r) afterWrite(r.removed
-      ? name + " 的限额登记已删除（回到只监控不限速）"
-      : name + " 本来就没有限额登记，无需改动");
+    if (r) {
+      fe.qDirty = false;
+      afterWrite(r.removed
+        ? name + " 的限额登记已删除（回到只监控不限速）"
+        : name + " 本来就没有限额登记，无需改动");
+    }
   };
   state.fes.set(name, fe);
   return fe;
@@ -713,10 +725,11 @@ function updateCard(fe, u) {
   $(".fe-name", c).textContent = fe.name;
   $(".fe-bind", c).textContent = (conf.bind_address || "*") + ":" + (conf.bind_port ?? "?");
   $(".fe-mode", c).textContent = conf.mode || "tcp";
-  // 编辑框跟随当前配置值，但正在输入时绝不覆盖（10s 一刷的 overview
-  // 会打断人打到一半的数字）。
+  // 编辑框跟随当前配置值，但用户动过（qDirty）或正聚焦时**绝不覆盖**
+  // ——本函数每秒随 SSE 跑一次，回填一旦失控输入框就没法用了。
   const qIn = $(".fe-quota-in", c);
-  if (document.activeElement !== qIn && conf.quota_mbps !== undefined)
+  if (!fe.qDirty && document.activeElement !== qIn
+      && conf.quota_mbps !== undefined)
     qIn.value = conf.quota_mbps;
   if (!u) return;
   const set = (sel, v, unit) =>
@@ -790,8 +803,10 @@ async function loadOverview() {
     ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
   const nq = o.nic_quota_mbps || 0;
   $("#nic-quota-cur").textContent = nq ? nq + " Mbps" : "不限";
+  // 与 frontend 卡片的 qDirty 同一套规则：用户动过就不再自动回填。
   const nIn = $("#nic-quota-input");
-  if (document.activeElement !== nIn) nIn.value = nq || "";
+  if (!state.nicDirty && document.activeElement !== nIn)
+    nIn.value = nq || "";
   if (o.latest && o.latest.instance) updateInstance(o.latest.instance);
 
   const names = Object.keys(o.frontends || {}).sort();
@@ -849,6 +864,7 @@ $("#window-sel").onchange = (e) => {
   state.windowS = parseInt(e.target.value, 10);
   redrawAll();
 };
+$("#nic-quota-input").addEventListener("input", () => { state.nicDirty = true; });
 $("#nic-quota-save").onclick = async () => {
   const el = $("#nic-quota-input");
   const v = parseFloat(el.value);
@@ -857,12 +873,18 @@ $("#nic-quota-save").onclick = async () => {
     return;
   }
   const r = await apiWrite("PUT", "/api/nic-quota", {quota_mbps: v});
-  if (r) afterWrite(v ? "网卡总限速已设为 " + v + " Mbps（tc 层级模式）"
-                      : "网卡总限速已取消（不限，回到平铺模式）");
+  if (r) {
+    state.nicDirty = false;
+    afterWrite(v ? "网卡总限速已设为 " + v + " Mbps（tc 层级模式）"
+                 : "网卡总限速已取消（不限，回到平铺模式）");
+  }
 };
 $("#nic-quota-clear").onclick = async () => {
   const r = await apiWrite("DELETE", "/api/nic-quota");
-  if (r) afterWrite("网卡总限速已取消（不限，回到平铺模式）");
+  if (r) {
+    state.nicDirty = false;
+    afterWrite("网卡总限速已取消（不限，回到平铺模式）");
+  }
 };
 $("#log-level").onchange = (e) => {
   state.logLevel = e.target.value;
