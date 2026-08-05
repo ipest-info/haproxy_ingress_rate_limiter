@@ -4,7 +4,7 @@
 # 角色：docker compose 演示环境里挂在 HAProxy backend 后面的"真实业务"
 # 替身。每个请求返回一段**随机大小**的响应体（在 [min-bytes, max-bytes]
 # 区间内均匀抽取），用来模拟大小不一的业务响应（页面、图片、下载分片），
-# 让 HAProxy frontend 的 bytes_out 产生足够真实的波动供 rl-limiter 采样。
+# 让 HAProxy frontend 的 bytes_out 产生足够真实的波动供采样端观测。
 #
 # 另有 /big 端点：**大文件下载**场景（长连接、单个响应流式传输数百 MB、
 # 在限速下要下载很久），供验证 tc 对长连接的持续限速、以及限额调整

@@ -7,8 +7,8 @@ import contextlib
 
 import pytest
 
-from rl_limiter import model
-from rl_limiter.haproxy import (
+from hap_agg import model
+from hap_agg.haproxy import (
     SHOW_INFO_CMD,
     SHOW_STAT_CMD,
     CommandError,
@@ -327,24 +327,22 @@ async def test_show_stat_over_unix_socket(tmp_path):
         assert c.endpoint() == str(sock)
 
 
-async def test_from_node_picks_wiring(tmp_path):
-    """from_node 是"该走 unix 还是 TCP"的唯一判断点，接线装配不必重复分支。"""
+async def test_both_wiring_forms_work(tmp_path):
+    """unix 与 TCP 两种接线的命令语义与解析完全一致，只有建连一步不同。"""
     sock = tmp_path / "admin.sock"
     async with fake_unix_haproxy(lambda cmd: CANNED_CSV, sock) as srv:
-        node = model.NodeConfig(name="hap-1", socket_path=str(sock))
-        stats = await RuntimeClient.from_node(node).show_stat()
+        stats = await RuntimeClient(socket_path=str(sock)).show_stat()
         assert [s.name for s in stats] == ["fe_env1", "fe_idle"]
         assert srv.commands == [SHOW_STAT_CMD]
 
     async with fake_haproxy(lambda cmd: CANNED_CSV) as srv:
-        node = model.NodeConfig(name="hap-2", host="127.0.0.1", port=srv.port)
-        stats = await RuntimeClient.from_node(node).show_stat()
+        stats = await RuntimeClient("127.0.0.1", srv.port).show_stat()
         assert [s.name for s in stats] == ["fe_env1", "fe_idle"]
 
 
 async def test_unix_socket_missing_raises(tmp_path):
     """socket 文件不存在（HAProxy 未起/路径写错）按普通采样失败上抛，
-    由 collector 的单节点容错兜住（fail-static + degraded）。"""
+    由采样器的单目标容错兜住（失败隔离 + degraded）。"""
     c = RuntimeClient(socket_path=str(tmp_path / "nope.sock"), timeout_s=1.0)
     with pytest.raises((FileNotFoundError, ConnectionError, OSError)):
         await c.show_stat()

@@ -2,7 +2,7 @@
 #
 # 这些脚本以 `python3 tools/<name>.py` 方式直跑（sys.path[0] 即 tools/
 # 目录），因此可以直接 `from _common import ...` 互相共享，而不必把
-# 演示工具的代码搬进 rl_limiter 包。
+# 演示工具的代码搬进 hap_agg 包。
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import sys
 def env_int(name: str, default: int, prog: str) -> int:
     """读取整数环境变量：未设置或空白返回 default；非法值打印带 prog
     前缀的中文错误后以退出码 1 结束进程（脚本口径的 fail-fast，区别于
-    rl_limiter.config 库口径的抛 ValueError）。"""
+    hap_agg.config 库口径的抛 ValueError）。"""
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         return default

@@ -7,13 +7,13 @@
 #       `stats socket /run/haproxy/admin.sock mode 660 level user`）
 #   --port 19991                         → 跨机集中监控（haproxy.cfg 的
 #       `stats socket ipv4@<内网IP>:9999 level user`）
-# rl-limiter 连上来后：
+# 采样端连上来后：
 #   - "show stat -1 1 -1"：返回带 "# " 列头的 CSV，其中各 frontend 的
 #     bytes_out 计数器按 --frontends 指定的速率 × 真实流逝时间持续增长
 #     （附带 --jitter 抖动），scur 在 5~50 之间随机游走，模拟真实流量；
 #   - "set map <path> <key> <value>" / "add map ..."：记录到内存 map 并在
 #     值变化时打 info 日志（保留自旧的 runtime map 方案，聚合限速架构
-#     下 rl-limiter 不再调用，仅供手工联调 runtime API），
+#     下 hap-agg 不会调用，仅供手工联调 runtime API），
 #     回包为空（与真实 HAProxy 成功时的行为一致）。
 #
 # 协议要点（与真实 runtime socket 一致）：非交互模式下一次连接只服务
@@ -52,7 +52,7 @@ class FakeFrontend:
     def advance(self) -> None:
         """按真实流逝的时间推进计数器：懒计算，只在被采样时更新。
         用真实时间差而不是固定步长，使采样节奏与增长速率解耦——
-        rl-limiter 差分出的速率因此接近 --frontends 声明的目标值。"""
+        采样端差分出的速率因此接近 --frontends 声明的目标值。"""
         now = time.monotonic()
         dt = now - self._last
         self._last = now
@@ -98,7 +98,7 @@ class FakeHAProxy:
         self.maps[(map_path, key)] = value
         if old != value:
             # 值发生变化才打日志：这是观察限速值真实下发的主要窗口。
-            log.info("收到 map 更新（当前架构下 rl-limiter 不会调用，多半来自手工联调） "
+            log.info("收到 map 更新（当前架构下 hap-agg 不会调用，多半来自手工联调） "
                      "peer=%s map=%s key=%s old=%s new=%s",
                      peer, map_path, key, old if old is not None else "-", value)
         return "\n"
@@ -173,7 +173,7 @@ async def amain(args: argparse.Namespace) -> None:
         server = await asyncio.start_server(
             fake.handle, host=args.host, port=args.port)
         endpoint = f"{args.host}:{args.port}"
-    log.info("假 HAProxy stats socket 已开始监听，等待 rl-limiter 接入 "
+    log.info("假 HAProxy stats socket 已开始监听，等待采样端接入 "
              "endpoint=%s frontends=%s jitter=%.2f",
              endpoint, frontends, args.jitter)
     try:
@@ -187,7 +187,7 @@ async def amain(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="假 HAProxy stats socket（unix 或 TCP），"
-                    "本地演示/联调 rl-limiter 用")
+                    "本地演示/联调 hap-agg 用")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 %(default)s）")
     parser.add_argument(
         "--port", type=int,

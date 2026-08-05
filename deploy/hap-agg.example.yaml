@@ -1,0 +1,27 @@
+# hap-agg（HAProxy 多实例监控聚合）配置示例。
+#
+# hap-agg 是**纯只读**的跨机观测程序：经各台机器 haproxy.cfg 里暴露的
+# 内网 TCP stats socket 批量采样 show stat / show info，把 N 台 HAProxy
+# 合并成一个视图（Web 页面 + JSON API + Prometheus /metrics）。目标机器
+# 上**不需要装任何东西**，只要 haproxy.cfg 的 global 段有一条内网 TCP
+# stats socket：
+#
+#     stats socket ipv4@<内网IP>:9999 level user
+#
+# level user 就够（本程序只读）；level admin 的 socket 也能用，但把
+# admin 级 socket 绑在 0.0.0.0 上等于把 HAProxy 的管理权暴露给全内网，
+# 强烈建议绑内网 IP 并用防火墙/安全组限制来源。
+#
+# 目标清单也可以在页面/API 上批量导入（每行一条，需设 HAP_AGG_TOKEN），
+# 导入结果回写本文件（手写注释会丢）。**手工编辑本文件要重启才生效**
+# ——运行态以进程内存为准，写 API 是唯一的运行期入口。
+
+log_level: info          # debug | info | warn | error
+poll_interval_s: 1.0     # 采样节拍（秒），0.2-60
+timeout_ms: 500          # 单目标单命令超时（连接 + 读写）
+
+# 目标清单：两种写法等价（名字缺省 = 地址本身）。
+targets:
+  - 10.0.0.11:9999
+  - name: sg-02
+    addr: 10.0.0.12:9999

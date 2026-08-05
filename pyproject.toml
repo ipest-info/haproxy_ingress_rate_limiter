@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rl-limiter"
-version = "0.4.0"
-description = "HAProxy 入口带宽限速与监控：读本机 haproxy.cfg 与 YAML 限额，经内核 tc 限速并做秒级监控"
+name = "hap-agg"
+version = "0.1.0"
+description = "HAProxy 多实例监控聚合：经内网 TCP stats socket 批量采样 N 台 HAProxy，合并成一个视图（Web 页面 + JSON API + Prometheus /metrics）"
 requires-python = ">=3.9"
 dependencies = [
     "PyYAML>=6.0",
@@ -16,15 +16,14 @@ dependencies = [
 test = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.scripts]
-rl-limiter = "rl_limiter.__main__:main"
-hap-agg = "rl_limiter.aggmain:main"
+hap-agg = "hap_agg.__main__:main"
 
 [tool.setuptools]
-packages = ["rl_limiter"]
+packages = ["hap_agg"]
 
 [tool.setuptools.package-data]
-# Web 控制台的静态页面随包分发（webconsole 按包内相对路径读取）。
-rl_limiter = ["static/*.html"]
+# Web 页面随包分发（web 模块按包内相对路径读取）。
+hap_agg = ["static/*.html"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

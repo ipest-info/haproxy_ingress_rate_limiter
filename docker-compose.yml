@@ -1,90 +1,44 @@
-# docker compose 单节点环境：一台 **Ubuntu 24.04 节点**（= HAProxy +
-# 同机 rl-limiter）。完整的三节点演示（含模拟后端与压测服务）见
-# docker-compose-demo.yml 与 docs/04-DockerCompose演示.md。
+# hap-agg 一键演示：三台 HAProxy（官方 2.8 镜像，目标机器零安装——
+# 只在 cfg 里暴露 9999 端口的 stats socket）+ 模拟后端 + 可调并发压测
+# + 聚合器本体。
 #
 #   启动：docker compose up -d --build
-#   控制台：http://localhost:8090
-#   观察：docker compose logs -f node1
+#   页面：http://localhost:8100 （批量导入/删除目标需令牌 demo-token）
 #   收场：docker compose down
-#
-# 部署形态：**rl-limiter 与 HAProxy 同机**。node 容器 = 生产上的一台
-# ECS：容器内同时跑 haproxy 与 rl-limiter，rl-limiter 通过本机 unix
-# socket（/run/haproxy/admin.sock）只采本机那台 HAProxy——stats socket
-# 不占任何网络端口。
-#
-# 配置来源只有两个本地文件（没有数据库）：
-#   - haproxy.cfg（挂 deploy/docker/haproxy-base.cfg 为模板）——负载
-#     均衡配置的**唯一权威**：监听端口、模式、后端服务器都写在这里，
-#     改完 reload HAProxy；rl-limiter 只读它解析受管 frontend 清单；
-#   - rl-limiter 的 YAML（挂 deploy/docker/limiter-node.yaml 为模板）——
-#     stats socket 接线 + quotas 限额登记（frontend 名 → Mbps）。
-# 两份文件的内容都被 rl-limiter 轮询（5s），改了即热生效。
-# 限速由本机内核 tc（HTB，按监听端口分类）执行。
-
 services:
-  # ---- 节点：Ubuntu 24.04 + HAProxy 2.8(发行版自带) + 同机 rl-limiter。
-  node1:
-    build:
-      context: .
-    # 限速由内核 tc 执行，容器默认没有操作网络设备的权限，必须显式给。
-    # 少了它 rl-limiter 一启动就会因为 tc 权限不足而退出（入口脚本会
-    # 明确报出来，不会静默地"没在限速"）。
-    cap_add:
-      - NET_ADMIN
-    # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
-    # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
-    # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
-    #
-    # 下面 HAPROXY_MAXCONN/MAXPIPES 都是 100 万，于是
-    #     FD 需求 = 1000000×2 + 1000000×2 + 34 = 4000034
-    # nofile 必须盖得住这个数（tests/test_deploy_limits.py 会盯着这条）。
-    #
-    # **注意：这已经超过宿主机 `fs.nr_open` 的默认值 1048576。** 那是单
-    # 进程 RLIMIT_NOFILE 的硬天花板，**容器里改不动**——不先在宿主机抬上去，
-    # 容器连启动都启不来（runc 设 rlimit 直接失败）。先执行：
-    #     sudo sysctl -w fs.nr_open=4194304
-    # 要持久化用 deploy/sysctl/tune-kernel.sh dump（表里已含这一项）。
-    #
-    # 开发机上不想动宿主机内核参数的话，把这两个变量连同 nofile 一起降到
-    # 10 万量级即可（10 万连接 = 400034 fd，nofile 524288 就够）。
-    #
-    # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
-    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
-    ulimits:
-      nofile:
-        soft: 4194304
-        hard: 4194304
-    volumes:
-      # 两份配置模板（入口脚本复制成容器内的普通文件，进容器改副本即可
-      # 演示热生效；副本路径见 deploy/docker/node-entrypoint.sh）。
-      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
-      - ./deploy/docker/limiter-node.yaml:/etc/rl-limiter/config-template.yaml:ro
-    environment:
-      # 与 haproxy-base.cfg 的默认值一致（100 万）。改这两个数**必须**同步
-      # 改上面的 ulimits.nofile 与宿主机的 fs.nr_open，见那段注释。
-      HAPROXY_MAXCONN: "1000000"
-      HAPROXY_MAXPIPES: "1000000"
-      RL_CONSOLE_PORT: "8090"
-      # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
-      # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
-      RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
-      # 演示需要从宿主机打开控制台，故绑 0.0.0.0；宿主机侧只映射到回环
-      # （下方 ports）。生产默认是 127.0.0.1，控制台无鉴权，切勿裸奔。
-      RL_CONSOLE_BIND: 0.0.0.0
-      # 写 API（页面/API 改限额）的演示令牌。生产上请生成随机值
-      # （openssl rand -hex 24），不设则写接口整体 403、页面只读。
-      RL_API_TOKEN: demo-token
-    ports:
-      - "127.0.0.1:8080:8080"   # fe_main（业务入口）
-      - "127.0.0.1:8090:8090"   # Web 控制台（只读）
-    networks:
-      - default
+  web:
+    build: .
+    command: python3 tools/random_web.py --port 9000
     restart: unless-stopped
 
+  node1: &node
+    image: haproxy:2.8
+    volumes:
+      - ./deploy/demo/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - web
+    restart: unless-stopped
+  node2: *node
+  node3: *node
 
-networks:
-  default:
-    ipam:
-      config:
-        - subnet: 10.211.0.0/24
-          gateway: 10.211.0.1
+  loadgen:
+    build: .
+    command: >
+      python3 tools/loadgen.py
+      --target http://node1:8080/,http://node2:8080/,http://node3:8080/
+      --concurrency 30
+    depends_on: [node1, node2, node3]
+    restart: unless-stopped
+
+  hapagg:
+    build: .
+    volumes:
+      - ./deploy/demo/hap-agg.yaml:/etc/hap-agg/config.yaml
+    environment:
+      # demo 令牌：页面/API 批量导入用。生产请生成随机值
+      # （openssl rand -hex 24），不设则写接口整体 403、页面只读。
+      HAP_AGG_TOKEN: demo-token
+    ports:
+      - "127.0.0.1:8100:8100"
+    depends_on: [node1, node2, node3]
+    restart: unless-stopped

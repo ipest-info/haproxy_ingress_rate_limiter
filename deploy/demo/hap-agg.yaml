@@ -1,0 +1,8 @@
+# hap-agg demo 配置：三台 HAProxy 节点（compose 服务名即内网主机名）。
+log_level: info
+poll_interval_s: 1.0
+timeout_ms: 500
+targets:
+  - node-1 node1:9999
+  - node-2 node2:9999
+  - node-3 node3:9999
