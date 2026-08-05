@@ -51,6 +51,7 @@ YAML（`-c` 指定：stats socket 接线、cfg 路径、quotas 限额）。运�
 | [docs/07-API文档.md](docs/07-API文档.md) | **HTTP API 参考（面向第三方开发）**：监控数据读接口（overview/history/SSE//metrics/logs）与限额写接口（令牌鉴权），字段口径、错误码、集成示例 |
 | [docs/08-内核参数调优.md](docs/08-内核参数调优.md) | **让瓶颈落在 maxconn 而不是内核默认值上**：初始化阶段的 sysctl 调优与 FD 预检、哪些容器里改不动、怎么验证真的生效 |
 | [docs/09-裸机部署.md](docs/09-裸机部署.md) | **HAProxy 已装好的机器上怎么加 rl-limiter**：一键装机脚本、两份配置文件、权限的由来 |
+| [docs/10-监控聚合.md](docs/10-监控聚合.md) | **hap-agg：多台 HAProxy 的聚合监控**——经各机内网 TCP stats socket 批量采样，IP:port 批量导入，合并成一个视图（页面 + API + /metrics），目标机器零安装 |
 
 ## 系统组成
 
@@ -66,6 +67,10 @@ rl_limiter/       # Python 3.11 + asyncio 服务（与 HAProxy 同机）
   webconsole.py   #   内置 Web 控制台（带宽曲线 + 实例视图 + 日志 + 限额编辑/写 API）
   configstore.py  #   写 API 的 YAML 回写（整份校验 + 原子替换，唯一写配置的地方）
   loop.py         #   1s 监控主循环（采集 → 超限判定 → 发布）
+  agg.py          #   hap-agg：多目标采样差分与合并（独立入口 hap-agg，见 docs/10）
+  aggconfig.py    #   hap-agg 的 YAML 配置（targets 清单 + 回写）
+  aggweb.py       #   hap-agg 的 Web 视图/API/metrics
+  aggmain.py      #   hap-agg 服务入口
 tools/            # fake_haproxy.py（联调假节点，支持 unix / TCP）
                   # random_web.py（随机大小响应的模拟后端）、loadgen.py（可调并发压测）
                   # tc_check.py（限速检查：plan 干跑 / doctor 体检 / verify 核对）
