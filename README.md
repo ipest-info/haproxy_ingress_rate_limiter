@@ -51,6 +51,7 @@ YAML（`-c` 指定：stats socket 接线、cfg 路径、quotas 限额）。运�
 | [docs/07-API文档.md](docs/07-API文档.md) | **HTTP API 参考（面向第三方开发）**：监控数据读接口（overview/history/SSE//metrics/logs）与限额写接口（令牌鉴权），字段口径、错误码、集成示例 |
 | [docs/08-内核参数调优.md](docs/08-内核参数调优.md) | **让瓶颈落在 maxconn 而不是内核默认值上**：初始化阶段的 sysctl 调优与 FD 预检、哪些容器里改不动、怎么验证真的生效 |
 | [docs/09-裸机部署.md](docs/09-裸机部署.md) | **HAProxy 已装好的机器上怎么加 rl-limiter**：一键装机脚本、两份配置文件、权限的由来 |
+| [docs/12-HAProxy监控聚合.md](docs/12-HAProxy监控聚合.md) | **`hapagg`：把多台 HAProxy 合并成一个监控视图**（独立工具，纯只读）。批量导入 IP:port 清单，经 stats socket 拉全维度数据；部分失败可见、跨机合并规则逐项交代 |
 
 ## 系统组成
 
@@ -66,7 +67,15 @@ rl_limiter/       # Python 3.11 + asyncio 服务（与 HAProxy 同机）
   webconsole.py   #   内置 Web 控制台（带宽曲线 + 实例视图 + 日志 + 限额编辑/写 API）
   configstore.py  #   写 API 的 YAML 回写（整份校验 + 原子替换，唯一写配置的地方）
   loop.py         #   1s 监控主循环（采集 → 超限判定 → 发布）
+hapagg/           # **多台 HAProxy 的监控聚合**（独立工具，纯只读；见 docs/12）
+  targets.py      #   批量导入目标清单（命名/末段区间/IPv6/去重/报错到行）
+  stats.py        #   show stat CSV 与 show info 解析 + 监控维度与跨机合并规则
+  collect.py      #   并发采集，部分失败可见
+  aggregate.py    #   合并成一个视图 + per-node 下钻
+  view.py cli.py  #   渲染与命令行
 tools/            # fake_haproxy.py（联调假节点，支持 unix / TCP）
+                  # fake_haproxy_cluster.py（假集群：完整 CSV 列头 +
+                  #   故意制造 DOWN/慢/缺 proxy/老版本，供 hapagg 联调）
                   # random_web.py（随机大小响应的模拟后端）、loadgen.py（可调并发压测）
                   # tc_check.py（限速检查：plan 干跑 / doctor 体检 / verify 核对）
 deploy/           # systemd（同机形态）、haproxy 完整配置示例、YAML 示例配置

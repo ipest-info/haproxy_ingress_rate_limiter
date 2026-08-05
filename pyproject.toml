@@ -17,9 +17,11 @@ test = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 rl-limiter = "rl_limiter.__main__:main"
+# 多台 HAProxy 的监控聚合。与 rl_limiter 不共享代码与配置，可单独拿走。
+hapagg = "hapagg.cli:main"
 
 [tool.setuptools]
-packages = ["rl_limiter"]
+packages = ["rl_limiter", "hapagg"]
 
 [tool.setuptools.package-data]
 # Web 控制台的静态页面随包分发（webconsole 按包内相对路径读取）。
