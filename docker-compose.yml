@@ -6,39 +6,14 @@
 #   页面：http://localhost:8100 （批量导入/删除目标需令牌 demo-token）
 #   收场：docker compose down
 services:
-  web:
-    build: .
-    command: python3 tools/random_web.py --port 9000
-    restart: unless-stopped
-
-  node1: &node
-    image: haproxy:2.8
-    volumes:
-      - ./deploy/demo/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-    depends_on:
-      - web
-    restart: unless-stopped
-  node2: *node
-  node3: *node
-
-  loadgen:
-    build: .
-    command: >
-      python3 tools/loadgen.py
-      --target http://node1:8080/,http://node2:8080/,http://node3:8080/
-      --concurrency 30
-    depends_on: [node1, node2, node3]
-    restart: unless-stopped
-
   hapagg:
     build: .
     volumes:
       - ./deploy/demo/hap-agg.yaml:/etc/hap-agg/config.yaml
     environment:
       # demo 令牌：页面/API 批量导入用。生产请生成随机值
-      # （openssl rand -hex 24），不设则写接口整体 403、页面只读。
+      # （openssl rand -hex 24  ），不设则写接口整体 403、页面只读。
       HAP_AGG_TOKEN: demo-token
     ports:
       - "127.0.0.1:8100:8100"
-    depends_on: [node1, node2, node3]
     restart: unless-stopped
