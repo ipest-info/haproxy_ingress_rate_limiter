@@ -793,6 +793,10 @@ async def test_debug_state_is_readonly_and_labeled():
     # FakeTc 对 `tc filter show` 有预置输出，其余 show 输出为空 → "(空)"。
     assert st["raw"][2]["text"] == "filter parent 1: protocol ip ..."
     assert st["raw"][0]["text"] == "(空)"
+    # 随附解释必须在：help（怎么读）非空，每段输出都带一句话 note——
+    # 面板是给不熟 tc 的人排障用的，光有原始输出读不懂。
+    assert st["help"]
+    assert all(r["note"] for r in st["raw"])
 
 
 async def test_debug_state_renders_failures_inline():
