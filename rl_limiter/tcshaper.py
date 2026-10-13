@@ -887,16 +887,44 @@ class TcShaper:
                     f"[命令失败 rc={rc}] {(err or '').strip()}"
             return text or "(空)"
 
+        # note/help 是给不熟 tc 的人看的随附解释（页面上 note 跟在命令
+        # 标签后，help 收在"怎么读"折叠块里）。解释随数据一起出——页面
+        # 对内容零假设，派生分支（入向 police 等）各自带自己的解释。
         return {
             "iface": self.iface,
+            "help": [
+                "classid 的次要号是十六进制端口：如 1:1f90 = 端口 8080"
+                "（0x1f90）那个 frontend 的队列；1:1 是未登记限额的流量走"
+                "的默认类（线速不限）；1:ffff 是实例总闸（设了实例总限速"
+                "才有，各 frontend 类挂在它下面）。",
+                "rate/ceil：该类的保障速率/上限，两者相等就是硬限速；"
+                "burst/cburst：允许的瞬时突发字节数（本服务显式算好下发，"
+                "不留给 tc 按 MTU 兜底）。",
+                "Sent N bytes M pkt：建类以来的累计流量；dropped：队列放"
+                "不下被丢掉的包；overlimits：因触到限速被刹车的次数——"
+                "限额吃不吃紧主要看这两个在不在涨。",
+                "backlog：此刻还排在队列里的字节/包，持续不为 0 说明流量"
+                "正顶着限额跑；tokens/ctokens：令牌桶余量（负数 = 正在"
+                "刹车）。",
+                "排障顺序：先对「期望配置」——该有的端口类在不在、rate 对"
+                "不对；不一致说明配置还没下发或网卡被人动过，去日志里找 "
+                "tc 相关告警。",
+            ],
             "raw": [
                 {"label": f"tc -s qdisc show dev {self.iface}",
+                 "note": "整张网卡的根队列（htb 1:）总体统计；default 0x1 "
+                         "= 没匹配到任何 frontend 的流量走 1:1 默认类。",
                  "text": await run(["tc", "-s", "qdisc", "show",
                                     "dev", self.iface])},
                 {"label": f"tc -s class show dev {self.iface}",
+                 "note": "一个 frontend 一个类（限速的执行单元），速率与"
+                         "统计都在这段——看限速执行情况主要看它。",
                  "text": await run(["tc", "-s", "class", "show",
                                     "dev", self.iface])},
                 {"label": f"tc filter show dev {self.iface}",
+                 "note": "分流规则：按出向包的 TCP 源端口（= frontend 监听"
+                         "端口）送进对应的类；match 1f900000/ffff0000 at "
+                         "20 即「源端口 = 0x1f90（8080）」。",
                  "text": await run(["tc", "filter", "show",
                                     "dev", self.iface])},
             ],
