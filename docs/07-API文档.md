@@ -116,7 +116,8 @@ curl -s http://127.0.0.1:8090/api/overview
   "config_version": 3750930076,
   "units": {                        // 按 frontend 名索引
     "fe_main": {
-      "rate_bytes_per_s": 4998321.0,    // 实时下行速率（限速的方向）
+      "rate_bytes_per_s": 4998321.0,    // 瞬时下行速率（1s 差分；控制台
+                                        // 显示用的是它的 5s 滚动均值）
       "mean10_bytes_per_s": 5003210.0,  // 10 秒滑动均值（计费/超限判定口径）
       "ewma60_bytes_per_s": 4712000.0,  // 60 秒指数均值
       "rate_in_bytes_per_s": 88231.0,   // 实时上行速率

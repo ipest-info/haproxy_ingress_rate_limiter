@@ -6,7 +6,8 @@
 rl-limiter**——rl-limiter 通过容器内的 unix socket
 （`/run/haproxy/admin.sock`）只采本机那台 HAProxy，stats socket
 不占任何网络端口、也无需跨容器可达。限速由各节点的**内核 tc（HTB）**
-执行（各 40 Mbps）。
+执行。**端口默认不限速**：demo 起来后先给 fe_main 登记限额（最快的
+方式是控制台，见下文"改限额"），再观察限速效果。
 
 配置来源只有两个本地文件（**没有数据库**）：
 
@@ -14,7 +15,8 @@ rl-limiter**——rl-limiter 通过容器内的 unix socket
   配置的**唯一权威**：`listen fe_main` 监听 8080、转发到 `web:9000`
   都直接写在里面；
 - **rl-limiter 的 YAML**（模板 `deploy/docker/limiter-node.yaml`）——
-  stats socket 接线 + quotas 限额登记（`fe_main: 40`）。
+  stats socket 接线 + quotas 限额登记（**默认空**：端口不登记就不限速、
+  只监控）。
 
 rl-limiter 轮询两份文件的内容（5s），改了即热生效。后端挂一个**每次请求
 返回随机大小响应**的模拟 web 服务，再用一个**可在线调节并发数的压测
@@ -98,7 +100,7 @@ docker compose exec node1 tc class show dev eth0          # tc 速率类（1:1f9
 
 ```
 吞吐观测 concurrency=24 total_mbps=115.8 ...（表格按入口逐行：并发/速率/请求/错误/状态）
-  http://node1:8080/  …  ≈40 Mbps  正常   ← 每台节点被内核 tc 精确压在 40M
+  http://node1:8080/  …  ≈40 Mbps  正常   ← 给 fe_main 登记 40M 后被内核 tc 精确压住
 ```
 
 宿主机也可以直接体验：`curl -o /dev/null http://localhost:8080/`。
@@ -229,11 +231,17 @@ curl http://localhost:8084/status    # big_downloads[]：每条在途下载的
 改副本即可演示热生效——改 node1 不会牵动 node2/node3，与生产上"每台
 机器一份自己的配置"完全一致。
 
-**改限额（不 reload，存量连接立刻跟上）**：
+**设/改限额（不 reload，存量连接立刻跟上）**。最快的方式是控制台：
+页头填 API 令牌（demo 的 `RL_API_TOKEN=demo-token`），在 fe_main 卡片
+右上角输入限额保存即可。命令行等价操作：
 
 ```bash
-# 把 node1 的 fe_main 从 40 Mbps 降到 20 Mbps
-docker compose exec node1 sed -i 's/fe_main: 40/fe_main: 20/' \
+# 给 node1 的 fe_main 登记 40 Mbps（端口默认不限速，首次要先登记）
+curl -X PUT http://localhost:8090/api/quotas/fe_main \
+  -H "X-API-Token: demo-token" -d '{"quota_mbps": 40}'
+
+# 或直接改容器内的 YAML 副本（把 40 改成 20 同理）：
+docker compose exec node1 sed -i 's/^quotas: {}/quotas: {fe_main: 20}/' \
   /etc/rl-limiter/config.yaml
 
 # ≤5s 内观察它落到数据面：

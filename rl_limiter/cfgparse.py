@@ -135,7 +135,8 @@ def build_frontends(
     合并规则：
       - cfg 里有、quotas 里登记了正限额 → 限速 + 监控；
       - cfg 里有、quotas 里没有 → **只监控不限速**（quota_mbps=0，
-        不建 tc 类、不做超限判定），warn 一次提示未登记限额；
+        不建 tc 类、不做超限判定）——**默认不限速**是正常状态，
+        只记一条 info 供排障时核对，不按异常告警；
       - cfg 里有、quotas 里**显式写 0** → 同样只监控不限速，但这是
         运维的明确决定，不再 warn；
       - quotas 里有、cfg 里没有 → warn 一次（多半是 cfg 里删了段、或
@@ -184,10 +185,12 @@ def build_frontends(
             key = f"noquota:{s.name}"
             if key not in warned:
                 warned.add(key)
-                log.warning(
-                    "frontend 未在 YAML 的 quotas 里登记限额，只监控不限速 "
-                    "section=%s bind=%s:%d（要限速请在配置文件 quotas 段加"
-                    "一行：%s: <Mbps>）",
+                # 端口**默认不限速**：未登记限额是正常状态，不按异常
+                # 告警，只记一条 info 供排障时核对"到底限了谁"。
+                log.info(
+                    "frontend 未登记限额，默认不限速（只监控） "
+                    "section=%s bind=%s:%d（要限速可在控制台/写 API 设置，"
+                    "或在配置文件 quotas 段加一行：%s: <Mbps>）",
                     s.name, addr or "*", port, s.name)
         out.append(model.FrontendConfig(
             name=s.name, bind_address=addr, bind_port=port,

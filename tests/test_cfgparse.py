@@ -114,25 +114,28 @@ def test_merge_quota_and_monitor_only():
     assert fes["fe_api"].quota_mbps == 0 and not fes["fe_api"].limited
 
 
-def test_unregistered_frontend_warns_once(caplog):
+def test_unregistered_frontend_notes_once_at_info(caplog):
+    """端口默认不限速：未登记限额只记 info（不是 warning——那是正常
+    状态），且同一集合内只记一次不刷屏。"""
     warned: set[str] = set()
-    with caplog.at_level(logging.WARNING, logger="t.cfgparse"):
+    with caplog.at_level(logging.INFO, logger="t.cfgparse"):
         build({"fe_main": 40}, warned=warned)
-        n = len([r for r in caplog.records if "只监控不限速" in r.getMessage()])
-        assert n == 2                       # fe_api、fe_edge 各一条
+        notes = [r for r in caplog.records if "默认不限速" in r.getMessage()]
+        assert len(notes) == 2              # fe_api、fe_edge 各一条
+        assert all(r.levelno == logging.INFO for r in notes)
         build({"fe_main": 40}, warned=warned)   # 同一集合：不再刷屏
         assert len([r for r in caplog.records
-                    if "只监控不限速" in r.getMessage()]) == n
+                    if "默认不限速" in r.getMessage()]) == 2
 
 
 def test_explicit_zero_quota_is_silent_monitor_only(caplog):
     """quotas 显式写 0 = 运维确认过的不限速：行为与未登记相同（不建 tc
-    类），但**不再告警**——告警是给"忘了登记"准备的。"""
-    with caplog.at_level(logging.WARNING, logger="t.cfgparse"):
+    类），连 info 也不记——那条 info 是给"核对到底限了谁"准备的。"""
+    with caplog.at_level(logging.INFO, logger="t.cfgparse"):
         fes = {f.name: f for f in build({"fe_main": 40, "fe_api": 0,
                                          "fe_edge": 0})}
     assert not fes["fe_api"].limited and not fes["fe_edge"].limited
-    assert not [r for r in caplog.records if "只监控不限速" in r.getMessage()]
+    assert not [r for r in caplog.records if "默认不限速" in r.getMessage()]
 
 
 def test_orphan_quota_warns_and_is_ignored(caplog):

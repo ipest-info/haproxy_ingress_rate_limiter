@@ -15,14 +15,19 @@ haproxy:
   timeout_ms: 500
 
 # 出向带宽**目标**：frontend 名（= cfg 里的段名）→ Mbps。
-# 本分支（闭环形态）里它不驱动出向 HTB（compose 已把出向 tc 关掉，
-# RL_TC_IFACE=-），而是作为 dynamic_ingress 闭环的**目标值**：实测出向
-# 带宽超过它就压入向、低于它就松入向。改这里一个轮询周期（5s）内热生效。
-quotas:
-  fe_main: 40
+# **端口默认不限速**：不登记就只监控。本分支（闭环形态）里这个数字
+# 不驱动出向 HTB（compose 已把出向 tc 关掉，RL_TC_IFACE=-），而是
+# dynamic_ingress 闭环的**目标值**：实测出向带宽超过它就压入向、低于
+# 它就松入向。要启用限速：用控制台（页头填 API 令牌 demo-token）或
+# 写 API 登记，或直接改容器内 /etc/rl-limiter/config.yaml（解开下面
+# 的示例行，并同时解开 request_limits——闭环两样都要）。改动一个轮询
+# 周期（5s）内热生效。
+quotas: {}
+#   fe_main: 40
 
 # 请求方向（入向）限速：双网卡形态（demo 的 compose 已是双网络拓扑，
-# 客户端侧网卡由入口脚本按 RL_FRONT_SUBNET 自动定位）。
+# 客户端侧网卡由入口脚本按 RL_FRONT_SUBNET 自动定位）。默认不登记 =
+# 入向也不限速；启用闭环时解开下面的示例。
 #   mbps      入向带宽的**上限**（闭环的起点与封顶）：动态调节在
 #             [floor_ratio×mbps, mbps] 区间内活动。入向主要是 GET 请求
 #             + 回传 ACK（ACK 约为下载带宽的 1/40~1/20），10 Mbps 对
@@ -30,15 +35,16 @@ quotas:
 #   conn_rate 每秒新建连接上限（静态，不参与闭环——这是防滥用阈值）。
 #             demo 的压测是短连接，1000 并发 ÷ 3 节点 ≈ 每节点 200~300
 #             conn/s 的供给——设 150 能明显看到 SYN 速率闸在工作。
-request_limits:
-  fe_main:
-    mbps: 10
-    conn_rate: 150
+request_limits: {}
+#   fe_main:
+#     mbps: 10
+#     conn_rate: 150
 
 # 入向动态限速（闭环）：按实测出向带宽（10s 均值）对照 quotas 目标，
 # 平缓调整入向 police 上限——超了小步压、低了小步松、目标附近不动。
-# 其余参数用默认值（调节周期 15s、死区 [0.85, 1.0]×目标、上调 +5%/次、
-# 下调封顶 -10%/次、下限 10%×上限、变化 <2% 不下发），字段语义与算法
-# 见 rl_limiter/ingressgov.py。本段启动时定型，改了要重启容器。
+# 开着无妨：quotas/request_limits 没登记时它没有可调的对象，不做任何
+# 动作。其余参数用默认值（调节周期 15s、死区 [0.85, 1.0]×目标、上调
+# +5%/次、下调封顶 -10%/次、下限 10%×上限、变化 <2% 不下发），字段
+# 语义与算法见 rl_limiter/ingressgov.py。本段启动时定型，改了要重启。
 dynamic_ingress:
   enabled: true
