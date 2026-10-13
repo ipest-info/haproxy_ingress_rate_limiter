@@ -305,8 +305,8 @@ input:focus, select:focus {
           <div><div class="stat-l">活跃 / 非活跃</div><div class="stat-v" id="i-actidle">–</div></div>
           <div><div class="stat-l">每秒新建</div><div class="stat-v" id="i-new">–</div></div>
           <div><div class="stat-l">每秒丢失</div><div class="stat-v" id="i-denied">–</div></div>
-          <div><div class="stat-l">流入带宽</div><div class="stat-v" id="i-rin">–<small>Mbps</small></div></div>
-          <div><div class="stat-l">流出带宽</div><div class="stat-v" id="i-rout">–<small>Mbps</small></div></div>
+          <div><div class="stat-l">流入带宽（5s 均值）</div><div class="stat-v" id="i-rin">–<small>Mbps</small></div></div>
+          <div><div class="stat-l">流出带宽（5s 均值）</div><div class="stat-v" id="i-rout">–<small>Mbps</small></div></div>
           <div><div class="stat-l">连接上限</div><div class="stat-v" id="i-maxconn">–</div></div>
           <div><div class="stat-l">HAProxy 空闲率</div><div class="stat-v" id="i-idle">–<small>%</small></div></div>
         </div>
@@ -406,6 +406,20 @@ const fmtMbps = (bps) => (bps * 8 / 1e6).toFixed(2);
 const fmtRate = (v) => (v >= 100 ? Math.round(v).toString()
                       : v >= 10 ? v.toFixed(1) : v.toFixed(2));
 const fmtInt = (v) => Math.round(v || 0).toString();
+
+// 实时带宽的**显示口径：5 秒滚动平均**。1 秒差分的瞬时值毛刺太大
+// （短连接场景尤甚），读数一跳一跳没法读；5s 滚动均值够"实时"又够稳。
+// 只影响显示：服务端的告警/承诺口径仍是 10s 均值（st-mean 那格），
+// API 返回的 rate_* 字段仍是瞬时值。
+function roll5(buf, key) {
+  if (!buf.length) return 0;
+  const last = buf[buf.length - 1];
+  let s = 0, n = 0;
+  for (let i = buf.length - 1; i >= 0 && last.ts - buf[i].ts <= 4.5; i--) {
+    s += buf[i][key] || 0; n++;
+  }
+  return n ? s / n : 0;
+}
 
 const state = {
   fes: new Map(),            // frontend 名 → {buf, conf, card, charts…}
@@ -605,11 +619,11 @@ function buildInstanceCharts() {
       ],
     }),
     makeChart(bw, {
-      title: "实例带宽统计", source: "HAProxy 应用层口径",
+      title: "实例带宽统计", source: "HAProxy 应用层口径 · 5s 滚动均值",
       fmt: fmtMbps, unit: "Mbps", points: pts,
       series: [
-        {key: "rin", label: "流入带宽", color: "--s-in"},
-        {key: "rout", label: "流出带宽", color: "--s-out"},
+        {key: "rin5", label: "流入带宽", color: "--s-in"},
+        {key: "rout5", label: "流出带宽", color: "--s-out"},
       ],
     }),
     makeChart(bw, {
@@ -639,8 +653,11 @@ function updateInstance(i) {
   set("#i-actidle", fmtInt(i.active_conns) + " / " + fmtInt(i.idle_conns));
   set("#i-new", fmtRate(i.conn_new_ps), "个/秒");
   set("#i-denied", fmtRate(i.conn_denied_ps), "个/秒");
-  set("#i-rin", fmtMbps(i.rate_in_bytes_per_s), "Mbps");
-  set("#i-rout", fmtMbps(i.rate_out_bytes_per_s), "Mbps");
+  const itail = state.instBuf[state.instBuf.length - 1];
+  set("#i-rin", fmtMbps(itail && itail.rin5 !== undefined
+    ? itail.rin5 : i.rate_in_bytes_per_s), "Mbps");
+  set("#i-rout", fmtMbps(itail && itail.rout5 !== undefined
+    ? itail.rout5 : i.rate_out_bytes_per_s), "Mbps");
   set("#i-maxconn", i.max_conn ? fmtInt(i.max_conn) : "–");
   set("#i-idle", fmtInt(i.idle_pct), "%");
   $("#inst-degraded").hidden = !i.degraded;
@@ -672,7 +689,7 @@ function ensureCard(name) {
     </div>
     <div class="card-body">
       <div class="stats">
-        <div><div class="stat-l">实时下行</div><div class="stat-v st-rate">–<small>Mbps</small></div></div>
+        <div><div class="stat-l">实时下行（5s 均值）</div><div class="stat-v st-rate">–<small>Mbps</small></div></div>
         <div><div class="stat-l">10s 均值</div><div class="stat-v st-mean">–<small>Mbps</small></div></div>
         <div><div class="stat-l">限额</div><div class="stat-v st-quota">–<small>Mbps</small></div></div>
         <div><div class="stat-l">利用率</div><div class="stat-v st-util">–</div></div>
@@ -703,11 +720,11 @@ function ensureCard(name) {
       ],
     }),
     makeChart(grid, {
-      title: "带宽统计", source: "bin / bout 差分（应用层）",
+      title: "带宽统计", source: "bin / bout 差分（应用层）· 5s 滚动均值",
       fmt: fmtMbps, unit: "Mbps", points: pts,
       series: [
-        {key: "rin", label: "流入带宽", color: "--s-in"},
-        {key: "rout", label: "流出带宽", color: "--s-out"},
+        {key: "rin5", label: "流入带宽", color: "--s-in"},
+        {key: "rout5", label: "流出带宽", color: "--s-out"},
         {key: "mean", label: "流出 10s 均值", color: "--s-mean"},
       ],
       // 限额参考线只对流出方向有意义——tc 只整形出方向。
@@ -779,7 +796,9 @@ function updateCard(fe, u) {
   if (!u) return;
   const set = (sel, v, unit) =>
     $(sel, c).innerHTML = esc(v) + (unit ? `<small>${unit}</small>` : "");
-  set(".st-rate", fmtMbps(u.rate_bytes_per_s), "Mbps");
+  const ftail = fe.buf[fe.buf.length - 1];
+  set(".st-rate", fmtMbps(ftail && ftail.rout5 !== undefined
+    ? ftail.rout5 : u.rate_bytes_per_s), "Mbps");
   set(".st-mean", fmtMbps(u.mean10_bytes_per_s), "Mbps");
   set(".st-quota", u.quota_bytes_per_s ? fmtMbps(u.quota_bytes_per_s) : "–",
       u.quota_bytes_per_s ? "Mbps" : "");
@@ -809,6 +828,9 @@ function applySnapshot(snap, live) {
       din: i.drop_in_ps, dout: i.drop_out_ps,
     });
     if (state.instBuf.length > BUF_MAX) state.instBuf.shift();
+    const ie = state.instBuf[state.instBuf.length - 1];
+    ie.rin5 = roll5(state.instBuf, "rin");
+    ie.rout5 = roll5(state.instBuf, "rout");
     if (live) {
       updateInstance(i);
       if (state.tab === "instance") for (const ch of state.instCharts) drawChart(ch);
@@ -828,6 +850,9 @@ function applySnapshot(snap, live) {
       overlimit: u.overlimit_ps || 0,
     });
     if (fe.buf.length > BUF_MAX) fe.buf.shift();
+    const feen = fe.buf[fe.buf.length - 1];
+    feen.rin5 = roll5(fe.buf, "rin");
+    feen.rout5 = roll5(fe.buf, "rout");
     if (live) {
       updateCard(fe, u);
       if (state.tab === "frontend") for (const ch of fe.charts) drawChart(ch);

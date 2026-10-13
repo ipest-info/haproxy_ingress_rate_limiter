@@ -19,7 +19,8 @@
 #     均衡配置的**唯一权威**：监听端口、模式、后端服务器都写在这里，
 #     改完 reload HAProxy 即生效，rl-limiter 只读它解析受管清单；
 #   - rl-limiter 的 YAML（挂 deploy/docker/limiter-node.yaml 为模板）——
-#     stats socket 接线 + quotas 限额登记（fe_main: 40 Mbps）。
+#     stats socket 接线 + quotas 限额登记（**默认不登记 = 全部端口不
+#     限速**，demo 起来后用控制台/写 API 给 fe_main 设限额来观察限速）。
 # 两份文件的内容都被 rl-limiter 轮询（5s），改了即热生效。
 #
 # 拓扑（三台 TCP L4 节点，各自独立）：
@@ -27,7 +28,7 @@
 #                          └──> web:9000（随机大小响应）
 #   node{1,2,3} 内的 rl-limiter ──show stat──> 本机 unix socket（不出容器）
 #   node{1,2,3} 内的 rl-limiter ──轮询──> 本机 haproxy.cfg + YAML（热更新）
-# 限速由各台机器的内核 tc（各 40 Mbps）在本机执行。每个控制台只展示
+# 限速（登记限额后）由各台机器的内核 tc 在本机执行。每个控制台只展示
 # 本机那台 HAProxy（只读监控；改配置 = 进容器改那两份文件）。
 
 services:

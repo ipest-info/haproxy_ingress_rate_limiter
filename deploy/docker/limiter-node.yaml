@@ -14,8 +14,10 @@ haproxy:
   cfg_path: /etc/haproxy/haproxy.cfg
   timeout_ms: 500
 
-# 限额登记：frontend 名（= cfg 里的段名）→ Mbps。改这里（容器内
-# /etc/rl-limiter/config.yaml）一个轮询周期（5s）内热生效，tc 即时换挡，
-# 不需要 reload HAProxy、更不需要重启。
-quotas:
-  fe_main: 40
+# 限额登记：frontend 名（= cfg 里的段名）→ Mbps。**端口默认不限速**：
+# 不登记就只监控；要限速时用控制台（页头填 API 令牌 demo-token 后在
+# 卡片上设置）、写 API，或直接改容器内 /etc/rl-limiter/config.yaml
+# （比如解开下面一行）——都是一个轮询周期（5s）内热生效，tc 即时
+# 换挡，不需要 reload HAProxy、更不需要重启。
+quotas: {}
+#   fe_main: 40
