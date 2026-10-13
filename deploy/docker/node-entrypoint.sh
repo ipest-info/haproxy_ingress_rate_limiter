@@ -151,6 +151,39 @@ tc_selfcheck() {
     log "限速自检通过：tc 可用、有 CAP_NET_ADMIN、内核支持 HTB"
     return 0
 }
+# ---- 双网卡：按网段定位客户端侧网卡 -------------------------------------
+# compose 给容器接两个网络时，容器内 eth0/eth1 的先后顺序**不可靠**
+# （接入顺序受网络名排序影响，且各 compose 版本行为不一），所以不能
+# 写死网卡名——按 IP 网段找才稳：RL_FRONT_SUBNET 给出客户端侧网段前缀
+# （如 "10.211.1."），脚本据此解析出网卡名并导出 RL_TC_IFACE（出向
+# HTB）与 RL_TC_IN_IFACE（入向 police）。两者都在客户端侧那张上——
+# 后端流量在另一张网卡上，物理隔开、绝不误伤。
+# 显式给的 RL_TC_IFACE / RL_TC_IN_IFACE 优先（含 "-" 关闭）。
+iface_by_subnet() {
+    # $1 = IP 前缀（如 10.211.1.）。输出第一个地址匹配的网卡名。
+    ip -o -4 addr show scope global 2>/dev/null         | awk -v p="$1" 'index($4, p) == 1 { print $2; exit }'
+}
+if [ "${RL_TC_IFACE:-}" = "-" ]; then
+    # 监控-only 模式：入向限速也随之默认关闭（除非显式指定）——
+    # 沙箱/CI 内核缺 tc 模块时整个节点退化为纯监控。
+    if [ -z "${RL_TC_IN_IFACE:-}" ]; then
+        export RL_TC_IN_IFACE="-"
+    fi
+elif [ -n "${RL_FRONT_SUBNET:-}" ]; then
+    front_if=$(iface_by_subnet "$RL_FRONT_SUBNET")
+    if [ -z "$front_if" ]; then
+        log "致命：按网段 $RL_FRONT_SUBNET 找不到客户端侧网卡——compose 的"
+        log "致命：networks 配置与 RL_FRONT_SUBNET 对不上。容器内地址："
+        ip -o -4 addr show scope global 2>/dev/null | while read -r line; do
+            log "致命：  $line"
+        done
+        exit 1
+    fi
+    export RL_TC_IFACE="${RL_TC_IFACE:-$front_if}"
+    export RL_TC_IN_IFACE="${RL_TC_IN_IFACE:-$front_if}"
+    log "双网卡：已按网段 $RL_FRONT_SUBNET 定位客户端侧网卡 iface=$front_if"         "（出向 HTB 与入向 police 都在这张上）RL_TC_IFACE=$RL_TC_IFACE"         "RL_TC_IN_IFACE=$RL_TC_IN_IFACE"
+fi
+
 if [ "${RL_TC_IFACE:-}" = "-" ]; then
     log "警告：已显式关闭 tc 限速（RL_TC_IFACE=-），本节点只做监控"
 elif ! tc_selfcheck; then

@@ -168,6 +168,15 @@ curl -X PUT http://localhost:8084/concurrency -d '0'           # 暂停打流
 限额——tc 限总量，各连接动态分享额度（新连接加入时存量连接立即让出
 份额，无需重连）。
 
+## 双网卡拓扑（本分支）
+
+compose 起的是**双网络**：`frontnet`（loadgen ↔ 节点，客户端侧）与
+`backnet`（节点 ↔ web，后端侧）——每台节点两张网卡，与分支 1 的部署
+前提一致。入口脚本按 `RL_FRONT_SUBNET` 网段自动定位客户端侧网卡并
+导出 `RL_TC_IFACE`/`RL_TC_IN_IFACE`；入向限速（request_limits）已在
+`limiter-node.yaml` 里默认启用，详见
+[10-双网卡请求方向限速.md](10-双网卡请求方向限速.md) §4。
+
 ## 压测场景说明（默认：小文件短连接）
 
 默认场景刻意贴近真实业务：**大量慢客户端访问小文件**——

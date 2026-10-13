@@ -19,3 +19,16 @@ haproxy:
 # 不需要 reload HAProxy、更不需要重启。
 quotas:
   fe_main: 40
+
+# 请求方向（入向）限速：双网卡形态（demo 的 compose 已是双网络拓扑，
+# 客户端侧网卡由入口脚本按 RL_FRONT_SUBNET 自动定位）。
+#   mbps      入向带宽上限。下载型业务的入向主要是 GET 请求 + 回传 ACK
+#             （ACK 流量约为下载带宽的 1/40~1/20），10 Mbps 对 40M 的
+#             下载限额来说留足了余量，不会误伤 ACK；
+#   conn_rate 每秒新建连接上限。demo 的压测是短连接（每请求一条新连接），
+#             1000 并发 ÷ 3 节点 ≈ 每节点 200~300 conn/s 的供给——设 150
+#             能明显看到 SYN 速率闸在工作（loadgen 错误/延迟上升）。
+request_limits:
+  fe_main:
+    mbps: 10
+    conn_rate: 150

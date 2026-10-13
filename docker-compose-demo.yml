@@ -43,6 +43,7 @@ services:
       # /big 大文件下载端点的默认大小：512 MiB（40 Mbps 限速下约 100s
       # 下完），供长连接大文件场景（loadgen 的 big worker）使用。
       WEB_BIG_BYTES: ${WEB_BIG_BYTES:-536870912}
+    networks: [backnet]          # 后端只在后端侧网络：节点经 eth-back 访问它
     restart: unless-stopped
 
   # ---- 三台节点：Ubuntu 24.04 + HAProxy 2.8(发行版自带) + 同机 rl-limiter。
@@ -82,6 +83,10 @@ services:
       HAPROXY_MAXCONN: "100000"
       HAPROXY_MAXPIPES: "100000"
       RL_CONSOLE_PORT: "8090"
+      # 双网卡：按网段定位客户端侧网卡（compose 接两个网络时 eth0/eth1
+      # 的先后顺序不可靠，入口脚本按 IP 网段找）。入向限速（request_
+      # limits）与出向限速都落在客户端侧那张上。
+      RL_FRONT_SUBNET: "10.211.1."
       # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
       # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
       RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
@@ -97,6 +102,7 @@ services:
     depends_on:
       web:
         condition: service_started
+    networks: [frontnet, backnet]   # 双网卡：客户端侧 + 后端侧
     restart: unless-stopped
 
   node2:
@@ -132,6 +138,10 @@ services:
       HAPROXY_MAXCONN: "100000"
       HAPROXY_MAXPIPES: "100000"
       RL_CONSOLE_PORT: "8090"
+      # 双网卡：按网段定位客户端侧网卡（compose 接两个网络时 eth0/eth1
+      # 的先后顺序不可靠，入口脚本按 IP 网段找）。入向限速（request_
+      # limits）与出向限速都落在客户端侧那张上。
+      RL_FRONT_SUBNET: "10.211.1."
       # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
       # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
       RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
@@ -145,6 +155,7 @@ services:
     depends_on:
       web:
         condition: service_started
+    networks: [frontnet, backnet]   # 双网卡：客户端侧 + 后端侧
     restart: unless-stopped
 
   node3:
@@ -180,6 +191,10 @@ services:
       HAPROXY_MAXCONN: "100000"
       HAPROXY_MAXPIPES: "100000"
       RL_CONSOLE_PORT: "8090"
+      # 双网卡：按网段定位客户端侧网卡（compose 接两个网络时 eth0/eth1
+      # 的先后顺序不可靠，入口脚本按 IP 网段找）。入向限速（request_
+      # limits）与出向限速都落在客户端侧那张上。
+      RL_FRONT_SUBNET: "10.211.1."
       # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
       # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
       RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
@@ -193,6 +208,7 @@ services:
     depends_on:
       web:
         condition: service_started
+    networks: [frontnet, backnet]   # 双网卡：客户端侧 + 后端侧
     restart: unless-stopped
 
   # ---- 客户端群：可在线调节并发数的压测服务（模拟并发带宽）----
@@ -223,11 +239,22 @@ services:
       - node1
       - node2
       - node3
+    networks: [frontnet]         # 客户端群只在客户端侧网络
     restart: unless-stopped
 
+# 双网络拓扑 = 每台节点双网卡（分支 1 的部署前提）：
+#   frontnet 客户端侧（loadgen ↔ 节点）：出向 HTB 与入向 police 都在
+#            节点的这张网卡上；
+#   backnet  后端侧（节点 ↔ web）：后端流量物理隔开，绝不会被误伤。
+# 网段固定：入口脚本按 RL_FRONT_SUBNET 前缀定位客户端侧网卡名。
 networks:
-  default:
+  frontnet:
     ipam:
       config:
-        - subnet: 10.211.0.0/24
-          gateway: 10.211.0.1
+        - subnet: 10.211.1.0/24
+          gateway: 10.211.1.1
+  backnet:
+    ipam:
+      config:
+        - subnet: 10.211.2.0/24
+          gateway: 10.211.2.1
