@@ -48,8 +48,10 @@ class FakeTc:
         return 0, "", ""
 
     def mutations(self):
-        """只保留会改变内核状态的命令（show 是只读的）。"""
-        return [c for c in self.calls if c[2] != "show"]
+        """只保留会改变内核状态的命令（show 是只读的）。按"命令里是否
+        含 show"判断而不是看固定位置——`tc -s qdisc show` 的 -s 会把
+        动词挤到别的下标去。"""
+        return [c for c in self.calls if "show" not in c]
 
 
 def shaper(**kw):
@@ -771,3 +773,34 @@ async def test_instance_mode_failure_reports_not_ok():
     sh, fake = shaper(fail_on=("class add",))
     res = await sh.reconcile([fe(port=8080, quota=40.0)], INST)
     assert not res.ok and res.error
+
+
+# ---------------------------------------------------------------------------
+# debug_state：控制台 tc 调试面板的数据源
+# ---------------------------------------------------------------------------
+
+async def test_debug_state_is_readonly_and_labeled():
+    """三段原始输出（qdisc/class/filter），每段带完整命令做标签；
+    全程只读——调试面板绝不能碰内核状态。"""
+    sh, fake = shaper(filters="filter parent 1: protocol ip ...")
+    st = await sh.debug_state()
+    assert st["iface"] == IFACE
+    labels = [r["label"] for r in st["raw"]]
+    assert labels == [f"tc -s qdisc show dev {IFACE}",
+                      f"tc -s class show dev {IFACE}",
+                      f"tc filter show dev {IFACE}"]
+    assert fake.mutations() == []
+    # FakeTc 对 `tc filter show` 有预置输出，其余 show 输出为空 → "(空)"。
+    assert st["raw"][2]["text"] == "filter parent 1: protocol ip ..."
+    assert st["raw"][0]["text"] == "(空)"
+
+
+async def test_debug_state_renders_failures_inline():
+    """某条 show 失败时把错误文本当输出展示（面板上能看出是哪条命令
+    怎么失败的），而不是整个接口报错。"""
+    sh, fake = shaper(fail_on=("qdisc show",))
+    st = await sh.debug_state()
+    assert "[命令失败 rc=1]" in st["raw"][0]["text"]
+    assert "fake failure" in st["raw"][0]["text"]
+    # 其余两条照常。
+    assert "[命令失败" not in st["raw"][1]["text"]

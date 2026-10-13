@@ -209,6 +209,26 @@ input:focus, select:focus {
 /* ---- 令牌输入（页头） ---- */
 #api-token { width: 150px; padding: 4px 8px; font-size: 12px; }
 
+/* ---- tc 实况（调试面板） ----
+   页面对 /api/tc 的结构零假设：有几个 section 画几个，每个 section 里有
+   几段原始输出画几段。这样派生分支（入向 police 等）在服务端多返回一个
+   section 就自动出现在页面上，前端不用随分支改。 */
+.tc-section + .tc-section { margin-top: 18px; }
+.tc-sec-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tc-sec-title { font-size: 13px; font-weight: 600; }
+.tc-desired { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
+.tc-pre-label {
+  font: 11.5px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  color: var(--text-muted); margin-top: 10px;
+}
+.tc-pre {
+  margin: 4px 0 0; padding: 8px 10px; border-radius: 7px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  font: 12px/1.55 ui-monospace, Menlo, Consolas, monospace;
+  white-space: pre-wrap; word-break: break-all;
+  max-height: 280px; overflow-y: auto;
+}
+
 /* ---- toast：写 API 的结果反馈 ---- */
 #toast {
   position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
@@ -312,6 +332,19 @@ input:focus, select:focus {
       <div class="card-head"><span class="card-title">带宽视图</span>
         <span class="hint">带宽为 HAProxy 应用层口径；数据包为网卡口径</span></div>
       <div class="card-body"><div class="chart-grid" id="i-bw-charts"></div></div>
+    </div>
+
+    <!-- tc 实况：排障时把"期望配置"和内核里 tc 的原始输出摆在一起看。
+         不自动轮询（tc show 的原始文本一秒一刷没法读），打开页面取一次，
+         之后手动刷新。 -->
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">tc 实况（调试）</span>
+        <span class="hint" id="tc-updated"></span>
+        <span class="grow"></span>
+        <button id="tc-refresh">刷新</button>
+      </div>
+      <div class="card-body" id="tc-sections"><div class="hint">加载中…</div></div>
     </div>
 
   </section>
@@ -821,6 +854,40 @@ async function loadOverview() {
   }
 }
 
+// tc 实况：/api/tc 返回 {sections: [{title, iface, desired, raw:[{label,text}]}]}
+// 或 {sections: [], disabled_reason}。渲染完全照返回的数组走（见样式区的
+// 说明）；全部文本——命令输出、desired、错误——都来自外部，必须过 esc。
+async function loadTc() {
+  const box = $("#tc-sections");
+  let j;
+  try {
+    const resp = await fetch("/api/tc");
+    j = await resp.json();
+    if (!resp.ok) throw new Error(j.error || "HTTP " + resp.status);
+  } catch (e) {
+    box.innerHTML = `<div class="hint" style="color:var(--critical)">${esc("加载 tc 状态失败：" + (e.message || e))}</div>`;
+    return;
+  }
+  const secs = j.sections || [];
+  if (!secs.length) {
+    box.innerHTML = `<div class="hint">${esc(j.disabled_reason || "没有可展示的 tc 状态")}</div>`;
+  } else {
+    box.innerHTML = secs.map(sec => `
+      <div class="tc-section">
+        <div class="tc-sec-head">
+          <span class="tc-sec-title">${esc(sec.title || sec.key || "tc")}</span>
+          ${sec.iface ? `<span class="tag">dev ${esc(sec.iface)}</span>` : ""}
+        </div>
+        ${sec.desired ? `<div class="tc-desired">期望配置：${esc(sec.desired)}</div>` : ""}
+        ${(sec.raw || []).map(r => `
+          <div class="tc-pre-label">$ ${esc(r.label)}</div>
+          <pre class="tc-pre">${esc(r.text)}</pre>`).join("")}
+      </div>`).join("");
+  }
+  $("#tc-updated").textContent = "取于 " + new Date().toLocaleTimeString();
+}
+$("#tc-refresh").onclick = loadTc;
+
 async function loadLogs() {
   const j = await (await fetch("/api/logs?after=" + state.logAfter)).json();
   const box = $("#logs");
@@ -901,6 +968,7 @@ $("#log-level").onchange = (e) => {
     for (const snap of h.snapshots || []) applySnapshot(snap, false);
   } catch (e) {}
   redrawAll();
+  loadTc();
   await loadLogs();
   connectSSE();
   setInterval(loadLogs, 2000);

@@ -872,6 +872,36 @@ class TcShaper:
         await self._tc(["tc", "qdisc", "del", "dev", self.iface, "root"],
                        fatal=False)
 
+    async def debug_state(self) -> dict:
+        """调试快照：把网卡上 tc 的原始输出按命令原样取回（控制台的
+        "tc 实况"面板用）。
+
+        带 -s 取统计版（含字节/丢包计数，排障时最有用）；全部只读、
+        非致命——哪条命令失败就把错误文本当输出展示，比空白诚实。
+        """
+        async def run(argv: list[str]) -> str:
+            rc, out, err = await self._run(argv)
+            text = (out or "").strip()
+            if rc != 0:
+                text = (text + "\n" if text else "") + \
+                    f"[命令失败 rc={rc}] {(err or '').strip()}"
+            return text or "(空)"
+
+        return {
+            "iface": self.iface,
+            "raw": [
+                {"label": f"tc -s qdisc show dev {self.iface}",
+                 "text": await run(["tc", "-s", "qdisc", "show",
+                                    "dev", self.iface])},
+                {"label": f"tc -s class show dev {self.iface}",
+                 "text": await run(["tc", "-s", "class", "show",
+                                    "dev", self.iface])},
+                {"label": f"tc filter show dev {self.iface}",
+                 "text": await run(["tc", "filter", "show",
+                                    "dev", self.iface])},
+            ],
+        }
+
 
 def parse_class_stats(out: str) -> dict[int, TcClassStat]:
     """解析 `tc -s -j class show` 的 JSON，返回 端口 → TcClassStat。
