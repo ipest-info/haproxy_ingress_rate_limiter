@@ -375,6 +375,7 @@ def build_app(
     api_token: str = "",
     known_frontends_fn: Callable[[], set] | None = None,
     poke: "asyncio.Event | None" = None,
+    tc_debug_fn=None,
 ) -> web.Application:
     """组装控制台的 aiohttp 应用（静态页 + 只读 API + 限额写 API）。
 
@@ -412,6 +413,26 @@ def build_app(
         """
         return web.Response(text=render_prometheus(hub),
                             content_type="text/plain", charset="utf-8")
+
+    async def handle_tc(_request: web.Request) -> web.Response:
+        """tc 实况（调试面板）：期望配置 + 网卡上 tc 的原始输出。
+
+        只读、按需执行（每次请求现跑几条 tc show，开销可忽略）。
+        tc_debug_fn 由 __main__ 注入（async，返回 {"sections": [...]}）；
+        未注入（限速关闭/测试形态）时返回空 sections + 原因。
+        """
+        if tc_debug_fn is None:
+            return web.json_response({
+                "sections": [],
+                "disabled_reason": "tc 限速未启用（RL_TC_IFACE=- 或未接线），"
+                                   "没有可展示的 tc 状态",
+            })
+        try:
+            return web.json_response(await tc_debug_fn())
+        except Exception as e:
+            log.warning("采集 tc 调试快照失败 err=%s", e)
+            return web.json_response(
+                {"error": f"采集 tc 状态失败：{e}"}, status=500)
 
     async def handle_logs(request: web.Request) -> web.Response:
         try:
@@ -581,6 +602,7 @@ def build_app(
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/overview", handle_overview)
     app.router.add_get("/api/history", handle_history)
+    app.router.add_get("/api/tc", handle_tc)
     app.router.add_get("/api/logs", handle_logs)
     app.router.add_get("/api/stream", handle_stream)
     # Prometheus 抓取端点：与只读 API 同一个监听面（同样的安全边界——
@@ -605,6 +627,7 @@ async def run_console(
     api_token: str = "",
     known_frontends_fn: Callable[[], set] | None = None,
     poke: "asyncio.Event | None" = None,
+    tc_debug_fn=None,
 ) -> None:
     """常驻任务：启动控制台 HTTP 服务并挂起到被取消，取消时干净回收。
 
@@ -615,7 +638,8 @@ async def run_console(
     """
     runner = web.AppRunner(
         build_app(hub, logbuf, log, yaml_path=yaml_path, api_token=api_token,
-                  known_frontends_fn=known_frontends_fn, poke=poke),
+                  known_frontends_fn=known_frontends_fn, poke=poke,
+                  tc_debug_fn=tc_debug_fn),
         access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, bind, port)

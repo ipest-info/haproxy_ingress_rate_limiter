@@ -236,6 +236,22 @@ async def _amain(cfg, log: logging.Logger,
                        boot_instance_quota_mbps=cfg.instance_quota_mbps,
                        poke=cfg_poke),
         name="cfg-watch"))
+    # tc 实况（控制台调试面板）：期望配置来自监控循环的当前清单，
+    # 实况是 shaper 现场跑 tc show 的原始输出——页面上两边对照着看。
+    tc_debug_fn = None
+    if shaper is not None:
+        async def tc_debug_fn():                      # noqa: F811
+            desired = "; ".join(
+                f"{f.name}@:{f.bind_port}={f.quota_mbps:g}Mbps"
+                for f in ctl.frontends() if f.limited) or "(没有登记限额的 frontend)"
+            inst = ctl.instance_quota_mbps
+            if inst:
+                desired += f"; 实例总限速={inst:g}Mbps（层级模式）"
+            section = await shaper.debug_state()
+            section.update(key="egress", title="出向 HTB（响应方向限速）",
+                           desired=desired)
+            return {"sections": [section]}
+
     if hub is not None:
         tasks.append(asyncio.create_task(
             webconsole.run_console(
@@ -243,7 +259,7 @@ async def _amain(cfg, log: logging.Logger,
                 yaml_path=yaml_path, api_token=api_token,
                 # 写限额前校验段名存在：以当前 cfg 解析出的清单为准。
                 known_frontends_fn=lambda: {f.name for f in ctl.frontends()},
-                poke=cfg_poke),
+                poke=cfg_poke, tc_debug_fn=tc_debug_fn),
             name="web-console"))
 
     if shaper is not None and tc_applied is not None:
