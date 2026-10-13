@@ -283,7 +283,10 @@ async def watch(
             svc = configmod.load(yaml_path)
             quotas = dict(svc.quotas)
             yaml_rest = (svc.log_level, svc.tick_interval_s,
-                         svc.haproxy.endpoint(), svc.haproxy.cfg_path)
+                         svc.haproxy.endpoint(), svc.haproxy.cfg_path,
+                         # 入向动态限速参数启动时定型：改了要重启才生效，
+                         # 塞进这个元组让变化触发下面的"需重启"提醒。
+                         repr(svc.dynamic_ingress))
             frontends = load_frontends(cfg_path, quotas, log, warned)
         except Exception as e:
             log.warning(

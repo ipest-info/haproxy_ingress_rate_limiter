@@ -163,9 +163,11 @@ iface_by_subnet() {
     # $1 = IP 前缀（如 10.211.1.）。输出第一个地址匹配的网卡名。
     ip -o -4 addr show scope global 2>/dev/null         | awk -v p="$1" 'index($4, p) == 1 { print $2; exit }'
 }
-if [ "${RL_TC_IFACE:-}" = "-" ]; then
+if [ "${RL_TC_IFACE:-}" = "-" ] && [ -z "${RL_FRONT_SUBNET:-}" ]; then
     # 监控-only 模式：入向限速也随之默认关闭（除非显式指定）——
     # 沙箱/CI 内核缺 tc 模块时整个节点退化为纯监控。
+    # （给了 RL_FRONT_SUBNET 则走下面的网段解析：RL_TC_IFACE=- 只关
+    # 出向，入向网卡照常按网段定位——本分支的闭环形态就是这样跑的。）
     if [ -z "${RL_TC_IN_IFACE:-}" ]; then
         export RL_TC_IN_IFACE="-"
     fi
@@ -181,11 +183,16 @@ elif [ -n "${RL_FRONT_SUBNET:-}" ]; then
     fi
     export RL_TC_IFACE="${RL_TC_IFACE:-$front_if}"
     export RL_TC_IN_IFACE="${RL_TC_IN_IFACE:-$front_if}"
-    log "双网卡：已按网段 $RL_FRONT_SUBNET 定位客户端侧网卡 iface=$front_if"         "（出向 HTB 与入向 police 都在这张上）RL_TC_IFACE=$RL_TC_IFACE"         "RL_TC_IN_IFACE=$RL_TC_IN_IFACE"
+    log "双网卡：已按网段 $RL_FRONT_SUBNET 定位客户端侧网卡 iface=$front_if"         "RL_TC_IFACE=$RL_TC_IFACE RL_TC_IN_IFACE=$RL_TC_IN_IFACE"         "（- = 该方向不做 tc）"
 fi
 
 if [ "${RL_TC_IFACE:-}" = "-" ]; then
-    log "警告：已显式关闭 tc 限速（RL_TC_IFACE=-），本节点只做监控"
+    if [ -n "${RL_TC_IN_IFACE:-}" ] && [ "${RL_TC_IN_IFACE}" != "-" ]; then
+        log "出向 tc 整形已关闭（RL_TC_IFACE=-）；限速走入向 police" \
+            "（$RL_TC_IN_IFACE，闭环：按出向带宽动态压入向）"
+    else
+        log "警告：已显式关闭 tc 限速（RL_TC_IFACE=-），本节点只做监控"
+    fi
 elif ! tc_selfcheck; then
     exit 1
 fi

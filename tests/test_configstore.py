@@ -107,3 +107,18 @@ def test_preserves_file_permissions(yml):
     os.chmod(yml, 0o640)
     configstore.set_quota(str(yml), "fe_api", 8)
     assert (yml.stat().st_mode & 0o777) == 0o640
+
+
+def test_rewrite_preserves_dynamic_sections(yml):
+    """写 API 只动自己的键：request_limits 与 dynamic_ingress（闭环参数）
+    必须原样留下——丢了它们等于静默关掉入向限速。"""
+    yml.write_text(BASE + (
+        "request_limits:\n  fe_main: {mbps: 10, conn_rate: 150}\n"
+        "dynamic_ingress:\n  enabled: true\n  interval_s: 30\n"),
+        encoding="utf-8")
+    configstore.set_quota(str(yml), "fe_main", 80)
+    cfg = configmod.load(str(yml))
+    assert cfg.quotas["fe_main"] == 80.0
+    assert cfg.request_limits["fe_main"].mbps == 10.0
+    assert cfg.dynamic_ingress.enabled
+    assert cfg.dynamic_ingress.interval_s == 30.0

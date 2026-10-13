@@ -259,3 +259,47 @@ def test_request_limits_default_empty(tmp_path):
 def test_request_limits_rejections(tmp_path, text, match):
     with pytest.raises(ValueError, match=match):
         load_from(tmp_path, text)
+
+
+# ---------------------------------------------------------------------------
+# 入向动态限速（dynamic_ingress，闭环）
+# ---------------------------------------------------------------------------
+
+def test_dynamic_ingress_default_disabled(tmp_path):
+    g = load_from(tmp_path, minimal()).dynamic_ingress
+    assert not g.enabled
+    # 默认参数本身必须能过校验（load 成功即证明）。
+    assert g.interval_s == 15.0
+
+
+def test_dynamic_ingress_parsed(tmp_path):
+    g = load_from(tmp_path, minimal(extra=(
+        "dynamic_ingress:\n"
+        "  enabled: true\n  interval_s: 30\n  low_ratio: 0.8\n"
+        "  high_ratio: 1.05\n  step_up: 0.1\n  step_down_max: 0.2\n"
+        "  floor_ratio: 0.2\n  apply_epsilon: 0.05\n"))).dynamic_ingress
+    assert g.enabled and g.interval_s == 30.0
+    assert g.low_ratio == 0.8 and g.high_ratio == 1.05
+    assert g.step_up == 0.1 and g.step_down_max == 0.2
+    assert g.floor_ratio == 0.2 and g.apply_epsilon == 0.05
+
+
+def test_dynamic_ingress_unknown_key_rejected(tmp_path):
+    with pytest.raises(ValueError, match="不认识的键"):
+        load_from(tmp_path, minimal(
+            extra="dynamic_ingress: {enable: true}\n"))
+
+
+def test_dynamic_ingress_bad_values_rejected(tmp_path):
+    """越界参数逐条拒绝——这是刻意平缓的控制器，参数上界写死在校验里。"""
+    for extra, msg in (
+        ("dynamic_ingress: {interval_s: 2}", "interval_s"),
+        ("dynamic_ingress: {low_ratio: 1.2, high_ratio: 1.0}", "low_ratio"),
+        ("dynamic_ingress: {step_up: 0.9}", "step_up"),
+        ("dynamic_ingress: {step_down_max: 0.9}", "step_down_max"),
+        ("dynamic_ingress: {floor_ratio: 0}", "floor_ratio"),
+        ("dynamic_ingress: {apply_epsilon: 0.5}", "apply_epsilon"),
+        ("dynamic_ingress: {interval_s: x}", "必须是数字"),
+    ):
+        with pytest.raises(ValueError, match=msg):
+            load_from(tmp_path, minimal(extra=extra + "\n"))

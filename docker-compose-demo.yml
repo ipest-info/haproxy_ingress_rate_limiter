@@ -85,8 +85,12 @@ services:
       RL_CONSOLE_PORT: "8090"
       # 双网卡：按网段定位客户端侧网卡（compose 接两个网络时 eth0/eth1
       # 的先后顺序不可靠，入口脚本按 IP 网段找）。入向限速（request_
-      # limits）与出向限速都落在客户端侧那张上。
+      # limits）落在客户端侧那张上。
       RL_FRONT_SUBNET: "10.211.1."
+      # 闭环形态：**出向不做 tc 整形**，限速全靠入向 police——入向上限
+      # 由 dynamic_ingress 按实测出向带宽（对照 quotas 目标）动态调节。
+      # 显式关掉出向（- = 该方向不做 tc），入向网卡仍按上面的网段定位。
+      RL_TC_IFACE: "-"
       # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
       # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
       RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
@@ -140,8 +144,12 @@ services:
       RL_CONSOLE_PORT: "8090"
       # 双网卡：按网段定位客户端侧网卡（compose 接两个网络时 eth0/eth1
       # 的先后顺序不可靠，入口脚本按 IP 网段找）。入向限速（request_
-      # limits）与出向限速都落在客户端侧那张上。
+      # limits）落在客户端侧那张上。
       RL_FRONT_SUBNET: "10.211.1."
+      # 闭环形态：**出向不做 tc 整形**，限速全靠入向 police——入向上限
+      # 由 dynamic_ingress 按实测出向带宽（对照 quotas 目标）动态调节。
+      # 显式关掉出向（- = 该方向不做 tc），入向网卡仍按上面的网段定位。
+      RL_TC_IFACE: "-"
       # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
       # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
       RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
@@ -193,8 +201,12 @@ services:
       RL_CONSOLE_PORT: "8090"
       # 双网卡：按网段定位客户端侧网卡（compose 接两个网络时 eth0/eth1
       # 的先后顺序不可靠，入口脚本按 IP 网段找）。入向限速（request_
-      # limits）与出向限速都落在客户端侧那张上。
+      # limits）落在客户端侧那张上。
       RL_FRONT_SUBNET: "10.211.1."
+      # 闭环形态：**出向不做 tc 整形**，限速全靠入向 police——入向上限
+      # 由 dynamic_ingress 按实测出向带宽（对照 quotas 目标）动态调节。
+      # 显式关掉出向（- = 该方向不做 tc），入向网卡仍按上面的网段定位。
+      RL_TC_IFACE: "-"
       # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
       # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
       RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl

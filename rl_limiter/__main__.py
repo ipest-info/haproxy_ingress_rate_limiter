@@ -25,7 +25,7 @@ import sys
 
 from . import cfgparse
 from . import config as configmod
-from . import haproxy, metricslog, model
+from . import haproxy, ingressgov, metricslog, model
 from . import netdev
 from . import tcingress as tcinmod
 from . import tcshaper as tcmod
@@ -146,9 +146,29 @@ async def _amain(cfg, log: logging.Logger,
             haproxy=cfg.haproxy,
             degraded_fn=lambda: col.degraded)
 
+    # 入向动态限速控制器（闭环）：按实测出向带宽对照 quotas 目标平缓
+    # 调整入向 police 上限。挂在 sampler 链上吃每拍的 mean10。
+    gov: "ingressgov.IngressGovernor | None" = None
+    if ingress is not None and cfg.dynamic_ingress.enabled:
+        gov = ingressgov.IngressGovernor(cfg.dynamic_ingress, log)
+        log.info("入向动态限速已启用：按出向带宽（目标=quotas 登记值）"
+                 "平缓调节入向 police 上限 interval=%gs 死区=[%g, %g] "
+                 "step_up=%g step_down_max=%g floor=%g",
+                 cfg.dynamic_ingress.interval_s,
+                 cfg.dynamic_ingress.low_ratio,
+                 cfg.dynamic_ingress.high_ratio,
+                 cfg.dynamic_ingress.step_up,
+                 cfg.dynamic_ingress.step_down_max,
+                 cfg.dynamic_ingress.floor_ratio)
+    elif cfg.dynamic_ingress.enabled:
+        log.warning("dynamic_ingress.enabled=true 但入向限速未接线"
+                    "（RL_TC_IN_IFACE 未设或为 -），动态调节不会运行")
+
     # sampler：监控循环每拍喂给控制台（内存实时曲线）与监控数据落盘器
     # （分钟粒度 JSONL）——同一拍、同一份数据，两个出口。
     sinks = [x.record for x in (hub, mlog) if x is not None]
+    if gov is not None:
+        sinks.append(gov.record)
     if not sinks:
         sampler = None
     elif len(sinks) == 1:
@@ -262,10 +282,25 @@ async def _amain(cfg, log: logging.Logger,
                                desired=desired)
                 sections.append(section)
             if ingress is not None:
-                ports = {f.name: f.bind_port for f in ctl.frontends()}
+                fes = ctl.frontends()
+                ports = {f.name: f.bind_port for f in fes}
+                targets = {f.name: f.quota_mbps for f in fes if f.limited}
+                cur = gov.current() if gov is not None else {}
                 parts = []
                 for name, rl in sorted(ctl.request_limits().items()):
-                    want = [f"{rl.mbps:g}Mbps"] if rl.mbps else []
+                    want = []
+                    if rl.mbps:
+                        if name in cur:
+                            # 动态调节中：展示当前生效值与来龙去脉。
+                            want.append(
+                                f"{cur[name]:.1f}Mbps（动态，上限 "
+                                f"{rl.mbps:g}、出向目标 "
+                                f"{targets.get(name, 0):g}）")
+                        elif gov is not None and targets.get(name):
+                            want.append(f"{rl.mbps:g}Mbps（动态上限，"
+                                        f"当前全开）")
+                        else:
+                            want.append(f"{rl.mbps:g}Mbps")
                     if rl.conn_rate:
                         want.append(f"{rl.conn_rate}conn/s")
                     parts.append(f"{name}@:{ports.get(name, '?')}="
@@ -308,12 +343,30 @@ async def _amain(cfg, log: logging.Logger,
 
     if ingress is not None and tcin_applied is not None:
         # 请求方向（入向）限速：事件驱动 + 周期兜底，与出向同一套节奏。
+        # 挂了动态控制器时，下发的是控制器调节后的值（登记值只是上限）。
+        def _tcin_desired():
+            limits = ctl.request_limits()
+            if gov is not None:
+                limits = gov.effective_limits(limits)
+            return list(ctl.frontends()), limits
+
         tasks.append(asyncio.create_task(
             tcinmod.run_ingress(
-                ingress,
-                lambda: (list(ctl.frontends()), ctl.request_limits()),
+                ingress, _tcin_desired,
                 tcin_applied, log, period_s=apply_period_s),
             name="tc-ingress"))
+        if gov is not None:
+            # 调节器：周期跑一轮，有变化就 set tcin_applied 叫醒上面的
+            # 下发任务立刻 reconcile（与配置热更共用同一个事件，语义
+            # 相同——"期望值变了"）。
+            tasks.append(asyncio.create_task(
+                ingressgov.run_governor(
+                    gov,
+                    lambda: (list(ctl.frontends()), ctl.request_limits()),
+                    tcin_applied, log,
+                    interval_s=cfg.dynamic_ingress.interval_s,
+                    degraded_fn=lambda: col.degraded),
+                name="ingress-governor"))
 
     log.info("rl-limiter 服务已启动，监控循环开始运行 instance=%s "
              "endpoint=%s cfg=%s frontends=%d version=%s",

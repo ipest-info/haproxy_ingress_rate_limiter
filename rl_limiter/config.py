@@ -30,7 +30,7 @@ from typing import Any
 
 import yaml
 
-from . import model
+from . import ingressgov, model
 
 # 各键缺失时补上的默认值。与部署示例配置保持一致。
 DEFAULT_LOG_LEVEL = "info"
@@ -70,6 +70,10 @@ class ServiceConfig:
     # 请求方向（入向）限速登记：frontend 名 → RequestLimit（mbps /
     # conn_rate）。双网卡形态专用，入向执行网卡由 RL_TC_IN_IFACE 指定。
     request_limits: dict = field(default_factory=dict)
+    # 入向动态限速（闭环）：按实测出向带宽对照 quotas 目标，平缓调整
+    # 入向 police 的带宽上限。启动时定型。见 rl_limiter/ingressgov.py。
+    dynamic_ingress: "ingressgov.IngressGovConfig" = field(
+        default_factory=lambda: ingressgov.IngressGovConfig())
     # 本机 HAProxy 的接线（stats socket + cfg 路径）。
     haproxy: model.NodeConfig = field(default_factory=model.NodeConfig)
     # 限额登记：frontend 名 → 限额（Mbps，≥ 0；0 = 显式不限速）。
@@ -177,6 +181,9 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
         cfg.request_limits[str(name).strip()] = model.RequestLimit(
             mbps=mbps, conn_rate=conn_rate)
 
+    cfg.dynamic_ingress = _parse_dynamic_ingress(
+        raw.get("dynamic_ingress") or {})
+
     quotas_raw = raw.get("quotas") or {}
     if not isinstance(quotas_raw, dict):
         raise ValueError(
@@ -189,6 +196,33 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
             raise ValueError(
                 f"quotas.{name} 必须是数字（Mbps），当前值 {v!r}") from None
     return cfg
+
+
+def _parse_dynamic_ingress(d: Any) -> ingressgov.IngressGovConfig:
+    """解析入向动态限速段（dynamic_ingress）。启动时定型：运行期改动
+    不热生效（cfg 轮询检测到变化会提示需重启）。"""
+    if not isinstance(d, dict):
+        raise ValueError(
+            f"dynamic_ingress 必须是键值映射，实际是 {type(d).__name__}")
+    g = ingressgov.IngressGovConfig()
+    known = {"enabled", "interval_s", "low_ratio", "high_ratio",
+             "step_up", "step_down_max", "floor_ratio", "apply_epsilon"}
+    unknown = set(d) - known
+    if unknown:
+        raise ValueError(
+            f"dynamic_ingress 有不认识的键 {sorted(unknown)}"
+            f"（支持 {sorted(known)}）")
+    g.enabled = bool(d.get("enabled", g.enabled))
+    for key in ("interval_s", "low_ratio", "high_ratio", "step_up",
+                "step_down_max", "floor_ratio", "apply_epsilon"):
+        if key in d:
+            try:
+                setattr(g, key, float(d[key]))
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"dynamic_ingress.{key} 必须是数字，"
+                    f"当前值 {d[key]!r}") from None
+    return g
 
 
 def _parse_haproxy(h: Any) -> model.NodeConfig:
@@ -287,6 +321,34 @@ def _validate(cfg: ServiceConfig) -> None:
             raise ValueError(
                 f"quotas.{name}={mbps} 太小（换算成 bytes/s 后不足 1），"
                 f"tc 会拒绝这个速率；要不限速请写 0")
+
+    g = cfg.dynamic_ingress
+    if g.interval_s < 5:
+        raise ValueError(
+            f"dynamic_ingress.interval_s 必须 ≥ 5（当前值 {g.interval_s}）"
+            f"——观测用的是 10s 均值，调得比观测窗口还快只会追着噪声振荡")
+    if not (0 < g.low_ratio <= g.high_ratio):
+        raise ValueError(
+            f"dynamic_ingress 需要 0 < low_ratio ≤ high_ratio（当前 "
+            f"low_ratio={g.low_ratio} high_ratio={g.high_ratio}）——"
+            f"[low, high]×目标 是不动作的死区")
+    if not (0 < g.step_up <= 0.5):
+        raise ValueError(
+            f"dynamic_ingress.step_up 必须在 (0, 0.5] 内（当前值 "
+            f"{g.step_up}）——这是刻意平缓的控制器，单步上调超过上限的"
+            f"一半就不平缓了")
+    if not (0 < g.step_down_max <= 0.5):
+        raise ValueError(
+            f"dynamic_ingress.step_down_max 必须在 (0, 0.5] 内（当前值 "
+            f"{g.step_down_max}）——单次砍一半以上请直接用静态限速")
+    if not (0 < g.floor_ratio < 1):
+        raise ValueError(
+            f"dynamic_ingress.floor_ratio 必须在 (0, 1) 内（当前值 "
+            f"{g.floor_ratio}）——0 会把入向掐死，≥1 等于不调")
+    if not (0 <= g.apply_epsilon <= 0.2):
+        raise ValueError(
+            f"dynamic_ingress.apply_epsilon 必须在 [0, 0.2] 内（当前值 "
+            f"{g.apply_epsilon}）——太大的死区会让调节永远下发不出去")
 
 
 def _validate_haproxy(n: model.NodeConfig) -> None:
