@@ -230,6 +230,37 @@ data: ...
 }
 ```
 
+### 4.6 `GET /api/tc` — tc 实况（调试）
+
+控制台"tc 实况（调试）"面板的数据源：把**期望配置**（当前登记的限额）
+和内核里 tc 的**原始输出**（`tc show` 原样文本）放在一起返回，供人工
+排障对照。每次请求现跑几条只读的 `tc ... show`，不缓存。
+
+```jsonc
+{
+  "sections": [                    // 有几个限速面就有几个 section
+    {
+      "key": "egress",             // 机器可读的面标识
+      "title": "出向 HTB（响应方向限速）",
+      "iface": "eth0",             // 这一面作用的网卡
+      "desired": "fe_main@:8080=40Mbps; 实例总限速=200Mbps（层级模式）",
+      "raw": [                     // 原始输出，每条带完整命令做标签
+        {"label": "tc -s qdisc show dev eth0", "text": "qdisc htb 1: …"},
+        {"label": "tc -s class show dev eth0", "text": "class htb 1:1 …"},
+        {"label": "tc filter show dev eth0",   "text": "filter parent 1: …"}
+      ]
+    }
+  ]
+}
+```
+
+- tc 限速未启用（`RL_TC_IFACE=-`）时返回 `{"sections": [],
+  "disabled_reason": "…"}`，仍是 200。
+- 某条 show 命令失败时，错误文本以 `[命令失败 rc=N] …` 的形式拼在该段
+  `text` 里，接口本身不报错；采集整体失败才 500。
+- `raw[].text` 是内核 tc 的原样输出，**格式随内核/iproute2 版本变化，
+  仅供人读**，程序请勿解析它——要机器可读的统计走 `/metrics`。
+
 ---
 
 ## 5. 写接口（修改限额）

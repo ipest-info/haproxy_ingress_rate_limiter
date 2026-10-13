@@ -400,3 +400,48 @@ def test_overview_carries_request_limits():
         request_limits={"fe_a": model.RequestLimit(mbps=10.0, conn_rate=200)}))
     o = h.overview()
     assert o["request_limits"] == {"fe_a": {"mbps": 10.0, "conn_rate": 200}}
+
+
+# ---------------------------------------------------------------------------
+# /api/tc：tc 实况（调试面板）
+# ---------------------------------------------------------------------------
+
+async def test_tc_endpoint_disabled_without_fn(client):
+    """未注入 tc_debug_fn（限速关闭/测试形态）→ 空 sections + 原因，
+    而不是 404：页面好歹能告诉人为什么没内容。"""
+    r = await client.get("/api/tc")
+    assert r.status == 200
+    body = await r.json()
+    assert body["sections"] == []
+    assert "RL_TC_IFACE" in body["disabled_reason"]
+
+
+async def test_tc_endpoint_passes_sections_through():
+    """接口原样透传 tc_debug_fn 的结果：页面按 sections 数组渲染，
+    派生分支多返回一个 section 无需改前端。"""
+    payload = {"sections": [{"key": "egress", "title": "出向 HTB",
+                             "iface": "eth0", "desired": "fe_a@:8080=40Mbps",
+                             "raw": [{"label": "tc -s qdisc show dev eth0",
+                                      "text": "qdisc htb 1: root ..."}]}]}
+    async def fake_tc():
+        return payload
+    app = webconsole.build_app(
+        hub(), webconsole.LogBuffer(), __import__("logging").getLogger("t"),
+        tc_debug_fn=fake_tc)
+    async with TestClient(TestServer(app)) as c:
+        r = await c.get("/api/tc")
+        assert r.status == 200
+        assert await r.json() == payload
+
+
+async def test_tc_endpoint_reports_fn_failure_as_500():
+    async def boom():
+        raise RuntimeError("tc 炸了")
+    app = webconsole.build_app(
+        hub(), webconsole.LogBuffer(), __import__("logging").getLogger("t"),
+        tc_debug_fn=boom)
+    async with TestClient(TestServer(app)) as c:
+        r = await c.get("/api/tc")
+        assert r.status == 500
+        assert "tc 炸了" in (await r.json())["error"]
+
