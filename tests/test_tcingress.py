@@ -43,12 +43,16 @@ class FakeTc:
         for bad in self._fail_on:
             if bad in joined:
                 return 1, "", f"fake failure: {bad}"
-        if argv[:3] == ["tc", "filter", "show"]:
+        # 同样不看固定位置：`tc filter show` 和 `tc -s filter show`
+        # 都该吐预置的过滤器文本。
+        if "filter" in argv and "show" in argv:
             return 0, self._filters, ""
         return 0, "", ""
 
     def mutations(self):
-        return [c for c in self.calls if c[2] != "show"]
+        # 按"是否含 show"过滤而不是看固定位置——`tc -s filter show`
+        # 的 -s 会把动词挤到别的下标去。
+        return [c for c in self.calls if "show" not in c]
 
 
 def shaper(**kw):
@@ -240,3 +244,28 @@ async def test_unknown_names_warned_once(caplog):
         await sh.reconcile([fe()], {"fe_typo": rl(10.0)})
     hits = [r for r in caplog.records if "fe_typo" in r.getMessage()]
     assert len(hits) == 1
+
+
+# ---------------------------------------------------------------------------
+# debug_state：控制台 tc 调试面板的入向 section
+# ---------------------------------------------------------------------------
+
+async def test_debug_state_is_readonly_and_labeled():
+    """两段原始输出（ingress qdisc + 带统计的 police 过滤器），每段带
+    完整命令做标签；全程只读——调试面板绝不能碰内核状态。"""
+    sh, fake = shaper(filters="filter protocol ip pref 1 u32 ... police")
+    st = await sh.debug_state()
+    assert st["iface"] == IFACE
+    assert [r["label"] for r in st["raw"]] == [
+        f"tc qdisc show dev {IFACE} ingress",
+        f"tc -s filter show dev {IFACE} parent ffff:"]
+    assert fake.mutations() == []
+    assert "police" in st["raw"][1]["text"]
+    assert st["raw"][0]["text"] == "(空)"
+
+
+async def test_debug_state_renders_failures_inline():
+    sh, fake = shaper(fail_on=("qdisc show",))
+    st = await sh.debug_state()
+    assert "[命令失败 rc=1]" in st["raw"][0]["text"]
+    assert "[命令失败" not in st["raw"][1]["text"]

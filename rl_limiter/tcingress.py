@@ -335,6 +335,32 @@ class TcIngress:
         await self._tc(["tc", "qdisc", "del", "dev", self.iface, "ingress"],
                        fatal=False)
 
+    async def debug_state(self) -> dict:
+        """调试快照：入向 qdisc 与 police 过滤器的原始输出（控制台的
+        "tc 实况"面板用）。与 TcShaper.debug_state 同一约定：全部只读、
+        非致命，失败的命令把错误文本当输出展示。"""
+        async def run(argv: list[str]) -> str:
+            rc, out, err = await self._run(argv)
+            text = (out or "").strip()
+            if rc != 0:
+                text = (text + "\n" if text else "") + \
+                    f"[命令失败 rc={rc}] {(err or '').strip()}"
+            return text or "(空)"
+
+        return {
+            "iface": self.iface,
+            "raw": [
+                {"label": f"tc qdisc show dev {self.iface} ingress",
+                 "text": await run(["tc", "qdisc", "show", "dev",
+                                    self.iface, "ingress"])},
+                # -s 带上 police 的命中/丢弃计数——限速到底有没有在丢包，
+                # 看这里。
+                {"label": f"tc -s filter show dev {self.iface} parent ffff:",
+                 "text": await run(["tc", "-s", "filter", "show", "dev",
+                                    self.iface, "parent", "ffff:"])},
+            ],
+        }
+
 
 async def run_ingress(shaper: TcIngress,
                       desired_fn,

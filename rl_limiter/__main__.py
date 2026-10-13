@@ -242,19 +242,41 @@ async def _amain(cfg, log: logging.Logger,
         name="cfg-watch"))
     # tc 实况（控制台调试面板）：期望配置来自监控循环的当前清单，
     # 实况是 shaper 现场跑 tc show 的原始输出——页面上两边对照着看。
+    # 双网卡形态下出向 HTB 与入向 police 各一个 section（页面按数组
+    # 渲染，有几个画几个）。
     tc_debug_fn = None
-    if shaper is not None:
+    if shaper is not None or ingress is not None:
         async def tc_debug_fn():                      # noqa: F811
-            desired = "; ".join(
-                f"{f.name}@:{f.bind_port}={f.quota_mbps:g}Mbps"
-                for f in ctl.frontends() if f.limited) or "(没有登记限额的 frontend)"
-            inst = ctl.instance_quota_mbps
-            if inst:
-                desired += f"; 实例总限速={inst:g}Mbps（层级模式）"
-            section = await shaper.debug_state()
-            section.update(key="egress", title="出向 HTB（响应方向限速）",
-                           desired=desired)
-            return {"sections": [section]}
+            sections = []
+            if shaper is not None:
+                desired = "; ".join(
+                    f"{f.name}@:{f.bind_port}={f.quota_mbps:g}Mbps"
+                    for f in ctl.frontends() if f.limited) or \
+                    "(没有登记限额的 frontend)"
+                inst = ctl.instance_quota_mbps
+                if inst:
+                    desired += f"; 实例总限速={inst:g}Mbps（层级模式）"
+                section = await shaper.debug_state()
+                section.update(key="egress",
+                               title="出向 HTB（响应方向限速）",
+                               desired=desired)
+                sections.append(section)
+            if ingress is not None:
+                ports = {f.name: f.bind_port for f in ctl.frontends()}
+                parts = []
+                for name, rl in sorted(ctl.request_limits().items()):
+                    want = [f"{rl.mbps:g}Mbps"] if rl.mbps else []
+                    if rl.conn_rate:
+                        want.append(f"{rl.conn_rate}conn/s")
+                    parts.append(f"{name}@:{ports.get(name, '?')}="
+                                 + "+".join(want or ["0"]))
+                section = await ingress.debug_state()
+                section.update(key="ingress",
+                               title="入向 police（请求方向限速）",
+                               desired="; ".join(parts)
+                               or "(没有登记 request_limits)")
+                sections.append(section)
+            return {"sections": sections}
 
     if hub is not None:
         tasks.append(asyncio.create_task(
