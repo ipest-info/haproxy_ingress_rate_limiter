@@ -50,6 +50,7 @@ YAML（`-c` 指定：stats socket 接线、cfg 路径、quotas 限额）。运�
 | [docs/06-tc限速方案.md](docs/06-tc限速方案.md) | **限速为什么从 HAProxy bwlim 换成内核 tc**：实测依据、映射方式、行为差异，以及尚未验证的部分 |
 | [docs/07-API文档.md](docs/07-API文档.md) | **HTTP API 参考（面向第三方开发）**：监控数据读接口（overview/history/SSE//metrics/logs）与限额写接口（令牌鉴权），字段口径、错误码、集成示例 |
 | [docs/08-内核参数调优.md](docs/08-内核参数调优.md) | **让瓶颈落在 maxconn 而不是内核默认值上**：初始化阶段的 sysctl 调优与 FD 预检、哪些容器里改不动、怎么验证真的生效 |
+| [docs/10-动态请求限速.md](docs/10-动态请求限速.md) | **本分支的新能力**：带宽驱动的 AIMD 控制环——超限时经 runtime API 收缩 frontend 的请求接纳上限，回落后恢复（需 stats socket level admin） |
 | [docs/09-裸机部署.md](docs/09-裸机部署.md) | **HAProxy 已装好的机器上怎么加 rl-limiter**：一键装机脚本、两份配置文件、权限的由来 |
 
 ## 系统组成
@@ -130,6 +131,9 @@ deploy/bare/rl-limiter.sh check     # 体检：只看不改
   `PUT /api/instance-quota`。设置后 tc 切换为层级模式：本机 HAProxy
   **全部 frontend**（含未登记限额的）出向合计不超过总限速，各端口限额
   仍各自生效，SSH/系统流量不在总闸内；0 = 取消（回到平铺模式）；
+- **动态请求限速**（本分支新增，默认关闭）→ YAML 的
+  `dynamic_request_limit` 段（enabled/min_conns 等），带宽超限时自动
+  收缩该 frontend 的请求接纳上限、回落后恢复，见 docs/10；
 - **改端口/后端** → 改 haproxy.cfg → `systemctl reload haproxy`。
   rl-limiter 轮询到 cfg 内容变化后自动更新监控清单与 tc 分类
   （**这一类没有页面/API 入口**：haproxy.cfg 只归运维手工编辑）。

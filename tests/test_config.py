@@ -227,3 +227,40 @@ def test_old_nic_quota_key_rejected_with_migration_hint(tmp_path):
 def test_instance_quota_rejections(tmp_path, text, match):
     with pytest.raises(ValueError, match=match):
         load_from(tmp_path, text)
+
+
+# ---------------------------------------------------------------------------
+# 动态请求限速（dynamic_request_limit）
+# ---------------------------------------------------------------------------
+
+def test_reqgov_default_disabled(tmp_path):
+    cfg = load_from(tmp_path, minimal())
+    assert cfg.reqgov.enabled is False
+
+
+def test_reqgov_parsed(tmp_path):
+    cfg = load_from(tmp_path, minimal(
+        extra="dynamic_request_limit:\n  enabled: true\n  min_conns: 100\n"
+              "  max_conns: 5000\n  high_ratio: 1.05\n  low_ratio: 0.8\n"
+              "  decrease: 0.5\n  adjust_interval_s: 5\n"))
+    g = cfg.reqgov
+    assert g.enabled and g.min_conns == 100 and g.max_conns == 5000
+    assert g.high_ratio == 1.05 and g.low_ratio == 0.8
+    assert g.decrease == 0.5 and g.adjust_interval_s == 5.0
+
+
+@pytest.mark.parametrize("text,match", [
+    (minimal(extra="dynamic_request_limit: {min_conns: 0}\n"), r"min_conns 必须"),
+    (minimal(extra="dynamic_request_limit: {min_conns: 100, max_conns: 10}\n"),
+     r"max_conns"),
+    (minimal(extra="dynamic_request_limit: {low_ratio: 1.2, high_ratio: 1.0}\n"),
+     r"low_ratio"),
+    (minimal(extra="dynamic_request_limit: {decrease: 1.5}\n"), r"decrease"),
+    (minimal(extra="dynamic_request_limit: {adjust_interval_s: 0.1}\n"),
+     r"adjust_interval_s"),
+    (minimal(extra="dynamic_request_limit: {foo: 1}\n"), r"不认识的键"),
+    (minimal(extra="dynamic_request_limit: [x]\n"), r"必须是键值映射"),
+])
+def test_reqgov_rejections(tmp_path, text, match):
+    with pytest.raises(ValueError, match=match):
+        load_from(tmp_path, text)

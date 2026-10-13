@@ -27,6 +27,7 @@ from . import cfgparse
 from . import config as configmod
 from . import haproxy, metricslog, model
 from . import netdev
+from . import reqgov as reqgovmod
 from . import tcshaper as tcmod
 from . import webconsole
 from .collector import Collector
@@ -138,9 +139,17 @@ async def _amain(cfg, log: logging.Logger,
             haproxy=cfg.haproxy,
             degraded_fn=lambda: col.degraded)
 
-    # sampler：监控循环每拍喂给控制台（内存实时曲线）与监控数据落盘器
-    # （分钟粒度 JSONL）——同一拍、同一份数据，两个出口。
-    sinks = [x.record for x in (hub, mlog) if x is not None]
+    # 动态请求限速（本分支的新能力）：带宽驱动的 AIMD 控制环，经
+    # runtime API 调 frontend 的接纳上限。与 hub/mlog 并列吃 sampler
+    # 的数据（同一拍、同一份），自带任务下发命令。
+    governor = None
+    if getattr(cfg, "reqgov", None) is not None and cfg.reqgov.enabled:
+        governor = reqgovmod.RequestGovernor(
+            client, cfg.reqgov, lambda: ctl.frontends(), log)
+
+    # sampler：监控循环每拍喂给控制台（内存实时曲线）、监控数据落盘器
+    # （分钟粒度 JSONL）与动态请求限速——同一拍、同一份数据，多个出口。
+    sinks = [x.record for x in (hub, mlog, governor) if x is not None]
     if not sinks:
         sampler = None
     elif len(sinks) == 1:
@@ -254,6 +263,16 @@ async def _amain(cfg, log: logging.Logger,
                 shaper, _tc_desired,
                 tc_applied, log, period_s=apply_period_s),
             name="tc-shaper"))
+
+    if governor is not None:
+        tasks.append(asyncio.create_task(governor.run(), name="req-governor"))
+        log.warning(
+            "动态请求限速已启用：带宽超限时将经 runtime API 收缩对应 "
+            "frontend 的接纳上限（需要 stats socket **level admin**）。"
+            "min_conns=%d high_ratio=%g low_ratio=%g decrease=%g "
+            "adjust_interval_s=%g",
+            cfg.reqgov.min_conns, cfg.reqgov.high_ratio, cfg.reqgov.low_ratio,
+            cfg.reqgov.decrease, cfg.reqgov.adjust_interval_s)
 
     log.info("rl-limiter 服务已启动，监控循环开始运行 instance=%s "
              "endpoint=%s cfg=%s frontends=%d version=%s",

@@ -31,6 +31,7 @@ from typing import Any
 import yaml
 
 from . import model
+from .reqgov import ReqGovConfig
 
 # 各键缺失时补上的默认值。与部署示例配置保持一致。
 DEFAULT_LOG_LEVEL = "info"
@@ -71,6 +72,9 @@ class ServiceConfig:
     haproxy: model.NodeConfig = field(default_factory=model.NodeConfig)
     # 限额登记：frontend 名 → 限额（Mbps，≥ 0；0 = 显式不限速）。
     quotas: dict[str, float] = field(default_factory=dict)
+    # 动态请求限速（AIMD 控制环，见 reqgov 模块）。启动时定型，改了
+    # 要重启。
+    reqgov: ReqGovConfig = field(default_factory=ReqGovConfig)
 
 
 def load(path: str) -> ServiceConfig:
@@ -142,6 +146,32 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
             f"当前值 {inst_raw!r}") from None
 
     cfg.haproxy = _parse_haproxy(raw.get("haproxy") or {})
+
+    gov_raw = raw.get("dynamic_request_limit") or {}
+    if not isinstance(gov_raw, dict):
+        raise ValueError(
+            f"dynamic_request_limit 必须是键值映射，"
+            f"实际是 {type(gov_raw).__name__}")
+    _GOV_KEYS = {"enabled", "min_conns", "max_conns", "high_ratio",
+                 "low_ratio", "decrease", "adjust_interval_s"}
+    unknown = set(gov_raw) - _GOV_KEYS
+    if unknown:
+        raise ValueError(
+            f"dynamic_request_limit 有不认识的键 {sorted(unknown)}，"
+            f"可用：{sorted(_GOV_KEYS)}")
+    gov = ReqGovConfig()
+    gov.enabled = bool(gov_raw.get("enabled", False))
+    try:
+        gov.min_conns = int(gov_raw.get("min_conns", gov.min_conns))
+        gov.max_conns = int(gov_raw.get("max_conns", gov.max_conns))
+        gov.high_ratio = float(gov_raw.get("high_ratio", gov.high_ratio))
+        gov.low_ratio = float(gov_raw.get("low_ratio", gov.low_ratio))
+        gov.decrease = float(gov_raw.get("decrease", gov.decrease))
+        gov.adjust_interval_s = float(
+            gov_raw.get("adjust_interval_s", gov.adjust_interval_s))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"dynamic_request_limit 的字段必须是数字：{e}") from None
+    cfg.reqgov = gov
 
     quotas_raw = raw.get("quotas") or {}
     if not isinstance(quotas_raw, dict):
@@ -218,6 +248,29 @@ def _validate(cfg: ServiceConfig) -> None:
         raise ValueError(
             f"instance_quota_mbps={cfg.instance_quota_mbps} 太小（换算成 "
             f"bytes/s 后不足 1），tc 会拒绝这个速率；要不限就写 0")
+
+    g = cfg.reqgov
+    if g.min_conns < 1:
+        raise ValueError(
+            f"dynamic_request_limit.min_conns 必须 ≥ 1（当前值 "
+            f"{g.min_conns}）——收缩下限为 0 等于把入口饿死")
+    if g.max_conns < g.min_conns:
+        raise ValueError(
+            f"dynamic_request_limit.max_conns（{g.max_conns}）不能小于 "
+            f"min_conns（{g.min_conns}）")
+    if not (0 < g.low_ratio <= g.high_ratio):
+        raise ValueError(
+            f"dynamic_request_limit 要求 0 < low_ratio ≤ high_ratio"
+            f"（当前 low={g.low_ratio} high={g.high_ratio}）——两者之间是"
+            f"滞回带，顺序反了会在限额线附近来回抖")
+    if not (0 < g.decrease < 1):
+        raise ValueError(
+            f"dynamic_request_limit.decrease 必须在 (0,1) 区间（当前值 "
+            f"{g.decrease}）——它是乘性收缩系数")
+    if not (0.5 <= g.adjust_interval_s <= 60):
+        raise ValueError(
+            f"dynamic_request_limit.adjust_interval_s 必须在 0.5-60 秒"
+            f"（当前值 {g.adjust_interval_s}）")
 
     for name, mbps in cfg.quotas.items():
         if not _NAME_RE.match(name):

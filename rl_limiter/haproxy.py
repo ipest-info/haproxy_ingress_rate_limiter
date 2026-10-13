@@ -263,6 +263,7 @@ def parse_show_stat(out: str) -> list[model.FrontendStat]:
             err_req=opt("ereq"),
             # 只取 h1：h2/h3 没有 frontend 方向的 open_streams 列，
             # 理由见 model.FrontendStat 的字段注释。
+            sess_limit=opt("slim"),
             open_conns=opt("h1_open_connections"),
             open_streams=opt("h1_open_streams"),
             mode=_field_at(fields, col_idx.get("mode", -1)),

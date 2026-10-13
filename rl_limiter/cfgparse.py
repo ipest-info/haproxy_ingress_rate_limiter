@@ -275,7 +275,8 @@ async def watch(
             svc = configmod.load(yaml_path)
             quotas = dict(svc.quotas)
             yaml_rest = (svc.log_level, svc.tick_interval_s,
-                         svc.haproxy.endpoint(), svc.haproxy.cfg_path)
+                         svc.haproxy.endpoint(), svc.haproxy.cfg_path,
+                         repr(getattr(svc, "reqgov", None)))
             frontends = load_frontends(cfg_path, quotas, log, warned)
         except Exception as e:
             log.warning(

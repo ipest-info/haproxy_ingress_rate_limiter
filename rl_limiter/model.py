@@ -60,6 +60,9 @@ class FrontendStat:
     denied_req: int = 0
     denied_resp: int = 0
     err_req: int = 0     # 请求错误数（ereq）
+    # 该 frontend 配置的并发上限（slim 列；0 = cfg 未给 frontend 级
+    # maxconn）。动态请求限速用它当恢复基准（压下去之后放回到哪）。
+    sess_limit: int = 0
     # HTTP/1 的连接/流计数（h1_open_connections / h1_open_streams）。实测
     # 这两列是**按 frontend** 统计的，可据此拆出活跃/空闲：有在途流的连接
     # 算活跃，建着但没有流的（keep-alive 空等）算空闲。
