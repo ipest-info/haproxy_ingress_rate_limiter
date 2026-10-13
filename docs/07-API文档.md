@@ -244,10 +244,15 @@ data: ...
       "title": "出向 HTB（响应方向限速）",
       "iface": "eth0",             // 这一面作用的网卡
       "desired": "fe_main@:8080=40Mbps; 实例总限速=200Mbps（层级模式）",
+      "help": [                    // "怎么读这段输出"的解释条目（给人看）
+        "classid 的次要号是十六进制端口：如 1:1f90 = 端口 8080…", "…"
+      ],
       "raw": [                     // 原始输出，每条带完整命令做标签
-        {"label": "tc -s qdisc show dev eth0", "text": "qdisc htb 1: …"},
-        {"label": "tc -s class show dev eth0", "text": "class htb 1:1 …"},
-        {"label": "tc filter show dev eth0",   "text": "filter parent 1: …"}
+        {"label": "tc -s qdisc show dev eth0",
+         "note": "整张网卡的根队列总体统计…",   // 这段输出是什么，一句话
+         "text": "qdisc htb 1: …"},
+        {"label": "tc -s class show dev eth0", "note": "…", "text": "…"},
+        {"label": "tc filter show dev eth0",   "note": "…", "text": "…"}
       ]
     }
   ]
