@@ -218,19 +218,25 @@ def load_frontends(cfg_path: str, quotas: dict[str, float],
 
 
 def canonical(frontends: list[model.FrontendConfig],
-              instance_quota_mbps: float = 0.0) -> str:
+              instance_quota_mbps: float = 0.0,
+              request_limits: "dict | None" = None) -> str:
     """配置内容的精确身份（变更检测用字符串比较，不经哈希）。"""
     body = ";".join(
         f"{f.name}|{f.bind_address}|{f.bind_port}|{f.mode}|{f.quota_mbps:g}"
         for f in sorted(frontends, key=lambda x: x.name)
     )
-    return f"{body};inst:{instance_quota_mbps:g}"
+    req = ",".join(
+        f"{name}|{rl.mbps:g}|{rl.conn_rate}"
+        for name, rl in sorted((request_limits or {}).items()))
+    return f"{body};inst:{instance_quota_mbps:g};req:{req}"
 
 
 def checksum(frontends: list[model.FrontendConfig],
-             instance_quota_mbps: float = 0.0) -> int:
+             instance_quota_mbps: float = 0.0,
+             request_limits: "dict | None" = None) -> int:
     """内容校验和：充当配置版本号（控制台展示/核对用）。"""
-    return zlib.crc32(canonical(frontends, instance_quota_mbps).encode("utf-8"))
+    return zlib.crc32(canonical(frontends, instance_quota_mbps,
+                                request_limits).encode("utf-8"))
 
 
 async def watch(
@@ -241,6 +247,7 @@ async def watch(
     log: logging.Logger,
     interval_s: float = WATCH_INTERVAL_S,
     boot_instance_quota_mbps: float = 0.0,
+    boot_request_limits: "dict | None" = None,
     poke: "asyncio.Event | None" = None,
 ) -> None:
     """常驻任务：轮询 haproxy.cfg 与 YAML 配置文件，内容变化就把新
@@ -257,7 +264,8 @@ async def watch(
     """
     from . import config as configmod  # 延迟导入避免环形依赖
 
-    last = canonical(boot_frontends, boot_instance_quota_mbps)
+    last = canonical(boot_frontends, boot_instance_quota_mbps,
+                     boot_request_limits)
     warned: set[str] = set()
     last_yaml_rest: tuple | None = None
     while True:
@@ -292,7 +300,8 @@ async def watch(
                 "接线等）：这些字段在进程启动时定型，热更新不生效，请重启 "
                 "rl-limiter")
 
-        cur = canonical(frontends, svc.instance_quota_mbps)
+        cur = canonical(frontends, svc.instance_quota_mbps,
+                        svc.request_limits)
         if cur == last:
             continue
         last = cur
@@ -301,10 +310,12 @@ async def watch(
         version = zlib.crc32(cur.encode("utf-8"))
         queue.put_nowait(model.ControllerConfig(
             version=version, frontends=frontends,
-            instance_quota_mbps=svc.instance_quota_mbps))
+            instance_quota_mbps=svc.instance_quota_mbps,
+            request_limits=dict(svc.request_limits)))
         log.info(
             "检测到 haproxy.cfg / 限额配置变化，已提交监控循环热生效 "
-            "version=%s frontends=%d instance_quota=%s", version,
-            len(frontends),
+            "version=%s frontends=%d instance_quota=%s request_limits=%d",
+            version, len(frontends),
             f"{svc.instance_quota_mbps:g}Mbps"
-            if svc.instance_quota_mbps else "不限")
+            if svc.instance_quota_mbps else "不限",
+            len(svc.request_limits))

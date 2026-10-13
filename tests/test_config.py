@@ -227,3 +227,35 @@ def test_old_nic_quota_key_rejected_with_migration_hint(tmp_path):
 def test_instance_quota_rejections(tmp_path, text, match):
     with pytest.raises(ValueError, match=match):
         load_from(tmp_path, text)
+
+
+# ---------------------------------------------------------------------------
+# 请求方向限速（request_limits，双网卡形态）
+# ---------------------------------------------------------------------------
+
+def test_request_limits_parsed(tmp_path):
+    cfg = load_from(tmp_path, minimal(
+        extra="request_limits:\n  fe_a: {mbps: 10, conn_rate: 200}\n"
+              "  fe_b: {mbps: 5.5}\n  fe_c: {conn_rate: 50}\n"))
+    assert cfg.request_limits["fe_a"].mbps == 10.0
+    assert cfg.request_limits["fe_a"].conn_rate == 200
+    assert cfg.request_limits["fe_b"].conn_rate == 0
+    assert cfg.request_limits["fe_c"].mbps == 0.0
+
+
+def test_request_limits_default_empty(tmp_path):
+    assert load_from(tmp_path, minimal()).request_limits == {}
+
+
+@pytest.mark.parametrize("text,match", [
+    (minimal(extra="request_limits: [fe_a]\n"), r"request_limits 必须是键值映射"),
+    (minimal(extra="request_limits: {fe_a: 10}\n"), r"request_limits.fe_a 必须是映射"),
+    (minimal(extra="request_limits: {fe_a: {mbps: -1}}\n"), r"不能为负数"),
+    (minimal(extra="request_limits: {fe_a: {mbps: 0.000004}}\n"), r"太小"),
+    (minimal(extra="request_limits: {fe_a: {conn_rate: -5}}\n"), r"conn_rate 不能为负数"),
+    (minimal(extra="request_limits: {fe_a: {rate: 10}}\n"), r"不认识的键"),
+    (minimal(extra="request_limits: {'fe bad': {mbps: 10}}\n"), r"request_limits 的键"),
+])
+def test_request_limits_rejections(tmp_path, text, match):
+    with pytest.raises(ValueError, match=match):
+        load_from(tmp_path, text)

@@ -390,3 +390,13 @@ def test_overview_carries_instance_quota():
 def test_metrics_carries_instance_quota():
     body = webconsole.render_prometheus(hub_with_instance_quota(800.0))
     assert "rl_limiter_instance_quota_bytes_per_second 100000000.0" in body
+
+
+def test_overview_carries_request_limits():
+    """请求方向限速登记随 overview 暴露（页面/第三方可见，双网卡形态）。"""
+    h = webconsole.StatusHub("test", version_fn=lambda: 1)
+    h.update_config(model.ControllerConfig(
+        version=1, frontends=[fe()],
+        request_limits={"fe_a": model.RequestLimit(mbps=10.0, conn_rate=200)}))
+    o = h.overview()
+    assert o["request_limits"] == {"fe_a": {"mbps": 10.0, "conn_rate": 200}}

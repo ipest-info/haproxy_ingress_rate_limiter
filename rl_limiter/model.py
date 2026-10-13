@@ -303,6 +303,19 @@ class InstanceUsage:
 
 
 @dataclass(**SLOTS)
+class RequestLimit:
+    """请求方向（客户端→HAProxy，入向）的限速登记——双网卡形态专用。
+
+    与 quotas（响应方向/下行）相互独立：quotas 限的是 HAProxy 发回
+    客户端的带宽（出向 tc/HTB），这里限的是客户端打进来的请求流
+    （客户端侧网卡的**入向** tc police）。两者可以只配一边。
+    """
+
+    mbps: float = 0.0       # 入向带宽上限（Mbps；0 = 不限）
+    conn_rate: int = 0      # 每秒新建连接（SYN）上限（0 = 不限）
+
+
+@dataclass(**SLOTS)
 class ControllerConfig:
     """投递给监控主循环的运行期配置文档（业务配置的内存形态）。
 
@@ -317,6 +330,9 @@ class ControllerConfig:
     # （单端口生效上限 = min(自身限额, 实例总限速)）。SSH/系统流量不在
     # 总闸内。
     instance_quota_mbps: float = 0.0
+    # 请求方向限速登记（frontend 名 → RequestLimit）。双网卡形态下由
+    # tcingress 在客户端侧网卡的入向执行。
+    request_limits: dict = field(default_factory=dict)
 
     def quotas(self) -> dict[str, float]:
         """frontend 名 → 限额（bytes/s），供超限判定使用。"""

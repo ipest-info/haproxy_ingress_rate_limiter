@@ -67,6 +67,9 @@ class ServiceConfig:
     # 的出向流量合计（含只监控未登记限额的段）；SSH/监控/系统流量不在
     # 总闸之内、不受影响。tc 侧实现见 tcshaper 的层级模式。
     instance_quota_mbps: float = 0.0
+    # 请求方向（入向）限速登记：frontend 名 → RequestLimit（mbps /
+    # conn_rate）。双网卡形态专用，入向执行网卡由 RL_TC_IN_IFACE 指定。
+    request_limits: dict = field(default_factory=dict)
     # 本机 HAProxy 的接线（stats socket + cfg 路径）。
     haproxy: model.NodeConfig = field(default_factory=model.NodeConfig)
     # 限额登记：frontend 名 → 限额（Mbps，≥ 0；0 = 显式不限速）。
@@ -143,6 +146,37 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
 
     cfg.haproxy = _parse_haproxy(raw.get("haproxy") or {})
 
+    req_raw = raw.get("request_limits") or {}
+    if not isinstance(req_raw, dict):
+        raise ValueError(
+            f"request_limits 必须是键值映射（frontend 名 → {{mbps, "
+            f"conn_rate}}），实际是 {type(req_raw).__name__}")
+    for name, item in req_raw.items():
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"request_limits.{name} 必须是映射（可含 mbps / conn_rate "
+                f"两个键），实际是 {type(item).__name__}")
+        unknown = set(item) - {"mbps", "conn_rate"}
+        if unknown:
+            raise ValueError(
+                f"request_limits.{name} 有不认识的键 {sorted(unknown)}"
+                f"——只支持 mbps（入向带宽，Mbps）与 conn_rate（每秒新建"
+                f"连接上限）")
+        try:
+            mbps = float(item.get("mbps", 0) or 0)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"request_limits.{name}.mbps 必须是数字（Mbps），"
+                f"当前值 {item.get('mbps')!r}") from None
+        try:
+            conn_rate = int(item.get("conn_rate", 0) or 0)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"request_limits.{name}.conn_rate 必须是整数（个/秒），"
+                f"当前值 {item.get('conn_rate')!r}") from None
+        cfg.request_limits[str(name).strip()] = model.RequestLimit(
+            mbps=mbps, conn_rate=conn_rate)
+
     quotas_raw = raw.get("quotas") or {}
     if not isinstance(quotas_raw, dict):
         raise ValueError(
@@ -218,6 +252,26 @@ def _validate(cfg: ServiceConfig) -> None:
         raise ValueError(
             f"instance_quota_mbps={cfg.instance_quota_mbps} 太小（换算成 "
             f"bytes/s 后不足 1），tc 会拒绝这个速率；要不限就写 0")
+
+    for name, rl in cfg.request_limits.items():
+        if not _NAME_RE.match(name):
+            raise ValueError(
+                f"request_limits 的键 {name!r} 非法——应为 haproxy.cfg 里"
+                f"的 frontend/listen 段名（字母、数字、点、下划线、连字符，"
+                f"长度 1-64）")
+        if rl.mbps < 0:
+            raise ValueError(
+                f"request_limits.{name}.mbps 不能为负数（当前值 "
+                f"{rl.mbps!r}）——正数是请求方向带宽上限（Mbps），0 表示"
+                f"不限带宽")
+        if 0 < rl.mbps * 1_000_000 / 8 < 1:
+            raise ValueError(
+                f"request_limits.{name}.mbps={rl.mbps} 太小（换算成 "
+                f"bytes/s 后不足 1），tc 会拒绝这个速率；要不限就写 0")
+        if rl.conn_rate < 0:
+            raise ValueError(
+                f"request_limits.{name}.conn_rate 不能为负数（当前值 "
+                f"{rl.conn_rate!r}）——正数是每秒新建连接上限，0 表示不限")
 
     for name, mbps in cfg.quotas.items():
         if not _NAME_RE.match(name):

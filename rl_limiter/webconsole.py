@@ -145,6 +145,7 @@ class StatusHub:
         self._fe_config: dict[str, dict[str, Any]] = {}
         # 实例总限速（Mbps；0 = 不限）。随配置热更。
         self._instance_quota_mbps = 0.0
+        self._request_limits: dict = {}
         self._started = time.time()
 
     # ---- 配置与数据注入 ----
@@ -157,6 +158,12 @@ class StatusHub:
         for name, d in self._fe_config.items():
             d["quota_bytes_per_s"] = d["quota_mbps"] * 1e6 / 8.0
         self._instance_quota_mbps = getattr(cfg, "instance_quota_mbps", 0.0)
+        # 请求方向限速登记（双网卡形态）。页面暂只在 overview 里展示，
+        # 修改入口是 YAML（本分支的写 API 不覆盖它）。
+        self._request_limits = {
+            name: {"mbps": rl.mbps, "conn_rate": rl.conn_rate}
+            for name, rl in (getattr(cfg, "request_limits", {}) or {}).items()
+        }
 
     def _haproxy_view(self) -> dict[str, Any]:
         """本机 HAProxy 视图：接线 + 采样健康。"""
@@ -255,6 +262,8 @@ class StatusHub:
             "frontends": self._fe_config,
             # 实例总限速（Mbps；0 = 不限）与换算好的 bytes/s（图表参考线）。
             "instance_quota_mbps": self._instance_quota_mbps,
+            # 请求方向（入向）限速登记：frontend 名 → {mbps, conn_rate}。
+            "request_limits": self._request_limits,
             "instance_quota_bytes_per_s": self._instance_quota_mbps * 1e6 / 8.0,
             "haproxy": self._haproxy_view(),
             "latest": self._history[-1] if self._history else None,

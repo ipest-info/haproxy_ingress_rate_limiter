@@ -27,6 +27,7 @@ from . import cfgparse
 from . import config as configmod
 from . import haproxy, metricslog, model
 from . import netdev
+from . import tcingress as tcinmod
 from . import tcshaper as tcmod
 from . import webconsole
 from .collector import Collector
@@ -66,6 +67,12 @@ ENV_TC_IFACE = "RL_TC_IFACE"
 # 不设则跟随 RL_TC_IFACE；设为 "-" 表示禁用入向包统计。
 ENV_NIC = "RL_NIC"
 
+# 请求方向（入向）限速的执行网卡 = **客户端侧**那张（双网卡形态）。
+# 配置了 request_limits 就必须显式指定——入向 police 放错网卡会误伤
+# 后端流量，所以这一项**绝不自动探测**；设为 "-" 表示明确不做入向限速
+# （request_limits 仍会被解析但只告警不执行）。
+ENV_TC_IN_IFACE = "RL_TC_IN_IFACE"
+
 # 监控数据落盘：设为本地文件路径即启用（JSONL，分钟粒度，按天轮转，
 # 见 metricslog 模块）。不设 = 不落盘，只有内存实时曲线。
 ENV_METRICS_LOG = "RL_METRICS_LOG"
@@ -98,6 +105,7 @@ async def _amain(cfg, log: logging.Logger,
                  console_bind: str = DEFAULT_CONSOLE_BIND,
                  apply_period_s: float = DEFAULT_APPLY_PERIOD_S,
                  shaper: "tcmod.TcShaper | None" = None,
+                 ingress: "tcinmod.TcIngress | None" = None,
                  nic: str = "",
                  mlog: "metricslog.MetricsLog | None" = None,
                  api_token: str = "") -> None:
@@ -152,7 +160,8 @@ async def _amain(cfg, log: logging.Logger,
     # 配置一变就叫醒"下发"类任务（下发限速的 tcshaper）：监控循环每应用
     # 一份配置就 set 这个事件。
     tc_applied = asyncio.Event() if shaper is not None else None
-    config_applied = [e for e in (tc_applied,) if e is not None]
+    tcin_applied = asyncio.Event() if ingress is not None else None
+    config_applied = [e for e in (tc_applied, tcin_applied) if e is not None]
     ctl = MonitorLoop(col, sampler=sampler, log=log,
                       config_applied=config_applied)
     if mlog is not None:
@@ -163,10 +172,13 @@ async def _amain(cfg, log: logging.Logger,
     # 直接喂给监控循环。版本号取内容校验和，watch 以同一算法做变更检测
     # 基准——首轮轮询读到同样内容时不会再触发一次重复应用。
     seed_version = cfgparse.checksum(boot_frontends,
-                                     cfg.instance_quota_mbps)
-    seed_cfg = model.ControllerConfig(version=seed_version,
-                                      frontends=list(boot_frontends),
-                                      instance_quota_mbps=cfg.instance_quota_mbps)
+                                     cfg.instance_quota_mbps,
+                                     cfg.request_limits)
+    seed_cfg = model.ControllerConfig(
+        version=seed_version,
+        frontends=list(boot_frontends),
+        instance_quota_mbps=cfg.instance_quota_mbps,
+        request_limits=dict(cfg.request_limits))
     ctl.seed(seed_cfg)
     if hub is not None:
         hub.update_config(seed_cfg)
@@ -225,6 +237,7 @@ async def _amain(cfg, log: logging.Logger,
         cfgparse.watch(cfg.haproxy.cfg_path, yaml_path, source_queue,
                        boot_frontends, log,
                        boot_instance_quota_mbps=cfg.instance_quota_mbps,
+                       boot_request_limits=cfg.request_limits,
                        poke=cfg_poke),
         name="cfg-watch"))
     if hub is not None:
@@ -254,6 +267,15 @@ async def _amain(cfg, log: logging.Logger,
                 shaper, _tc_desired,
                 tc_applied, log, period_s=apply_period_s),
             name="tc-shaper"))
+
+    if ingress is not None and tcin_applied is not None:
+        # 请求方向（入向）限速：事件驱动 + 周期兜底，与出向同一套节奏。
+        tasks.append(asyncio.create_task(
+            tcinmod.run_ingress(
+                ingress,
+                lambda: (list(ctl.frontends()), ctl.request_limits()),
+                tcin_applied, log, period_s=apply_period_s),
+            name="tc-ingress"))
 
     log.info("rl-limiter 服务已启动，监控循环开始运行 instance=%s "
              "endpoint=%s cfg=%s frontends=%d version=%s",
@@ -413,6 +435,31 @@ def main() -> None:
                     "listen——服务照常启动，之后 cfg 内容变化会被轮询接上 "
                     "cfg_path=%s", cfg.haproxy.cfg_path)
 
+    # 请求方向（入向）限速：双网卡形态，执行网卡 = 客户端侧那张，只认
+    # RL_TC_IN_IFACE 显式指定（绝不自动探测——入向 police 放错网卡会误伤
+    # 后端流量）。配置了 request_limits 却没指定网卡 → 启动失败，宁可
+    # 起不来也不要"以为限了请求方向其实没有"。
+    ingress = None
+    raw_in_iface = (os.environ.get(ENV_TC_IN_IFACE) or "").strip()
+    if raw_in_iface == "-":
+        if cfg.request_limits:
+            log.warning("已显式关闭入向限速（%s=-），YAML 里的 "
+                        "request_limits（%d 条）不会执行",
+                        ENV_TC_IN_IFACE, len(cfg.request_limits))
+    elif raw_in_iface:
+        ingress = tcinmod.TcIngress(raw_in_iface, log)
+    elif cfg.request_limits:
+        print(
+            f"rl-limiter: YAML 里配置了 request_limits（请求方向限速），"
+            f"但没有指定入向执行网卡。\n"
+            f"  双网卡形态下请设 {ENV_TC_IN_IFACE}=<客户端侧网卡名>"
+            f"（这一项不做自动探测——入向 police 放错网卡会误伤后端"
+            f"流量）；\n"
+            f"  确实不需要请求方向限速时，删掉 request_limits 段或设 "
+            f"{ENV_TC_IN_IFACE}=- 明确关闭。",
+            file=sys.stderr)
+        raise SystemExit(1)
+
     # 监控数据落盘（可选）：设 RL_METRICS_LOG=<文件路径> 即启用。
     mlog = None
     raw_mlog = (os.environ.get(ENV_METRICS_LOG) or "").strip()
@@ -455,13 +502,15 @@ def main() -> None:
     log.info(
         "服务配置加载完成，以下为完整配置摘要（排障第一条要看的日志） "
         "yaml=%s cfg=%s instance=%s endpoint=%s log_level=%s "
-        "tick_interval_s=%s instance_quota=%s frontends=%d detail=%s",
+        "tick_interval_s=%s instance_quota=%s request_limits=%d "
+        "frontends=%d detail=%s",
         args.config, cfg.haproxy.cfg_path,
         cfg.haproxy.name, cfg.haproxy.endpoint(),
         cfg.log_level,
         getattr(cfg, "tick_interval_s", 1.0),
         (f"{cfg.instance_quota_mbps:g}Mbps" if cfg.instance_quota_mbps
          else "不限（未设实例总限速）"),
+        len(cfg.request_limits),
         len(boot_frontends), _summarize_frontends(boot_frontends),
     )
 
@@ -471,8 +520,8 @@ def main() -> None:
                            boot_frontends=boot_frontends,
                            console_port=console_port, logbuf=logbuf,
                            console_bind=console_bind,
-                           shaper=shaper, nic=nic, mlog=mlog,
-                           api_token=api_token))
+                           shaper=shaper, ingress=ingress, nic=nic,
+                           mlog=mlog, api_token=api_token))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
     log.info("rl-limiter 服务已停止")

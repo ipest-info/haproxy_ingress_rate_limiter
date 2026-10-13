@@ -308,3 +308,30 @@ async def test_watch_pushes_on_instance_quota_change(tmp_path):
         f"  cfg_path: {cfg_file}\nquotas:\n  fe_main: 40\n", encoding="utf-8")
     got = await run_watch_once(cfg_file, yaml_file, boot)
     assert got and got[-1].instance_quota_mbps == 500.0
+
+
+def test_checksum_is_request_limits_sensitive():
+    """请求方向限速参与内容身份：只改 request_limits 也必须触发热更。"""
+    a = model.FrontendConfig(name="fe_a", bind_port=1, quota_mbps=8)
+    lim1 = {"fe_a": model.RequestLimit(mbps=10.0, conn_rate=100)}
+    lim2 = {"fe_a": model.RequestLimit(mbps=10.0, conn_rate=200)}
+    assert cfgparse.checksum([a], 0.0, lim1) != cfgparse.checksum([a], 0.0, lim2)
+    assert cfgparse.checksum([a], 0.0, lim1) == cfgparse.checksum([a], 0.0, dict(lim1))
+    assert cfgparse.checksum([a]) != cfgparse.checksum([a], 0.0, lim1)
+
+
+async def test_watch_pushes_on_request_limits_change(tmp_path):
+    """只改 request_limits（quotas/cfg 都没动）也要推出一份新配置。"""
+    cfg_file = tmp_path / "haproxy.cfg"
+    cfg_file.write_text("listen fe_main\n    bind :8080\n", encoding="utf-8")
+    yaml_file = write_yaml(tmp_path, cfg_file)
+    boot = cfgparse.load_frontends(str(cfg_file), {"fe_main": 40}, log)
+
+    yaml_file.write_text(
+        f"haproxy:\n  socket_path: /run/h.sock\n  cfg_path: {cfg_file}\n"
+        f"quotas:\n  fe_main: 40\n"
+        f"request_limits:\n  fe_main: {{mbps: 10, conn_rate: 200}}\n",
+        encoding="utf-8")
+    got = await run_watch_once(cfg_file, yaml_file, boot)
+    assert got and got[-1].request_limits["fe_main"].mbps == 10.0
+    assert got[-1].request_limits["fe_main"].conn_rate == 200

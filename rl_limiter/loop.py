@@ -91,6 +91,7 @@ class MonitorLoop:
         self._frontends: list[model.FrontendConfig] = []
         # 实例总限速（Mbps；0 = 不限），随配置热更。
         self._instance_quota_mbps: float = 0.0
+        self._request_limits: dict = {}
         # frontend 名 → 超限滞回状态。
         self._over: dict[str, _OverState] = {}
         # 每次应用配置后被 set 的信号量，供"下发"类任务（下发限速的
@@ -114,6 +115,11 @@ class MonitorLoop:
         取的是配置内容的校验和；控制台展示它，便于核对配置是否已热更
         到位。"""
         return self._version
+
+    def request_limits(self) -> dict:
+        """当前请求方向限速登记（frontend 名 → RequestLimit），入向 tc
+        下发任务每轮现取。"""
+        return dict(self._request_limits)
 
     @property
     def instance_quota_mbps(self) -> float:
@@ -143,6 +149,7 @@ class MonitorLoop:
         任务），组件间不会看到半新半旧的配置。"""
         self._frontends = list(cfg.frontends)
         self._instance_quota_mbps = getattr(cfg, "instance_quota_mbps", 0.0)
+        self._request_limits = dict(getattr(cfg, "request_limits", {}) or {})
         self._collector.set_managed(cfg.names())
         self._quotas = cfg.quotas()
         # 已下线 frontend 的滞回状态一并丢弃；限额变化的保留计数（判定基准
