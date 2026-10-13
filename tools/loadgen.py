@@ -2,9 +2,17 @@
 # tools/loadgen.py —— 可在线调节并发数的 HTTP 压测服务（模拟并发带宽）。
 #
 # 角色：docker compose 演示环境里的"客户端群"替身。维持 N 个并发 worker
-# 持续请求目标 URL（经 HAProxy 入口，可给多个、逗号分隔，每请求随机挑一），
-# 把响应体完整读完并累计字节数——制造出可控强度的下行带宽压力，供观察
-# 各入口聚合限速的效果（总速率贴限额、连接间动态分享）。限速在内核 tc 上。
+# 持续请求目标 URL（经 HAProxy 入口，可给多个、逗号分隔，worker 轮转
+# 绑定入口），把响应体完整读完并累计字节数——制造出可控强度的下行带宽
+# 压力，供观察各入口聚合限速的效果（总速率贴限额、连接间动态分享）。
+#
+# **默认场景：小文件 + 慢客户端 + 短连接**（贴近真实业务）：
+#   - 后端返回随机大小的小文件（random_web 默认 4 KiB–256 KiB）；
+#   - 每个请求按 --per-req-kbs 限读（默认 100 KB/s，模拟终端用户的
+#     下载速度；0 = 不限）——限速在客户端侧，经 TCP 接收窗口把背压
+#     传回 HAProxy/后端，这正是海量慢客户端的真实形态；
+#   - **每个请求响应读完即由客户端断开连接，绝不复用**（无 keep-alive
+#     复用）——高连接翻新率（conn churn）是场景的一部分。
 #
 # 并发数可两种方式调节：
 #   - 启动参数 --concurrency / 环境变量 LOADGEN_CONCURRENCY：初始并发；
@@ -32,8 +40,11 @@
 # 实现要点：
 #   - worker 是纯 asyncio 任务：加/减并发 = 补/撤任务，撤销点在请求边界
 #     （cancel 由 aiohttp 在 await 处响应），不会留下半截连接；
-#   - 每个 worker 独立 keep-alive 连接、周期轮转（REQUESTS_PER_CONNECTION
-#     注释解释了为什么既不能长期持有同一连接、也不能用 Connection: close）；
+#   - 短连接的断开方向在**客户端侧**（TCPConnector force_close：响应读
+#     完后由客户端关闭）。绝不能用 Connection: close 让服务端先关——
+#     server 提前 FIN 会与 L4 整形器尚未放完的整形数据竞争，导致 client
+#     侧响应截断（实测短连接全部报 ContentLengthError）；客户端读完再关
+#     则完全正常；
 #   - 请求失败（HAProxy 未就绪、后端重启等）只计数并小睡退避，worker
 #     永不退出——压测器要比被测对象皮实。
 
@@ -56,13 +67,13 @@ log = logging.getLogger("loadgen")
 DEFAULT_CONCURRENCY = 8
 DEFAULT_CONTROL_PORT = 8081
 DEFAULT_REPORT_S = 2.0
-# 每条 TCP 连接复用的请求数，之后由**客户端侧**优雅关闭并重建。
-# 两头兼顾：TCP L4 整形的每连接限速在建连时定格，周期轮转连接让
-# 限额调整后新连接尽快进入新额度；同时绝不能用 Connection: close
-# 让服务端先关（server 提前 FIN 会与整形器尚未放完的
-# 整形数据竞争，导致 client 侧响应截断——实测短连接全部报
-# ContentLengthError，keep-alive 由客户端关则完全正常）。
-REQUESTS_PER_CONNECTION = 8
+# 每请求的客户端侧限读速度（KB/s，1 KB = 1024 字节）。模拟终端用户的
+# 下载速度：真实业务里单个用户远跑不满入口带宽，聚合压力来自"很多个
+# 慢客户端"。0 = 不限（回到尽力读）。
+DEFAULT_PER_REQ_KBS = 100.0
+# 限读的分块大小：块越小 pacing 越平滑；16 KiB 在 100 KB/s 下约每
+# 160ms 一拍，足够平滑又不至于 syscall 刷屏。
+THROTTLE_CHUNK = 16 * 1024
 # 并发上限：防御性钳制，防止一条打错的 curl（比如 32000）把演示环境
 # 的文件描述符耗尽。演示所需并发远低于此。
 MAX_CONCURRENCY = 1024
@@ -139,8 +150,10 @@ class LoadGen:
     （随机每请求挑目标会出现这种排队效应）。
     """
 
-    def __init__(self, targets: list[str]):
+    def __init__(self, targets: list[str], per_req_kbs: float = DEFAULT_PER_REQ_KBS):
         self._targets = list(targets)
+        # 每请求限读速度（bytes/s；0 = 不限）。
+        self.per_req_rate = per_req_kbs * 1024.0
         self._workers: list[asyncio.Task] = []
         # 大文件 worker：每目标 N 个（(task, state) 成对管理）。
         self._big: list[tuple[asyncio.Task, BigState]] = []
@@ -214,28 +227,48 @@ class LoadGen:
             self._workers.pop().cancel()
         return n
 
-    async def _worker(self, target: str) -> None:
-        """单个"客户端"：循环请求绑定的目标并把响应体完整读完。
+    async def _read_throttled(self, resp, st: TargetStats) -> None:
+        """把响应体读完，按 per_req_rate 限读（0 = 不限）。
 
-        - 连接生命周期：每个 worker 独立 session（keep-alive，连接池 1），
-          复用 REQUESTS_PER_CONNECTION 个请求后由客户端优雅关闭重建
-          （理由见常量注释：跟随限额调整 + 避开 server 先 FIN 的截断竞争）；
-        - 读响应用分块迭代而不是 read()——限速生效时单个响应会拖长到
-          数秒，分块累计让吞吐统计平滑跟随实际到达的字节，而不是在
-          响应结束时跳变一大块。
+        pacing 放在客户端读侧：读慢了 → TCP 接收窗口收紧 → 背压经
+        HAProxy 传回后端，与真实慢客户端的行为一致。分块累计让吞吐
+        统计平滑跟随实际到达的字节。
+        """
+        rate = self.per_req_rate
+        if rate <= 0:
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                st.bytes_total += len(chunk)
+            return
+        start = time.monotonic()
+        got = 0
+        async for chunk in resp.content.iter_chunked(THROTTLE_CHUNK):
+            st.bytes_total += len(chunk)
+            got += len(chunk)
+            # 已到字节对应的"应耗时"与实际耗时的差 = 需要补睡的时间。
+            ahead = got / rate - (time.monotonic() - start)
+            if ahead > 0:
+                await asyncio.sleep(ahead)
+
+    async def _worker(self, target: str) -> None:
+        """单个"客户端"：循环请求绑定的目标，读完即断连，绝不复用。
+
+        - **短连接**：TCPConnector(force_close=True) 让每个响应读完后由
+          客户端关闭连接，下个请求重新建连——没有任何 keep-alive 复用。
+          断开方向在客户端侧（server 先 FIN 会与 L4 整形竞争出截断，
+          见文件头注释）；
+        - 每请求按 per_req_rate 限读（_read_throttled），模拟慢客户端。
         """
         st = self._stats[target]
         timeout = aiohttp.ClientTimeout(total=None, connect=10.0)
         while True:
             try:
-                connector = aiohttp.TCPConnector(limit=1)
+                connector = aiohttp.TCPConnector(limit=1, force_close=True)
                 async with aiohttp.ClientSession(
                         timeout=timeout, connector=connector) as sess:
-                    for _ in range(REQUESTS_PER_CONNECTION):
+                    while True:
                         async with sess.get(target) as resp:
                             if resp.status == 200:
-                                async for chunk in resp.content.iter_chunked(64 * 1024):
-                                    st.bytes_total += len(chunk)
+                                await self._read_throttled(resp, st)
                                 st.requests_total += 1
                             else:
                                 # 非 200（如后端未就绪时 HAProxy 的 503）：
@@ -404,6 +437,7 @@ class LoadGen:
                 for _, st in self._big
             ],
             "big_per_target": self._big_per_target,
+            "per_req_kbs": round(self.per_req_rate / 1024.0, 1),
             "concurrency": self.concurrency,
             "max_concurrency": MAX_CONCURRENCY,
             "rate_bytes_per_s": round(self.rate_bytes_per_s),
@@ -474,7 +508,7 @@ async def amain(args: argparse.Namespace) -> None:
     # 连接由各 worker 自建（每 worker 独立 keep-alive session，周期轮转，
     # 见 _worker/REQUESTS_PER_CONNECTION 注释），这里只负责压测器骨架。
     targets = [u.strip() for u in args.target.split(",") if u.strip()]
-    gen = LoadGen(targets)
+    gen = LoadGen(targets, per_req_kbs=args.per_req_kbs)
     applied = gen.set_concurrency(args.concurrency)
     applied_big = gen.set_big_per_target(args.big_per_target)
 
@@ -484,9 +518,11 @@ async def amain(args: argparse.Namespace) -> None:
     await site.start()
 
     log.info(
-        "压测服务已启动 targets=%s concurrency=%d big_per_target=%d control_port=%d "
+        "压测服务已启动（小文件短连接场景：每请求限读 %.0f KB/s、读完即断、"
+        "不复用连接） targets=%s concurrency=%d big_per_target=%d control_port=%d "
         "（在线调节：curl -X PUT http://<host>:%d/concurrency -d '{\"concurrency\": N}'；"
         "大文件长连接：PUT /big -d '{\"per_target\": N}'）",
+        gen.per_req_rate / 1024.0,
         ",".join(targets), applied, applied_big,
         args.control_port, args.control_port)
     try:
@@ -508,6 +544,11 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int,
                         default=env_int("LOADGEN_CONCURRENCY", DEFAULT_CONCURRENCY, "loadgen"),
                         help="初始并发数（默认 %(default)s，环境变量 LOADGEN_CONCURRENCY）")
+    parser.add_argument("--per-req-kbs", type=float,
+                        default=float(env_int("LOADGEN_PER_REQ_KBS",
+                                              int(DEFAULT_PER_REQ_KBS), "loadgen")),
+                        help="每请求的客户端侧限读速度（KB/s，默认 %(default)s，"
+                             "环境变量 LOADGEN_PER_REQ_KBS；0 = 不限）")
     parser.add_argument("--big-per-target", type=int,
                         default=env_int("LOADGEN_BIG_PER_TARGET", 0, "loadgen"),
                         help="每目标的长连接大文件下载 worker 数（默认 %(default)s，"
@@ -527,6 +568,10 @@ def main() -> None:
     if args.big_per_target < 0 or args.big_per_target > MAX_BIG_PER_TARGET:
         print(f"loadgen: --big-per-target 必须在 0-{MAX_BIG_PER_TARGET} 范围内，"
               f"当前值 {args.big_per_target}", file=sys.stderr)
+        raise SystemExit(1)
+    if args.per_req_kbs < 0:
+        print(f"loadgen: --per-req-kbs 不能为负数，当前值 {args.per_req_kbs}",
+              file=sys.stderr)
         raise SystemExit(1)
     if args.report_s <= 0:
         print(f"loadgen: --report-s 必须 > 0，当前值 {args.report_s}",

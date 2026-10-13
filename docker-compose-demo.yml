@@ -37,8 +37,9 @@ services:
     command: python3 tools/random_web.py --port 9000
     environment:
       # 响应体大小区间（字节）：默认 256 KiB ~ 2 MiB，可按需覆盖。
-      WEB_MIN_BYTES: ${WEB_MIN_BYTES:-262144}
-      WEB_MAX_BYTES: ${WEB_MAX_BYTES:-2097152}
+      # 小文件为主、大小随机（与 loadgen 的慢客户端短连接场景配套）。
+      WEB_MIN_BYTES: ${WEB_MIN_BYTES:-4096}
+      WEB_MAX_BYTES: ${WEB_MAX_BYTES:-262144}
       # /big 大文件下载端点的默认大小：512 MiB（40 Mbps 限速下约 100s
       # 下完），供长连接大文件场景（loadgen 的 big worker）使用。
       WEB_BIG_BYTES: ${WEB_BIG_BYTES:-536870912}
@@ -207,10 +208,15 @@ services:
       # 初始并发：LOADGEN_CONCURRENCY=32 docker compose up -d 即可改；
       # 运行中用控制端口在线调节（见文件头速查）。
       LOADGEN_CONCURRENCY: ${LOADGEN_CONCURRENCY:-1000}
+      # 每请求限读 100 KB/s（模拟终端用户的下载速度；0 = 不限）。
+      # 1000 并发 × ≤100KB/s ≈ ≤800 Mbps 的聚合压力，仍远超各入口限额。
+      LOADGEN_PER_REQ_KBS: ${LOADGEN_PER_REQ_KBS:-100}
       # 长连接大文件下载场景：每个入口 N 条长连接循环下载 /big（默认
       # 每入口 1 条）。验证 tc 对存量长连接的持续限速与限额
       # 调整（reload + hard-stop）对在途下载的影响。
-      LOADGEN_BIG_PER_TARGET: ${LOADGEN_BIG_PER_TARGET:-1}
+      # 默认 0：主场景是小文件短连接。要演示长连接大文件限速再开
+      # （运行中 PUT /big 也行）。
+      LOADGEN_BIG_PER_TARGET: ${LOADGEN_BIG_PER_TARGET:-0}
     ports:
       - "8084:8081"   # 控制端口（宿主机 8084）：GET /status、PUT /concurrency
     depends_on:

@@ -3,7 +3,8 @@
 #
 # 角色：docker compose 演示环境里挂在 HAProxy backend 后面的"真实业务"
 # 替身。每个请求返回一段**随机大小**的响应体（在 [min-bytes, max-bytes]
-# 区间内均匀抽取），用来模拟大小不一的业务响应（页面、图片、下载分片），
+# 区间内均匀抽取），默认区间是**小文件**（4 KiB–256 KiB：页面、接口
+# 响应、小图片的量级）——与 loadgen 的"慢客户端 + 短连接"场景配套，
 # 让 HAProxy frontend 的 bytes_out 产生足够真实的波动供 rl-limiter 采样。
 #
 # 另有 /big 端点：**大文件下载**场景（长连接、单个响应流式传输数百 MB、
@@ -22,7 +23,7 @@
 #   - /healthz 是编排层健康检查端点，返回固定 "ok"（不计入随机载荷）。
 #
 # 用法（docker compose 中由 compose 文件传参）：
-#   python3 tools/random_web.py --port 9000 --min-bytes 262144 --max-bytes 2097152
+#   python3 tools/random_web.py --port 9000 --min-bytes 4096 --max-bytes 262144
 # 参数也可用环境变量 WEB_PORT / WEB_MIN_BYTES / WEB_MAX_BYTES /
 # WEB_BIG_BYTES 覆盖默认值。
 
@@ -40,8 +41,8 @@ from _common import env_int
 log = logging.getLogger("random_web")
 
 DEFAULT_PORT = 9000
-DEFAULT_MIN_BYTES = 256 * 1024       # 256 KiB
-DEFAULT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
+DEFAULT_MIN_BYTES = 4 * 1024         # 4 KiB：小文件场景的下沿
+DEFAULT_MAX_BYTES = 256 * 1024       # 256 KiB：小文件场景的上沿
 DEFAULT_BIG_BYTES = 512 * 1024 * 1024  # 512 MiB：40 Mbps 限速下约 100s 下完
 # ?bytes= 覆盖值的上限：防止一条打错的 curl 造出天文数字的传输。
 BIG_BYTES_CAP = 8 * 1024 * 1024 * 1024  # 8 GiB
