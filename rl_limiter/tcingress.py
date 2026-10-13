@@ -349,13 +349,34 @@ class TcIngress:
 
         return {
             "iface": self.iface,
+            "help": [
+                "入向用的是 police（监管）而不是出向的 HTB（整形）：HTB 把"
+                "超速流量排队延后，police 没有队列、超限直接丢包——客户端"
+                "看到的是丢包重传，不是排队变慢。所以这里没有 backlog。",
+                "rate …bit burst …b 的 u32 规则：按 TCP 目的端口（= "
+                "frontend 监听端口）限入向带宽，conform-exceed drop = 超了"
+                "就丢；match 0000XXXX/0000ffff at 20|40 即「目的端口 = "
+                "0xXXXX」（IPv4 在 at 20、IPv6 在 at 40 各一条）。",
+                "pkts_rate N 的 flower 规则：只匹配 SYN 包，每秒放行 N 个 "
+                "= 新建连接速率上限；老内核缺 cls_flower 时这条可能不在，"
+                "启动日志会有告警（带宽规则不受影响）。",
+                "-s 统计里每条规则自己的 Sent/dropped：dropped 在涨 = 这条"
+                "限速正在真实丢包。",
+                "排障顺序：先对「期望配置」——端口（十六进制）在过滤器里"
+                "找得到吗、rate 对不对；找不到或不符 = 还没下发或网卡被人"
+                "动过，去日志里找 tc 相关告警。",
+            ],
             "raw": [
                 {"label": f"tc qdisc show dev {self.iface} ingress",
+                 "note": "入向钩子本体（ffff:）：police 不排队，这里没有"
+                         "队列统计，有这一行就说明入向限速的挂载点在。",
                  "text": await run(["tc", "qdisc", "show", "dev",
                                     self.iface, "ingress"])},
                 # -s 带上 police 的命中/丢弃计数——限速到底有没有在丢包，
                 # 看这里。
                 {"label": f"tc -s filter show dev {self.iface} parent ffff:",
+                 "note": "police 规则与各自的命中/丢弃统计——入向限速的"
+                         "执行情况主要看这段。",
                  "text": await run(["tc", "-s", "filter", "show", "dev",
                                     self.iface, "parent", "ffff:"])},
             ],

@@ -262,6 +262,9 @@ async def test_debug_state_is_readonly_and_labeled():
     assert fake.mutations() == []
     assert "police" in st["raw"][1]["text"]
     assert st["raw"][0]["text"] == "(空)"
+    # 随附解释必须在：help 非空、每段带 note——面板是给不熟 tc 的人用的。
+    assert st["help"]
+    assert all(r["note"] for r in st["raw"])
 
 
 async def test_debug_state_renders_failures_inline():
