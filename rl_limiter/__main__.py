@@ -27,6 +27,7 @@ from . import cfgparse
 from . import config as configmod
 from . import haproxy, ingressgov, metricslog, model
 from . import netdev
+from . import tcifb as tcifbmod
 from . import tcingress as tcinmod
 from . import tcshaper as tcmod
 from . import webconsole
@@ -72,6 +73,16 @@ ENV_NIC = "RL_NIC"
 # 后端流量，所以这一项**绝不自动探测**；设为 "-" 表示明确不做入向限速
 # （request_limits 仍会被解析但只告警不执行）。
 ENV_TC_IN_IFACE = "RL_TC_IN_IFACE"
+# 入向限速的执行机制：
+#   ifb（默认）  重定向到 IFB 虚拟网卡 + HTB **排队整形**——平稳慢放，
+#                与出向同款机制（内核需 ifb/act_mirred/sch_htb，均为
+#                发行版通用内核标配）；
+#   police       入向 police **超额丢包**——无队列，靠 TCP 重传兜底
+#                （内核需 act_police；曲线毛糙，作为老内核的备选）。
+ENV_TC_IN_MODE = "RL_TC_IN_MODE"
+# ifb 模式的虚拟网卡名（默认 ifbrl0——刻意避开教程惯用的 ifb0，防止与
+# 运维手工建的设备互相踩）。
+ENV_TC_IFB = "RL_TC_IFB"
 
 # 监控数据落盘：设为本地文件路径即启用（JSONL，分钟粒度，按天轮转，
 # 见 metricslog 模块）。不设 = 不落盘，只有内存实时曲线。
@@ -307,7 +318,10 @@ async def _amain(cfg, log: logging.Logger,
                                  + "+".join(want or ["0"]))
                 section = await ingress.debug_state()
                 section.update(key="ingress",
-                               title="入向 police（请求方向限速）",
+                               title=("入向整形 IFB+HTB（请求方向限速）"
+                                      if getattr(ingress, "mode", "police")
+                                      == "ifb"
+                                      else "入向 police（请求方向限速）"),
                                desired="; ".join(parts)
                                or "(没有登记 request_limits)")
                 sections.append(section)
@@ -538,7 +552,20 @@ def main() -> None:
                         "request_limits（%d 条）不会执行",
                         ENV_TC_IN_IFACE, len(cfg.request_limits))
     elif raw_in_iface:
-        ingress = tcinmod.TcIngress(raw_in_iface, log)
+        in_mode = (os.environ.get(ENV_TC_IN_MODE) or "ifb").strip().lower()
+        if in_mode == "ifb":
+            ifb_dev = (os.environ.get(ENV_TC_IFB) or "").strip() \
+                or tcifbmod.DEFAULT_IFB
+            ingress = tcifbmod.TcIfbIngress(raw_in_iface, ifb=ifb_dev,
+                                            log=log)
+        elif in_mode == "police":
+            ingress = tcinmod.TcIngress(raw_in_iface, log)
+        else:
+            print(
+                f"rl-limiter: {ENV_TC_IN_MODE}={in_mode!r} 不认识——"
+                f"可选 ifb（IFB+HTB 排队整形，默认）或 police"
+                f"（超额丢包，老内核备选）。", file=sys.stderr)
+            raise SystemExit(1)
     elif cfg.request_limits:
         print(
             f"rl-limiter: YAML 里配置了 request_limits（请求方向限速），"

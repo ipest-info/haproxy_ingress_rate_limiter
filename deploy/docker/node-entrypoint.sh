@@ -188,8 +188,8 @@ fi
 
 if [ "${RL_TC_IFACE:-}" = "-" ]; then
     if [ -n "${RL_TC_IN_IFACE:-}" ] && [ "${RL_TC_IN_IFACE}" != "-" ]; then
-        log "出向 tc 整形已关闭（RL_TC_IFACE=-）；限速走入向 police" \
-            "（$RL_TC_IN_IFACE，闭环：按出向带宽动态压入向）"
+        log "出向 tc 整形已关闭（RL_TC_IFACE=-）；限速走入向" \
+            "（$RL_TC_IN_IFACE，模式=${RL_TC_IN_MODE:-ifb}，闭环：按出向带宽动态压入向）"
     else
         log "警告：已显式关闭 tc 限速（RL_TC_IFACE=-），本节点只做监控"
     fi

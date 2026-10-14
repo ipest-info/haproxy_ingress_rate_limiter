@@ -354,7 +354,8 @@ def desired_rates(frontends: list[model.FrontendConfig]) -> dict[int, int]:
 
 
 def _rebuild_cmds(iface: str,
-                  frontends: list[model.FrontendConfig]) -> list[tuple[list[str], bool]]:
+                  frontends: list[model.FrontendConfig],
+                  sport: bool = True) -> list[tuple[list[str], bool]]:
     """重建整棵 tc 树的命令序列。
 
     返回 (argv, fatal) 列表：fatal 为假的命令失败只记警告不中断——
@@ -394,34 +395,36 @@ def _rebuild_cmds(iface: str,
         cmds.append((
             ["tc", "qdisc", "add", "dev", iface, "parent", cid,
              "handle", f"{port:x}:", LEAF_QDISC], False))
-        # 分类：出方向、源端口 = 该 frontend 的监听端口。IPv4/IPv6 各一条
-        # ——只写 IPv4 的话，客户端走 IPv6 进来时限速会整个失效。
-        cmds.append((
-            ["tc", "filter", "add", "dev", iface, "protocol", "ip",
-             "parent", ROOT_HANDLE, "prio", "1", "u32",
-             "match", "ip", "sport", str(port), "0xffff", "flowid", cid], True))
-        cmds.append((
-            ["tc", "filter", "add", "dev", iface, "protocol", "ipv6",
-             "parent", ROOT_HANDLE, "prio", "1", "u32",
-             "match", "ip6", "sport", str(port), "0xffff", "flowid", cid], True))
+        # 分类：IPv4/IPv6 各一条——只写 IPv4 的话，客户端走 IPv6 进来
+        # 时限速会整个失效。端口取 sport（出向）还是 dport（入向/IFB）
+        # 由调用方定。
+        cmds.extend(_filter_cmds(iface, port, cid, sport=sport))
     return cmds
 
 
-def _filter_cmds(iface: str, port: int, cid: str) -> list[tuple[list[str], bool]]:
-    """一个端口的分类规则（IPv4/IPv6 各一条，与平铺模式完全相同）。"""
+def _filter_cmds(iface: str, port: int, cid: str,
+                 sport: bool = True) -> list[tuple[list[str], bool]]:
+    """一个端口的分类规则（IPv4/IPv6 各一条）。
+
+    sport=True 为出向语义（按源端口分类，网卡上的既有用法）；False 为
+    入向语义（按目的端口）——IFB 整形用：重定向到 IFB 的是客户端打进
+    来的包，frontend 监听端口在 dport 一侧。
+    """
+    kw4, kw6 = ("sport", "sport") if sport else ("dport", "dport")
     return [
         (["tc", "filter", "add", "dev", iface, "protocol", "ip",
           "parent", ROOT_HANDLE, "prio", "1", "u32",
-          "match", "ip", "sport", str(port), "0xffff", "flowid", cid], True),
+          "match", "ip", kw4, str(port), "0xffff", "flowid", cid], True),
         (["tc", "filter", "add", "dev", iface, "protocol", "ipv6",
           "parent", ROOT_HANDLE, "prio", "1", "u32",
-          "match", "ip6", "sport", str(port), "0xffff", "flowid", cid], True),
+          "match", "ip6", kw6, str(port), "0xffff", "flowid", cid], True),
     ]
 
 
 def _instance_rebuild_cmds(iface: str,
                            frontends: list[model.FrontendConfig],
-                           instance_bits: int) -> list[tuple[list[str], bool]]:
+                           instance_bits: int,
+                           sport: bool = True) -> list[tuple[list[str], bool]]:
     """层级模式（设了实例总限速）的整树重建命令序列。
 
     结构：root htb default=兜底 → {兜底类 1:1（线速，不整形——SSH/监控
@@ -454,7 +457,7 @@ def _instance_rebuild_cmds(iface: str,
         cmds.append((
             ["tc", "qdisc", "add", "dev", iface, "parent", cid,
              "handle", f"{port:x}:", LEAF_QDISC], False))
-        cmds.extend(_filter_cmds(iface, port, cid))
+        cmds.extend(_filter_cmds(iface, port, cid, sport=sport))
     return cmds
 
 
@@ -612,8 +615,11 @@ class TcShaper:
     """
 
     def __init__(self, iface: str, log: logging.Logger | None = None,
-                 runner=None):
+                 runner=None, match_dport: bool = False):
         self.iface = iface
+        # 分类方向：默认按源端口（出向整形，网卡上的既有用法）；
+        # match_dport=True 按目的端口——IFB 入向整形用（tcifb 模块）。
+        self._sport = not match_dport
         self._log = log if log is not None else logging.getLogger("rl_limiter.tc")
         # 临时端口冲突告警的去重键（同一组 frontend 只说一次）。
         self._logged_ephemeral: str | None = None
@@ -788,7 +794,8 @@ class TcShaper:
                 return TcResult(ok=True, changed=True, frontends=names,
                                 action="rate-change")
 
-            for argv, fatal in _rebuild_cmds(self.iface, frontends):
+            for argv, fatal in _rebuild_cmds(self.iface, frontends,
+                                             sport=self._sport):
                 await self._tc(argv, fatal=fatal)
             self._log.warning(
                 "已重建本机网卡的 tc 限速队列树（数据面已按新配置整形） "
@@ -846,7 +853,8 @@ class TcShaper:
 
         try:
             for argv, fatal in _instance_rebuild_cmds(self.iface, frontends,
-                                                      instance_bits):
+                                                      instance_bits,
+                                                      sport=self._sport):
                 await self._tc(argv, fatal=fatal)
         except TcError as e:
             self._log.error(
@@ -922,9 +930,12 @@ class TcShaper:
                  "text": await run(["tc", "-s", "class", "show",
                                     "dev", self.iface])},
                 {"label": f"tc filter show dev {self.iface}",
-                 "note": "分流规则：按出向包的 TCP 源端口（= frontend 监听"
-                         "端口）送进对应的类；match 1f900000/ffff0000 at "
-                         "20 即「源端口 = 0x1f90（8080）」。",
+                 "note": ("分流规则：按出向包的 TCP 源端口（= frontend 监听"
+                          "端口）送进对应的类；match 1f900000/ffff0000 at "
+                          "20 即「源端口 = 0x1f90（8080）」。" if self._sport
+                          else "分流规则：按包的 TCP 目的端口（= frontend "
+                          "监听端口）送进对应的类；match 00001f90/0000ffff "
+                          "at 20 即「目的端口 = 0x1f90（8080）」。"),
                  "text": await run(["tc", "filter", "show",
                                     "dev", self.iface])},
             ],

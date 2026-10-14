@@ -808,3 +808,14 @@ async def test_debug_state_renders_failures_inline():
     assert "fake failure" in st["raw"][0]["text"]
     # 其余两条照常。
     assert "[命令失败" not in st["raw"][1]["text"]
+
+
+async def test_match_dport_classifies_by_dest_port():
+    """match_dport=True（IFB 入向整形用）：分类规则按目的端口，其余
+    结构（HTB 树、burst、就地变更）与出向完全一致。"""
+    sh, fake = shaper()
+    sh2 = T.TcShaper(IFACE, runner=fake, match_dport=True)
+    await sh2.reconcile([fe(port=8080, quota=40.0)], 0)
+    flt = [c for c in fake.calls if "filter" in c and "add" in c]
+    assert flt and all("dport" in c for c in flt)
+    assert not [c for c in flt if "sport" in c]
