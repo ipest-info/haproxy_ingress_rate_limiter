@@ -131,6 +131,7 @@ class StatusHub:
         version_fn: Callable[[], int],
         haproxy: model.NodeConfig | None = None,
         degraded_fn: Callable[[], bool] | None = None,
+        instance_quota_executable: bool = True,
     ):
         self._service_version = service_version
         self._version_fn = version_fn
@@ -146,6 +147,9 @@ class StatusHub:
         # 实例总限速（Mbps；0 = 不限）。随配置热更。
         self._instance_quota_mbps = 0.0
         self._request_limits: dict = {}
+        # 实例总限速在本机是否有执行者（出向 tc 开着才有），页面据此
+        # 把卡片置灰并说明原因。
+        self._instance_quota_executable = instance_quota_executable
         self._started = time.time()
 
     # ---- 配置与数据注入 ----
@@ -265,6 +269,7 @@ class StatusHub:
             # 请求方向（入向）限速登记：frontend 名 → {mbps, conn_rate}。
             "request_limits": self._request_limits,
             "instance_quota_bytes_per_s": self._instance_quota_mbps * 1e6 / 8.0,
+            "instance_quota_executable": self._instance_quota_executable,
             "haproxy": self._haproxy_view(),
             "latest": self._history[-1] if self._history else None,
         }
@@ -385,8 +390,15 @@ def build_app(
     known_frontends_fn: Callable[[], set] | None = None,
     poke: "asyncio.Event | None" = None,
     tc_debug_fn=None,
+    egress_tc_enabled: bool = True,
 ) -> web.Application:
     """组装控制台的 aiohttp 应用（静态页 + 只读 API + 限额写 API）。
+
+    egress_tc_enabled：本机出向 tc 整形是否在执行（RL_TC_IFACE=- 的
+    纯监控/闭环形态为 False）。实例总限速只有出向 HTB 这一个执行者，
+    关了还放任页面写入就是"看起来设置成功、实际纹丝不动"——那种
+    静默比报错恶劣得多，所以 False 时 PUT 直接 409 拒绝（DELETE 仍
+    放行：清掉残留配置是合法清理）。
 
     写 API 只在 yaml_path 非空时挂载（测试/极简形态可以只要只读部分），
     且每个请求都要过令牌校验：api_token 为空 = 未配置 RL_API_TOKEN，
@@ -575,6 +587,15 @@ def build_app(
         denied = _authorized(request)
         if denied is not None:
             return denied
+        if not egress_tc_enabled:
+            # 诚实优先：本机没有出向整形，这个数字写进去也不会有任何
+            # 效果——拒绝并把替代方案说清楚，而不是让人以为限上了。
+            return web.json_response({"error":
+                "本机出向 tc 整形已关闭（RL_TC_IFACE=-），实例总限速"
+                "没有执行者，设置被拒绝。纯监控节点请先用 RL_TC_IFACE "
+                "指定出向网卡；双网卡闭环形态的限速入口是各 frontend 的"
+                " quotas（出向带宽目标，入向闭环执行），不是实例总限速"
+                "。"}, status=409)
         try:
             quota = await _read_quota_body(request)
         except ValueError as e:
@@ -637,6 +658,7 @@ async def run_console(
     known_frontends_fn: Callable[[], set] | None = None,
     poke: "asyncio.Event | None" = None,
     tc_debug_fn=None,
+    egress_tc_enabled: bool = True,
 ) -> None:
     """常驻任务：启动控制台 HTTP 服务并挂起到被取消，取消时干净回收。
 
@@ -648,7 +670,8 @@ async def run_console(
     runner = web.AppRunner(
         build_app(hub, logbuf, log, yaml_path=yaml_path, api_token=api_token,
                   known_frontends_fn=known_frontends_fn, poke=poke,
-                  tc_debug_fn=tc_debug_fn),
+                  tc_debug_fn=tc_debug_fn,
+                  egress_tc_enabled=egress_tc_enabled),
         access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, bind, port)
