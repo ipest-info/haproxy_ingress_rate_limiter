@@ -365,7 +365,9 @@ async def _amain(cfg, log: logging.Logger,
                 # 写限额前校验段名存在：以当前 cfg 解析出的清单为准。
                 known_frontends_fn=lambda: {f.name for f in ctl.frontends()},
                 poke=cfg_poke, tc_debug_fn=tc_debug_fn,
-                egress_tc_enabled=shaper is not None),
+                # 实例总限速的执行者：出向 HTB 或 ifb 闭环的入向总闸，
+                # 两者有其一写接口就放行（语义见 inst_executable）。
+                egress_tc_enabled=inst_executable),
             name="web-console"))
 
     if shaper is not None and tc_applied is not None:
