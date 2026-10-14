@@ -136,7 +136,10 @@ async def _amain(cfg, log: logging.Logger,
             SERVICE_VERSION,
             version_fn=lambda: ctl.version,
             haproxy=cfg.haproxy,
-            degraded_fn=lambda: col.degraded)
+            degraded_fn=lambda: col.degraded,
+            # 出向 tc 关着（纯监控/闭环形态）时实例总限速没有执行者，
+            # 页面把那张卡置灰、写接口 409 拒绝（见 webconsole）。
+            instance_quota_executable=shaper is not None)
 
     # sampler：监控循环每拍喂给控制台（内存实时曲线）与监控数据落盘器
     # （分钟粒度 JSONL）——同一拍、同一份数据，两个出口。
@@ -155,6 +158,12 @@ async def _amain(cfg, log: logging.Logger,
     config_applied = [e for e in (tc_applied,) if e is not None]
     ctl = MonitorLoop(col, sampler=sampler, log=log,
                       config_applied=config_applied)
+    if shaper is None and cfg.instance_quota_mbps:
+        log.warning(
+            "YAML 里配置了实例总限速（%gMbps）但出向 tc 整形已关闭"
+            "（RL_TC_IFACE=-）——**该限速不会执行**。纯监控节点请用 "
+            "RL_TC_IFACE 指定出向网卡；不需要时删掉 instance_quota_mbps "
+            "以免误导", cfg.instance_quota_mbps)
     if mlog is not None:
         # 落盘行里的限额要取"采样当时"的值：延迟经 ctl 取当前受管清单。
         mlog.set_quotas_fn(metricslog.quotas_from_frontends(ctl.frontends))
@@ -250,7 +259,8 @@ async def _amain(cfg, log: logging.Logger,
                 yaml_path=yaml_path, api_token=api_token,
                 # 写限额前校验段名存在：以当前 cfg 解析出的清单为准。
                 known_frontends_fn=lambda: {f.name for f in ctl.frontends()},
-                poke=cfg_poke, tc_debug_fn=tc_debug_fn),
+                poke=cfg_poke, tc_debug_fn=tc_debug_fn,
+                egress_tc_enabled=shaper is not None),
             name="web-console"))
 
     if shaper is not None and tc_applied is not None:

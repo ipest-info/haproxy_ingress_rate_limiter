@@ -434,3 +434,43 @@ async def test_tc_endpoint_reports_fn_failure_as_500():
         r = await c.get("/api/tc")
         assert r.status == 500
         assert "tc 炸了" in (await r.json())["error"]
+
+
+# ---------------------------------------------------------------------------
+# 实例总限速在出向 tc 关闭形态下的诚实性
+# ---------------------------------------------------------------------------
+
+async def test_instance_quota_rejected_when_egress_tc_disabled(tmp_path):
+    """出向 tc 关着（RL_TC_IFACE=-：纯监控/双网卡闭环形态）时实例总
+    限速没有执行者：PUT 必须 409 拒绝并说明替代方案——接受写入就是
+    "页面显示设置成功、tc 纹丝不动"的静默失效（真实用户报障）。
+    DELETE 仍放行：清掉残留配置是合法清理。普通 quotas 不受影响。"""
+    yml = tmp_path / "config.yaml"
+    yml.write_text(BASE_YAML, encoding="utf-8")
+    app = webconsole.build_app(
+        hub(), webconsole.LogBuffer(), __import__("logging").getLogger("t"),
+        yaml_path=str(yml), api_token=TOKEN,
+        known_frontends_fn=lambda: {"fe_a"},
+        egress_tc_enabled=False)
+    async with TestClient(TestServer(app)) as c:
+        r = await c.put("/api/instance-quota", json={"quota_mbps": 100},
+                        headers=auth())
+        assert r.status == 409
+        err = (await r.json())["error"]
+        assert "RL_TC_IFACE" in err and "quotas" in err
+        # 文件没被写入（实例总限速仍是 0/未设）。
+        assert "instance_quota_mbps" not in yml.read_text(encoding="utf-8")
+        # DELETE（清理）放行。
+        r = await c.delete("/api/instance-quota", headers=auth())
+        assert r.status == 200
+        # 各 frontend 的 quotas 是这个形态下的正经限速入口，照常可写。
+        r = await c.put("/api/quotas/fe_a", json={"quota_mbps": 20},
+                        headers=auth())
+        assert r.status == 200
+
+
+def test_overview_carries_instance_quota_executable():
+    h = webconsole.StatusHub("t", version_fn=lambda: 1,
+                             instance_quota_executable=False)
+    assert h.overview()["instance_quota_executable"] is False
+    assert hub().overview()["instance_quota_executable"] is True
