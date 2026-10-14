@@ -400,21 +400,30 @@ def _rebuild_cmds(iface: str,
             ["tc", "filter", "add", "dev", iface, "protocol", "ip",
              "parent", ROOT_HANDLE, "prio", "1", "u32",
              "match", "ip", "sport", str(port), "0xffff", "flowid", cid], True))
+        # IPv6 用 prio 2：tc 的约定是**一个 prio 只能绑一种 protocol**，
+        # ip 与 ipv6 同 prio 会被内核拒绝（"Protocol mismatch for filter
+        # with specified priority"）。早先两条都写 prio 1，IPv6 分类从来
+        # 没加上过——首轮 rebuild 在这里报错中断，IPv4 恰好已先加上、
+        # 比对又只看 classid 集合，于是"看起来在限速"而 v6 流量漏网。
         cmds.append((
             ["tc", "filter", "add", "dev", iface, "protocol", "ipv6",
-             "parent", ROOT_HANDLE, "prio", "1", "u32",
+             "parent", ROOT_HANDLE, "prio", "2", "u32",
              "match", "ip6", "sport", str(port), "0xffff", "flowid", cid], True))
     return cmds
 
 
 def _filter_cmds(iface: str, port: int, cid: str) -> list[tuple[list[str], bool]]:
-    """一个端口的分类规则（IPv4/IPv6 各一条，与平铺模式完全相同）。"""
+    """一个端口的分类规则（IPv4/IPv6 各一条，与平铺模式完全相同）。
+
+    IPv6 用 prio 2：一个 prio 只能绑一种 protocol（内核会拒绝同 prio
+    的第二种），见 _rebuild_cmds 里的详细注释。
+    """
     return [
         (["tc", "filter", "add", "dev", iface, "protocol", "ip",
           "parent", ROOT_HANDLE, "prio", "1", "u32",
           "match", "ip", "sport", str(port), "0xffff", "flowid", cid], True),
         (["tc", "filter", "add", "dev", iface, "protocol", "ipv6",
-          "parent", ROOT_HANDLE, "prio", "1", "u32",
+          "parent", ROOT_HANDLE, "prio", "2", "u32",
           "match", "ip6", "sport", str(port), "0xffff", "flowid", cid], True),
     ]
 

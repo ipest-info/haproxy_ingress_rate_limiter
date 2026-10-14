@@ -808,3 +808,19 @@ async def test_debug_state_renders_failures_inline():
     assert "fake failure" in st["raw"][0]["text"]
     # 其余两条照常。
     assert "[命令失败" not in st["raw"][1]["text"]
+
+
+async def test_ipv4_ipv6_filters_use_distinct_prios():
+    """tc 约定：一个 prio 只能绑一种 protocol——ip 与 ipv6 的分类过滤
+    器必须用不同 prio，否则内核拒绝第二条（"Protocol mismatch"），
+    IPv6 流量漏网（真机 e2e 抓到的实况 bug）。"""
+    sh, fake = shaper()
+    await sh.reconcile([fe(port=8080, quota=40.0)], 0)
+    await sh.reconcile([fe(port=8080, quota=40.0)], INST)
+    prios = {}
+    for c in fake.calls:
+        if "filter" in c and "add" in c:
+            prios.setdefault(c[c.index("protocol") + 1],
+                             set()).add(c[c.index("prio") + 1])
+    assert prios["ip"] and prios["ipv6"]
+    assert not (prios["ip"] & prios["ipv6"])
