@@ -78,6 +78,13 @@ THROTTLE_CHUNK = 16 * 1024
 # 的文件描述符耗尽。每个 worker 一条连接 ≈ 一个 fd，压满上限前记得把
 # 容器/进程的 nofile 抬到 ≳ 上限 + 余量（compose 的 ulimits 已给足）。
 MAX_CONCURRENCY = 10240
+# 压测进程数：Python 的 asyncio 是单线程事件循环，一个进程至多吃满一个
+# CPU 核；上万并发时事件循环本身先饱和（每请求分片限读 ≈ 每秒几万次
+# 协程唤醒），CPU 和吞吐都卡在单核上。多进程分片突破：父进程只管控制
+# 端口/聚合/监督，N 个子进程各自跑一份事件循环、分摊并发。
+# 0 = 自动（CPU 核数，封顶 MAX_PROCS）；1 = 单进程（旧行为）。
+DEFAULT_PROCS = 0
+MAX_PROCS = 16
 # 每目标大文件 worker 上限（每个都是一条长期占带宽的下载，几个就够演示）。
 MAX_BIG_PER_TARGET = 16
 # 大文件下载端点（相对目标 URL）。
@@ -345,7 +352,8 @@ class LoadGen:
                     time.monotonic() - state.conn_started, e)
                 await asyncio.sleep(1.0)
 
-    async def report_loop(self, interval_s: float) -> None:
+    async def report_loop(self, interval_s: float,
+                          quiet: bool = False) -> None:
         """周期输出吞吐报告：首行汇总 + 按目标逐行的表格（一条日志）。
 
         每个入口一行（并发/速率/请求/错误/状态），入口打不通时该行速率
@@ -372,6 +380,10 @@ class LoadGen:
                 total_req_rate += s.rate_requests_per_s
             self.rate_bytes_per_s = total_bytes_rate
             self.rate_requests_per_s = total_req_rate
+            if quiet:
+                # 分片子进程：速率窗口照常刷新（/status 要用），日志
+                # 留给父进程聚合输出——N 份一样的表格只会刷屏。
+                continue
 
             # 组表：目标列宽随最长 URL 自适应，数字列右对齐。
             # 大文件列 = 该入口的长连接下载 worker 数（0 则整列仍在，便于对齐）。
@@ -505,6 +517,201 @@ def make_control_app(gen: LoadGen) -> web.Application:
     return app
 
 
+def _split(total: int, n: int) -> list[int]:
+    """把 total 尽量均匀地拆成 n 份（前 total%n 份多 1）。"""
+    base, extra = divmod(max(0, total), n)
+    return [base + (1 if i < extra else 0) for i in range(n)]
+
+
+async def parent_amain(args: argparse.Namespace, procs: int) -> None:
+    """分片父进程：对外控制端口 + 聚合观测 + 子进程监督。
+
+    子进程 = 同一个脚本加 --shard（控制口绑 127.0.0.1:父端口+1+i，
+    report_loop 安静化），并发/大文件数按份拆给各分片。对外接口与单
+    进程完全一致（/status、PUT /concurrency、PUT /big），脚本和演示
+    文档不用区分形态。
+    """
+    import os
+
+    shares = _split(min(args.concurrency, MAX_CONCURRENCY), procs)
+    big_shares = _split(args.big_per_target, procs)
+    ports = [args.control_port + 1 + i for i in range(procs)]
+    script = os.path.abspath(__file__)
+
+    children: list[asyncio.subprocess.Process] = []
+    for i in range(procs):
+        children.append(await asyncio.create_subprocess_exec(
+            sys.executable, script,
+            "--target", args.target,
+            "--concurrency", str(shares[i]),
+            "--per-req-kbs", str(args.per_req_kbs),
+            "--big-per-target", str(big_shares[i]),
+            "--control-port", str(ports[i]),
+            "--report-s", str(args.report_s),
+            "--shard"))
+    log.info("压测父进程已启动 procs=%d（单进程 asyncio 只能吃满一个 "
+             "CPU 核，分片突破单核瓶颈） 并发分片=%s control_port=%d",
+             procs, "+".join(map(str, shares)), args.control_port)
+
+    session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=3))
+    state = {"concurrency": sum(shares), "big": sum(big_shares)}
+
+    async def _fan_get(path: str) -> list[dict]:
+        out = []
+        for port in ports:
+            try:
+                async with session.get(
+                        f"http://127.0.0.1:{port}{path}") as r:
+                    out.append(await r.json())
+            except Exception as e:
+                out.append({"error": str(e), "_port": port})
+        return out
+
+    async def _fan_put(path: str, values: list[int], key: str) -> None:
+        for port, v in zip(ports, values):
+            try:
+                async with session.put(
+                        f"http://127.0.0.1:{port}{path}",
+                        data=json.dumps({key: v})) as r:
+                    await r.read()
+            except Exception as e:
+                log.warning("分片调节失败 port=%d err=%s", port, e)
+
+    def _aggregate(parts: list[dict]) -> dict:
+        targets: dict[str, dict] = {}
+        agg = {"concurrency": 0, "rate_bytes_per_s": 0.0,
+               "rate_requests_per_s": 0.0, "bytes_total": 0,
+               "requests_total": 0, "errors_total": 0,
+               "big_downloads": [], "big_per_target": 0}
+        alive = 0
+        for part in parts:
+            if "error" in part:
+                continue
+            alive += 1
+            for k in ("concurrency", "rate_bytes_per_s",
+                      "rate_requests_per_s", "bytes_total",
+                      "requests_total", "errors_total", "big_per_target"):
+                agg[k] += part.get(k, 0)
+            agg["big_downloads"].extend(part.get("big_downloads", []))
+            for t in part.get("targets", []):
+                d = targets.setdefault(t["target"], dict(
+                    t, workers=0, big_workers=0, rate_bytes_per_s=0,
+                    rate_mbps=0.0, rate_requests_per_s=0.0,
+                    requests_total=0, errors_total=0,
+                    big_done_total=0, big_interrupted_total=0))
+                for k in ("workers", "big_workers", "rate_bytes_per_s",
+                          "rate_mbps", "rate_requests_per_s",
+                          "requests_total", "errors_total",
+                          "big_done_total", "big_interrupted_total"):
+                    d[k] += t.get(k, 0)
+                if t.get("health") != "正常":
+                    d["health"] = t.get("health")
+        agg["targets"] = list(targets.values())
+        agg["rate_mbps"] = round(agg["rate_bytes_per_s"] * 8 / 1e6, 2)
+        agg["rate_bytes_per_s"] = round(agg["rate_bytes_per_s"])
+        agg["rate_requests_per_s"] = round(agg["rate_requests_per_s"], 1)
+        agg["max_concurrency"] = MAX_CONCURRENCY
+        agg["per_req_kbs"] = args.per_req_kbs
+        agg["procs"] = procs
+        agg["shards_alive"] = alive
+        return agg
+
+    async def handle_status(_request: web.Request) -> web.Response:
+        return web.json_response(_aggregate(await _fan_get("/status")))
+
+    async def handle_set_concurrency(request: web.Request) -> web.Response:
+        body = (await request.text()).strip()
+        try:
+            parsed = json.loads(body)
+            value = parsed["concurrency"] if isinstance(parsed, dict) else parsed
+            n = int(value)
+        except (ValueError, TypeError, KeyError):
+            return web.json_response(
+                {"error": "请求体须为 {\"concurrency\": N} 或裸整数 N",
+                 "got": body[:200]}, status=400)
+        n = max(0, min(n, MAX_CONCURRENCY))
+        prev = state["concurrency"]
+        await _fan_put("/concurrency", _split(n, procs), "concurrency")
+        state["concurrency"] = n
+        log.info("并发数已在线调整（分片下发） from=%d applied=%d procs=%d",
+                 prev, n, procs)
+        return web.json_response(
+            {"previous": prev, "requested": n, "concurrency": n,
+             "procs": procs})
+
+    async def handle_set_big(request: web.Request) -> web.Response:
+        body = (await request.text()).strip()
+        try:
+            parsed = json.loads(body)
+            value = parsed["per_target"] if isinstance(parsed, dict) else parsed
+            n = int(value)
+        except (ValueError, TypeError, KeyError):
+            return web.json_response(
+                {"error": "请求体须为 {\"per_target\": N} 或裸整数 N",
+                 "got": body[:200]}, status=400)
+        n = max(0, min(n, MAX_BIG_PER_TARGET))
+        prev = state["big"]
+        await _fan_put("/big", _split(n, procs), "per_target")
+        state["big"] = n
+        return web.json_response(
+            {"previous": prev, "requested": n, "big_per_target": n})
+
+    app = web.Application()
+    app.router.add_get("/", handle_status)
+    app.router.add_get("/status", handle_status)
+    app.router.add_put("/concurrency", handle_set_concurrency)
+    app.router.add_post("/concurrency", handle_set_concurrency)
+    app.router.add_put("/big", handle_set_big)
+    app.router.add_post("/big", handle_set_big)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", args.control_port).start()
+
+    async def report():
+        while True:
+            await asyncio.sleep(args.report_s)
+            agg = _aggregate(await _fan_get("/status"))
+            rows = []
+            name_w = max(24, max((_disp_width(t["target"])
+                                  for t in agg["targets"]), default=24))
+            for t in sorted(agg["targets"], key=lambda x: x["target"]):
+                rows.append("  ".join([
+                    _pad(t["target"], name_w),
+                    _pad(str(t["workers"]), 4, True),
+                    _pad(f"{t['rate_bytes_per_s'] * 8 / 1e6:.1f}", 8, True),
+                    _pad(f"{t['rate_requests_per_s']:.1f}", 6, True),
+                    _pad(str(t["errors_total"]), 8, True),
+                    _pad(t.get("health", "?"), 4, True),
+                ]))
+            log.info("吞吐观测（聚合 %d 分片）concurrency=%d total_mbps=%.1f "
+                     "total_req_per_s=%.1f errors_total=%d\n  %s",
+                     agg["shards_alive"], agg["concurrency"],
+                     agg["rate_mbps"], agg["rate_requests_per_s"],
+                     agg["errors_total"], "\n  ".join(rows))
+
+    report_task = asyncio.create_task(report())
+    waiters = {asyncio.create_task(c.wait()): i
+               for i, c in enumerate(children)}
+    try:
+        done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        # 任一分片退出都整体退出（compose restart 拉起全套）——比带着
+        # 缺一片的状态继续跑诚实。
+        idx = waiters[done.pop()]
+        log.error("压测分片 %d 意外退出（rc=%s），父进程整体退出",
+                  idx, children[idx].returncode)
+        raise SystemExit(1)
+    finally:
+        report_task.cancel()
+        for c in children:
+            if c.returncode is None:
+                c.terminate()
+        await asyncio.gather(*(c.wait() for c in children),
+                             return_exceptions=True)
+        await session.close()
+        await runner.cleanup()
+
+
 async def amain(args: argparse.Namespace) -> None:
     # 连接由各 worker 自建（每 worker 独立 keep-alive session，周期轮转，
     # 见 _worker/REQUESTS_PER_CONNECTION 注释），这里只负责压测器骨架。
@@ -515,19 +722,25 @@ async def amain(args: argparse.Namespace) -> None:
 
     runner = web.AppRunner(make_control_app(gen))
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", args.control_port)
+    # 分片子进程只接受父进程的内部调度，控制口绑回环。
+    bind = "127.0.0.1" if args.shard else "0.0.0.0"
+    site = web.TCPSite(runner, bind, args.control_port)
     await site.start()
 
-    log.info(
-        "压测服务已启动（小文件短连接场景：每请求限读 %.0f KB/s、读完即断、"
-        "不复用连接） targets=%s concurrency=%d big_per_target=%d control_port=%d "
-        "（在线调节：curl -X PUT http://<host>:%d/concurrency -d '{\"concurrency\": N}'；"
-        "大文件长连接：PUT /big -d '{\"per_target\": N}'）",
-        gen.per_req_rate / 1024.0,
-        ",".join(targets), applied, applied_big,
-        args.control_port, args.control_port)
+    if args.shard:
+        log.info("压测分片已启动 control=127.0.0.1:%d concurrency=%d "
+                 "big_per_target=%d", args.control_port, applied, applied_big)
+    else:
+        log.info(
+            "压测服务已启动（小文件短连接场景：每请求限读 %.0f KB/s、读完即断、"
+            "不复用连接） targets=%s concurrency=%d big_per_target=%d control_port=%d "
+            "（在线调节：curl -X PUT http://<host>:%d/concurrency -d '{\"concurrency\": N}'；"
+            "大文件长连接：PUT /big -d '{\"per_target\": N}'）",
+            gen.per_req_rate / 1024.0,
+            ",".join(targets), applied, applied_big,
+            args.control_port, args.control_port)
     try:
-        await gen.report_loop(args.report_s)
+        await gen.report_loop(args.report_s, quiet=args.shard)
     finally:
         gen.set_concurrency(0)
         gen.set_big_per_target(0)
@@ -560,6 +773,15 @@ def main() -> None:
                              "（默认 %(default)s，环境变量 LOADGEN_CONTROL_PORT）")
     parser.add_argument("--report-s", type=float, default=DEFAULT_REPORT_S,
                         help="吞吐日志输出周期（秒，默认 %(default)s）")
+    parser.add_argument("--procs", type=int,
+                        default=env_int("LOADGEN_PROCS", DEFAULT_PROCS,
+                                        "loadgen"),
+                        help="压测进程数（默认 %(default)s=自动按 CPU 核数，"
+                             "封顶 16；1=单进程。单进程 asyncio 只能吃满"
+                             "一个核，上万并发要靠多进程分片；环境变量 "
+                             "LOADGEN_PROCS）")
+    parser.add_argument("--shard", action="store_true",
+                        help=argparse.SUPPRESS)   # 内部：分片子进程标记
     args = parser.parse_args()
 
     if args.concurrency < 0 or args.concurrency > MAX_CONCURRENCY:
@@ -578,13 +800,22 @@ def main() -> None:
         print(f"loadgen: --report-s 必须 > 0，当前值 {args.report_s}",
               file=sys.stderr)
         raise SystemExit(1)
+    if args.procs < 0 or args.procs > MAX_PROCS:
+        print(f"loadgen: --procs 必须在 0-{MAX_PROCS} 范围内（0=自动），"
+              f"当前值 {args.procs}", file=sys.stderr)
+        raise SystemExit(1)
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z")
+    import os
+    procs = args.procs if args.procs else min(os.cpu_count() or 1, MAX_PROCS)
     try:
-        asyncio.run(amain(args))
+        if procs > 1 and not args.shard:
+            asyncio.run(parent_amain(args, procs))
+        else:
+            asyncio.run(amain(args))
     except KeyboardInterrupt:
         pass
     log.info("压测服务已停止")
