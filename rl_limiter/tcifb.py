@@ -106,7 +106,7 @@ class TcIfbIngress:
         # conn_rate 的配置指纹（SYN 过滤器非致命、不读回比对，与
         # tcingress 同一取舍）。
         self._syn_fp = ""
-        # 入向实测速率的差分基准：(单调时钟, IFB 根 qdisc 累计字节)。
+        # 入向实测速率的差分基准：(单调时钟, 网卡 RX 累计字节)。
         self._rate_prev: "tuple[float, int] | None" = None
 
     async def _tc(self, argv: list[str], fatal: bool = True) -> str:
@@ -243,32 +243,34 @@ class TcIfbIngress:
         await self._tc(["ip", "link", "del", self.ifb], fatal=False)
 
     async def ingress_rate_bits(self) -> "float | None":
-        """当前入向线上速率（bit/s）：IFB 根 qdisc 的 Sent 字节差分。
+        """当前流入带宽（bit/s）：**真实客户端侧网卡**的 RX 字节差分
+        （`ip -s -j link show dev <iface>`）。
 
-        给动态闭环当"落位"参考——总闸首次收紧时直接落到实测入向带宽
+        给动态闭环当"落位"参考——总闸首次收紧时直接落到实测流入带宽
         附近，而不是从上限/出向目标慢慢爬下来（入向因 ACK 杠杆比出向
-        小一两个数量级，从上限起步前几十步都是空转）。线上口径：含
-        ACK 与经过这张网卡的全部重定向流量，比 HAProxy 应用层的 bin
-        差分更接近总闸真正要管的东西。
+        小一两个数量级，从上限起步前几十步都是空转）。
 
-        首次调用（没有差分基准）、读取失败、计数器回卷（整形树刚重建
-        过）都返回 None——调用方回退到无实测的行为，绝不拿猜的数字
-        当实测。
+        为什么读网卡而不是 IFB 的计数器：IFB 上有没有流量取决于重定向
+        装没装——没登记任何 request_limits、只设实例目标的部署里，
+        **首次收紧那一刻管路还没建**，IFB 计数器必然读不到数，落位就
+        永远赶不上第一步（真实用户场景抓到的缺陷）。网卡的 RX 计数与
+        tc 管路无关，进程一启动差分基准就能热起来。线上口径：含 ACK
+        与这张网卡的全部流入，正是总闸要管的东西。
+
+        首次调用（没有差分基准）、读取失败、计数器回卷都返回 None——
+        调用方自行决定等待或回退，绝不拿猜的数字当实测。
         """
         rc, out, err = await self._run(
-            ["tc", "-s", "-j", "qdisc", "show", "dev", self.ifb])
+            ["ip", "-s", "-j", "link", "show", "dev", self.iface])
         now = time.monotonic()
         if rc != 0:
             return None
         try:
-            total = None
-            for q in json.loads(out or "[]"):
-                if q.get("kind") == "htb":
-                    total = int(q.get("bytes", 0))
-                    break
-        except (ValueError, TypeError):
-            return None
-        if total is None:
+            links = json.loads(out or "[]")
+            st = (links[0].get("stats64") or links[0].get("stats")
+                  or {}) if links else {}
+            total = int((st.get("rx") or {}).get("bytes"))
+        except (ValueError, TypeError, KeyError, IndexError):
             return None
         prev = self._rate_prev
         self._rate_prev = (now, total)

@@ -101,6 +101,10 @@ class IngressGovernor:
         # 没有层级），以及当前动态总闸值（Mbps；None = 全开=上限）。
         self._instance_capable = instance_capable
         self._cur_inst: "float | None" = None
+        # 落位等待标记：首次收紧时实测暂缺（差分基准刚建）就等一轮，
+        # 第二轮仍没有才回退"从上限爬降"——落位值得等 5~15s，但不能
+        # 让一个坏掉的测量源把实例环永远卡死。
+        self._land_waited = False
         # 全部 frontend 出向 mean10 之和（bytes/s），实例级环的观测值。
         self._mean_total = 0.0
 
@@ -226,7 +230,16 @@ class IngressGovernor:
             if ratio > self._cfg.high_ratio:
                 land = (min(max_inst, max(floor, ingress_now_mbps * 1.1))
                         if ingress_now_mbps else None)
-                if self._cur_inst is None and land is not None and land < cur:
+                if (self._cur_inst is None and land is None
+                        and not self._land_waited):
+                    # 首次收紧但还没有流入带宽实测（差分基准刚建立）：
+                    # 等一轮。直接回退从上限爬降的话，落位就永远赶不上
+                    # 第一步（真实用户场景抓到的缺陷）。
+                    self._land_waited = True
+                    self._log.info(
+                        "入向总闸需要收紧，但流入带宽实测尚未就绪"
+                        "（差分基准刚建立），等下一轮落位")
+                elif self._cur_inst is None and land is not None and land < cur:
                     # 首次收紧：**落位到实测入向带宽附近**（×1.1 留一
                     # 口气），而不是从上限/出向目标开始一步步爬下来——
                     # 入向因 ACK 杠杆比出向小一两个数量级，从上限起步
@@ -256,6 +269,7 @@ class IngressGovernor:
         elif self._cur_inst is not None:
             # 实例目标被删/执行侧不支持 → 回到全开语义并触发下发。
             self._cur_inst = None
+            self._land_waited = False
             changed = True
             self._log.info("入向总闸退出动态调节（实例出向目标已移除）")
         return changed

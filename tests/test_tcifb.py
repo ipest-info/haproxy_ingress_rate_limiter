@@ -209,17 +209,20 @@ async def test_instance_bits_without_rules_keeps_running():
     assert not f.muts("qdisc", "del", IFACE, "ingress")
 
 
-async def test_ingress_rate_bits_diffs_root_qdisc():
-    """实测入向速率：IFB 根 qdisc 的 Sent 字节差分。首次调用建基准
-    返回 None；统计清零（整形树重建）返回 None 并重新落基准。"""
+async def test_ingress_rate_bits_diffs_nic_rx():
+    """实测流入带宽：**真实网卡**的 RX 字节差分（与 tc 管路无关——
+    没登记任何 request_limits、只设实例目标时首次收紧那一刻 IFB 上
+    还没有流量，读 IFB 必然落空，真实用户场景抓到的缺陷）。
+    首次调用建基准返回 None；计数回卷返回 None 并重落基准。"""
     import json as _json
     sh, f = shaper()
-    seq = [1_000_000, 2_250_000, 100]      # 第三次：计数器被重建清零
+    seq = [1_000_000, 2_250_000, 100]      # 第三次：计数被清零/回卷
     async def runner(argv):
         f.calls.append(list(argv))
-        if "-j" in argv and "qdisc" in argv:
-            return 0, _json.dumps([{"kind": "htb", "handle": "1:",
-                                    "bytes": seq.pop(0)}]), ""
+        if argv[:2] == ["ip", "-s"] and "link" in argv:
+            assert IFACE in argv            # 测的是真实网卡，不是 IFB
+            return 0, _json.dumps([{"ifname": IFACE, "stats64":
+                                    {"rx": {"bytes": seq.pop(0)}}}]), ""
         return 0, "", ""
     sh._run = runner
     assert await sh.ingress_rate_bits() is None          # 建基准

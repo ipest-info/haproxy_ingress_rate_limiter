@@ -161,10 +161,12 @@ def feed_many(g, means, names_ports=None):
 
 def test_instance_over_target_shrinks_gate_gently():
     """总出向超实例目标 → 总闸下调，单步封顶 -10%，上限 = 登记的
-    入向上限之和（fe_main 10Mbps）。"""
+    入向上限之和（fe_main 10Mbps）。无实测时第一轮等待（落位值得等
+    一轮），第二轮回退步降。"""
     g = gov()
     feed_many(g, {"fe_main": 200.0})
     # frontend 不带单端口 quotas 目标：只有实例环动作。
+    assert not g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
     assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
     assert g.current_instance() == pytest.approx(10.0 * 0.90)
     assert g.effective_instance_bits(LIMITS, 40.0) == int(9.0e6)
@@ -174,6 +176,7 @@ def test_instance_over_target_shrinks_gate_gently():
 def test_instance_deadband_and_recovery():
     g = gov()
     feed_many(g, {"fe_main": 200.0})
+    g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)   # 等实测
     g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)   # 10→9
     # 死区：总出向落在 [0.85, 1.0]×40 → 不动。
     feed_many(g, {"fe_main": 38.0})
@@ -194,6 +197,7 @@ def test_instance_max_falls_back_to_target_without_limits():
     g = gov()
     assert g.effective_instance_bits({}, 40.0) == int(40e6)
     feed_many(g, {"fe_main": 200.0})
+    assert not g.adjust_once([fe(quota=0.0)], {}, inst_target=40.0)  # 等实测
     assert g.adjust_once([fe(quota=0.0)], {}, inst_target=40.0)
     assert g.current_instance() == pytest.approx(36.0)
 
@@ -201,7 +205,8 @@ def test_instance_max_falls_back_to_target_without_limits():
 def test_instance_target_removed_restores_flat():
     g = gov()
     feed_many(g, {"fe_main": 200.0})
-    g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
+    g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
+                  ingress_now_mbps=1.5)
     assert g.current_instance() is not None
     assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=0.0)
     assert g.current_instance() is None
@@ -222,9 +227,10 @@ def test_both_loops_coexist():
     """单端口环与实例环同时在跑：各调各的，互不覆盖。"""
     g = gov()
     feed_many(g, {"fe_main": 200.0})
-    assert g.adjust_once([fe(quota=40.0)], LIMITS, inst_target=50.0)
+    assert g.adjust_once([fe(quota=40.0)], LIMITS, inst_target=50.0,
+                         ingress_now_mbps=5.0)
     assert g.current()["fe_main"] == pytest.approx(9.0)
-    assert g.current_instance() == pytest.approx(9.0)
+    assert g.current_instance() == pytest.approx(5.5)   # 5.0×1.1 落位
 
 
 def test_instance_first_tighten_lands_on_measured_ingress():
@@ -259,11 +265,21 @@ def test_instance_landing_clamped_to_floor_and_max():
     assert g2.current_instance() == pytest.approx(1.0)
 
 
-def test_instance_no_measurement_falls_back_to_stepdown():
-    """没有实测（None）→ 回退旧行为：从上限按步幅爬降，绝不拿猜的
-    数字当实测。"""
+def test_instance_no_measurement_waits_once_then_falls_back():
+    """没有实测（None）：第一轮等待（差分基准刚建，落位值得等 5~15s），
+    第二轮仍没有才回退从上限爬降——坏掉的测量源不能把实例环卡死。"""
     g = gov()
     feed_many(g, {"fe_main": 200.0})
+    assert not g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
+                             ingress_now_mbps=None)
+    assert g.current_instance() is None
     assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
                          ingress_now_mbps=None)
     assert g.current_instance() == pytest.approx(9.0)
+    # 等待后下一轮实测到了也照样能落位（新 governor 验证顺序无妨）。
+    g2 = gov()
+    feed_many(g2, {"fe_main": 200.0})
+    assert not g2.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
+    assert g2.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
+                          ingress_now_mbps=1.5)
+    assert g2.current_instance() == pytest.approx(1.65)
