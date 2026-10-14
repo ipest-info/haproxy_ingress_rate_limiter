@@ -317,6 +317,9 @@ input:focus, select:focus {
       <div class="card-head">
         <span class="card-title">实例总限速</span>
         <span class="tag" id="inst-quota-cur">–</span>
+        <!-- 出向 tc 关闭（RL_TC_IFACE=-，纯监控/双网卡闭环形态）时本机
+             没有它的执行者：卡片置灰 + 明示原因，写接口也会 409 拒绝。 -->
+        <span class="tag warn" id="inst-quota-noexec" hidden>本机不执行</span>
         <span class="quota-edit">
           <span class="hint">Mbps，0 = 不限</span>
           <input id="inst-quota-input" type="number" min="0" step="any" placeholder="Mbps">
@@ -325,7 +328,7 @@ input:focus, select:focus {
         </span>
       </div>
       <div class="card-body">
-        <div class="hint">本机 HAProxy **全部** frontend 出向流量合计的总闸
+        <div class="hint" id="inst-quota-hint">本机 HAProxy **全部** frontend 出向流量合计的总闸
           （含未登记限额、只监控的段）：设置后 tc 切换为层级模式，各
           frontend 自己的限额仍各自生效；SSH/监控等系统流量**不在**总闸内、
           不受影响。修改经写 API 回写 YAML 后数秒内热生效——需先在页头
@@ -873,6 +876,15 @@ async function loadOverview() {
     ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
   const iq = o.instance_quota_mbps || 0;
   $("#inst-quota-cur").textContent = iq ? iq + " Mbps" : "不限";
+  // 实例总限速在本机没有执行者（出向 tc 关着）：置灰编辑控件并明示。
+  const noexec = o.instance_quota_executable === false;
+  $("#inst-quota-noexec").hidden = !noexec;
+  $("#inst-quota-input").disabled = noexec;
+  $("#inst-quota-save").disabled = noexec;
+  if (noexec) $("#inst-quota-hint").textContent =
+    "本机出向 tc 整形已关闭（RL_TC_IFACE=-），实例总限速没有执行者，" +
+    "设置已禁用——纯监控节点请先用 RL_TC_IFACE 指定出向网卡；双网卡" +
+    "闭环形态的限速入口是各监听端口的限额（出向目标，入向闭环执行）。";
   // 与 frontend 卡片的 qDirty 同一套规则：用户动过就不再自动回填。
   const iIn = $("#inst-quota-input");
   if (!state.instDirty && document.activeElement !== iIn)
