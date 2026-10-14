@@ -148,3 +148,80 @@ def test_no_samples_yet_climbs_from_max_is_noop():
     g = gov()
     assert not g.adjust_once([fe()], LIMITS)
     assert g.current() == {}
+
+
+# ---------------------------------------------------------------------------
+# 实例级环：实例出向总带宽 对照 instance_quota 目标 → 入向总闸
+# ---------------------------------------------------------------------------
+
+def feed_many(g, means, names_ports=None):
+    """按 {名: 出向 mean Mbps} 喂一拍（总量 = 各端口之和）。"""
+    g.record(0.0, [usage(n, m) for n, m in means.items()])
+
+
+def test_instance_over_target_shrinks_gate_gently():
+    """总出向超实例目标 → 总闸下调，单步封顶 -10%，上限 = 登记的
+    入向上限之和（fe_main 10Mbps）。"""
+    g = gov()
+    feed_many(g, {"fe_main": 200.0})
+    # frontend 不带单端口 quotas 目标：只有实例环动作。
+    assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
+    assert g.current_instance() == pytest.approx(10.0 * 0.90)
+    assert g.effective_instance_bits(LIMITS, 40.0) == int(9.0e6)
+    assert g.current() == {}            # 单端口环没动
+
+
+def test_instance_deadband_and_recovery():
+    g = gov()
+    feed_many(g, {"fe_main": 200.0})
+    g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)   # 10→9
+    # 死区：总出向落在 [0.85, 1.0]×40 → 不动。
+    feed_many(g, {"fe_main": 38.0})
+    assert not g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
+    # 低了 → +5%×上限/步爬回；到顶退出动态（None = 全开）。
+    feed_many(g, {"fe_main": 10.0})
+    assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
+    assert g.current_instance() == pytest.approx(9.5)
+    for _ in range(5):
+        g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
+    assert g.current_instance() is None
+    assert g.effective_instance_bits(LIMITS, 40.0) == int(10e6)
+
+
+def test_instance_max_falls_back_to_target_without_limits():
+    """一个 request_limits 都没登记：总闸上限退化为目标值本身（有界
+    的"全开"），实例环照样可用。"""
+    g = gov()
+    assert g.effective_instance_bits({}, 40.0) == int(40e6)
+    feed_many(g, {"fe_main": 200.0})
+    assert g.adjust_once([fe(quota=0.0)], {}, inst_target=40.0)
+    assert g.current_instance() == pytest.approx(36.0)
+
+
+def test_instance_target_removed_restores_flat():
+    g = gov()
+    feed_many(g, {"fe_main": 200.0})
+    g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
+    assert g.current_instance() is not None
+    assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=0.0)
+    assert g.current_instance() is None
+    assert g.effective_instance_bits(LIMITS, 0.0) == 0
+
+
+def test_instance_loop_disabled_when_not_capable():
+    """police 模式没有层级可言：instance_capable=False 时实例环整个
+    关闭（不调、不下发总闸），单端口环不受影响。"""
+    cfg = ingressgov.IngressGovConfig(enabled=True)
+    g = ingressgov.IngressGovernor(cfg, log, instance_capable=False)
+    feed_many(g, {"fe_main": 200.0})
+    assert not g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
+    assert g.effective_instance_bits(LIMITS, 40.0) == 0
+
+
+def test_both_loops_coexist():
+    """单端口环与实例环同时在跑：各调各的，互不覆盖。"""
+    g = gov()
+    feed_many(g, {"fe_main": 200.0})
+    assert g.adjust_once([fe(quota=40.0)], LIMITS, inst_target=50.0)
+    assert g.current()["fe_main"] == pytest.approx(9.0)
+    assert g.current_instance() == pytest.approx(9.0)

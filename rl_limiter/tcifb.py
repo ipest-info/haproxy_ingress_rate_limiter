@@ -152,11 +152,17 @@ class TcIfbIngress:
                 self.iface, self.ifb)
 
     async def reconcile(self, frontends: list[model.FrontendConfig],
-                        limits: dict) -> TcResult:
+                        limits: dict,
+                        instance_bits: int = 0) -> TcResult:
         """把入向整形收敛到配置描述的样子。
 
         字节整形的一致性/变更检测全部委托给 TcShaper（读回 IFB 上的类
         与速率，支持 rate 就地变更）；conn_rate 走配置指纹。
+
+        instance_bits > 0 = 入向**总闸**（实例级闭环的执行面）：IFB 上
+        切到与出向实例模式同一套层级——全部 frontend 的端口类挂进
+        1:ffff 聚合类，聚合速率即 instance_bits；登记了入向上限的端口
+        在总闸内仍有各自的 ceil，没登记的只受总闸管。
         """
         rules, unknown = desired_rules(frontends, limits)
         self._warn_unknown(unknown)
@@ -165,7 +171,7 @@ class TcIfbIngress:
         except TcError as e:
             return TcResult(ok=False, changed=False, error=str(e))
 
-        if not rules:
+        if not rules and not instance_bits:
             return await self._teardown_rules()
 
         try:
@@ -179,10 +185,18 @@ class TcIfbIngress:
 
         # 字节整形：把入向登记翻译成 TcShaper 的 frontend 清单。quota
         # 单位换算（bit/s → Mbps）只在这一处。
-        fes = [model.FrontendConfig(name=r.name, bind_port=r.port,
-                                    quota_mbps=r.rate_bits / 1e6)
-               for r in rules if r.rate_bits]
-        res = await self._shaper.reconcile(fes, 0)
+        if instance_bits:
+            # 层级（入向总闸）：全部 frontend 都要挂进聚合类——没登记
+            # 入向上限的端口 quota=0（只受总闸管），登记了的带各自 ceil。
+            caps = {r.port: r.rate_bits / 1e6 for r in rules if r.rate_bits}
+            fes = [model.FrontendConfig(name=f.name, bind_port=f.bind_port,
+                                        quota_mbps=caps.get(f.bind_port, 0.0))
+                   for f in frontends]
+        else:
+            fes = [model.FrontendConfig(name=r.name, bind_port=r.port,
+                                        quota_mbps=r.rate_bits / 1e6)
+                   for r in rules if r.rate_bits]
+        res = await self._shaper.reconcile(fes, instance_bits)
 
         # conn_rate：真实网卡上的 SYN police，配置变了才重刷。
         fp = ";".join(f"{r.port}|{r.conn_rate}"

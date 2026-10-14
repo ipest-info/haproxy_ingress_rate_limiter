@@ -386,15 +386,15 @@ async def run_ingress(shaper: TcIngress,
                       period_s: float = 30.0) -> None:
     """常驻任务：配置一变就下发入向限速，另有周期性兜底 reconcile。
 
-    desired_fn() 返回 (frontends, request_limits)。结构与 tcshaper 的
-    run_shaper 相同：事件驱动保证改完立刻生效，周期兜底纠正手工动过
-    tc 造成的漂移。
+    desired_fn() 返回 reconcile 的位置参数元组——police 模式是
+    (frontends, request_limits)，ifb 模式可以多一个 instance_bits
+    （入向总闸）。结构与 tcshaper 的 run_shaper 相同：事件驱动保证改完
+    立刻生效，周期兜底纠正手工动过 tc 造成的漂移。
     """
     import asyncio
     while True:
         try:
-            frontends, limits = desired_fn()
-            await shaper.reconcile(frontends, limits)
+            await shaper.reconcile(*desired_fn())
         except asyncio.CancelledError:
             raise
         except Exception as e:                      # 常驻任务不能因单次异常退出

@@ -41,6 +41,13 @@ police 只掐请求流（体量远小于响应流），响应路径零排队—�
 作为出向带宽的**目标值**供本控制器用——同一个数字，换了执行机制。
 frontend 没登记 quotas 目标、或 request_limits 没登记 mbps 的，不参与
 动态调节（后者无物可调，前者保持静态值下发）。
+
+**实例级环**（instance_quota_mbps = 实例出向总带宽目标）：与单端口环
+同一套算法，观测换成全部 frontend 出向 mean10 之和，执行换成 IFB 上的
+HTB **聚合类**（层级模式，与出向实例模式同一结构：全部端口挂进总闸，
+总闸速率即动态值）。总闸的上限 = 登记的 request_limits.mbps 之和
+（一个都没登记时退化为目标值本身——入向远小于出向，等于全开但有界）。
+仅 ifb 执行模式支持（police 没有层级可言），见 instance_capable。
 """
 from __future__ import annotations
 
@@ -80,7 +87,8 @@ class IngressGovernor:
     """
 
     def __init__(self, cfg: IngressGovConfig,
-                 log: logging.Logger | None = None):
+                 log: logging.Logger | None = None,
+                 instance_capable: bool = True):
         self._cfg = cfg
         self._log = log if log is not None else logging.getLogger(
             "rl_limiter.ingressgov")
@@ -89,18 +97,44 @@ class IngressGovernor:
         self._cur: dict[str, float] = {}
         # frontend 名 → 最近一拍的出向 mean10（bytes/s）。
         self._mean: dict[str, float] = {}
+        # 实例级环：执行侧是否支持聚合总闸（仅 ifb 模式支持——police
+        # 没有层级），以及当前动态总闸值（Mbps；None = 全开=上限）。
+        self._instance_capable = instance_capable
+        self._cur_inst: "float | None" = None
+        # 全部 frontend 出向 mean10 之和（bytes/s），实例级环的观测值。
+        self._mean_total = 0.0
 
     # ---- 监控循环的 sampler 链挂点（每拍一次） ----
 
     def record(self, now: float, usages: list, instance=None) -> None:
         for u in usages:
             self._mean[u.name] = u.mean10_bps
+        self._mean_total = sum(u.mean10_bps for u in usages)
 
     # ---- 下发侧取值 ----
 
     def current(self) -> dict[str, float]:
         """当前动态值（frontend 名 → Mbps），只含被调节过的。"""
         return dict(self._cur)
+
+    def current_instance(self) -> "float | None":
+        """入向总闸的当前动态值（Mbps；None = 全开，即等于上限）。"""
+        return self._cur_inst
+
+    def _instance_max(self, limits: dict, inst_target: float) -> float:
+        """总闸的上限：登记的入向上限之和；一个都没登记时退化为目标值
+        本身（下载型业务入向远小于出向，= 实际上全开但有界）。"""
+        s = sum(rl.mbps for rl in limits.values() if rl.mbps > 0)
+        return s if s > 0 else float(inst_target)
+
+    def effective_instance_bits(self, limits: dict,
+                                inst_target: float) -> int:
+        """下发侧取总闸速率（bit/s；0 = 不启用层级/没有实例目标）。"""
+        if not self._instance_capable or not inst_target or inst_target <= 0:
+            return 0
+        cur = self._cur_inst if self._cur_inst is not None \
+            else self._instance_max(limits, inst_target)
+        return int(cur * 1e6)
 
     def effective_limits(self, limits: dict) -> dict:
         """静态登记 + 动态当前值 → 实际要下发的 request_limits。
@@ -121,10 +155,12 @@ class IngressGovernor:
     # ---- 调节 ----
 
     def adjust_once(self, frontends: list, limits: dict,
+                    inst_target: float = 0.0,
                     degraded: bool = False) -> bool:
         """跑一轮调节，返回是否有值发生变化（变了调用方去触发下发）。
 
-        frontends/limits 每轮现取（配置热更后自动跟上）。
+        frontends/limits/inst_target（实例出向总带宽目标，Mbps，0 =
+        未设）每轮现取（配置热更后自动跟上）。
         """
         if degraded:
             # 采样失联：mean10 是陈旧值，按它调只会调错。保持现状。
@@ -175,6 +211,33 @@ class IngressGovernor:
             if new == max_mbps:
                 # 爬回了全开：删掉记录，语义与"从未调节过"一致。
                 del self._cur[name]
+
+        # ---- 实例级环：出向总带宽 对照 实例出向目标 ----
+        if (self._instance_capable and inst_target and inst_target > 0):
+            max_inst = self._instance_max(limits, inst_target)
+            floor = max_inst * self._cfg.floor_ratio
+            cur = self._cur_inst if self._cur_inst is not None else max_inst
+            mean_mbps = self._mean_total * 8 / 1e6
+            ratio = mean_mbps / inst_target
+            new = cur
+            if ratio > self._cfg.high_ratio:
+                down = min(self._cfg.step_down_max,
+                           (ratio - self._cfg.high_ratio) * 0.5)
+                new = max(floor, cur * (1.0 - down))
+            elif ratio < self._cfg.low_ratio and cur < max_inst:
+                new = min(max_inst, cur + max_inst * self._cfg.step_up)
+            if new != cur and abs(new - cur) >= cur * self._cfg.apply_epsilon:
+                self._cur_inst = None if new >= max_inst else new
+                changed = True
+                self._log.info(
+                    "入向总闸动态调整 %.1f→%.1fMbps（出向总 mean10="
+                    "%.1fMbps 实例目标=%gMbps 上限=%gMbps）",
+                    cur, new, mean_mbps, inst_target, max_inst)
+        elif self._cur_inst is not None:
+            # 实例目标被删/执行侧不支持 → 回到全开语义并触发下发。
+            self._cur_inst = None
+            changed = True
+            self._log.info("入向总闸退出动态调节（实例出向目标已移除）")
         return changed
 
 
@@ -187,15 +250,16 @@ async def run_governor(gov: IngressGovernor,
     """常驻任务：周期跑调节，有变化就 set 下发事件（run_ingress 被叫醒
     后经 effective_limits 拿到新值立刻 reconcile）。
 
-    desired_fn() 返回 (frontends, request_limits)，与 run_ingress 的
-    同名参数语义一致，每轮现取。
+    desired_fn() 返回 (frontends, request_limits, 实例出向目标 Mbps)，
+    每轮现取。
     """
     while True:
         await asyncio.sleep(interval_s)
         try:
-            frontends, limits = desired_fn()
+            frontends, limits, inst_target = desired_fn()
             degraded = bool(degraded_fn()) if degraded_fn else False
-            if gov.adjust_once(frontends, limits, degraded=degraded):
+            if gov.adjust_once(frontends, limits, inst_target=inst_target,
+                               degraded=degraded):
                 poke.set()
         except asyncio.CancelledError:
             raise

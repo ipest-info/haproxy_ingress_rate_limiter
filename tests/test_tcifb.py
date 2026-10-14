@@ -180,3 +180,30 @@ async def test_debug_state_readonly_and_covers_both_devices():
     assert IFACE in labels and IFB in labels
     assert st["help"] and all(r["note"] for r in st["raw"])
     assert not [c for c in f.calls if "show" not in c]
+
+
+async def test_instance_bits_builds_hierarchy_with_all_frontends():
+    """实例级闭环的执行面：instance_bits > 0 → IFB 上切层级——全部
+    frontend（含没登记入向上限的）挂进 1:ffff 总闸，总闸速率即动态值；
+    登记了上限的端口在总闸内保留各自的 ceil。"""
+    sh, f = shaper(redirect_out=REDIRECT_PRESENT)
+    res = await sh.reconcile(
+        [fe(), fe(name="fe_other", port=9090)], LIMITS,
+        instance_bits=int(8e6))
+    assert res.ok
+    # 总闸类 + 两个端口类都在（9090 没登记也要挂进总闸）。
+    assert f.muts("class", "add", IFB, "1:ffff")
+    assert f.muts("class", "add", IFB, "1:1f90")
+    assert f.muts("class", "add", IFB, "1:2382")   # 0x2382 = 9090
+    # 端口类挂的是总闸（parent 1:ffff）。
+    assert all("1:ffff" in c for c in f.muts("class", "add", "1:1f90"))
+
+
+async def test_instance_bits_without_rules_keeps_running():
+    """只有实例目标、一个 request_limits 都没登记：不是 teardown——
+    总闸本身就是执行面，全部端口挂进去只受总闸管。"""
+    sh, f = shaper(redirect_out=REDIRECT_PRESENT)
+    res = await sh.reconcile([fe()], {}, instance_bits=int(40e6))
+    assert res.ok
+    assert f.muts("class", "add", IFB, "1:ffff")
+    assert not f.muts("qdisc", "del", IFACE, "ingress")

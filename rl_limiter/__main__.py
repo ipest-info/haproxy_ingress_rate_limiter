@@ -149,25 +149,21 @@ async def _amain(cfg, log: logging.Logger,
     # version_fn 是延迟求值闭包（ctl 在下方才赋值，闭包只会在运行期被
     # 调用，届时 ctl 已完成构造）。
     ctl: MonitorLoop
-    hub: webconsole.StatusHub | None = None
-    if console_port:
-        hub = webconsole.StatusHub(
-            SERVICE_VERSION,
-            version_fn=lambda: ctl.version,
-            haproxy=cfg.haproxy,
-            degraded_fn=lambda: col.degraded,
-            # 出向 tc 关着（纯监控/闭环形态）时实例总限速没有执行者，
-            # 页面把那张卡置灰、写接口 409 拒绝（见 webconsole）。
-            instance_quota_executable=shaper is not None)
 
-    # 入向动态限速控制器（闭环）：按实测出向带宽对照 quotas 目标平缓
-    # 调整入向 police 上限。挂在 sampler 链上吃每拍的 mean10。
+    # 入向动态限速控制器（闭环）：按实测出向带宽对照目标平缓调整入向
+    # 上限。两个环：单端口（quotas → 各端口入向上限）与实例级
+    # （instance_quota_mbps = 实例出向总带宽目标 → IFB 上的入向总闸，
+    # 仅 ifb 执行模式支持——police 没有层级）。挂 sampler 链吃 mean10。
+    in_mode_ifb = getattr(ingress, "mode", "") == "ifb"
     gov: "ingressgov.IngressGovernor | None" = None
     if ingress is not None and cfg.dynamic_ingress.enabled:
-        gov = ingressgov.IngressGovernor(cfg.dynamic_ingress, log)
-        log.info("入向动态限速已启用：按出向带宽（目标=quotas 登记值）"
-                 "平缓调节入向 police 上限 interval=%gs 死区=[%g, %g] "
+        gov = ingressgov.IngressGovernor(cfg.dynamic_ingress, log,
+                                         instance_capable=in_mode_ifb)
+        log.info("入向动态限速已启用：按出向带宽（目标=quotas 登记值"
+                 "%s）平缓调节入向上限 interval=%gs 死区=[%g, %g] "
                  "step_up=%g step_down_max=%g floor=%g",
+                 "；实例总限速=实例出向总目标（入向总闸）"
+                 if in_mode_ifb else "",
                  cfg.dynamic_ingress.interval_s,
                  cfg.dynamic_ingress.low_ratio,
                  cfg.dynamic_ingress.high_ratio,
@@ -177,6 +173,18 @@ async def _amain(cfg, log: logging.Logger,
     elif cfg.dynamic_ingress.enabled:
         log.warning("dynamic_ingress.enabled=true 但入向限速未接线"
                     "（RL_TC_IN_IFACE 未设或为 -），动态调节不会运行")
+
+    # 实例总限速的执行者：出向 HTB（基线形态），或 ifb 闭环的入向总闸
+    # （本分支形态）。两者都没有时页面置灰、写接口 409（见 webconsole）。
+    inst_executable = shaper is not None or (gov is not None and in_mode_ifb)
+    hub: webconsole.StatusHub | None = None
+    if console_port:
+        hub = webconsole.StatusHub(
+            SERVICE_VERSION,
+            version_fn=lambda: ctl.version,
+            haproxy=cfg.haproxy,
+            degraded_fn=lambda: col.degraded,
+            instance_quota_executable=inst_executable)
 
     # sampler：监控循环每拍喂给控制台（内存实时曲线）与监控数据落盘器
     # （分钟粒度 JSONL）——同一拍、同一份数据，两个出口。
@@ -198,12 +206,18 @@ async def _amain(cfg, log: logging.Logger,
     config_applied = [e for e in (tc_applied, tcin_applied) if e is not None]
     ctl = MonitorLoop(col, sampler=sampler, log=log,
                       config_applied=config_applied)
-    if shaper is None and cfg.instance_quota_mbps:
+    if cfg.instance_quota_mbps and not inst_executable:
         log.warning(
-            "YAML 里配置了实例总限速（%gMbps）但出向 tc 整形已关闭"
-            "（RL_TC_IFACE=-）——**该限速不会执行**。纯监控节点请用 "
-            "RL_TC_IFACE 指定出向网卡；不需要时删掉 instance_quota_mbps "
-            "以免误导", cfg.instance_quota_mbps)
+            "YAML 里配置了实例总限速（%gMbps）但本机没有它的执行者"
+            "（出向 tc 关闭，且入向闭环不可用/为 police 模式）——"
+            "**该限速不会执行**。纯监控节点请用 RL_TC_IFACE 指定出向"
+            "网卡；不需要时删掉 instance_quota_mbps 以免误导",
+            cfg.instance_quota_mbps)
+    elif cfg.instance_quota_mbps and shaper is None:
+        log.info(
+            "实例总限速（%gMbps）在本形态下作为**实例出向总带宽目标**"
+            "由入向闭环执行（IFB 入向总闸动态调节），出向不做 tc 整形",
+            cfg.instance_quota_mbps)
     if mlog is not None:
         # 落盘行里的限额要取"采样当时"的值：延迟经 ctl 取当前受管清单。
         mlog.set_quotas_fn(metricslog.quotas_from_frontends(ctl.frontends))
@@ -325,6 +339,13 @@ async def _amain(cfg, log: logging.Logger,
                         want.append(f"{rl.conn_rate}conn/s")
                     parts.append(f"{name}@:{ports.get(name, '?')}="
                                  + "+".join(want or ["0"]))
+                inst_t = ctl.instance_quota_mbps
+                if gov is not None and in_mode_ifb and inst_t:
+                    cur_i = gov.current_instance()
+                    parts.append(
+                        f"实例出向目标={inst_t:g}Mbps→入向总闸 "
+                        + (f"{cur_i:.1f}Mbps（动态）" if cur_i is not None
+                           else "全开"))
                 section = await ingress.debug_state()
                 section.update(key="ingress",
                                title=("入向整形 IFB+HTB（请求方向限速）"
@@ -370,9 +391,16 @@ async def _amain(cfg, log: logging.Logger,
         # 挂了动态控制器时，下发的是控制器调节后的值（登记值只是上限）。
         def _tcin_desired():
             limits = ctl.request_limits()
-            if gov is not None:
-                limits = gov.effective_limits(limits)
-            return list(ctl.frontends()), limits
+            if gov is None:
+                return list(ctl.frontends()), limits
+            eff = gov.effective_limits(limits)
+            if in_mode_ifb:
+                # ifb 模式多一个入向总闸速率（实例级闭环的执行面；
+                # 0 = 没设实例目标，平铺）。
+                return (list(ctl.frontends()), eff,
+                        gov.effective_instance_bits(
+                            limits, ctl.instance_quota_mbps))
+            return list(ctl.frontends()), eff
 
         tasks.append(asyncio.create_task(
             tcinmod.run_ingress(
@@ -386,7 +414,8 @@ async def _amain(cfg, log: logging.Logger,
             tasks.append(asyncio.create_task(
                 ingressgov.run_governor(
                     gov,
-                    lambda: (list(ctl.frontends()), ctl.request_limits()),
+                    lambda: (list(ctl.frontends()), ctl.request_limits(),
+                             ctl.instance_quota_mbps),
                     tcin_applied, log,
                     interval_s=cfg.dynamic_ingress.interval_s,
                     degraded_fn=lambda: col.degraded),

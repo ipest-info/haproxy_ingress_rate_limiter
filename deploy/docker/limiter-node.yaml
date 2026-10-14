@@ -14,6 +14,11 @@ haproxy:
   cfg_path: /etc/haproxy/haproxy.cfg
   timeout_ms: 500
 
+# 实例出向总带宽目标（可选）：本形态下它不驱动出向 HTB，而是实例级
+# 闭环的目标——总出向超了就收紧 IFB 上的入向总闸（页面"实例总限速"
+# 卡设置的就是它，热生效）。
+# instance_quota_mbps: 60
+
 # 出向带宽**目标**：frontend 名（= cfg 里的段名）→ Mbps。
 # **端口默认不限速**：不登记就只监控。本分支（闭环形态）里这个数字
 # 不驱动出向 HTB（compose 已把出向 tc 关掉，RL_TC_IFACE=-），而是
