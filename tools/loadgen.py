@@ -74,9 +74,10 @@ DEFAULT_PER_REQ_KBS = 100.0
 # 限读的分块大小：块越小 pacing 越平滑；16 KiB 在 100 KB/s 下约每
 # 160ms 一拍，足够平滑又不至于 syscall 刷屏。
 THROTTLE_CHUNK = 16 * 1024
-# 并发上限：防御性钳制，防止一条打错的 curl（比如 32000）把演示环境
-# 的文件描述符耗尽。演示所需并发远低于此。
-MAX_CONCURRENCY = 1024
+# 并发上限：防御性钳制，防止一条打错的 curl（比如 320000）把演示环境
+# 的文件描述符耗尽。每个 worker 一条连接 ≈ 一个 fd，压满上限前记得把
+# 容器/进程的 nofile 抬到 ≳ 上限 + 余量（compose 的 ulimits 已给足）。
+MAX_CONCURRENCY = 10240
 # 每目标大文件 worker 上限（每个都是一条长期占带宽的下载，几个就够演示）。
 MAX_BIG_PER_TARGET = 16
 # 大文件下载端点（相对目标 URL）。

@@ -205,6 +205,13 @@ services:
       python3 tools/loadgen.py
       --target http://node1:8080/,http://node2:8080/,http://node3:8080/
       --control-port 8081
+    # 并发上限是 10240（loadgen.py 的 MAX_CONCURRENCY），每个 worker 一条
+    # 连接 ≈ 一个 fd：nofile 要盖过上限并留出控制端口/日志等的余量，
+    # 否则并发拉高时 worker 建连报 EMFILE。
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 16384
     environment:
       # 初始并发：LOADGEN_CONCURRENCY=32 docker compose up -d 即可改；
       # 运行中用控制端口在线调节（见文件头速查）。
