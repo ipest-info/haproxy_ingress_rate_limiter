@@ -225,3 +225,45 @@ def test_both_loops_coexist():
     assert g.adjust_once([fe(quota=40.0)], LIMITS, inst_target=50.0)
     assert g.current()["fe_main"] == pytest.approx(9.0)
     assert g.current_instance() == pytest.approx(9.0)
+
+
+def test_instance_first_tighten_lands_on_measured_ingress():
+    """首次收紧带实测入向带宽：总闸直接落位到 实测×1.1（而不是从
+    上限爬降）——入向因 ACK 杠杆比出向小一两个数量级，从上限起步
+    前几十步全是空转。落位后续步仍是小步细调。"""
+    g = gov()
+    feed_many(g, {"fe_main": 200.0})
+    assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
+                         ingress_now_mbps=1.5)
+    assert g.current_instance() == pytest.approx(1.65)   # 1.5×1.1
+    # 第二轮起回到小步：不再重复落位。
+    feed_many(g, {"fe_main": 200.0})
+    g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
+                  ingress_now_mbps=1.5)
+    assert g.current_instance() == pytest.approx(1.65 * 0.9)
+
+
+def test_instance_landing_clamped_to_floor_and_max():
+    g = gov()
+    feed_many(g, {"fe_main": 200.0})
+    # 实测高于上限（max=10）：落位没有收紧效果（≥ 当前值），必须退回
+    # 正常步降而不是每轮空转。
+    assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
+                         ingress_now_mbps=50.0)
+    assert g.current_instance() == pytest.approx(9.0)
+    # 实测低于下限（floor=1.0）→ 托到下限。
+    g2 = gov()
+    feed_many(g2, {"fe_main": 200.0})
+    assert g2.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
+                          ingress_now_mbps=0.1)
+    assert g2.current_instance() == pytest.approx(1.0)
+
+
+def test_instance_no_measurement_falls_back_to_stepdown():
+    """没有实测（None）→ 回退旧行为：从上限按步幅爬降，绝不拿猜的
+    数字当实测。"""
+    g = gov()
+    feed_many(g, {"fe_main": 200.0})
+    assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
+                         ingress_now_mbps=None)
+    assert g.current_instance() == pytest.approx(9.0)

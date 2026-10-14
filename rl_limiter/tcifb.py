@@ -31,7 +31,9 @@
 # 并每轮重试，绝不静默降级。
 from __future__ import annotations
 
+import json
 import logging
+import time
 
 from . import model, tcshaper
 from .tcingress import (INGRESS_PARENT, PRIO_SYN, IngressRule, TcResult,
@@ -104,6 +106,8 @@ class TcIfbIngress:
         # conn_rate 的配置指纹（SYN 过滤器非致命、不读回比对，与
         # tcingress 同一取舍）。
         self._syn_fp = ""
+        # 入向实测速率的差分基准：(单调时钟, IFB 根 qdisc 累计字节)。
+        self._rate_prev: "tuple[float, int] | None" = None
 
     async def _tc(self, argv: list[str], fatal: bool = True) -> str:
         rc, out, err = await self._run(argv)
@@ -237,6 +241,44 @@ class TcIfbIngress:
                        fatal=False)
         await self._shaper.teardown()
         await self._tc(["ip", "link", "del", self.ifb], fatal=False)
+
+    async def ingress_rate_bits(self) -> "float | None":
+        """当前入向线上速率（bit/s）：IFB 根 qdisc 的 Sent 字节差分。
+
+        给动态闭环当"落位"参考——总闸首次收紧时直接落到实测入向带宽
+        附近，而不是从上限/出向目标慢慢爬下来（入向因 ACK 杠杆比出向
+        小一两个数量级，从上限起步前几十步都是空转）。线上口径：含
+        ACK 与经过这张网卡的全部重定向流量，比 HAProxy 应用层的 bin
+        差分更接近总闸真正要管的东西。
+
+        首次调用（没有差分基准）、读取失败、计数器回卷（整形树刚重建
+        过）都返回 None——调用方回退到无实测的行为，绝不拿猜的数字
+        当实测。
+        """
+        rc, out, err = await self._run(
+            ["tc", "-s", "-j", "qdisc", "show", "dev", self.ifb])
+        now = time.monotonic()
+        if rc != 0:
+            return None
+        try:
+            total = None
+            for q in json.loads(out or "[]"):
+                if q.get("kind") == "htb":
+                    total = int(q.get("bytes", 0))
+                    break
+        except (ValueError, TypeError):
+            return None
+        if total is None:
+            return None
+        prev = self._rate_prev
+        self._rate_prev = (now, total)
+        if prev is None:
+            return None
+        dt = now - prev[0]
+        db = total - prev[1]
+        if dt <= 0.5 or db < 0:      # 太近测不准；负数 = 统计被重建清零
+            return None
+        return db * 8.0 / dt
 
     async def debug_state(self) -> dict:
         """调试快照（控制台"tc 实况"面板）：重定向 + IFB 上的整形树。"""

@@ -207,3 +207,24 @@ async def test_instance_bits_without_rules_keeps_running():
     assert res.ok
     assert f.muts("class", "add", IFB, "1:ffff")
     assert not f.muts("qdisc", "del", IFACE, "ingress")
+
+
+async def test_ingress_rate_bits_diffs_root_qdisc():
+    """实测入向速率：IFB 根 qdisc 的 Sent 字节差分。首次调用建基准
+    返回 None；统计清零（整形树重建）返回 None 并重新落基准。"""
+    import json as _json
+    sh, f = shaper()
+    seq = [1_000_000, 2_250_000, 100]      # 第三次：计数器被重建清零
+    async def runner(argv):
+        f.calls.append(list(argv))
+        if "-j" in argv and "qdisc" in argv:
+            return 0, _json.dumps([{"kind": "htb", "handle": "1:",
+                                    "bytes": seq.pop(0)}]), ""
+        return 0, "", ""
+    sh._run = runner
+    assert await sh.ingress_rate_bits() is None          # 建基准
+    sh._rate_prev = (sh._rate_prev[0] - 2.0, sh._rate_prev[1])  # 模拟隔 2s
+    r = await sh.ingress_rate_bits()
+    assert r is not None and abs(r - 1_250_000 * 8 / 2.0) / r < 0.2
+    sh._rate_prev = (sh._rate_prev[0] - 2.0, sh._rate_prev[1])
+    assert await sh.ingress_rate_bits() is None          # 回卷 → None

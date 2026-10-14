@@ -420,7 +420,11 @@ async def _amain(cfg, log: logging.Logger,
                              ctl.instance_quota_mbps),
                     tcin_applied, log,
                     interval_s=cfg.dynamic_ingress.interval_s,
-                    degraded_fn=lambda: col.degraded),
+                    degraded_fn=lambda: col.degraded,
+                    # 总闸落位的实测来源：IFB 根 qdisc 的 Sent 差分
+                    # （仅 ifb 模式有；police 模式本就没有实例环）。
+                    ingress_rate_fn=getattr(ingress, "ingress_rate_bits",
+                                            None)),
                 name="ingress-governor"))
 
     log.info("rl-limiter 服务已启动，监控循环开始运行 instance=%s "

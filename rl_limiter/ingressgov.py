@@ -156,11 +156,14 @@ class IngressGovernor:
 
     def adjust_once(self, frontends: list, limits: dict,
                     inst_target: float = 0.0,
+                    ingress_now_mbps: "float | None" = None,
                     degraded: bool = False) -> bool:
         """跑一轮调节，返回是否有值发生变化（变了调用方去触发下发）。
 
         frontends/limits/inst_target（实例出向总带宽目标，Mbps，0 =
-        未设）每轮现取（配置热更后自动跟上）。
+        未设）每轮现取（配置热更后自动跟上）。ingress_now_mbps 是执行
+        面实测的当前入向线上速率（IFB 根 qdisc 差分；None = 没有实测）
+        ——总闸首次收紧时的落位参考。
         """
         if degraded:
             # 采样失联：mean10 是陈旧值，按它调只会调错。保持现状。
@@ -221,9 +224,26 @@ class IngressGovernor:
             ratio = mean_mbps / inst_target
             new = cur
             if ratio > self._cfg.high_ratio:
-                down = min(self._cfg.step_down_max,
-                           (ratio - self._cfg.high_ratio) * 0.5)
-                new = max(floor, cur * (1.0 - down))
+                land = (min(max_inst, max(floor, ingress_now_mbps * 1.1))
+                        if ingress_now_mbps else None)
+                if self._cur_inst is None and land is not None and land < cur:
+                    # 首次收紧：**落位到实测入向带宽附近**（×1.1 留一
+                    # 口气），而不是从上限/出向目标开始一步步爬下来——
+                    # 入向因 ACK 杠杆比出向小一两个数量级，从上限起步
+                    # 前几十步全是空转。落位本身不掐流量（闸 ≈ 当前
+                    # 流量 + 余量），真正的收紧仍由后续小步完成，柔和
+                    # 性质不变。没有实测（None）回退旧行为。
+                    new = land
+                    self._log.info(
+                        "入向总闸落位：按当前实测入向带宽起调 "
+                        "%.1fMbps×1.1→%.1fMbps（出向总 mean10=%.1fMbps "
+                        "实例目标=%gMbps；不再从上限 %gMbps 爬降）",
+                        ingress_now_mbps, new, mean_mbps, inst_target,
+                        max_inst)
+                else:
+                    down = min(self._cfg.step_down_max,
+                               (ratio - self._cfg.high_ratio) * 0.5)
+                    new = max(floor, cur * (1.0 - down))
             elif ratio < self._cfg.low_ratio and cur < max_inst:
                 new = min(max_inst, cur + max_inst * self._cfg.step_up)
             if new != cur and abs(new - cur) >= cur * self._cfg.apply_epsilon:
@@ -246,19 +266,27 @@ async def run_governor(gov: IngressGovernor,
                        poke: asyncio.Event,
                        log: logging.Logger,
                        interval_s: float,
-                       degraded_fn=None) -> None:
+                       degraded_fn=None,
+                       ingress_rate_fn=None) -> None:
     """常驻任务：周期跑调节，有变化就 set 下发事件（run_ingress 被叫醒
     后经 effective_limits 拿到新值立刻 reconcile）。
 
     desired_fn() 返回 (frontends, request_limits, 实例出向目标 Mbps)，
-    每轮现取。
+    每轮现取。ingress_rate_fn 是执行面的实测入向速率（async，bit/s 或
+    None）——总闸落位用，见 adjust_once。
     """
     while True:
         await asyncio.sleep(interval_s)
         try:
             frontends, limits, inst_target = desired_fn()
             degraded = bool(degraded_fn()) if degraded_fn else False
+            now_mbps = None
+            if ingress_rate_fn is not None:
+                bits = await ingress_rate_fn()
+                if bits:
+                    now_mbps = bits / 1e6
             if gov.adjust_once(frontends, limits, inst_target=inst_target,
+                               ingress_now_mbps=now_mbps,
                                degraded=degraded):
                 poke.set()
         except asyncio.CancelledError:
