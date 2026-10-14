@@ -409,6 +409,13 @@ def _filter_cmds(iface: str, port: int, cid: str,
     sport=True 为出向语义（按源端口分类，网卡上的既有用法）；False 为
     入向语义（按目的端口）——IFB 整形用：重定向到 IFB 的是客户端打进
     来的包，frontend 监听端口在 dport 一侧。
+
+    IPv6 用 prio 2：tc 的约定是**一个 prio 只能绑一种 protocol**，
+    ip 与 ipv6 同 prio 会被内核拒绝（"Protocol mismatch for filter
+    with specified priority"）。早先两条都写 prio 1，IPv6 分类从来
+    没加上过——首轮 rebuild 在这里报错中断，IPv4 恰好已先加上、
+    比对又只看 classid 集合，于是"看起来在限速"而 v6 流量漏网
+    （真机 e2e 抓到）。
     """
     kw4, kw6 = ("sport", "sport") if sport else ("dport", "dport")
     return [
@@ -416,7 +423,7 @@ def _filter_cmds(iface: str, port: int, cid: str,
           "parent", ROOT_HANDLE, "prio", "1", "u32",
           "match", "ip", kw4, str(port), "0xffff", "flowid", cid], True),
         (["tc", "filter", "add", "dev", iface, "protocol", "ipv6",
-          "parent", ROOT_HANDLE, "prio", "1", "u32",
+          "parent", ROOT_HANDLE, "prio", "2", "u32",
           "match", "ip6", kw6, str(port), "0xffff", "flowid", cid], True),
     ]
 
