@@ -105,6 +105,12 @@ class IngressGovernor:
         # 第二轮仍没有才回退"从上限爬降"——落位值得等 5~15s，但不能
         # 让一个坏掉的测量源把实例环永远卡死。
         self._land_waited = False
+        # 落位锚：落位后实例环的下限改锚定在落位值上（floor_ratio×落位
+        # 值，绝对下限 0.1Mbps）。没登记 request_limits 时 max_inst 退化
+        # 为出向目标值，floor_ratio×它是**出向刻度**的下限——比入向的
+        # 均衡点高一个量级，总闸会贴着它卡死、出向永远压不到目标
+        # （e2e 实测抓到）。下限必须跟流入刻度走。
+        self._inst_anchor: "float | None" = None
         # 全部 frontend 出向 mean10 之和（bytes/s），实例级环的观测值。
         self._mean_total = 0.0
 
@@ -228,7 +234,7 @@ class IngressGovernor:
             ratio = mean_mbps / inst_target
             new = cur
             if ratio > self._cfg.high_ratio:
-                land = (min(max_inst, max(floor, ingress_now_mbps * 1.1))
+                land = (min(max_inst, max(0.1, ingress_now_mbps * 1.1))
                         if ingress_now_mbps else None)
                 if (self._cur_inst is None and land is None
                         and not self._land_waited):
@@ -247,6 +253,7 @@ class IngressGovernor:
                     # 流量 + 余量），真正的收紧仍由后续小步完成，柔和
                     # 性质不变。没有实测（None）回退旧行为。
                     new = land
+                    self._inst_anchor = land
                     self._log.info(
                         "入向总闸落位：按当前实测入向带宽起调 "
                         "%.1fMbps×1.1→%.1fMbps（出向总 mean10=%.1fMbps "
@@ -256,7 +263,12 @@ class IngressGovernor:
                 else:
                     down = min(self._cfg.step_down_max,
                                (ratio - self._cfg.high_ratio) * 0.5)
-                    new = max(floor, cur * (1.0 - down))
+                    # 下限：落位过就锚定在落位值的刻度上（见 _inst_anchor
+                    # 注释），没落位过才用 floor_ratio×上限的旧语义。
+                    floor_eff = (max(0.1, self._inst_anchor
+                                     * self._cfg.floor_ratio)
+                                 if self._inst_anchor is not None else floor)
+                    new = max(floor_eff, cur * (1.0 - down))
             elif ratio < self._cfg.low_ratio and cur < max_inst:
                 new = min(max_inst, cur + max_inst * self._cfg.step_up)
             if new != cur and abs(new - cur) >= cur * self._cfg.apply_epsilon:
@@ -270,6 +282,7 @@ class IngressGovernor:
             # 实例目标被删/执行侧不支持 → 回到全开语义并触发下发。
             self._cur_inst = None
             self._land_waited = False
+            self._inst_anchor = None
             changed = True
             self._log.info("入向总闸退出动态调节（实例出向目标已移除）")
         return changed
@@ -299,6 +312,11 @@ async def run_governor(gov: IngressGovernor,
                 bits = await ingress_rate_fn()
                 if bits:
                     now_mbps = bits / 1e6
+            if inst_target:
+                # 闭环每轮的观测快照：落位靠它，排障时第一眼要看的数。
+                log.debug("闭环观测 流入实测=%s 出向总目标=%gMbps",
+                         f"{now_mbps:.2f}Mbps" if now_mbps else "无",
+                         inst_target)
             if gov.adjust_once(frontends, limits, inst_target=inst_target,
                                ingress_now_mbps=now_mbps,
                                degraded=degraded):

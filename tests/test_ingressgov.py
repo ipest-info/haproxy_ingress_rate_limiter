@@ -257,12 +257,14 @@ def test_instance_landing_clamped_to_floor_and_max():
     assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
                          ingress_now_mbps=50.0)
     assert g.current_instance() == pytest.approx(9.0)
-    # 实测低于下限（floor=1.0）→ 托到下限。
+    # 实测极低 → 落位只受 0.1Mbps 绝对下限保护，**不**被
+    # floor_ratio×上限（出向刻度）托高——那个下限比入向均衡点高一个
+    # 量级，会让总闸卡死、出向永远压不到目标（e2e 实测抓到）。
     g2 = gov()
     feed_many(g2, {"fe_main": 200.0})
     assert g2.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
-                          ingress_now_mbps=0.1)
-    assert g2.current_instance() == pytest.approx(1.0)
+                          ingress_now_mbps=0.05)
+    assert g2.current_instance() == pytest.approx(0.1)
 
 
 def test_instance_no_measurement_waits_once_then_falls_back():
@@ -283,3 +285,17 @@ def test_instance_no_measurement_waits_once_then_falls_back():
     assert g2.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
                           ingress_now_mbps=1.5)
     assert g2.current_instance() == pytest.approx(1.65)
+
+
+def test_instance_floor_anchors_to_landing():
+    """落位后下限锚定在落位值刻度（floor_ratio×落位值，绝对下限
+    0.1）——后续步降能走到入向均衡点，不被出向刻度的旧下限卡住。"""
+    g = gov()
+    feed_many(g, {"fe_main": 200.0})
+    g.adjust_once([fe(quota=0.0)], {}, inst_target=40.0,
+                  ingress_now_mbps=1.5)         # 落位 1.65（上限退化=40）
+    for _ in range(40):
+        feed_many(g, {"fe_main": 200.0})
+        g.adjust_once([fe(quota=0.0)], {}, inst_target=40.0)
+    # 旧语义下限 = 0.1×40 = 4.0；新语义 = max(0.1, 0.1×1.65) = 0.165。
+    assert g.current_instance() == pytest.approx(0.165, rel=0.01)
