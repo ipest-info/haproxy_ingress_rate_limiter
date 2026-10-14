@@ -216,6 +216,9 @@ services:
       # 初始并发：LOADGEN_CONCURRENCY=32 docker compose up -d 即可改；
       # 运行中用控制端口在线调节（见文件头速查）。
       LOADGEN_CONCURRENCY: ${LOADGEN_CONCURRENCY:-1000}
+      # 压测进程数：默认自动=CPU 核数（单进程 asyncio 只能吃满一个核，
+      # 上万并发靠多进程分片；1 = 旧的单进程行为）。
+      LOADGEN_PROCS: ${LOADGEN_PROCS:-0}
       # 每请求限读 100 KB/s（模拟终端用户的下载速度；0 = 不限）。
       # 1000 并发 × ≤100KB/s ≈ ≤800 Mbps 的聚合压力，仍远超各入口限额。
       LOADGEN_PER_REQ_KBS: ${LOADGEN_PER_REQ_KBS:-100}
