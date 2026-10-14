@@ -131,7 +131,9 @@ async def test_rebuild_from_scratch_builds_both_families():
     # 字节速率：IPv4 + IPv6 的 u32 dport police，rate 与 burst 都显式给。
     assert any("protocol ip prio 1 u32 match ip dport 8080 0xffff police "
                "rate 10000000bit burst 12500b drop" in c for c in cmds), cmds
-    assert any("protocol ipv6 prio 1 u32 match ip6 dport 8080 0xffff" in c
+    # IPv6 必须用自己的 prio（一个 prio 只能绑一种 protocol，同 prio
+    # 的第二种会被内核拒绝——真机 e2e 抓到的 bug）。
+    assert any("protocol ipv6 prio 2 u32 match ip6 dport 8080 0xffff" in c
                for c in cmds), cmds
     # SYN 速率：flower tcp_flags SYN/非ACK + pkts_rate（IPv4 + IPv6）。
     syn = [c for c in cmds if "flower" in c]

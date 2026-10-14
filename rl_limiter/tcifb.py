@@ -38,10 +38,11 @@ from .tcingress import (INGRESS_PARENT, PRIO_SYN, IngressRule, TcResult,
                         _check_rules, desired_rules)
 from .tcshaper import TcError, _run_argv
 
-# 重定向过滤器的 prio。SYN police 用 tcingress 的 PRIO_SYN（=2），重定向
-# 放在其后：SYN 包先过速率闸（超了丢、没超放行终止于 police 的 ok 动作
+# 重定向过滤器的 prio（ip/ipv6 各一个——tc 约定一个 prio 只能绑一种
+# protocol）。SYN police 用 tcingress 的 PRIO_SYN（3/4），重定向放在
+# 其后：SYN 包先过速率闸（超了丢、没超放行终止于 police 的 ok 动作
 # ——SYN 只有几十字节，不整形无伤大雅），其余包落到这条全匹配重定向。
-PRIO_REDIRECT = "5"
+PRIO_REDIRECT = {"ip": "5", "ipv6": "6"}
 
 # IFB 设备默认名。刻意不用惯例的 ifb0——那是教程和手工脚本最爱用的
 # 名字，撞上运维自己建的设备会互相踩；独占一个带项目印记的名字。
@@ -52,7 +53,7 @@ def _redirect_cmds(iface: str, ifb: str) -> list[tuple[list[str], bool]]:
     """把真实网卡入向的全部 IP 流量搬到 IFB 的过滤器（IPv4/IPv6 各一条）。"""
     return [
         (["tc", "filter", "add", "dev", iface, "parent", INGRESS_PARENT,
-          "protocol", proto, "prio", PRIO_REDIRECT, "u32",
+          "protocol", proto, "prio", PRIO_REDIRECT[proto], "u32",
           "match", "u32", "0", "0",
           "action", "mirred", "egress", "redirect", "dev", ifb], True)
         for proto in ("ip", "ipv6")
@@ -64,7 +65,8 @@ def _syn_cmds(iface: str,
     """conn_rate 的 SYN 速率过滤器（与 tcingress 同一套，全部非致命）。"""
     cmds: list[tuple[list[str], bool]] = [
         (["tc", "filter", "del", "dev", iface, "parent", INGRESS_PARENT,
-          "prio", PRIO_SYN], False),
+          "prio", prio], False)
+        for prio in PRIO_SYN.values()
     ]
     for r in sorted(rules, key=lambda x: x.port):
         if not r.conn_rate:
@@ -73,7 +75,7 @@ def _syn_cmds(iface: str,
             cmds.append((
                 ["tc", "filter", "add", "dev", iface,
                  "parent", INGRESS_PARENT, "protocol", proto,
-                 "prio", PRIO_SYN, "flower", "ip_proto", "tcp",
+                 "prio", PRIO_SYN[proto], "flower", "ip_proto", "tcp",
                  "dst_port", str(r.port), "tcp_flags", "0x02/0x12",
                  "action", "police",
                  "pkts_rate", str(r.conn_rate),

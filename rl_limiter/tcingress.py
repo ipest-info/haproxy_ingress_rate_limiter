@@ -52,8 +52,11 @@ from .tcshaper import TcError, TcResult, _run_argv, burst_bytes, parse_rate
 INGRESS_PARENT = "ffff:"
 # 过滤器优先级：1 = 字节速率（u32 police），2 = SYN 速率（flower）。
 # 重建时按 prio 整段删除，不会碰别人挂在同一网卡入向的其它 prio。
-PRIO_RATE = "1"
-PRIO_SYN = "2"
+# prio 布局：tc 约定**一个 prio 只能绑一种 protocol**（ip 与 ipv6 同
+# prio 会被内核拒绝 "Protocol mismatch"，真机 e2e 抓到），所以每种
+# protocol 各占一个 prio。
+PRIO_RATE = {"ip": "1", "ipv6": "2"}      # 字节速率 police
+PRIO_SYN = {"ip": "3", "ipv6": "4"}       # SYN 速率 police（conn_rate）
 
 
 @dataclass(**model.SLOTS)
@@ -115,29 +118,22 @@ def _rebuild_cmds(iface: str,
     """
     cmds: list[tuple[list[str], bool]] = [
         (["tc", "qdisc", "add", "dev", iface, "ingress"], False),
-        (["tc", "filter", "del", "dev", iface, "parent", INGRESS_PARENT,
-          "prio", PRIO_RATE], False),
-        (["tc", "filter", "del", "dev", iface, "parent", INGRESS_PARENT,
-          "prio", PRIO_SYN], False),
     ]
+    for prio in (*PRIO_RATE.values(), *PRIO_SYN.values()):
+        cmds.append((["tc", "filter", "del", "dev", iface,
+                      "parent", INGRESS_PARENT, "prio", prio], False))
     for r in sorted(rules, key=lambda x: x.port):
         if r.rate_bits:
             burst = burst_bytes(r.rate_bits / 8)
             # IPv4/IPv6 各一条——只写 IPv4 的话 v6 请求完全不受限。
-            cmds.append((
-                ["tc", "filter", "add", "dev", iface,
-                 "parent", INGRESS_PARENT, "protocol", "ip",
-                 "prio", PRIO_RATE, "u32",
-                 "match", "ip", "dport", str(r.port), "0xffff",
-                 "police", "rate", f"{r.rate_bits}bit",
-                 "burst", f"{burst}b", "drop"], True))
-            cmds.append((
-                ["tc", "filter", "add", "dev", iface,
-                 "parent", INGRESS_PARENT, "protocol", "ipv6",
-                 "prio", PRIO_RATE, "u32",
-                 "match", "ip6", "dport", str(r.port), "0xffff",
-                 "police", "rate", f"{r.rate_bits}bit",
-                 "burst", f"{burst}b", "drop"], True))
+            for proto, kw in (("ip", "ip"), ("ipv6", "ip6")):
+                cmds.append((
+                    ["tc", "filter", "add", "dev", iface,
+                     "parent", INGRESS_PARENT, "protocol", proto,
+                     "prio", PRIO_RATE[proto], "u32",
+                     "match", kw, "dport", str(r.port), "0xffff",
+                     "police", "rate", f"{r.rate_bits}bit",
+                     "burst", f"{burst}b", "drop"], True))
         if r.conn_rate:
             # SYN 速率：flower 的 tcp_flags 0x02/0x12 = SYN 置位且 ACK
             # 清零（放过 SYN-ACK——那是出向握手回包，不该出现在入向，
@@ -151,7 +147,7 @@ def _rebuild_cmds(iface: str,
                 cmds.append((
                     ["tc", "filter", "add", "dev", iface,
                      "parent", INGRESS_PARENT, "protocol", proto,
-                     "prio", PRIO_SYN, "flower", "ip_proto", "tcp",
+                     "prio", PRIO_SYN[proto], "flower", "ip_proto", "tcp",
                      "dst_port", str(r.port), "tcp_flags", "0x02/0x12",
                      "action", "police",
                      "pkts_rate", str(r.conn_rate),
