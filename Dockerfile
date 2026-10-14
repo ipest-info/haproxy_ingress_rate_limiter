@@ -31,6 +31,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 # HTTPS 取 wheel；procps：入口脚本用 pkill 给 haproxy 发 reload 信号；
 # iproute2：**限速本体**——限额由内核 tc（HTB）执行，没有它 rl-limiter
 # 一启动就会因为找不到 tc 而下发失败（见 rl_limiter/tcshaper.py）。
+#
+# 排障工具（进容器手工用，程序不依赖）：net-tools（ifconfig/netstat，
+# 双网卡形态下核对哪张网卡在哪个网段）、iputils-ping（ping，容器间连
+# 通性）、curl（容器内直接打本机 HAProxy / 控制台接口）。基础镜像一个
+# 都不带，真排障时现装还没有网络权限的话就只能干瞪眼。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         haproxy \
@@ -39,6 +44,9 @@ RUN apt-get update \
         ca-certificates \
         procps \
         iproute2 \
+        net-tools \
+        iputils-ping \
+        curl \
     && rm -rf /var/lib/apt/lists/* \
     && haproxy -v \
     # 版本闸门：cfg 里用到 option splice-*（2.8 起稳定可用），且监控
