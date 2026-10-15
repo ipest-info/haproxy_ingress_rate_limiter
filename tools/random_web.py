@@ -119,6 +119,17 @@ def make_app(min_bytes: int, max_bytes: int,
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="HAProxy 后端模拟 web 服务：每次请求返回随机大小的响应体")
+    # 多进程分片：单进程 asyncio 至多吃满一个 CPU 核，压测拉满时后端自己
+    # 先成瓶颈（实测 4Gbps 需求下单进程 91% CPU 顶死，accept 队列每分钟
+    # 溢出上万次，丢掉的 SYN 变成节点 HAProxy 的重试风暴——后端的锅记到
+    # 了节点头上）。借 SO_REUSEPORT 让 N 个进程监听同一端口，内核按连接
+    # 散列分流，不需要 loadgen 那样的父进程控制面。
+    parser.add_argument("--procs", type=int,
+                        default=env_int("WEB_PROCS", 0, "random-web"),
+                        help="服务进程数（默认 %(default)s=自动按 CPU 核数，"
+                             "封顶 16；1=单进程。环境变量 WEB_PROCS）")
+    parser.add_argument("--shard", action="store_true",
+                        help=argparse.SUPPRESS)   # 内部：分片子进程标记
     parser.add_argument("--port", type=int,
                         default=env_int("WEB_PORT", DEFAULT_PORT, "random-web"),
                         help="监听端口（默认 %(default)s，可用环境变量 WEB_PORT 覆盖）")
@@ -148,12 +159,45 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z")
 
+    import os
+    procs = args.procs if args.procs else min(os.cpu_count() or 1, 16)
+    if procs > 1 and not args.shard:
+        # 父进程只做监督：拉起 N 个 --shard 子进程（SO_REUSEPORT 同端口），
+        # 任一子进程退出就整体退出交 compose 拉起。
+        import subprocess
+        argv = [sys.executable, os.path.abspath(__file__),
+                "--port", str(args.port), "--min-bytes", str(args.min_bytes),
+                "--max-bytes", str(args.max_bytes),
+                "--big-bytes", str(args.big_bytes), "--shard"]
+        children = [subprocess.Popen(argv) for _ in range(procs)]
+        log.info("模拟业务后端已启动 %d 个分片进程（SO_REUSEPORT 同端口 %d；"
+                 "单进程 asyncio 只能吃满一个核）", procs, args.port)
+        import time
+        try:
+            while True:
+                for c in children:
+                    if c.poll() is not None:
+                        log.error("后端分片意外退出（rc=%s），整体退出",
+                                  c.returncode)
+                        raise SystemExit(1)
+                time.sleep(1)
+        finally:
+            for x in children:
+                if x.poll() is None:
+                    x.terminate()
+
     app = make_app(args.min_bytes, args.max_bytes, args.big_bytes)
     log.info("模拟业务后端已开始监听（每次请求返回随机大小响应；/big 为大文件下载） "
-             "port=%d min_bytes=%d max_bytes=%d big_bytes=%d",
-             args.port, args.min_bytes, args.max_bytes, args.big_bytes)
+             "port=%d min_bytes=%d max_bytes=%d big_bytes=%d shard=%s",
+             args.port, args.min_bytes, args.max_bytes, args.big_bytes,
+             args.shard)
     # access_log=None：压测场景下每秒成百上千请求，逐条访问日志只会刷屏。
-    web.run_app(app, host="0.0.0.0", port=args.port, access_log=None, print=None)
+    # backlog：aiohttp 默认 128——每秒上千新建连接下 accept 队列秒满、
+    # SYN 被静默丢弃（实测 75s 溢出 3.1 万次），上游表现为连接超时重试。
+    # 4096 受容器内 net.core.somaxconn 封顶，compose 的 sysctls 一并抬高。
+    # reuse_port：多分片共享端口的前提（单进程开着也无害）。
+    web.run_app(app, host="0.0.0.0", port=args.port, access_log=None,
+                print=None, backlog=4096, reuse_port=True)
     log.info("模拟业务后端已停止")
 
 
