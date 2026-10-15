@@ -155,6 +155,9 @@ async def test_missing_ifb_support_fails_loud_not_silent():
     sh, f = shaper(fail_on=("link show",))
     res = await sh.reconcile([fe()], LIMITS)
     assert not res.ok and res.error
+    # 报错必须带上创建失败的真实原因与处置建议——"设备不存在"四个字
+    # 只会让人瞎猜（真实用户在 Docker Desktop 上撞到过）。
+    assert "ifb" in res.error and "police" in res.error
     # 管路都没建成，绝不能继续下发整形/SYN 规则。
     assert not f.muts("htb") and not f.muts("flower")
 

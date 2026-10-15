@@ -138,9 +138,21 @@ class TcIfbIngress:
         # 设备可能已存在（上轮建的/重启残留），add 失败非致命；随后的
         # show 才是"设备到底在不在"的裁决，不在就致命——没有 IFB 一切
         # 免谈，宁可大声失败让周期重试，也不要装作在限速。
-        await self._tc(["ip", "link", "add", self.ifb, "type", "ifb"],
-                       fatal=False)
-        await self._tc(["ip", "link", "show", self.ifb])
+        # add 的 stderr 要留着：show 失败时它才是**真实原因**（典型如
+        # Docker Desktop/精简内核没有 ifb 模块时的 "Operation not
+        # supported"），只报"设备不存在"等于让人瞎猜。
+        rc, out, err = await self._run(
+            ["ip", "link", "add", self.ifb, "type", "ifb"])
+        add_err = (err or out or "").strip() if rc != 0 else ""
+        rc, out, err = await self._run(["ip", "link", "show", self.ifb])
+        if rc != 0:
+            raise TcError(
+                f"IFB 设备 {self.ifb} 不存在且创建失败"
+                f"（{add_err or '原因未知'}）。内核可能没有 ifb 模块——"
+                f"Docker Desktop(Mac/Win) 的精简虚拟机内核、容器优化型"
+                f"内核常见。可设 RL_TC_IN_MODE=police 改用丢包式入向"
+                f"限速（需 act_police；实例总闸在该模式下不可用），或"
+                f"在带通用内核的 Linux 主机上运行")
         await self._tc(["ip", "link", "set", self.ifb, "up"])
         await self._tc(["tc", "qdisc", "add", "dev", self.iface, "ingress"],
                        fatal=False)
