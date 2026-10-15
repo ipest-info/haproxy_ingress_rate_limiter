@@ -117,6 +117,19 @@ fi
 if [ -n "${HAPROXY_MAXPIPES:-}" ]; then
     override_directive maxpipes "$HAPROXY_MAXPIPES"
 fi
+# nbthread：模板刻意不写（2.8 不指定 = 自动等于可用 CPU 数，独占机器
+# 上这是对的）。但**同机多实例的演示**里它是负载放大器：3 节点 × 核数
+# 线程 + loadgen 分片 + web，在小核数宿主机上线程数轻松超配数倍，上下
+# 文切换把 loadavg 推高。演示用 HAPROXY_NBTHREAD 显式压小；模板里没有
+# 该指令，插到 global 段首行之后。
+if [ -n "${HAPROXY_NBTHREAD:-}" ]; then
+    if grep -qE "^[[:space:]]*nbthread[[:space:]]+[0-9]+" "$HAPROXY_CFG"; then
+        override_directive nbthread "$HAPROXY_NBTHREAD"
+    else
+        sed -i -E "0,/^global[[:space:]]*$/s//global\n    nbthread $HAPROXY_NBTHREAD/" "$HAPROXY_CFG"
+        log "已插入 nbthread=$HAPROXY_NBTHREAD（同机多实例的演示形态，压住线程超配）"
+    fi
+fi
 
 # 限速自检：限速由内核 tc（HTB）执行，不再走 HAProxy 的 bwlim。
 # 限速静默失效是本项目最不能接受的故障（用户以为限住了，实际没有），
