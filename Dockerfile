@@ -60,6 +60,16 @@ RUN apt-get update \
 
 WORKDIR /app
 
+# pip 镜像源（可选）：PyPI 直连慢/不稳的网络环境下，构建时指定国内镜像：
+#   docker compose -f docker-compose-demo.yml build \
+#       --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# 不传则走默认源。pip 原生识别 PIP_INDEX_URL 环境变量，空值等于没设。
+# 注意：构建报 "Temporary failure in name resolution" 是 Docker 构建
+# 环境的 DNS 坏了（连域名都解析不了），换镜像源救不了——先重启
+# Docker Desktop / 给 daemon 配 dns。
+ARG PIP_INDEX_URL=
+ENV PIP_INDEX_URL=${PIP_INDEX_URL}
+
 COPY pyproject.toml ./
 COPY rl_limiter ./rl_limiter
 COPY tools ./tools
