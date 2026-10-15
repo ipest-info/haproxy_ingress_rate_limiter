@@ -36,6 +36,15 @@ services:
   web:
     build: .
     command: python3 tools/random_web.py --port 9000
+    # net.* 按 network namespace 隔离，compose 可直接声明——web/loadgen
+    # 不经过节点入口脚本（tune-kernel 只在节点里跑），不在这里给就全是
+    # 发行版默认值：实测 5000 并发下 accept 队列（somaxconn 封顶）75 秒
+    # 溢出 3.1 万次，丢掉的 SYN 变成节点 HAProxy 的重试风暴。
+    sysctls:
+      net.core.somaxconn: 65536
+      net.ipv4.tcp_max_syn_backlog: 65536
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_max_tw_buckets: 2097152
     environment:
       # 响应体大小区间（字节）：默认 256 KiB ~ 2 MiB，可按需覆盖。
       # 小文件为主、大小随机（与 loadgen 的慢客户端短连接场景配套）。
@@ -44,6 +53,9 @@ services:
       # /big 大文件下载端点的默认大小：512 MiB（40 Mbps 限速下约 100s
       # 下完），供长连接大文件场景（loadgen 的 big worker）使用。
       WEB_BIG_BYTES: ${WEB_BIG_BYTES:-536870912}
+      # 服务进程数：默认自动=CPU 核数（单进程 asyncio 只能吃满一个核，
+      # 压测拉满时后端先成瓶颈——SO_REUSEPORT 分片见 random_web.py）。
+      WEB_PROCS: ${WEB_PROCS:-0}
     restart: unless-stopped
 
   # ---- 三台节点：Ubuntu 24.04 + HAProxy 2.8(发行版自带) + 同机 rl-limiter。
@@ -58,6 +70,18 @@ services:
     # 明确报出来，不会静默地"没在限速"）。
     cap_add:
       - NET_ADMIN
+    # tune-kernel.sh 在入口脚本里仍会逐项核验并报告，但有些运行时把
+    # 容器的 /proc/sys 挂成只读（日志里整排"调不动"）——net.* 是按
+    # network namespace 隔离的，compose 在创建期声明最可靠。端口区间
+    # 下界**保持 32768**：tc 按源端口分类，下探会撞监听端口（见
+    # tune-kernel.sh 里 ip_local_port_range 的说明）。
+    sysctls:
+      net.core.somaxconn: 65536
+      net.ipv4.tcp_max_syn_backlog: 65536
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_max_tw_buckets: 2097152
+      net.ipv4.tcp_fin_timeout: 15
+      net.ipv4.ip_local_port_range: 32768 65535
     # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
     # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
     # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
@@ -82,6 +106,10 @@ services:
       # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
       HAPROXY_MAXCONN: "100000"
       HAPROXY_MAXPIPES: "100000"
+      # 同机 3 节点的演示：不压 nbthread 的话每台 HAProxy 线程数=宿主机
+      # 核数，3 台加 loadgen 分片轻松超配数倍，上下文切换推高 loadavg。
+      # 生产独占机器请删掉它用模板默认（自动=核数）。
+      HAPROXY_NBTHREAD: ${HAPROXY_NBTHREAD:-2}
       RL_CONSOLE_PORT: "8090"
       # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
       # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
@@ -108,6 +136,18 @@ services:
     # 明确报出来，不会静默地"没在限速"）。
     cap_add:
       - NET_ADMIN
+    # tune-kernel.sh 在入口脚本里仍会逐项核验并报告，但有些运行时把
+    # 容器的 /proc/sys 挂成只读（日志里整排"调不动"）——net.* 是按
+    # network namespace 隔离的，compose 在创建期声明最可靠。端口区间
+    # 下界**保持 32768**：tc 按源端口分类，下探会撞监听端口（见
+    # tune-kernel.sh 里 ip_local_port_range 的说明）。
+    sysctls:
+      net.core.somaxconn: 65536
+      net.ipv4.tcp_max_syn_backlog: 65536
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_max_tw_buckets: 2097152
+      net.ipv4.tcp_fin_timeout: 15
+      net.ipv4.ip_local_port_range: 32768 65535
     # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
     # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
     # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
@@ -132,6 +172,10 @@ services:
       # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
       HAPROXY_MAXCONN: "100000"
       HAPROXY_MAXPIPES: "100000"
+      # 同机 3 节点的演示：不压 nbthread 的话每台 HAProxy 线程数=宿主机
+      # 核数，3 台加 loadgen 分片轻松超配数倍，上下文切换推高 loadavg。
+      # 生产独占机器请删掉它用模板默认（自动=核数）。
+      HAPROXY_NBTHREAD: ${HAPROXY_NBTHREAD:-2}
       RL_CONSOLE_PORT: "8090"
       # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
       # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
@@ -156,6 +200,18 @@ services:
     # 明确报出来，不会静默地"没在限速"）。
     cap_add:
       - NET_ADMIN
+    # tune-kernel.sh 在入口脚本里仍会逐项核验并报告，但有些运行时把
+    # 容器的 /proc/sys 挂成只读（日志里整排"调不动"）——net.* 是按
+    # network namespace 隔离的，compose 在创建期声明最可靠。端口区间
+    # 下界**保持 32768**：tc 按源端口分类，下探会撞监听端口（见
+    # tune-kernel.sh 里 ip_local_port_range 的说明）。
+    sysctls:
+      net.core.somaxconn: 65536
+      net.ipv4.tcp_max_syn_backlog: 65536
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_max_tw_buckets: 2097152
+      net.ipv4.tcp_fin_timeout: 15
+      net.ipv4.ip_local_port_range: 32768 65535
     # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
     # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
     # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
@@ -180,6 +236,10 @@ services:
       # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
       HAPROXY_MAXCONN: "100000"
       HAPROXY_MAXPIPES: "100000"
+      # 同机 3 节点的演示：不压 nbthread 的话每台 HAProxy 线程数=宿主机
+      # 核数，3 台加 loadgen 分片轻松超配数倍，上下文切换推高 loadavg。
+      # 生产独占机器请删掉它用模板默认（自动=核数）。
+      HAPROXY_NBTHREAD: ${HAPROXY_NBTHREAD:-2}
       RL_CONSOLE_PORT: "8090"
       # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
       # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
@@ -212,6 +272,15 @@ services:
       nofile:
         soft: 16384
         hard: 16384
+    # 短连接场景 loadgen 是 TIME_WAIT/临时端口压力最大的一侧（客户端先
+    # 关，TIME_WAIT 全在它这边：实测 5000 并发挂 4 万个）。默认端口区间
+    # 每目标仅 ~2.8 万个、tw_reuse=2 仅回环生效——满速时临时端口耗尽，
+    # 建连重试风暴会表现为**节点**的 SYN 负载。客户端侧没有 tc 按源端口
+    # 分类的顾虑，端口区间可以放心下探到 1024。
+    sysctls:
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.ip_local_port_range: 1024 65535
+      net.ipv4.tcp_max_tw_buckets: 2097152
     environment:
       # 初始并发：LOADGEN_CONCURRENCY=32 docker compose up -d 即可改；
       # 运行中用控制端口在线调节（见文件头速查）。
