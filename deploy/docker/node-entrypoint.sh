@@ -210,6 +210,26 @@ elif ! tc_selfcheck; then
     exit 1
 fi
 
+# 入向整形（ifb 模式）的预检：与出向 tc 自检同一铁律——内核没有 ifb
+# 模块（Docker Desktop 的精简虚拟机内核是重灾区）时**现在就失败**，
+# 而不是让 rl-limiter 起来之后每轮下发报错、看起来在限速其实没有。
+# rl-limiter 自己启动时还会再建真正的设备（双保险），这里先拦住并把
+# 处置说清楚。
+if [ -n "${RL_TC_IN_IFACE:-}" ] && [ "${RL_TC_IN_IFACE}" != "-" ] \
+        && [ "${RL_TC_IN_MODE:-ifb}" = "ifb" ]; then
+    if ip link add __rlifbchk type ifb >/dev/null 2>&1; then
+        ip link del __rlifbchk >/dev/null 2>&1 || true
+        log "入向整形自检通过：内核支持 ifb"
+    else
+        log "致命：内核无法创建 ifb 设备（入向平稳整形 RL_TC_IN_MODE=ifb"
+        log "致命：依赖 ifb 模块；Docker Desktop(Mac/Win) 的精简虚拟机内核"
+        log "致命：常缺）。处置：改设 RL_TC_IN_MODE=police（丢包式入向限速，"
+        log "致命：实例总闸不可用）；或换带通用内核的 Linux 主机；确实不要"
+        log "致命：入向限速则设 RL_TC_IN_IFACE=-。"
+        exit 1
+    fi
+fi
+
 # 内核参数调优：HAProxy 的 maxconn/backlog 配得再大，也会被内核默认值在
 # 下面削掉——最典型的是 net.core.somaxconn（默认 4096）给 cfg 里的
 # `backlog 65536` 封顶，配置写着 65536、实际生效 4096，没有任何告警。

@@ -601,6 +601,33 @@ def main() -> None:
         if in_mode == "ifb":
             ifb_dev = (os.environ.get(ENV_TC_IFB) or "").strip() \
                 or tcifbmod.DEFAULT_IFB
+            # 启动自检：IFB 设备现在就建出来，建不出来**直接启动失败**
+            # ——与出向 HTB 的 tc 自检、"配了 request_limits 没给网卡"
+            # 同一铁律：宁可起不来，也不要进程活着、以为在限速。失败
+            # 的典型场景：精简内核没有 ifb 模块（Docker Desktop 的
+            # 虚拟机）、容器没给 CAP_NET_ADMIN。建成的设备留给
+            # TcIfbIngress 接着用（它每轮还会幂等核对，防运行期被人删）。
+            import subprocess
+            add = subprocess.run(
+                ["ip", "link", "add", ifb_dev, "type", "ifb"],
+                capture_output=True, text=True)
+            exists = subprocess.run(
+                ["ip", "link", "show", ifb_dev],
+                capture_output=True).returncode == 0
+            if not exists:
+                print(
+                    f"rl-limiter: 无法创建 IFB 设备 {ifb_dev}"
+                    f"（{(add.stderr or add.stdout).strip() or '原因未知'}）"
+                    f"，启动失败。\n"
+                    f"  入向平稳整形（{ENV_TC_IN_MODE}=ifb，默认）依赖内核"
+                    f" ifb 模块与 CAP_NET_ADMIN：\n"
+                    f"  - Docker Desktop(Mac/Win) 等精简虚拟机内核常缺 "
+                    f"ifb——改设 {ENV_TC_IN_MODE}=police（丢包式入向限速，"
+                    f"实例总闸不可用），或换带通用内核的 Linux 主机；\n"
+                    f"  - 容器部署确认 compose 里有 cap_add: [NET_ADMIN]；\n"
+                    f"  - 确实不需要入向限速则设 {ENV_TC_IN_IFACE}=-。",
+                    file=sys.stderr)
+                raise SystemExit(1)
             ingress = tcifbmod.TcIfbIngress(raw_in_iface, ifb=ifb_dev,
                                             log=log)
         elif in_mode == "police":
