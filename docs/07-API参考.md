@@ -150,3 +150,10 @@ curl -X PUT -H "X-API-Token: $TOKEN" -H "Content-Type: application/json" \
 - `config_version` 变化 = 配置热更过，拉一次 overview 刷新配置视图；
 - 判断"限速是否真的在执行"别只看配置：对照 `/api/tc` 的原始输出，或
   机器上 `python3 tools/tc_check.py verify`。
+
+## 4. 总控（rl-fleet）的 API
+
+总控自身的 HTTP 面（overview/history/stream/logs + PUT/DELETE
+/api/total-quota）字段口径与本文一致，见
+[10 总控制台](10-总控制台.md) §4；总控消费的就是本文的节点读写
+接口（轮询 `/api/overview`、下发 `PUT /api/instance-quota`）。

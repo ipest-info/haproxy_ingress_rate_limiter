@@ -52,6 +52,7 @@ make demo-down
 | [07 API 参考](docs/07-API参考.md) | 读/写 HTTP API：字段口径、鉴权、错误码、curl 示例 |
 | [08 内核参数调优](docs/08-内核参数调优.md) | tune-kernel.sh：参数表、容器里哪些改不动、怎么验证生效 |
 | [09 排障指南](docs/09-排障指南.md) | 按症状查：启动失败、限速没生效、振荡、采样失联、高并发 |
+| [10 总控制台](docs/10-总控制台.md) | **多机总量控制**：rl-fleet 汇总数十台节点并把总流出带宽按需分配为各节点的出向目标 |
 
 ## 系统组成
 
@@ -63,6 +64,7 @@ rl_limiter/       # Python 3.9+ asyncio 服务（与 HAProxy 同机）
   tcifb.py        #   入向执行面 IFB+HTB       tcingress.py（police 备选 + SYN 闸）
   tcshaper.py     #   出向执行面 HTB（单网卡形态可选）
   webconsole.py   #   控制台 + API + /metrics  metricslog.py（JSONL 落盘）
+  fleet*.py       #   rl-fleet 总控：多机汇总 + 总带宽按需分配（docs/10）
 tools/            # loadgen.py / random_web.py / fake_haproxy.py / tc_check.py
 deploy/           # bare/（裸机装机+systemd） docker/（容器入口与模板）
                   # sysctl/tune-kernel.sh     config/limiter.example.yaml

@@ -36,6 +36,7 @@ make demo-down      # 收场（没有数据库，无需清理数据卷）
 | `localhost:8080` / `8082` / `8083` | 三台节点的 fe_main（可直接 curl 体验限速） |
 | `127.0.0.1:8090` / `8092` / `8093` | 三台节点各自的控制台 |
 | `localhost:8084` | loadgen 控制端口（GET /status、PUT /concurrency、PUT /big） |
+| `127.0.0.1:8095` | **总控制台 rl-fleet**（多机总量控制，玩法见 [10 总控制台](10-总控制台.md) §5） |
 
 前提：Linux 主机（内核有 ifb/HTB）。Docker Desktop（Mac/Win）缺 ifb，
 节点会**启动即失败**并在日志里写明三条出路——这是刻意行为，见
