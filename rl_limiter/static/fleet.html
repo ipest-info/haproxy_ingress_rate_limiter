@@ -1,0 +1,580 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rl-fleet 总控制台</title>
+<link rel="icon" href="data:,">
+<style>
+/* 总控制台：汇总数十台节点的流量并做总量控制。
+   视觉与交互骨架照抄节点控制台（index.html）——同一套配色/卡片/图表，
+   运维在两边切换时不用重新学一遍页面。两个 tab：总览 / 日志。 */
+:root {
+  --surface-0: #f5f5f4; --surface-1: #ffffff; --surface-2: #f0efed;
+  --surface-3: #e8e7e4;
+  --border: #dedcd8; --border-strong: #c8c6c1;
+  --text-primary: #16150f; --text-secondary: #5c5b55; --text-muted: #8d8c85;
+  --s-out: #2a78d6; --s-in: #0a9396; --s-bad: #cf3a3a; --s-idle: #b8790a;
+  --s-total: #7a4fd6;
+  --ref-quota: #77766f;
+  --ok: #0f9d3a; --warn: #b8790a; --critical: #cf3a3a;
+  --accent: #2a78d6; --accent-weak: rgba(42,120,214,.10);
+  --grid: rgba(0,0,0,.06);
+  --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 12px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-0: #131316; --surface-1: #1c1c20; --surface-2: #24242a;
+    --surface-3: #2d2d34;
+    --border: #33333b; --border-strong: #45454f;
+    --text-primary: #f0efec; --text-secondary: #b4b3ae; --text-muted: #85847e;
+    --ref-quota: #b4b3ae; --s-in: #2ab7ba; --s-total: #9b78e8;
+    --grid: rgba(255,255,255,.07); --accent-weak: rgba(42,120,214,.16);
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 12px rgba(0,0,0,.25);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--surface-0); color: var(--text-primary);
+  font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC",
+        "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1240px; margin: 0 auto; padding: 0 20px; }
+header {
+  background: var(--surface-1); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 30;
+}
+header .wrap {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding-top: 12px; padding-bottom: 12px;
+}
+h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .01em; }
+.meta { color: var(--text-secondary); font-size: 12.5px; white-space: nowrap; }
+.meta b { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+.grow { flex: 1 1 auto; }
+.badge {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+  padding: 3px 10px; border-radius: 999px; background: var(--surface-2);
+  color: var(--text-secondary); white-space: nowrap;
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.tabs {
+  display: flex; gap: 2px; border-bottom: 1px solid var(--border);
+  background: var(--surface-1); position: sticky; top: 53px; z-index: 29;
+}
+.tabs .wrap { display: flex; gap: 4px; padding-top: 0; padding-bottom: 0; }
+.tabs button {
+  border: 0; background: transparent; border-radius: 0; padding: 10px 16px;
+  font-size: 13.5px; color: var(--text-secondary); cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.tabs button:hover { background: var(--surface-2); }
+.tabs button[aria-selected=true] {
+  color: var(--accent); border-bottom-color: var(--accent); font-weight: 600;
+}
+main { padding: 20px 0 64px; }
+.tabpage { display: none; }
+.tabpage.on { display: block; }
+.tabpage > * + * { margin-top: 16px; }
+.card {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 11px; box-shadow: var(--shadow); overflow: hidden;
+}
+.card-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 13px 16px; border-bottom: 1px solid var(--border);
+}
+.card-title { font-size: 14.5px; font-weight: 650; }
+.card-body { padding: 14px 16px; }
+.tag {
+  font: 11.5px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  padding: 2px 7px; border-radius: 5px;
+  background: var(--surface-2); color: var(--text-secondary);
+}
+.tag.ok    { background: rgba(15,157,58,.12); color: var(--ok); font-weight: 600; }
+.tag.warn  { background: rgba(184,121,10,.16); color: var(--warn); font-weight: 600; }
+.tag.alert { background: rgba(207,58,58,.14); color: var(--critical); font-weight: 600; }
+.stats { display: flex; gap: 24px; flex-wrap: wrap; }
+.card-body > .stats + .chart-grid { margin-top: 14px; }
+.stat-l { font-size: 11.5px; color: var(--text-muted); }
+.stat-v {
+  font-size: 15px; font-weight: 620; font-variant-numeric: tabular-nums;
+  margin-top: 1px;
+}
+.stat-v small { font-size: 11.5px; font-weight: 400; color: var(--text-muted); margin-left: 3px; }
+.chart-grid {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+}
+.chart {
+  border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px 8px;
+  background: var(--surface-1); min-width: 0;
+}
+.chart-h { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.chart-t { font-size: 13px; font-weight: 600; }
+.chart-src { font-size: 11px; color: var(--text-muted); margin-left: auto; }
+canvas { width: 100%; height: 150px; display: block; margin-top: 6px; }
+.legend {
+  display: flex; gap: 14px; flex-wrap: wrap; margin-top: 6px;
+  font-size: 11.5px; color: var(--text-secondary);
+}
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.legend i { width: 10px; height: 2.5px; border-radius: 2px; flex: none; }
+.legend b { font-variant-numeric: tabular-nums; color: var(--text-primary); font-weight: 600; }
+button {
+  font: inherit; font-size: 13px; padding: 6px 13px; border-radius: 7px;
+  border: 1px solid var(--border-strong); background: var(--surface-1);
+  color: var(--text-primary); cursor: pointer; white-space: nowrap;
+}
+button:hover:not(:disabled) { background: var(--surface-2); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+input, select {
+  font: inherit; font-size: 13px; padding: 6px 9px; border-radius: 7px;
+  border: 1px solid var(--border-strong); background: var(--surface-1);
+  color: var(--text-primary); width: 100%; min-width: 0;
+}
+input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.hint { font-size: 11.5px; color: var(--text-muted); }
+#api-token { width: 150px; padding: 4px 8px; font-size: 12px; }
+.quota-edit { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+.quota-edit input { width: 110px; text-align: right; }
+
+/* 节点表 */
+.node-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.node-table th, .node-table td {
+  padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.node-table th { color: var(--text-muted); font-weight: 500; font-size: 11.5px; }
+.node-table th:first-child, .node-table td:first-child { text-align: left; }
+.node-table td.err {
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis;
+  text-align: left; color: var(--critical); font-size: 11.5px;
+}
+.node-table tr:last-child td { border-bottom: 0; }
+.node-table a { color: var(--accent); text-decoration: none; font-weight: 600; }
+.node-table a:hover { text-decoration: underline; }
+/* 利用率条 */
+.util { display: inline-block; width: 90px; height: 7px; border-radius: 4px;
+        background: var(--surface-3); overflow: hidden; vertical-align: middle; }
+.util i { display: block; height: 100%; background: var(--s-out); }
+.util i.hot { background: var(--warn); }
+
+#logs { max-height: 460px; overflow-y: auto;
+        font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace; }
+#logs div { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
+.lv-WARNING { color: var(--warn); }
+.lv-ERROR, .lv-CRITICAL { color: var(--critical); }
+.lv-DEBUG { color: var(--text-muted); }
+
+#toast {
+  position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+  max-width: min(620px, calc(100vw - 40px));
+  padding: 10px 16px; border-radius: 9px; font-size: 13px;
+  background: var(--text-primary); color: var(--surface-1);
+  box-shadow: var(--shadow); z-index: 99;
+  opacity: 0; pointer-events: none; transition: opacity .18s;
+}
+#toast.on { opacity: 1; }
+#toast.err { background: var(--critical); color: #fff; }
+@media (max-width: 720px) {
+  .tabs { top: 0; position: static; }
+  .quota-edit { margin-left: 0; width: 100%; }
+}
+</style>
+
+<header><div class="wrap">
+  <h1>rl-fleet 总控制台</h1>
+  <span class="badge"><span class="dot" id="sse-dot" style="background:var(--critical)"></span><span id="sse-text">连接中…</span></span>
+  <span class="grow"></span>
+  <span class="meta">运行 <b id="uptime">–</b></span>
+  <span class="meta">v<b id="svc-version">–</b></span>
+  <input id="api-token" type="password" placeholder="API 令牌（写操作用）"
+         autocomplete="off" title="rl-fleet 的 RL_API_TOKEN 值；改总带宽时随请求头发送。不填则页面只读">
+  <span class="meta">窗口
+    <select id="window-sel" style="width:auto;display:inline-block;padding:3px 6px">
+      <option value="300" selected>5 分钟</option>
+      <option value="600">10 分钟</option>
+      <option value="1200">20 分钟</option>
+    </select>
+  </span>
+</div></header>
+
+<nav class="tabs"><div class="wrap">
+  <button data-tab="overview" aria-selected="true">总览</button>
+  <button data-tab="logs" aria-selected="false">日志</button>
+</div></nav>
+
+<main><div class="wrap">
+  <section class="tabpage on" id="page-overview">
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">总量控制</span>
+        <span class="tag" id="f-total-tag">–</span>
+        <span class="quota-edit">
+          <span class="hint">总流出带宽 Mbps，0 = 纯观察</span>
+          <input id="total-input" type="number" min="0" step="any" placeholder="Mbps">
+          <button id="total-save">保存</button>
+          <button id="total-clear" title="置 0：停止分配（各节点保持当前配额），只汇总观察">取消总量控制</button>
+        </span>
+      </div>
+      <div class="card-body">
+        <div class="stats">
+          <div><div class="stat-l">总流出带宽目标</div><div class="stat-v" id="f-total">–</div></div>
+          <div><div class="stat-l">当前总出向（10s 均值口径）</div><div class="stat-v" id="f-egress">–</div></div>
+          <div><div class="stat-l">总利用率</div><div class="stat-v" id="f-util">–</div></div>
+          <div><div class="stat-l">当前总入向</div><div class="stat-v" id="f-ingress">–</div></div>
+          <div><div class="stat-l">在线节点</div><div class="stat-v" id="f-online">–</div></div>
+          <div><div class="stat-l">已分配合计（含冻结记账）</div><div class="stat-v" id="f-alloc">–</div></div>
+        </div>
+        <div class="chart-grid" id="f-charts"></div>
+        <div class="hint" style="margin-top:10px">总出向被压在虚线（总带宽）之下即总量控制的效果本身。
+          分配是**按需动态**的：总控周期按各节点近期出向占比重分实例出向目标（带保底份额），
+          节点自己的闭环再把目标转成入向限速。修改总带宽需页头令牌（rl-fleet 的 RL_API_TOKEN）。</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><span class="card-title">节点</span>
+        <span class="hint">配额列 = 节点自报的实例出向目标（括号内为总控本轮分配值，不符时标色）；
+          点名称跳该节点自己的控制台</span></div>
+      <div class="card-body" style="overflow-x:auto">
+        <table class="node-table" id="node-table"><tbody>
+          <tr><td class="hint">等待第一帧数据…</td></tr>
+        </tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <section class="tabpage" id="page-logs">
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">运行日志</span>
+        <span class="grow"></span>
+        <select id="log-level" style="width:auto;padding:4px 8px">
+          <option value="DEBUG">全部</option>
+          <option value="INFO" selected>INFO 及以上</option>
+          <option value="WARNING">WARNING 及以上</option>
+          <option value="ERROR">仅 ERROR</option>
+        </select>
+      </div>
+      <div class="card-body"><div id="logs"></div></div>
+    </div>
+  </section>
+</div></main>
+
+<div id="toast"></div>
+
+<script>
+const $ = (s, el) => (el || document).querySelector(s);
+const $$ = (s, el) => [...(el || document).querySelectorAll(s)];
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt1 = (v) => (v == null || !isFinite(v) ? "–" : (+v).toFixed(1));
+
+const state = { buf: [], charts: [], windowS: 300,
+                logAfter: 0, logLevel: "INFO", tab: "overview",
+                latest: null, totalDirty: false };
+const LEVELS = {DEBUG:10, INFO:20, WARNING:30, ERROR:40, CRITICAL:50};
+const BUF_MAX = 1200;
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name);
+
+// ---- 令牌与写 API（与节点控制台同一套交互） ----
+const tokenInput = $("#api-token");
+tokenInput.value = localStorage.getItem("rl_fleet_token") || "";
+tokenInput.addEventListener("change", () =>
+  localStorage.setItem("rl_fleet_token", tokenInput.value.trim()));
+
+let toastTimer = null;
+function toast(msg, isErr) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "on" + (isErr ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ""; }, isErr ? 6000 : 3000);
+}
+
+async function apiWrite(method, url, body) {
+  const token = tokenInput.value.trim();
+  if (!token) {
+    toast("请先在页头填入 API 令牌（rl-fleet 环境变量 RL_API_TOKEN 的值）", true);
+    return null;
+  }
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method,
+      headers: {"X-API-Token": token, "Content-Type": "application/json"},
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (e) { toast("请求失败：" + e, true); return null; }
+  let j = {};
+  try { j = await resp.json(); } catch (e) {}
+  if (!resp.ok) {
+    toast(j.error || (method + " " + url + " 失败（HTTP " + resp.status + "）"), true);
+    return null;
+  }
+  return j;
+}
+
+// ---- 图表（与节点控制台同一套 canvas 手绘） ----
+function makeChart(parent, spec) {
+  const el = document.createElement("div");
+  el.className = "chart";
+  el.innerHTML = `
+    <div class="chart-h">
+      <span class="chart-t">${esc(spec.title)}</span>
+      <span class="chart-src">${esc(spec.source || "")}</span>
+    </div>
+    <canvas></canvas>
+    <div class="legend">${spec.series.map(s =>
+      `<span><i style="background:${esc(s.color)}"></i>${esc(s.label)} <b data-k="${esc(s.key)}">–</b></span>`
+    ).join("")}</div>`;
+  parent.appendChild(el);
+  const ch = Object.assign({el, canvas: $("canvas", el), tooltipX: null}, spec);
+  ch.canvas.addEventListener("mousemove", (e) => { ch.tooltipX = e.offsetX; drawChart(ch); });
+  ch.canvas.addEventListener("mouseleave", () => { ch.tooltipX = null; drawChart(ch); });
+  new ResizeObserver(() => drawChart(ch)).observe(ch.canvas);
+  return ch;
+}
+
+function drawChart(ch) {
+  const cv = ch.canvas, dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const now = Date.now() / 1000;
+  const pts = ch.points().filter(p => now - p.ts <= state.windowS);
+  const ref = ch.ref ? ch.ref() : null;
+  let peak = ref ? ref.value : 0;
+  for (const p of pts) for (const s of ch.series) peak = Math.max(peak, p[s.key] || 0);
+  const top = (peak || 1) * 1.15;
+  const x = (ts) => w - (now - ts) / state.windowS * w;
+  const y = (v) => h - ((v || 0) / top) * (h - 4) - 2;
+  g.strokeStyle = css("--grid"); g.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const yy = Math.round(h * i / 4) + .5;
+    g.beginPath(); g.moveTo(0, yy); g.lineTo(w, yy); g.stroke();
+  }
+  g.font = "10.5px sans-serif";
+  g.fillStyle = css("--text-muted");
+  g.fillText(fmt1(top) + " Mbps", 4, 12);
+  if (ref && ref.value > 0) {
+    g.strokeStyle = css("--ref-quota");
+    g.setLineDash([5, 4]); g.beginPath();
+    g.moveTo(0, y(ref.value)); g.lineTo(w, y(ref.value)); g.stroke();
+    g.setLineDash([]);
+  }
+  for (const s of ch.series) {
+    g.strokeStyle = css(s.color) || s.color;
+    g.lineWidth = 1.6; g.beginPath();
+    pts.forEach((p, i) => i ? g.lineTo(x(p.ts), y(p[s.key]))
+                            : g.moveTo(x(p.ts), y(p[s.key])));
+    g.stroke();
+  }
+  if (ref && ref.value > 0) {
+    const lbl = ref.label, lw = g.measureText(lbl).width;
+    const lx = w - lw - 5, ly = Math.max(10, y(ref.value) - 4);
+    g.fillStyle = css("--surface-1");
+    g.fillRect(lx - 2, ly - 9, lw + 4, 12);
+    g.fillStyle = css("--ref-quota");
+    g.fillText(lbl, lx, ly);
+  }
+  let cur = pts.length ? pts[pts.length - 1] : null;
+  if (ch.tooltipX != null && pts.length) {
+    let bd = Infinity;
+    for (const p of pts) { const d = Math.abs(x(p.ts) - ch.tooltipX); if (d < bd) { bd = d; cur = p; } }
+    const px = x(cur.ts);
+    g.strokeStyle = css("--text-muted");
+    g.beginPath(); g.moveTo(px, 0); g.lineTo(px, h); g.stroke();
+  }
+  for (const b of $$(".legend b", ch.el))
+    b.textContent = cur ? fmt1(cur[b.dataset.k] || 0) : "–";
+}
+
+function buildCharts() {
+  const grid = $("#f-charts"), pts = () => state.buf;
+  state.charts = [
+    makeChart(grid, {
+      title: "总出向带宽 vs 总带宽", source: "Σ在线节点 · 与各节点闭环同口径（10s 均值）",
+      points: pts,
+      series: [{key: "egress", label: "总出向", color: "--s-out"}],
+      ref: () => state.latest && state.latest.total_quota_mbps
+        ? {value: state.latest.total_quota_mbps,
+           label: "总带宽 " + fmt1(state.latest.total_quota_mbps)}
+        : null,
+    }),
+    makeChart(grid, {
+      title: "总入向带宽", source: "Σ在线节点实测流入",
+      points: pts,
+      series: [{key: "ingress", label: "总入向", color: "--s-in"}],
+    }),
+    makeChart(grid, {
+      title: "在线节点数", source: "总控轮询在线判定",
+      points: pts,
+      series: [{key: "online", label: "在线", color: "--s-total"}],
+    }),
+  ];
+}
+function redrawAll() { for (const ch of state.charts) drawChart(ch); }
+
+// ---- 快照渲染 ----
+function applySnapshot(snap, live) {
+  state.latest = snap;
+  state.buf.push({ts: snap.ts, egress: snap.egress_mbps,
+                  ingress: snap.ingress_mbps, online: snap.nodes_online});
+  if (state.buf.length > BUF_MAX) state.buf.shift();
+  if (!live) return;
+  const set = (id, v, unit) =>
+    $(id).innerHTML = esc(v) + (unit ? `<small>${unit}</small>` : "");
+  const total = snap.total_quota_mbps || 0;
+  $("#f-total-tag").textContent = total ? total + " Mbps" : "纯观察（未设总带宽）";
+  set("#f-total", total ? fmt1(total) : "未设", total ? "Mbps" : "");
+  set("#f-egress", fmt1(snap.egress_mbps), "Mbps");
+  set("#f-util", total ? Math.round(snap.egress_mbps / total * 100) + "%" : "–");
+  set("#f-ingress", fmt1(snap.ingress_mbps), "Mbps");
+  set("#f-online", snap.nodes_online + " / " + snap.nodes_total);
+  const allocEl = $("#f-alloc");
+  set("#f-alloc", fmt1(snap.allocated_mbps), "Mbps");
+  // 已分配 ≠ 总带宽（超出 2%）标黄：有冻结记账缺口或超卖。
+  allocEl.style.color = (total && Math.abs(snap.allocated_mbps - total) > total * 0.02)
+    ? "var(--warn)" : "";
+  const iIn = $("#total-input");
+  if (!state.totalDirty && document.activeElement !== iIn)
+    iIn.value = total || "";
+  renderNodeTable(snap);
+  if (state.tab === "overview") redrawAll();
+}
+
+function nodeBadge(n) {
+  if (!n.online) return '<span class="tag alert">离线</span>';
+  if (n.degraded) return '<span class="tag warn">降级</span>';
+  if (!n.executable) return '<span class="tag">不可执行</span>';
+  if (!n.controllable) return '<span class="tag">只读观测</span>';
+  return '<span class="tag ok">在线</span>';
+}
+
+function renderNodeTable(snap) {
+  const rows = Object.entries(snap.nodes || {}).sort((a, b) => a[0] < b[0] ? -1 : 1);
+  const tb = $("#node-table tbody");
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td class="hint">节点清单为空——在 fleet.yaml 的 nodes 段登记节点（热生效）</td></tr>';
+    return;
+  }
+  tb.innerHTML = `<tr><th>节点</th><th>状态</th><th>出向 Mbps</th><th>入向</th>
+      <th>配额（本轮分配）</th><th>利用率</th><th style="text-align:left">最近错误</th></tr>` +
+    rows.map(([name, n]) => {
+      const quota = n.quota_mbps == null ? "–" : fmt1(n.quota_mbps);
+      const desired = n.desired_mbps == null ? "" :
+        `（<span style="${Math.abs((n.desired_mbps||0)-(n.quota_mbps||0)) > 1 ? 'color:var(--warn)' : ''}">${fmt1(n.desired_mbps)}</span>）`;
+      const u = n.util == null ? null : Math.min(n.util, 1.3);
+      const util = u == null ? "–" :
+        `<span class="util"><i class="${u > 0.95 ? 'hot' : ''}" style="width:${Math.min(u * 100, 100)}%"></i></span> ${Math.round(n.util * 100)}%`;
+      const err = n.write_err || n.error || "";
+      return `<tr>
+        <td><a href="${esc(n.console_url || '#')}" target="_blank" rel="noopener">${esc(name)}</a></td>
+        <td>${nodeBadge(n)}</td>
+        <td>${fmt1(n.egress_mbps)}</td>
+        <td>${fmt1(n.ingress_mbps)}</td>
+        <td>${quota}${desired}</td>
+        <td>${util}</td>
+        <td class="err" title="${esc(err)}">${esc(err)}</td>
+      </tr>`;
+    }).join("");
+}
+
+// ---- overview / 日志 / SSE ----
+async function loadOverview() {
+  const o = await (await fetch("/api/overview")).json();
+  $("#svc-version").textContent = o.service_version || "–";
+  const up = Math.floor(o.uptime_s || 0);
+  $("#uptime").textContent = up >= 3600
+    ? `${Math.floor(up/3600)}h${Math.floor(up%3600/60)}m` : `${Math.floor(up/60)}m${up%60}s`;
+  if (o.latest) applySnapshot(o.latest, true);
+}
+
+async function loadLogs() {
+  const j = await (await fetch("/api/logs?after=" + state.logAfter)).json();
+  const box = $("#logs");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  for (const e of j.logs || []) {
+    state.logAfter = Math.max(state.logAfter, e.seq);
+    const d = document.createElement("div");
+    d.className = "lv-" + e.level;
+    d.dataset.level = e.level;
+    d.textContent = `${new Date(e.ts * 1000).toLocaleTimeString()} ${e.level} ${e.msg}`;
+    d.style.display = (LEVELS[e.level] || 0) >= (LEVELS[state.logLevel] || 0) ? "" : "none";
+    box.appendChild(d);
+  }
+  while (box.children.length > 1000) box.removeChild(box.firstChild);
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function connectSSE() {
+  const es = new EventSource("/api/stream");
+  es.onopen = () => {
+    $("#sse-dot").style.background = "var(--ok)";
+    $("#sse-text").textContent = "实时连接正常";
+  };
+  es.onerror = () => {
+    $("#sse-dot").style.background = "var(--critical)";
+    $("#sse-text").textContent = "连接断开，重试中…";
+  };
+  es.onmessage = (ev) => { try { applySnapshot(JSON.parse(ev.data), true); } catch (e) {} };
+}
+
+// ---- 交互 ----
+function switchTab(name) {
+  state.tab = name;
+  for (const b of $$(".tabs button")) b.setAttribute("aria-selected", String(b.dataset.tab === name));
+  for (const p of $$(".tabpage")) p.classList.toggle("on", p.id === "page-" + name);
+  redrawAll();
+}
+for (const b of $$(".tabs button")) b.onclick = () => switchTab(b.dataset.tab);
+$("#window-sel").onchange = (e) => { state.windowS = parseInt(e.target.value, 10); redrawAll(); };
+$("#total-input").addEventListener("input", () => { state.totalDirty = true; });
+$("#total-save").onclick = async () => {
+  const el = $("#total-input");
+  const v = parseFloat(el.value);
+  if (el.value.trim() === "" || !isFinite(v) || v < 0) {
+    toast("总流出带宽必须是 ≥ 0 的数字（Mbps；0 = 纯观察）", true);
+    return;
+  }
+  const r = await apiWrite("PUT", "/api/total-quota", {quota_mbps: v});
+  if (r) {
+    state.totalDirty = false;
+    toast(v ? "总流出带宽已设为 " + v + " Mbps——下一个分配周期按需分到各节点"
+            : "已取消总量控制（纯观察；各节点保持当前配额）");
+    setTimeout(loadOverview, 1500);
+  }
+};
+$("#total-clear").onclick = async () => {
+  const r = await apiWrite("DELETE", "/api/total-quota");
+  if (r) {
+    state.totalDirty = false;
+    toast("已取消总量控制（纯观察；各节点保持当前配额）");
+    setTimeout(loadOverview, 1500);
+  }
+};
+$("#log-level").onchange = (e) => {
+  state.logLevel = e.target.value;
+  const min = LEVELS[state.logLevel] || 0;
+  for (const d of $("#logs").children)
+    d.style.display = (LEVELS[d.dataset.level] || 0) >= min ? "" : "none";
+};
+
+(async function boot() {
+  buildCharts();
+  try {
+    const h = await (await fetch("/api/history")).json();
+    for (const snap of h.snapshots || []) applySnapshot(snap, false);
+  } catch (e) {}
+  await loadOverview();
+  redrawAll();
+  await loadLogs();
+  connectSSE();
+  setInterval(loadLogs, 2000);
+  setInterval(loadOverview, 10000);
+})();
+</script>
