@@ -1,0 +1,69 @@
+# 生产形态样例：**host 网络**单节点部署（容器交付 + 宿主机网络栈）。
+#
+#   启动：docker compose -f docker-compose-host.yml up -d --build
+#   控制台：http://127.0.0.1:8090（默认只绑回环，远程看用 SSH 隧道）
+#   收场：docker compose -f docker-compose-host.yml down
+#
+# 为什么是 host 网络：bridge 形态每个包要走 veth→网桥→conntrack/NAT，
+# 高带宽/高新建连接下有 10%~30% 的数据面开销；host 网络没有这些层，
+# 性能与宿主机直跑 HAProxy 基本一致（容器只是 cgroup+namespace 包装，
+# CPU/内存本就没有虚拟化开销），同时保留镜像交付的便利。代价与注意：
+#
+#   - **端口直接占宿主机**：HAProxy 监听端口（haproxy.cfg 里的 bind）、
+#     控制台端口都直接落在宿主机网络栈上，没有 ports: 映射这回事，
+#     部署前确认不与宿主机现有服务冲突；一台宿主机只跑一份本服务。
+#   - **tc 直接作用于真实网卡**：RL_TC_IFACE 填宿主机的物理网卡名
+#     （ip route 看默认路由出口）。限速规则在宿主机内核上，容器退出
+#     时入口脚本会清掉自己建的 qdisc，但异常被杀时可能残留——重启本
+#     服务即幂等重建/接管。
+#   - **net.* 内核参数就是宿主机的**：host 网络下容器与宿主机共享
+#     network namespace，compose 的 sysctls: 在这里**不可用**（docker
+#     会拒绝），容器内 /proc/sys 也默认只读。入口脚本的 tune-kernel.sh
+#     会逐项核验并把"调不动"的项报在日志里——请在**宿主机**上执行
+#     deploy/sysctl/tune-kernel.sh（或按 docs/08 固化到 sysctl.d）。
+#   - 双网卡/入向限速等派生形态同理：相关 RL_* 变量照常可用，网卡名
+#     填宿主机真实网卡。
+#
+# 配置文件建议：生产请把 deploy/docker/ 下两份模板**复制一份**出来改
+# （限额、后端地址、maxconn 等），再把挂载路径指向你的副本——直接改
+# 仓库里的模板会在升级时产生冲突。
+services:
+  rl-node:
+    build: .
+    network_mode: host
+    # tc 限速必需；host 网络下这是对宿主机网卡的操作权限，仅此一项，
+    # 不需要 privileged。
+    cap_add:
+      - NET_ADMIN
+    # FD 需求 = maxconn×2 + maxpipes×2 + 34。这里给的是 10 万连接的
+    # 量级（与下方 HAPROXY_MAXCONN 配套）；要用模板默认的 100 万连接，
+    # 先按 docs/08 抬宿主机 fs.nr_open，再把这里改到 4200000 并删掉
+    # 下面两个 HAPROXY_* 变量。
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
+    volumes:
+      # 生产：换成你复制出来的副本路径（见文件头注释）。
+      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
+      - ./deploy/docker/limiter-node.yaml:/etc/rl-limiter/config-template.yaml:ro
+      # 监控数据落盘挂宿主机卷，长期保留、容器重建不丢。
+      - /var/log/rl-limiter:/var/log/rl-limiter
+    environment:
+      # 出向限速网卡 = 宿主机物理网卡名（ip route 查默认路由出口）。
+      # 不设则自动取默认路由网卡——生产建议显式写死，机器加卡/换
+      # bond 时不至于悄悄限错卡。
+      RL_TC_IFACE: eth0
+      # 10 万连接量级（与上方 ulimits 配套）；全量 100 万见 ulimits 注释。
+      HAPROXY_MAXCONN: "100000"
+      HAPROXY_MAXPIPES: "100000"
+      RL_CONSOLE_PORT: "8090"
+      # host 网络下控制台端口直接落在宿主机上：保持默认只绑回环
+      # （127.0.0.1），远程查看走 SSH 隧道；控制台无读鉴权，切勿绑
+      # 0.0.0.0 裸奔公网。
+      RL_CONSOLE_BIND: 127.0.0.1
+      # 写 API（页面/API 改限额）令牌：生产请生成随机值
+      # （openssl rand -hex 24）；不设则写接口整体 403、页面只读。
+      # RL_API_TOKEN: "<openssl rand -hex 24>"
+      RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
+    restart: unless-stopped
