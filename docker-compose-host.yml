@@ -50,10 +50,17 @@ services:
       # 监控数据落盘挂宿主机卷，长期保留、容器重建不丢。
       - /var/log/rl-limiter:/var/log/rl-limiter
     environment:
-      # 出向限速网卡 = 宿主机物理网卡名（ip route 查默认路由出口）。
-      # 不设则自动取默认路由网卡——生产建议显式写死，机器加卡/换
-      # bond 时不至于悄悄限错卡。
-      RL_TC_IFACE: eth0
+      # 本分支推荐形态（双网卡闭环）：出向不做 tc（RL_TC_IFACE=-），
+      # 按实测出向带宽动态压入向。RL_TC_IN_IFACE 填**客户端侧物理
+      # 网卡名**（这一项不做自动探测——放错网卡会误伤后端流量；也可
+      # 用 RL_FRONT_SUBNET=<客户端网段前缀> 让入口脚本按网段定位）。
+      # 宿主机内核需有 ifb 模块（modprobe ifb 验证）：没有则启动直接
+      # 失败，可改 RL_TC_IN_MODE=police 降级（丢包式，实例总闸不可用）。
+      # 要用单网卡出向 HTB 形态：删掉下面两行，改设
+      # RL_TC_IFACE=<出向物理网卡名>。
+      RL_TC_IFACE: "-"
+      RL_TC_IN_IFACE: eth0
+      # RL_TC_IN_MODE: ifb          # 默认 ifb（平稳整形）；老内核改 police
       # 10 万连接量级（与上方 ulimits 配套）；全量 100 万见 ulimits 注释。
       HAPROXY_MAXCONN: "100000"
       HAPROXY_MAXPIPES: "100000"
