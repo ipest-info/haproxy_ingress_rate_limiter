@@ -582,3 +582,55 @@ async def test_config_view_runtime_info_and_extra_sections(tmp_path):
         assert j["sections"][-1]["title"] == "入向限速（示例）"
         kv_sec = [s for s in j["sections"] if "kv" in s][0]
         assert {"label": "日志级别 log_level", "value": "info"} in kv_sec["kv"]
+
+
+# ---------------------------------------------------------------------------
+# 写 API：入向限速登记（/api/request-limits，配置页用）
+# ---------------------------------------------------------------------------
+
+async def test_put_request_limit_writes_yaml_and_pokes(wclient):
+    r = await wclient.put("/api/request-limits/fe_a",
+                          json={"mbps": 10, "conn_rate": 150},
+                          headers=auth())
+    assert r.status == 200
+    j = await r.json()
+    assert j["request_limit"] == {"mbps": 10.0, "conn_rate": 150}
+    text = wclient.app["yml"].read_text(encoding="utf-8")
+    assert "request_limits" in text and "fe_a" in text
+    assert wclient.app["poke"].is_set()
+    # 部分更新：只给 conn_rate，mbps 保留。
+    r = await wclient.put("/api/request-limits/fe_a",
+                          json={"conn_rate": 99}, headers=auth())
+    assert (await r.json())["request_limit"] == {"mbps": 10.0,
+                                                 "conn_rate": 99}
+
+
+async def test_put_request_limit_validates(wclient):
+    before = wclient.app["yml"].read_text(encoding="utf-8")
+    # 没带令牌。
+    r = await wclient.put("/api/request-limits/fe_a", json={"mbps": 10})
+    assert r.status == 401
+    # 未知段名。
+    r = await wclient.put("/api/request-limits/nope", json={"mbps": 10},
+                          headers=auth())
+    assert r.status == 400
+    # 两个字段都缺 / 类型不对。
+    r = await wclient.put("/api/request-limits/fe_a", json={},
+                          headers=auth())
+    assert r.status == 400
+    r = await wclient.put("/api/request-limits/fe_a",
+                          json={"mbps": -1}, headers=auth())
+    assert r.status == 400
+    r = await wclient.put("/api/request-limits/fe_a",
+                          json={"conn_rate": 1.5}, headers=auth())
+    assert r.status == 400
+    assert wclient.app["yml"].read_text(encoding="utf-8") == before
+
+
+async def test_delete_request_limit(wclient):
+    await wclient.put("/api/request-limits/fe_a", json={"mbps": 10},
+                      headers=auth())
+    r = await wclient.delete("/api/request-limits/fe_a", headers=auth())
+    assert (await r.json())["removed"] is True
+    r = await wclient.delete("/api/request-limits/fe_a", headers=auth())
+    assert (await r.json())["removed"] is False

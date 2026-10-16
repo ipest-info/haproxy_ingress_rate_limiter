@@ -122,3 +122,44 @@ def test_rewrite_preserves_dynamic_sections(yml):
     assert cfg.request_limits["fe_main"].mbps == 10.0
     assert cfg.dynamic_ingress.enabled
     assert cfg.dynamic_ingress.interval_s == 30.0
+
+
+# ---------------------------------------------------------------------------
+# request_limits 回写（配置页的入向限速编辑）
+# ---------------------------------------------------------------------------
+
+def test_set_request_limit_creates_entry(yml):
+    entry = configstore.set_request_limit(str(yml), "fe_main",
+                                          mbps=10.0, conn_rate=150)
+    assert entry == {"mbps": 10.0, "conn_rate": 150}
+    cfg = reload_cfg(yml)
+    assert cfg.request_limits["fe_main"].mbps == 10.0
+    assert cfg.request_limits["fe_main"].conn_rate == 150
+
+
+def test_set_request_limit_partial_update_keeps_other_key(yml):
+    """部分更新：只改 mbps 时 conn_rate 保留现值（反之亦然）——配置页
+    的两个输入框各自独立保存，不能互相清零。"""
+    configstore.set_request_limit(str(yml), "fe_main", mbps=10.0,
+                                  conn_rate=150)
+    configstore.set_request_limit(str(yml), "fe_main", mbps=20.0)
+    cfg = reload_cfg(yml)
+    assert cfg.request_limits["fe_main"].mbps == 20.0
+    assert cfg.request_limits["fe_main"].conn_rate == 150
+    configstore.set_request_limit(str(yml), "fe_main", conn_rate=99)
+    cfg = reload_cfg(yml)
+    assert cfg.request_limits["fe_main"].mbps == 20.0
+    assert cfg.request_limits["fe_main"].conn_rate == 99
+
+
+def test_set_request_limit_requires_at_least_one_field(yml):
+    with pytest.raises(configstore.ConfigStoreError):
+        configstore.set_request_limit(str(yml), "fe_main")
+
+
+def test_remove_request_limit(yml):
+    configstore.set_request_limit(str(yml), "fe_main", mbps=10.0)
+    assert configstore.remove_request_limit(str(yml), "fe_main") is True
+    assert configstore.remove_request_limit(str(yml), "fe_main") is False
+    cfg = reload_cfg(yml)
+    assert "fe_main" not in cfg.request_limits

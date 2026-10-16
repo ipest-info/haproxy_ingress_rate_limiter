@@ -729,6 +729,84 @@ def build_app(
                     "yaml=%s", yaml_path)
         return web.json_response({"ok": True, "instance_quota_mbps": 0})
 
+    async def handle_put_request_limit(request: web.Request) -> web.Response:
+        """登记/修改入向限速（request_limits.<name>，部分更新）。
+
+        体是 {"mbps": <数字>} 和/或 {"conn_rate": <整数>}——配置页的
+        两个输入框各自独立保存，另一维度保留现值。0 合法（显式关闭
+        该维度）。
+        """
+        denied = _authorized(request)
+        if denied is not None:
+            return denied
+        name = request.match_info["name"]
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError
+        except Exception:
+            return web.json_response(
+                {"error": "请求体必须是 JSON（{\"mbps\": <数字>} 和/或 "
+                          "{\"conn_rate\": <整数>}）"}, status=400)
+        mbps = body.get("mbps")
+        conn_rate = body.get("conn_rate")
+        if mbps is None and conn_rate is None:
+            return web.json_response(
+                {"error": "mbps 与 conn_rate 至少要给一个"}, status=400)
+        if mbps is not None:
+            if isinstance(mbps, bool) or not isinstance(mbps, (int, float)) \
+                    or mbps < 0:
+                return web.json_response(
+                    {"error": f"mbps 必须是 ≥0 的数字（Mbps），"
+                              f"当前值 {mbps!r}"}, status=400)
+            mbps = float(mbps)
+        if conn_rate is not None:
+            if isinstance(conn_rate, bool) or not isinstance(conn_rate, int) \
+                    or conn_rate < 0:
+                return web.json_response(
+                    {"error": f"conn_rate 必须是 ≥0 的整数（个/秒），"
+                              f"当前值 {conn_rate!r}"}, status=400)
+        known = known_frontends_fn() if known_frontends_fn is not None else None
+        if known is not None and name not in known:
+            return web.json_response(
+                {"error": f"haproxy.cfg 里没有名为 {name!r} 的 frontend/"
+                          f"listen 段（是不是拼错了？）。当前解析到的段："
+                          f"{sorted(known)}"},
+                status=400)
+        async with write_lock:
+            try:
+                entry = await asyncio.to_thread(
+                    configstore.set_request_limit, yaml_path, name,
+                    mbps, conn_rate)
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
+        if poke is not None:
+            poke.set()
+        log.warning("写 API 已修改入向限速登记并回写 YAML（即将热生效） "
+                    "frontend=%s request_limit=%s yaml=%s",
+                    name, entry, yaml_path)
+        return web.json_response({"ok": True, "frontend": name,
+                                  "request_limit": entry})
+
+    async def handle_delete_request_limit(request: web.Request) -> web.Response:
+        denied = _authorized(request)
+        if denied is not None:
+            return denied
+        name = request.match_info["name"]
+        async with write_lock:
+            try:
+                removed = await asyncio.to_thread(
+                    configstore.remove_request_limit, yaml_path, name)
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
+        if removed and poke is not None:
+            poke.set()
+        if removed:
+            log.warning("写 API 已删除入向限速登记（该 frontend 回到不限"
+                        "请求方向） frontend=%s yaml=%s", name, yaml_path)
+        return web.json_response({"ok": True, "frontend": name,
+                                  "removed": removed})
+
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/overview", handle_overview)
@@ -746,6 +824,10 @@ def build_app(
         app.router.add_put("/api/instance-quota", handle_put_instance_quota)
         app.router.add_delete("/api/instance-quota",
                               handle_delete_instance_quota)
+        app.router.add_put("/api/request-limits/{name}",
+                           handle_put_request_limit)
+        app.router.add_delete("/api/request-limits/{name}",
+                              handle_delete_request_limit)
     return app
 
 

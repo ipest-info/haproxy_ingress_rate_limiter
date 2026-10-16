@@ -391,6 +391,89 @@ async def _amain(cfg, log: logging.Logger,
              "value": ("已配置（页头填令牌后可改限额）" if api_token
                        else "未配置（写接口整体禁用，页面只读）")},
         ]
+        # 本分支的入向接线也属于"启动时定型"的事实，一并摆出来。
+        runtime_info.extend([
+            {"label": "入向限速网卡 RL_TC_IN_IFACE",
+             "value": (getattr(ingress, "iface", "")
+                       or "-（入向限速未接线）")},
+            {"label": "入向执行模式 RL_TC_IN_MODE",
+             "value": (("ifb（IFB+HTB 平稳整形，设备 "
+                        + getattr(ingress, "ifb", "?") + "）")
+                       if in_mode_ifb else
+                       ("police（超额丢包）" if ingress is not None
+                        else "（未接线）"))},
+        ])
+
+        # 配置页的分支扩展段：request_limits 可编辑（热生效）+
+        # dynamic_ingress 只读（启动时定型）。
+        def _extra_config_sections():
+            limits = ctl.request_limits()
+            rows = []
+            for f in sorted(ctl.frontends(), key=lambda x: x.name):
+                rl = limits.get(f.name)
+                fields = [
+                    {"name": "mbps",
+                     "label": "入向带宽上限 Mbps（0 = 不限带宽）",
+                     "value": (rl.mbps if rl is not None else ""),
+                     "api": {"method": "PUT",
+                             "url": f"/api/request-limits/{f.name}",
+                             "key": "mbps"}},
+                    {"name": "conn_rate",
+                     "label": "新建连接 个/秒（0 = 不限）",
+                     "value": (rl.conn_rate if rl is not None else ""),
+                     "api": {"method": "PUT",
+                             "url": f"/api/request-limits/{f.name}",
+                             "key": "conn_rate"}},
+                ]
+                if ingress is None:
+                    for fld in fields:
+                        fld["disabled"] = True
+                        fld["disabled_reason"] = ("入向限速未接线"
+                                                  "（RL_TC_IN_IFACE 未设"
+                                                  "或为 -），登记了也不会"
+                                                  "执行")
+                row = {"label": f"request_limits.{f.name}",
+                       "sub": (f"监听 :{f.bind_port} 的请求方向（入向）"
+                               f"限速登记"),
+                       "fields": fields}
+                if ingress is not None:
+                    row["del"] = {"url": f"/api/request-limits/{f.name}",
+                                  "label": "删除登记（不限请求方向）"}
+                rows.append(row)
+            di = cfg.dynamic_ingress
+            sections = [{
+                "title": "入向限速登记 request_limits（可改，热生效）",
+                "hint": "请求方向（入向）的静态登记：带宽上限 + 新建连接"
+                        "速率。闭环开着时登记的带宽是动态调节的**上限**，"
+                        "实际下发值由控制器按出向带宽决定（见调节视图）；"
+                        "conn_rate 恒为静态值。两个输入框各自独立保存。",
+                "rows": rows,
+            }, {
+                "title": "入向动态限速 dynamic_ingress（启动时定型，只读）",
+                "hint": "按出向带宽闭环调节入向上限的控制器参数。本段启动"
+                        "时定型：改 YAML 后重启 rl-limiter 生效。",
+                "kv": [
+                    {"label": "enabled",
+                     "value": ("true（闭环在跑）" if (di.enabled
+                               and ingress is not None)
+                               else "true（但入向未接线，不运行）"
+                               if di.enabled else "false（未启用）")},
+                    {"label": "调节周期 interval_s",
+                     "value": f"{di.interval_s:g}s"},
+                    {"label": "死区 [low_ratio, high_ratio]×目标",
+                     "value": f"[{di.low_ratio:g}, {di.high_ratio:g}]"},
+                    {"label": "上调步长 step_up（×当前值，乘性）",
+                     "value": f"+{di.step_up:g}/次（绝对下限 0.1Mbps）"},
+                    {"label": "单次下调封顶 step_down_max",
+                     "value": f"-{di.step_down_max:g}/次"},
+                    {"label": "动态值下限 floor_ratio",
+                     "value": f"{di.floor_ratio:g}×上限（落位后锚落位值）"},
+                    {"label": "最小下发变化 apply_epsilon",
+                     "value": f"{di.apply_epsilon:g}"},
+                ],
+            }]
+            return sections
+
         tasks.append(asyncio.create_task(
             webconsole.run_console(
                 console_port, hub, logbuf, log, bind=console_bind,
@@ -401,7 +484,8 @@ async def _amain(cfg, log: logging.Logger,
                 # 实例总限速的执行者：出向 HTB 或 ifb 闭环的入向总闸，
                 # 两者有其一写接口就放行（语义见 inst_executable）。
                 egress_tc_enabled=inst_executable,
-                runtime_info=runtime_info),
+                runtime_info=runtime_info,
+                extra_config_sections_fn=_extra_config_sections),
             name="web-console"))
 
     if shaper is not None and tc_applied is not None:

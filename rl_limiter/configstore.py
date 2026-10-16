@@ -3,8 +3,9 @@
 # 这是全项目**唯一**会写配置文件的地方，而且只写 rl-limiter 自己的 YAML
 # （-c 指定的那份）——haproxy.cfg 仍然绝对只读，"rl-limiter 不改 cfg、
 # 不 reload haproxy"的承诺不变。能改的只有限额类字段：quotas 里的单个
-# frontend 限额、实例总限速 instance_quota_mbps。接线字段（haproxy 段）、
-# log_level 这些**不开放**给 API——它们改了要重启进程，属于运维操作。
+# frontend 限额、实例总限速 instance_quota_mbps、request_limits 里的
+# 入向限速登记。接线字段（haproxy 段）、log_level、dynamic_ingress 这些
+# **不开放**给 API——它们改了要重启进程，属于运维操作。
 #
 # ## 写入方式：整份重写 + 原子替换
 #
@@ -138,3 +139,51 @@ def set_instance_quota(path: str, quota_mbps: float) -> None:
     else:
         raw.pop("instance_quota_mbps", None)
     _write_atomic(path, raw)
+
+
+def set_request_limit(path: str, name: str,
+                      mbps: "float | None" = None,
+                      conn_rate: "int | None" = None) -> dict:
+    """登记/修改一个 frontend 的入向限速（request_limits.<name>）。
+
+    mbps / conn_rate 是**部分更新**：只给其中一个时另一个保留现值
+    （没登记过则不写入该键）——配置页的两个输入框各自独立保存，不该
+    保存带宽时把 conn_rate 顺手清零。返回写入后的该段内容（dict），
+    供 API 回显。0 是合法值（显式关闭该维度）。
+    """
+    if mbps is None and conn_rate is None:
+        raise ConfigStoreError("mbps 与 conn_rate 至少要给一个")
+    raw = _load_raw(path)
+    limits = raw.get("request_limits")
+    if limits is None:
+        limits = {}
+    if not isinstance(limits, dict):
+        raise ConfigStoreError("配置文件里的 request_limits 不是键值映射，"
+                               "拒绝回写（请先手工修复）")
+    limits = dict(limits)
+    entry = limits.get(name)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    if mbps is not None:
+        entry["mbps"] = mbps
+    if conn_rate is not None:
+        entry["conn_rate"] = conn_rate
+    limits[name] = entry
+    raw["request_limits"] = limits
+    _write_atomic(path, raw)
+    return entry
+
+
+def remove_request_limit(path: str, name: str) -> bool:
+    """删掉一个 frontend 的入向限速登记（回到"不限请求方向"）。
+
+    返回是否真的删了（本来就没登记时返回 False，也不写文件）。
+    """
+    raw = _load_raw(path)
+    limits = raw.get("request_limits")
+    if not isinstance(limits, dict) or name not in limits:
+        return False
+    limits = dict(limits)
+    del limits[name]
+    raw["request_limits"] = limits
+    _write_atomic(path, raw)
+    return True
