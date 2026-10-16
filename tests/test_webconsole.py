@@ -505,3 +505,80 @@ def test_overview_carries_instance_quota_executable():
                              instance_quota_executable=False)
     assert h.overview()["instance_quota_executable"] is False
     assert hub().overview()["instance_quota_executable"] is True
+
+
+# ---------------------------------------------------------------------------
+# 配置页数据（/api/config-view）
+# ---------------------------------------------------------------------------
+
+async def test_config_view_lists_editable_limits(wclient):
+    """配置页的可编辑段：实例总限速 + 每个 frontend 的 quotas 登记，
+    每个字段带着自己的写 API 描述（前端通用渲染、通用提交）。"""
+    r = await wclient.get("/api/config-view")
+    assert r.status == 200
+    j = await r.json()
+    sec = j["sections"][0]
+    assert "热生效" in sec["title"]
+    rows = sec["rows"]
+    assert rows[0]["fields"][0]["api"]["url"] == "/api/instance-quota"
+    assert rows[0]["del"]["url"] == "/api/instance-quota"
+    by_label = {row["label"]: row for row in rows}
+    fea = by_label["quotas.fe_a"]
+    assert fea["fields"][0]["value"] == 8.0
+    assert fea["fields"][0]["api"] == {
+        "method": "PUT", "url": "/api/quotas/fe_a", "key": "quota_mbps"}
+    assert fea["del"]["url"] == "/api/quotas/fe_a"
+
+
+async def test_config_view_readonly_without_yaml():
+    """没有 YAML 路径（写 API 未挂载）：字段全部置灰并说明原因，
+    删除按钮不出现。"""
+    app = webconsole.build_app(
+        hub(), webconsole.LogBuffer(), __import__("logging").getLogger("t"))
+    async with TestClient(TestServer(app)) as c:
+        j = await (await c.get("/api/config-view")).json()
+        sec = j["sections"][0]
+        for row in sec["rows"]:
+            assert "del" not in row
+            for f in row["fields"]:
+                assert f["disabled"] is True
+
+
+async def test_config_view_instance_disabled_when_not_executable(tmp_path):
+    """实例总限速在本机没有执行者（出向 tc 关闭）：配置页该字段置灰
+    并说明原因——与 PUT 409 同一套诚实语义。"""
+    yml = tmp_path / "config.yaml"
+    yml.write_text(BASE_YAML, encoding="utf-8")
+    h = webconsole.StatusHub("test", version_fn=lambda: 1,
+                             instance_quota_executable=False)
+    h.update_config(model.ControllerConfig(version=1, frontends=[fe()]))
+    app = webconsole.build_app(
+        h, webconsole.LogBuffer(), __import__("logging").getLogger("t"),
+        yaml_path=str(yml), api_token=TOKEN)
+    async with TestClient(TestServer(app)) as c:
+        j = await (await c.get("/api/config-view")).json()
+        inst = j["sections"][0]["rows"][0]
+        assert inst["fields"][0]["disabled"] is True
+        assert "执行者" in inst["fields"][0]["disabled_reason"]
+        # frontend 的 quotas 不受影响。
+        assert "disabled" not in j["sections"][0]["rows"][1]["fields"][0]
+
+
+async def test_config_view_runtime_info_and_extra_sections(tmp_path):
+    """runtime_info 以只读 kv 段展示；extra_config_sections_fn（派生
+    分支注入）的段原样追加——通用承载在基线、数据在分支。"""
+    yml = tmp_path / "config.yaml"
+    yml.write_text(BASE_YAML, encoding="utf-8")
+    extra = [{"title": "入向限速（示例）", "rows": []}]
+    app = webconsole.build_app(
+        hub(), webconsole.LogBuffer(), __import__("logging").getLogger("t"),
+        yaml_path=str(yml), api_token=TOKEN,
+        runtime_info=[{"label": "日志级别 log_level", "value": "info"}],
+        extra_config_sections_fn=lambda: extra)
+    async with TestClient(TestServer(app)) as c:
+        j = await (await c.get("/api/config-view")).json()
+        titles = [s["title"] for s in j["sections"]]
+        assert any("启动时定型" in t for t in titles)
+        assert j["sections"][-1]["title"] == "入向限速（示例）"
+        kv_sec = [s for s in j["sections"] if "kv" in s][0]
+        assert {"label": "日志级别 log_level", "value": "info"} in kv_sec["kv"]

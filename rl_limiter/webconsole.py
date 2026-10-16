@@ -403,6 +403,8 @@ def build_app(
     poke: "asyncio.Event | None" = None,
     tc_debug_fn=None,
     egress_tc_enabled: bool = True,
+    runtime_info: "list[dict] | None" = None,
+    extra_config_sections_fn: "Callable[[], list] | None" = None,
 ) -> web.Application:
     """组装控制台的 aiohttp 应用（静态页 + 只读 API + 限额写 API）。
 
@@ -419,6 +421,13 @@ def build_app(
     known_frontends_fn 返回当前 haproxy.cfg 里解析到的段名集合，用来
     拒绝给不存在的 frontend 登记限额（多半是拼错了名字；写进去也只会
     被 cfgparse 忽略并 warn，不如在门口就说清楚）。
+
+    runtime_info 是"启动时定型"的运行参数清单（[{label, value}]，由
+    __main__ 注入），配置页以只读表格展示——这些字段改了不热生效，
+    页面不提供写入口，只负责把"现在生效的是什么"摆出来。
+    extra_config_sections_fn 返回配置页的额外 section（派生分支注入，
+    如入向 request_limits 的编辑段）——与 /api/tc 的 sections 同一套
+    "通用承载在基线、数据在分支"的合并卫生。
     """
 
     index_html = (_STATIC_DIR / "index.html").read_bytes()
@@ -466,6 +475,86 @@ def build_app(
             log.warning("采集 tc 调试快照失败 err=%s", e)
             return web.json_response(
                 {"error": f"采集 tc 状态失败：{e}"}, status=500)
+
+    async def handle_config_view(_request: web.Request) -> web.Response:
+        """配置页数据：能改的部分（可编辑行）+ 启动定型的部分（只读）。
+
+        页面对结构零假设：有几个 section 画几个。可编辑字段带着自己的
+        写 API 描述（method/url/body 键），前端通用渲染、通用提交——
+        派生分支在服务端多返回一个 section（如 request_limits），页面
+        不用随分支改。能改的边界与 configstore 一致：只有限额类字段
+        （改了热生效）；接线/运行参数只读展示并注明要重启。
+        """
+        o = hub.overview()
+        writable = bool(yaml_path)
+        rows = []
+        iq = o.get("instance_quota_mbps") or 0
+        inst_field = {
+            "name": "quota_mbps",
+            "label": "Mbps（0 = 不限）",
+            "value": iq or "",
+            "api": {"method": "PUT", "url": "/api/instance-quota",
+                    "key": "quota_mbps"},
+        }
+        if not o.get("instance_quota_executable", True):
+            inst_field["disabled"] = True
+            inst_field["disabled_reason"] = (
+                "本机出向 tc 整形已关闭（RL_TC_IFACE=-），实例总限速没有"
+                "执行者，设置被禁用")
+        rows.append({
+            "label": "实例总限速 instance_quota_mbps",
+            "sub": "本机 HAProxy 全部 frontend 出向流量合计的总闸",
+            "fields": [inst_field],
+            "del": {"url": "/api/instance-quota", "label": "取消总限速"},
+        })
+        for name, f in sorted((o.get("frontends") or {}).items()):
+            rows.append({
+                "label": f"quotas.{name}",
+                "sub": (f"监听 {f.get('bind_address') or '*'}:"
+                        f"{f.get('bind_port', '?')} 的出向限额"),
+                "fields": [{
+                    "name": "quota_mbps",
+                    "label": "Mbps（0 = 显式不限速）",
+                    "value": f.get("quota_mbps", ""),
+                    "api": {"method": "PUT",
+                            "url": f"/api/quotas/{name}",
+                            "key": "quota_mbps"},
+                }],
+                "del": {"url": f"/api/quotas/{name}",
+                        "label": "删除登记（回到只监控）"},
+            })
+        limits_sec = {
+            "title": "限额登记（可改，热生效）",
+            "hint": "修改经写 API 回写 YAML，数秒内热生效——需先在页头填入"
+                    " API 令牌（RL_API_TOKEN）。这是配置里**唯一**开放修改"
+                    "的部分；回写会重写整份 YAML，文件里的手写注释不保留。",
+            "rows": rows,
+        }
+        if not writable:
+            limits_sec["hint"] = ("写 API 未挂载（本形态没有 YAML 配置"
+                                  "路径），本页只读。")
+            for r in rows:
+                for fld in r["fields"]:
+                    fld["disabled"] = True
+                    fld.setdefault("disabled_reason", "写 API 未挂载")
+                r.pop("del", None)
+        sections = [limits_sec]
+        if runtime_info:
+            sections.append({
+                "title": "运行参数（启动时定型，只读）",
+                "hint": "这些字段改了**不热生效**：编辑 YAML/环境变量后"
+                        "重启 rl-limiter。负载均衡配置（监听端口/后端）的"
+                        "唯一权威是 haproxy.cfg，rl-limiter 与本页面都"
+                        "绝不写它。",
+                "kv": list(runtime_info),
+            })
+        if extra_config_sections_fn is not None:
+            try:
+                sections.extend(extra_config_sections_fn() or [])
+            except Exception as e:
+                log.warning("组装配置页扩展段失败 err=%s", e)
+        return web.json_response({"yaml_path": yaml_path,
+                                  "sections": sections})
 
     async def handle_logs(request: web.Request) -> web.Response:
         try:
@@ -645,6 +734,7 @@ def build_app(
     app.router.add_get("/api/overview", handle_overview)
     app.router.add_get("/api/history", handle_history)
     app.router.add_get("/api/tc", handle_tc)
+    app.router.add_get("/api/config-view", handle_config_view)
     app.router.add_get("/api/logs", handle_logs)
     app.router.add_get("/api/stream", handle_stream)
     # Prometheus 抓取端点：与只读 API 同一个监听面（同样的安全边界——
@@ -671,6 +761,8 @@ async def run_console(
     poke: "asyncio.Event | None" = None,
     tc_debug_fn=None,
     egress_tc_enabled: bool = True,
+    runtime_info: "list[dict] | None" = None,
+    extra_config_sections_fn: "Callable[[], list] | None" = None,
 ) -> None:
     """常驻任务：启动控制台 HTTP 服务并挂起到被取消，取消时干净回收。
 
@@ -683,7 +775,9 @@ async def run_console(
         build_app(hub, logbuf, log, yaml_path=yaml_path, api_token=api_token,
                   known_frontends_fn=known_frontends_fn, poke=poke,
                   tc_debug_fn=tc_debug_fn,
-                  egress_tc_enabled=egress_tc_enabled),
+                  egress_tc_enabled=egress_tc_enabled,
+                  runtime_info=runtime_info,
+                  extra_config_sections_fn=extra_config_sections_fn),
         access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, bind, port)
