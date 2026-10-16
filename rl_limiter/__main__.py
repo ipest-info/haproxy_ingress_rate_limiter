@@ -444,7 +444,7 @@ async def _amain(cfg, log: logging.Logger,
             sections = [{
                 "title": "入向限速登记 request_limits（可改，热生效）",
                 "hint": "请求方向（入向）的静态登记：带宽上限 + 新建连接"
-                        "速率。闭环开着时登记的带宽是动态调节的**上限**，"
+                        "速率。闭环开着时登记的带宽是动态调节的上限，"
                         "实际下发值由控制器按出向带宽决定（见调节视图）；"
                         "conn_rate 恒为静态值。两个输入框各自独立保存。",
                 "rows": rows,
