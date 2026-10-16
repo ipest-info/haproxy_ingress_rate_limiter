@@ -284,6 +284,31 @@ async def _amain(cfg, log: logging.Logger,
              "value": ("已配置（页头填令牌后可改限额）" if api_token
                        else "未配置（写接口整体禁用，页面只读）")},
         ]
+        # 配置页的分支扩展段：动态 maxconn 调节器的参数（启动时定型，
+        # 只读展示）。enabled=False 时也展示——"没开"本身就是要让人
+        # 一眼看到的配置事实。
+        def _extra_config_sections():
+            g = getattr(cfg, "reqgov", None)
+            if g is None:
+                return []
+            return [{
+                "title": "动态请求限速 dynamic_request_limit（启动时定型，只读）",
+                "hint": "按带宽利用率动态调节各 frontend 的 maxconn（AIMD）。"
+                        "本段启动时定型：改 YAML 后重启 rl-limiter 生效。",
+                "kv": [
+                    {"label": "enabled", "value": "true（调节器在跑）"
+                        if g.enabled else "false（未启用）"},
+                    {"label": "min_conns / max_conns",
+                     "value": f"{g.min_conns} / {g.max_conns}"},
+                    {"label": "死区 [low_ratio, high_ratio]×限额",
+                     "value": f"[{g.low_ratio:g}, {g.high_ratio:g}]"},
+                    {"label": "超限乘性压缩 decrease",
+                     "value": f"×{g.decrease:g}"},
+                    {"label": "调节周期 adjust_interval_s",
+                     "value": f"{g.adjust_interval_s:g}s"},
+                ],
+            }]
+
         tasks.append(asyncio.create_task(
             webconsole.run_console(
                 console_port, hub, logbuf, log, bind=console_bind,
@@ -292,7 +317,8 @@ async def _amain(cfg, log: logging.Logger,
                 known_frontends_fn=lambda: {f.name for f in ctl.frontends()},
                 poke=cfg_poke, tc_debug_fn=tc_debug_fn,
                 egress_tc_enabled=shaper is not None,
-                runtime_info=runtime_info),
+                runtime_info=runtime_info,
+                extra_config_sections_fn=_extra_config_sections),
             name="web-console"))
 
     if shaper is not None and tc_applied is not None:
