@@ -132,6 +132,7 @@ class StatusHub:
         haproxy: model.NodeConfig | None = None,
         degraded_fn: Callable[[], bool] | None = None,
         instance_quota_executable: bool = True,
+        regulation_fn: Callable[[], dict | None] | None = None,
     ):
         self._service_version = service_version
         self._version_fn = version_fn
@@ -150,6 +151,13 @@ class StatusHub:
         # 实例总限速在本机是否有执行者（出向 tc 开着才有），页面据此
         # 把卡片置灰并说明原因。
         self._instance_quota_executable = instance_quota_executable
+        # 调节视图的数据源（可选）：每拍调用一次，返回当前闭环调节状态
+        # （目标、动态总闸/上限、实测流入等，单位一律 Mbps），随快照下发。
+        # 基线没有闭环控制器，这里是 None → 快照不带 regulation 字段，
+        # 页面的"调节视图"卡保持隐藏。派生分支（入向闭环）注入真实数据
+        # 源后页面自动出现该卡——与 /api/tc 的 sections 同一套合并卫生：
+        # 通用承载进基线，分支只提供数据。
+        self._regulation_fn = regulation_fn
         self._started = time.time()
 
     # ---- 配置与数据注入 ----
@@ -220,6 +228,10 @@ class StatusHub:
             "instance": _instance_view(instance),
             "haproxy": self._haproxy_view(),
         }
+        if self._regulation_fn is not None:
+            reg = self._regulation_fn()
+            if reg:
+                snap["regulation"] = reg
         self._history.append(snap)
         for q in list(self._subs):
             # 慢消费者丢最旧一帧：页面只关心最新状态，绝不反压快环。
