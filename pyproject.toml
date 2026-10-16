@@ -17,6 +17,7 @@ test = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 rl-limiter = "rl_limiter.__main__:main"
+rl-fleet = "rl_limiter.fleetmain:main"
 
 [tool.setuptools]
 packages = ["rl_limiter"]
