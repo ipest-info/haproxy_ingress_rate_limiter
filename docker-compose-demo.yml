@@ -334,6 +334,36 @@ services:
     networks: [frontnet]         # 客户端群只在客户端侧网络
     restart: unless-stopped
 
+  # ---- 总控制台（rl-fleet）：汇总三台节点的流量，把总流出带宽按需
+  # 分配为各节点的实例出向目标（节点闭环再转成入向限速）。
+  # 玩法：打开 http://localhost:8095（令牌 demo-token），设总带宽后
+  # 加压观察三节点配额此消彼长、总出向被压在参考线下。 ----
+  fleet:
+    build: .
+    # 模板只读挂载 + 启动时拷到可写路径：总控的写 API 要整份重写这份
+    # YAML，bind-mount 的单文件 os.replace 会失败，必须先拷贝。
+    command: >-
+      bash -c "cp /etc/rl-limiter/fleet-template.yaml /etc/rl-limiter/fleet.yaml
+      && exec rl-fleet -c /etc/rl-limiter/fleet.yaml"
+    volumes:
+      - ./deploy/docker/fleet.yaml:/etc/rl-limiter/fleet-template.yaml:ro
+    environment:
+      RL_CONSOLE_PORT: "8095"
+      # 演示从宿主机打开；宿主机侧仍只映射到回环（下方 ports）。
+      RL_CONSOLE_BIND: 0.0.0.0
+      # 总控自己写 API 的令牌（改总带宽用）——与节点令牌是两回事，
+      # demo 里恰好同值。
+      RL_API_TOKEN: demo-token
+    ports:
+      - "127.0.0.1:8095:8095"    # 总控制台
+    depends_on:
+      - node1
+      - node2
+      - node3
+    # 管理面走后端侧网络：轮询/下发不混入客户端侧被整形的流量。
+    networks: [backnet]
+    restart: unless-stopped
+
 # 双网络拓扑 = 每台节点双网卡（分支 1 的部署前提）：
 #   frontnet 客户端侧（loadgen ↔ 节点）：出向 HTB 与入向 police 都在
 #            节点的这张网卡上；

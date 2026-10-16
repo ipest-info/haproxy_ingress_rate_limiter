@@ -1,0 +1,38 @@
+# deploy/docker/fleet.yaml —— compose 演示里总控（rl-fleet）的配置模板。
+#
+# 入口命令会把它复制成容器内可写的 /etc/rl-limiter/fleet.yaml（总控的
+# 写 API 要整份重写该文件，bind-mount 的单文件没法原子替换）。字段全量
+# 说明见 deploy/config/fleet.example.yaml。
+
+log_level: info
+
+# 总流出带宽目标（Mbps；0 = 纯观察，只汇总不下发）。demo 起来后在总控
+# 页面（http://localhost:8095，令牌 demo-token）设一个值即可看到按需
+# 分配：三节点的实例出向目标此消彼长、总出向被压在该值之下。
+total_egress_mbps: 0
+
+poll_interval_s: 2
+# demo 加速：生产默认 15s。
+alloc_interval_s: 10
+offline_after: 3
+
+allocation:
+  # 下载型业务 ACK 杠杆高，入向均衡点极低——与节点侧 demo 同理，
+  # 保底别太高、下限别抬高，其余参数用默认值。
+  min_share_ratio: 0.2
+
+nodes:
+  # url = 总控访问节点控制台的地址（容器内网络）；console_url = 页面
+  # 上"跳到该节点控制台"的链接（从宿主机浏览器打开，用宿主机映射）。
+  - name: node1
+    url: http://node1:8090
+    token: demo-token
+    console_url: http://localhost:8090
+  - name: node2
+    url: http://node2:8090
+    token: demo-token
+    console_url: http://localhost:8092
+  - name: node3
+    url: http://node3:8090
+    token: demo-token
+    console_url: http://localhost:8093
