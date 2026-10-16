@@ -1,6 +1,6 @@
 # docker compose 一键演示环境：三台 **Ubuntu 24.04 节点**（每台 =
 # HAProxy + 同机 rl-limiter）+ 模拟业务后端 + 可调并发压测服务。
-# 详细玩法见 docs/04-DockerCompose演示.md。
+# 详细玩法见 docs/05-DockerCompose演示.md。
 #
 #   启动：docker compose -f docker-compose-demo.yml up -d --build
 #   控制台：http://localhost:8090 / :8092 / :8093（每台节点各一个）
@@ -95,7 +95,7 @@ services:
     # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
     #
     # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
-    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
+    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §1。
     ulimits:
       nofile:
         soft: 524288
@@ -170,7 +170,7 @@ services:
     # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
     #
     # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
-    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
+    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §1。
     ulimits:
       nofile:
         soft: 524288
@@ -243,7 +243,7 @@ services:
     # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
     #
     # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
-    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §2。
+    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §1。
     ulimits:
       nofile:
         soft: 524288

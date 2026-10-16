@@ -206,7 +206,7 @@ class StatusHub:
                 "mean10_bytes_per_s": u.mean10_bps,
                 "ewma60_bytes_per_s": u.ewma60_bps,
                 "conn": u.conn_cur,
-                # --- 监控视图字段（见 docs/05-监控视图.md）---
+                # --- 监控视图字段（见 docs/06-控制台与监控.md）---
                 "rate_in_bytes_per_s": u.rate_in_bps,
                 "conn_new_ps": u.conn_new_ps,
                 "conn_denied_ps": u.conn_denied_ps,

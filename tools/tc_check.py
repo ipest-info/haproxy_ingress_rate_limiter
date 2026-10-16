@@ -162,7 +162,7 @@ def cmd_verify(args) -> int:
         # MTU 量级会让整台机器降速，而每个 frontend 看起来都完全正常。
         print(f"  [FAIL] 兜底类 1:{T.DEFAULT_CLASS_MINOR} 的 cburst 只有 "
               f"{cbursts.get(T.DEFAULT_CLASS_MINOR)} 字节 —— "
-              f"**本机未受管流量会被它整体压住**（见 docs/06 §9）")
+              f"**本机未受管流量会被它整体压住**（见 docs/02 §5）")
         bad_default = 1
     else:
         print("  [ok]   兜底类存在且 cburst 正常（未分类流量按线速放行）")
@@ -186,7 +186,7 @@ def cmd_verify(args) -> int:
             bad += 1
         elif T._cburst_too_small(cbursts.get(port), want[port]):
             # cburst 才是 ceil 那一路的桶。它被 tc 按 MTU 量级兜底的话，
-            # rate 显示完全正常，实际吞吐却上不去（见 docs/06 §9 那次事故）。
+            # rate 显示完全正常，实际吞吐却上不去（见 docs/02 §5 的历史依据）。
             print(f"  [FAIL] {f.name} (:{port}) cburst 只有 "
                   f"{cbursts.get(port)} 字节，应约 "
                   f"{T.burst_bytes(want[port] / 8)} —— **实际吞吐会远低于限额**")
@@ -227,7 +227,7 @@ def _verify_instance(fes, inst_bits: int, classes, cbursts,
     elif T._cburst_too_small(cbursts.get(T.INSTANCE_PARENT_MINOR), inst_bits):
         print(f"  [FAIL] 聚合父类 cburst 只有 "
               f"{cbursts.get(T.INSTANCE_PARENT_MINOR)} 字节 —— "
-              f"**实例吞吐会远低于总限速**（见 docs/06 §9）")
+              f"**实例吞吐会远低于总限速**（见 docs/02 §5）")
         bad += 1
     else:
         print(f"  [ok]   聚合父类在位，实例总限速 {inst_bits} bit/s")
@@ -246,7 +246,7 @@ def _verify_instance(fes, inst_bits: int, classes, cbursts,
                              T.DEFAULT_CLASS_RATE_BPS):
         print(f"  [FAIL] 兜底类 cburst 只有 "
               f"{cbursts.get(T.DEFAULT_CLASS_MINOR)} 字节 —— "
-              f"**本机未受管流量会被它整体压住**（见 docs/06 §9）")
+              f"**本机未受管流量会被它整体压住**（见 docs/02 §5）")
         bad += 1
     else:
         print("  [ok]   兜底类在位（线速放行，SSH/系统流量不受总闸影响）")

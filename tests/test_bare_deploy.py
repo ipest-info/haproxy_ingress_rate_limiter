@@ -43,7 +43,7 @@ def test_every_placeholder_in_the_unit_is_substituted():
 
 
 def test_unit_grants_net_admin_for_tc():
-    """限速由内核 tc 执行（docs/06），tc 要操作网络设备。
+    """限速由内核 tc 执行（docs/02），tc 要操作网络设备。
 
     没有 CAP_NET_ADMIN 服务直接起不来——这是刻意的，"静默地没在限速"比
     起不来危险得多。

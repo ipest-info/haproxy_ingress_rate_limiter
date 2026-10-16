@@ -171,7 +171,7 @@ def ephemeral_conflicts(frontends: list[model.FrontendConfig],
     frontend 的监听端口，那条连接的出向流量就会被误判进该 frontend 的限速
     类，吃掉本该给客户端的配额——而且是**随机偶发**的，极难排查。
 
-    两条出路（见 docs/06 的"单网卡还是两网卡"）：
+    两条出路（见 docs/02 §5）：
       1. 把监听端口挪到临时端口范围之外（<32768，也就是 80/443/8080 这类
          正常的入口端口）——推荐，零成本；
       2. 用两张网卡，只在客户端侧那张上限速，后端流量根本不经过限速树。
@@ -677,7 +677,7 @@ class TcShaper:
             "限速可能偶发失准**：HAProxy 连后端用的临时源端口可能撞上监听"
             "端口，那条连接的出向流量会被误判进该 frontend 的限速类。"
             "两条出路：把监听端口挪到 %d 以下，或用两张网卡、只在客户端侧"
-            "那张上限速（见 docs/06-tc限速方案.md） frontends=%s "
+            "那张上限速（见 docs/02-闭环限速原理.md） frontends=%s "
             "ephemeral_range=%d-%d",
             lo, key, lo, hi)
 

@@ -163,7 +163,7 @@ def _rebuild_cmds(iface: str,
 # police 行形如：
 #   police 0x1 rate 10Mbit burst 12500b mtu 2Kb action drop overhead 0b
 # 注意：**本解析格式未在真机上核对过**（开发沙箱内核没有 act_police，
-# 见 docs/10 的"未验证的部分"）——按 iproute2 源码的打印路径写成，首次
+# 见 docs/02 §6 已知边界）——按 iproute2 源码的打印路径写成，首次
 # 上线请用 `tc filter show` 人工比对一次，不符会表现为每轮都重建
 # （日志里连续的 rebuild 即是信号）。
 _DPORT_RE = re.compile(

@@ -55,5 +55,5 @@ dynamic_ingress:
   enabled: true
   # 下载型业务的入向主要是 ACK，杠杆很高（入向 1Mbps 的 ACK 可驱动
   # 约 70Mbps 出向），均衡点远低于直觉——下限要留得足够低，否则会
-  # "压到下限、出向仍高于目标"（详见 docs/10 §6）。
+  # "压到下限、出向仍高于目标"（详见 docs/02 §3）。
   floor_ratio: 0.05

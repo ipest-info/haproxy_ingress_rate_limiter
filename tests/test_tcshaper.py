@@ -10,7 +10,7 @@
 #      分类一个都不少。
 #
 # 用假的 runner 记录 argv，不依赖本机内核有没有 htb（本沙箱内核只内建
-# pfifo，见 docs/06 的"未验证的部分"）。
+# pfifo，见 docs/02 §6 已知边界）。
 
 from __future__ import annotations
 

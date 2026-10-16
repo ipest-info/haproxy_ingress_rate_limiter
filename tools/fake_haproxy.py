@@ -19,7 +19,7 @@
 # 协议要点（与真实 runtime socket 一致）：非交互模式下一次连接只服务
 # 一条命令，应答完即由服务端关闭连接——客户端每条命令都要重新拨号。
 #
-# 用法示例（见 docs/03-限速服务运行指南.md）：
+# 用法示例（见 docs/03-配置参考.md）：
 #   同机形态：
 #     python3 tools/fake_haproxy.py --unix-path /tmp/hap1.sock --frontends fe_main:2000000
 #   跨机形态：
