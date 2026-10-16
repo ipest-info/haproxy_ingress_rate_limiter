@@ -351,3 +351,27 @@ make demo-down    # = docker compose -f docker-compose-demo.yml down
 
 （没有数据库，也就没有要清理的数据卷；容器内改过的配置副本随容器一起
 消失，下次 `up` 回到模板初始值。）
+
+## 生产形态：host 网络部署样例
+
+演示 compose 用的是 bridge 网络（veth→网桥→conntrack/NAT），高带宽/
+高新建连接下数据面有 10%~30% 的开销。生产上推荐 **host 网络 +
+NET_ADMIN** 的容器形态：性能与宿主机直跑基本一致，又保留镜像交付的
+便利——样例见仓库根目录的 `docker-compose-host.yml`（单节点，一台
+宿主机一份）：
+
+```bash
+docker compose -f docker-compose-host.yml up -d --build
+```
+
+与演示 compose 的关键差异（样例文件里有逐项注释）：
+
+- 没有 `ports:` 映射——HAProxy 监听端口、控制台端口**直接占宿主机**，
+  部署前确认不冲突；控制台保持默认只绑 127.0.0.1，远程看走 SSH 隧道；
+- `RL_TC_IFACE` 填宿主机**物理网卡名**，tc 规则直接作用于真实网卡；
+- host 网络下 compose 的 `sysctls:` 不可用（与宿主机共享 network
+  namespace），内核参数请在宿主机上执行 `deploy/sysctl/tune-kernel.sh`
+  或按 docs/08 固化到 sysctl.d；
+- 配置模板请复制副本后把挂载路径指向副本，别直接改仓库里的模板。
+
+完全不走容器的裸机/systemd 部署见 docs/09。
