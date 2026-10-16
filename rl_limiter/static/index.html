@@ -253,6 +253,24 @@ input:focus, select:focus {
 .reg-table th:first-child, .reg-table td:first-child { text-align: left; }
 .reg-table tr:last-child td { border-bottom: 0; }
 
+/* ---- 配置页 ----
+   服务端下发 sections（可编辑行 / 只读 kv 表），页面通用渲染——结构
+   零假设，派生分支在服务端多返回一个 section 就自动出现（同 tc 面板）。 */
+.cfg-row {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 10px 0; border-bottom: 1px solid var(--border);
+}
+.cfg-row:last-child { border-bottom: 0; }
+.cfg-row-l { flex: 1 1 260px; min-width: 0; }
+.cfg-row-name {
+  font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace; font-weight: 600;
+}
+.cfg-row input { width: 110px; text-align: right; }
+.cfg-kv td:first-child {
+  font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace;
+  color: var(--text-secondary);
+}
+
 /* ---- toast：写 API 的结果反馈 ---- */
 #toast {
   position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
@@ -299,6 +317,7 @@ input:focus, select:focus {
 <nav class="tabs"><div class="wrap">
   <button data-tab="instance" aria-selected="true">实例</button>
   <button data-tab="frontend" aria-selected="false">监听端口</button>
+  <button data-tab="config" aria-selected="false">配置</button>
   <button data-tab="logs" aria-selected="false">日志</button>
 </div></nav>
 
@@ -408,6 +427,15 @@ input:focus, select:focus {
       限额存放在 YAML 的 quotas 段——在卡片右上角修改（0 = 显式不限速，
       "删除登记"= 回到只监控不限速），经写 API 回写 YAML 后数秒内热生效，
       需先在页头填入 API 令牌（RL_API_TOKEN）。</div>
+  </section>
+
+  <!-- ============ 配置 ============ -->
+  <section class="tabpage" id="page-config">
+    <div id="cfg-sections"><div class="hint">加载中…</div></div>
+    <div class="hint" style="padding:2px 4px">能改的只有限额类字段（改了经写
+      API 回写 YAML 热生效）；接线/运行参数启动时定型，只读展示——改它们
+      请编辑配置文件或环境变量后重启。haproxy.cfg（监听端口、后端）绝对
+      只读，页面不提供写入口。</div>
   </section>
 
   <!-- ============ 日志 ============ -->
@@ -1078,6 +1106,77 @@ async function loadTc() {
 }
 $("#tc-refresh").onclick = loadTc;
 
+// ============================================================ 配置页
+// /api/config-view 返回 {sections: [{title, hint, kv: [{label,value}],
+// rows: [{label, sub, fields: [{label, value, api{method,url,key},
+// disabled, disabled_reason}], del{url,label}}]}]}。渲染与提交都通用：
+// 可编辑字段带着自己的写 API 描述，页面照着发请求，不认识具体字段——
+// 派生分支在服务端多返回一个 section 就自动可编辑。全部文本过 esc。
+let cfgView = null;
+async function loadConfigView() {
+  const box = $("#cfg-sections");
+  let j;
+  try {
+    const resp = await fetch("/api/config-view");
+    j = await resp.json();
+    if (!resp.ok) throw new Error(j.error || "HTTP " + resp.status);
+  } catch (e) {
+    box.innerHTML = `<div class="hint" style="color:var(--critical)">${esc("加载配置失败：" + (e.message || e))}</div>`;
+    return;
+  }
+  cfgView = j;
+  box.innerHTML = (j.sections || []).map((sec, si) => `
+    <div class="card">
+      <div class="card-head"><span class="card-title">${esc(sec.title || "配置")}</span></div>
+      <div class="card-body">
+        ${sec.hint ? `<div class="hint" style="margin-bottom:10px">${esc(sec.hint)}</div>` : ""}
+        ${(sec.kv || []).length ? `<table class="reg-table cfg-kv"><tbody>${sec.kv.map(k =>
+          `<tr><td>${esc(k.label)}</td><td>${esc(k.value)}</td></tr>`).join("")}</tbody></table>` : ""}
+        ${(sec.rows || []).map((r, ri) => `
+          <div class="cfg-row">
+            <div class="cfg-row-l">
+              <div class="cfg-row-name">${esc(r.label)}</div>
+              ${r.sub ? `<div class="hint">${esc(r.sub)}</div>` : ""}
+            </div>
+            ${(r.fields || []).map((f, fi) => `
+              <span class="quota-edit" style="margin-left:0">
+                <span class="hint">${esc(f.label || "")}</span>
+                <input type="number" min="0" step="any" value="${esc(f.value ?? "")}"
+                       id="cfg-in-${si}-${ri}-${fi}"
+                       ${f.disabled ? "disabled" : ""}
+                       ${f.disabled_reason ? `title="${esc(f.disabled_reason)}"` : ""}>
+                <button class="cfg-save" data-si="${si}" data-ri="${ri}" data-fi="${fi}"
+                        ${f.disabled ? `disabled title="${esc(f.disabled_reason || "")}"` : ""}>保存</button>
+              </span>`).join("")}
+            ${r.del ? `<button class="cfg-del" data-si="${si}" data-ri="${ri}">${esc(r.del.label || "删除")}</button>` : ""}
+          </div>`).join("")}
+      </div>
+    </div>`).join("");
+  for (const b of $$(".cfg-save", box)) b.onclick = async () => {
+    const {si, ri, fi} = b.dataset;
+    const f = cfgView.sections[si].rows[ri].fields[fi];
+    const inp = $(`#cfg-in-${si}-${ri}-${fi}`, box);
+    const v = parseFloat(inp.value);
+    if (inp.value.trim() === "" || !isFinite(v) || v < 0) {
+      toast("必须是 ≥ 0 的数字", true);
+      return;
+    }
+    const r = await apiWrite(f.api.method || "PUT", f.api.url, {[f.api.key]: v});
+    if (r) {
+      afterWrite(cfgView.sections[si].rows[ri].label + " 已改为 " + v);
+      setTimeout(loadConfigView, 1500);
+    }
+  };
+  for (const b of $$(".cfg-del", box)) b.onclick = async () => {
+    const row = cfgView.sections[b.dataset.si].rows[b.dataset.ri];
+    const r = await apiWrite("DELETE", row.del.url);
+    if (r) {
+      afterWrite(row.label + " 的登记已删除/重置");
+      setTimeout(loadConfigView, 1500);
+    }
+  };
+}
+
 async function loadLogs() {
   const j = await (await fetch("/api/logs?after=" + state.logAfter)).json();
   const box = $("#logs");
@@ -1113,6 +1212,9 @@ function switchTab(name) {
   state.tab = name;
   for (const b of $$(".tabs button")) b.setAttribute("aria-selected", String(b.dataset.tab === name));
   for (const p of $$(".tabpage")) p.classList.toggle("on", p.id === "page-" + name);
+  // 配置页每次切进来都现取：别的入口（frontend 卡片、实例卡）也能改
+  // 限额，缓存旧值会让两处显示打架。
+  if (name === "config") loadConfigView();
   // 刚显示出来的画布此前 clientWidth 为 0，必须重绘一次才有内容。
   redrawAll();
 }

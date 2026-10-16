@@ -262,6 +262,28 @@ async def _amain(cfg, log: logging.Logger,
             return {"sections": [section]}
 
     if hub is not None:
+        # 配置页的"运行参数（启动时定型）"只读清单：把现在生效的接线/
+        # 运行值摆出来。这些字段 configstore 不开放（改了要重启），页面
+        # 只展示不提供写入口。
+        runtime_info = [
+            {"label": "YAML 配置文件", "value": yaml_path or "（未指定）"},
+            {"label": "haproxy.cfg", "value": cfg.haproxy.cfg_path},
+            {"label": "HAProxy stats 接口", "value": cfg.haproxy.endpoint()},
+            {"label": "采样周期 tick_interval_s",
+             "value": f"{cfg.tick_interval_s:g}s"},
+            {"label": "日志级别 log_level", "value": cfg.log_level},
+            {"label": "出向限速网卡 RL_TC_IFACE",
+             "value": (shaper.iface if shaper is not None
+                       else "-（出向 tc 整形已关闭）")},
+            {"label": "入向包统计网卡 RL_NIC",
+             "value": nic or "-（已禁用）"},
+            {"label": "监控数据落盘 RL_METRICS_LOG",
+             "value": ((os.environ.get(ENV_METRICS_LOG) or "").strip()
+                       or "未启用")},
+            {"label": "写 API 令牌 RL_API_TOKEN",
+             "value": ("已配置（页头填令牌后可改限额）" if api_token
+                       else "未配置（写接口整体禁用，页面只读）")},
+        ]
         tasks.append(asyncio.create_task(
             webconsole.run_console(
                 console_port, hub, logbuf, log, bind=console_bind,
@@ -269,7 +291,8 @@ async def _amain(cfg, log: logging.Logger,
                 # 写限额前校验段名存在：以当前 cfg 解析出的清单为准。
                 known_frontends_fn=lambda: {f.name for f in ctl.frontends()},
                 poke=cfg_poke, tc_debug_fn=tc_debug_fn,
-                egress_tc_enabled=shaper is not None),
+                egress_tc_enabled=shaper is not None,
+                runtime_info=runtime_info),
             name="web-console"))
 
     if shaper is not None and tc_applied is not None:
