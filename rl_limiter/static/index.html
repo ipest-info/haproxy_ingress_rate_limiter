@@ -240,6 +240,19 @@ input:focus, select:focus {
   max-height: 280px; overflow-y: auto;
 }
 
+/* ---- 调节视图（闭环动态限速） ----
+   每个受管端口的目标/动态值一行一个，等宽数字右对齐方便纵向比较。 */
+.reg-table {
+  width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 12.5px;
+}
+.reg-table th, .reg-table td {
+  padding: 5px 10px; text-align: right; border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+.reg-table th { color: var(--text-muted); font-weight: 500; font-size: 11.5px; }
+.reg-table th:first-child, .reg-table td:first-child { text-align: left; }
+.reg-table tr:last-child td { border-bottom: 0; }
+
 /* ---- toast：写 API 的结果反馈 ---- */
 #toast {
   position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
@@ -348,6 +361,30 @@ input:focus, select:focus {
       <div class="card-body"><div class="chart-grid" id="i-bw-charts"></div></div>
     </div>
 
+    <!-- 调节视图：闭环动态限速的全部调节数据摆在一处——目标、观测、
+         动态执行值（入向总闸/各端口上限）、实测流入与网卡带宽。
+         基线没有闭环控制器，快照不带 regulation 字段，本卡保持隐藏；
+         派生分支（入向闭环）注入数据源后自动出现——与 tc 面板同一套
+         "通用承载在基线、数据在分支"的合并卫生。 -->
+    <div class="card" id="reg-card" hidden>
+      <div class="card-head">
+        <span class="card-title">调节视图（闭环动态限速）</span>
+        <span class="hint">单位一律 Mbps。出向观测为 HAProxy 应用层 10s 均值
+          （控制环的观测值）；总闸/实测流入/网卡带宽为链路层口径。</span>
+      </div>
+      <div class="card-body">
+        <div class="stats">
+          <div><div class="stat-l">实例出向目标</div><div class="stat-v" id="r-target">–</div></div>
+          <div><div class="stat-l">出向总观测（10s 均值）</div><div class="stat-v" id="r-egress">–</div></div>
+          <div><div class="stat-l">入向总闸（动态）</div><div class="stat-v" id="r-gate">–</div></div>
+          <div><div class="stat-l">实测流入</div><div class="stat-v" id="r-ingress">–</div></div>
+          <div><div class="stat-l">调节状态</div><div class="stat-v" id="r-state">–</div></div>
+        </div>
+        <div class="chart-grid" id="reg-charts"></div>
+        <table class="reg-table" id="reg-fes" hidden></table>
+      </div>
+    </div>
+
     <!-- tc 实况：排障时把"期望配置"和内核里 tc 的原始输出摆在一起看。
          不自动轮询（tc show 的原始文本一秒一刷没法读），打开页面取一次，
          之后手动刷新。 -->
@@ -428,6 +465,8 @@ const state = {
   fes: new Map(),            // frontend 名 → {buf, conf, card, charts…}
   instBuf: [],               // 实例视图的样本环形缓冲
   instCharts: [],
+  regBuf: [],                // 调节视图的样本环形缓冲（Mbps 域）
+  regCharts: [], regLatest: null, regBuilt: false,
   windowS: 300, logAfter: 0, logLevel: "INFO", tab: "instance",
   instDirty: false,          // 实例总限速输入框：用户动过后不再自动回填
 };
@@ -593,7 +632,85 @@ function drawChart(ch) {
 
 function redrawAll() {
   for (const ch of state.instCharts) drawChart(ch);
+  for (const ch of state.regCharts) drawChart(ch);
   for (const fe of state.fes.values()) for (const ch of fe.charts) drawChart(ch);
+}
+
+// ============================================================ 调节视图
+// 快照里出现 regulation 字段才建卡建图（基线快照没有该字段，卡保持
+// 隐藏）。缓冲里的数值已经是 Mbps——闭环的全部量本来就以 Mbps 流转，
+// 不走 bytes/s 的内部口径。
+const fmtNum = (v) => (v == null || !isFinite(v) ? "–" : (+v).toFixed(2));
+function ensureRegCard() {
+  if (state.regBuilt) return;
+  state.regBuilt = true;
+  $("#reg-card").hidden = false;
+  const grid = $("#reg-charts"), pts = () => state.regBuf;
+  state.regCharts = [
+    makeChart(grid, {
+      title: "出向总带宽 vs 目标", source: "HAProxy 口径 · 控制环观测值",
+      fmt: fmtNum, unit: "Mbps", points: pts,
+      series: [{key: "egress", label: "出向总观测（10s 均值）", color: "--s-out"}],
+      ref: () => {
+        const i = state.regLatest && state.regLatest.instance;
+        return i && i.target_mbps
+          ? {value: i.target_mbps, label: "目标 " + fmtNum(i.target_mbps)}
+          : null;
+      },
+    }),
+    makeChart(grid, {
+      title: "入向总闸与实测流入", source: "tc/IFB 链路层口径 · 控制环执行值",
+      fmt: fmtNum, unit: "Mbps", points: pts,
+      series: [
+        {key: "gate", label: "入向总闸", color: "--s-total"},
+        {key: "ingress", label: "实测流入", color: "--s-in"},
+      ],
+    }),
+    makeChart(grid, {
+      title: "网卡带宽", source: "网卡口径（整机、链路层）",
+      fmt: fmtNum, unit: "Mbps", points: pts,
+      series: [
+        {key: "nic_in", label: "流入带宽", color: "--s-in"},
+        {key: "nic_out", label: "流出带宽", color: "--s-out"},
+      ],
+    }),
+  ];
+}
+
+function updateRegulation(r) {
+  const inst = r.instance;
+  const set = (id, v, unit) =>
+    $(id).innerHTML = esc(v) + (unit ? `<small>${unit}</small>` : "");
+  if (inst) {
+    set("#r-target", fmtNum(inst.target_mbps), "Mbps");
+    set("#r-egress", fmtNum(inst.egress_mbps), "Mbps");
+    if (inst.gate_mbps != null) set("#r-gate", fmtNum(inst.gate_mbps), "Mbps");
+    else set("#r-gate", "全开", "≤" + fmtNum(inst.gate_max_mbps) + " Mbps");
+    set("#r-ingress", inst.ingress_mbps != null
+      ? fmtNum(inst.ingress_mbps) : "–", inst.ingress_mbps != null ? "Mbps" : "");
+    set("#r-state", inst.gate_mbps == null ? "全开（未收紧）"
+      : (inst.landed ? "已落位，调节中" : "调节中"));
+  } else {
+    for (const id of ["#r-target", "#r-egress", "#r-gate", "#r-ingress"]) set(id, "–");
+    set("#r-state", "仅端口级调节");
+  }
+  // 每个受管端口一行：出向目标、观测、当前动态入向上限与登记上限。
+  const fes = Object.entries(r.frontends || {}).sort((a, b) => a[0] < b[0] ? -1 : 1);
+  const tbl = $("#reg-fes");
+  tbl.hidden = !fes.length;
+  if (fes.length) {
+    tbl.innerHTML = `<thead><tr><th>监听端口</th><th>出向目标</th>
+        <th>出向观测（10s 均值）</th><th>入向上限（动态）</th>
+        <th>入向登记上限</th><th>状态</th></tr></thead><tbody>` +
+      fes.map(([n, f]) => `<tr>
+        <td>${esc(n)}</td>
+        <td>${esc(fmtNum(f.target_mbps))} Mbps</td>
+        <td>${esc(fmtNum(f.egress_mbps))} Mbps</td>
+        <td>${esc(f.cap_mbps != null ? fmtNum(f.cap_mbps) + " Mbps" : "全开")}</td>
+        <td>${esc(fmtNum(f.max_mbps))} Mbps</td>
+        <td>${esc(f.cap_mbps != null ? "动态调节中" : "未收紧")}</td>
+      </tr>`).join("") + "</tbody>";
+  }
 }
 
 // ============================================================ 实例视图
@@ -837,6 +954,26 @@ function applySnapshot(snap, live) {
     if (live) {
       updateInstance(i);
       if (state.tab === "instance") for (const ch of state.instCharts) drawChart(ch);
+    }
+  }
+  const r = snap.regulation;
+  if (r) {
+    const ri = r.instance || {};
+    state.regBuf.push({
+      ts: snap.ts,
+      egress: ri.egress_mbps || 0,
+      // 全开时总闸的生效值就是上限本身——画上限，曲线才连续。
+      gate: ri.gate_mbps != null ? ri.gate_mbps : ri.gate_max_mbps,
+      ingress: ri.ingress_mbps != null ? ri.ingress_mbps : 0,
+      nic_in: ((i && i.nic_rate_in_bytes_per_s) || 0) * 8 / 1e6,
+      nic_out: ((i && i.nic_rate_out_bytes_per_s) || 0) * 8 / 1e6,
+    });
+    if (state.regBuf.length > BUF_MAX) state.regBuf.shift();
+    state.regLatest = r;
+    ensureRegCard();
+    if (live) {
+      updateRegulation(r);
+      if (state.tab === "instance") for (const ch of state.regCharts) drawChart(ch);
     }
   }
   for (const [name, u] of Object.entries(snap.units || {})) {

@@ -81,6 +81,27 @@ def test_snapshot_without_instance_view_is_still_valid():
     assert h.history()[-1]["instance"] == {}
 
 
+def test_snapshot_carries_regulation_when_fn_provided():
+    """调节视图的数据源（闭环分支注入的 regulation_fn）随快照透传——
+    基线只负责承载，内容结构由数据源决定（与 /api/tc 的 sections 同一
+    套合并卫生）。"""
+    reg = {"instance": {"target_mbps": 40.0, "gate_mbps": 0.8}}
+    h = hub(regulation_fn=lambda: reg)
+    h.record(1.0, [usage()])
+    assert h.history()[-1]["regulation"] == reg
+
+
+def test_snapshot_omits_regulation_when_absent():
+    """没有数据源（基线）或数据源本拍没数据（返回 None/{}）时快照不带
+    regulation 字段——页面据此让调节视图卡保持隐藏。"""
+    h = hub()
+    h.record(1.0, [usage()])
+    assert "regulation" not in h.history()[-1]
+    h2 = hub(regulation_fn=lambda: None)
+    h2.record(1.0, [usage()])
+    assert "regulation" not in h2.history()[-1]
+
+
 def test_snapshot_over_flag():
     h = hub()
     h.record(1.0, [usage(mean10=2_000_000)])       # 限额 1_000_000 bytes/s
