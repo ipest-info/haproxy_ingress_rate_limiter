@@ -1,0 +1,157 @@
+# tests.test_fleetconfig —— 总控配置的解析/校验/回写/热更。
+#
+# 与节点侧 config/configstore 同一套承诺：非法配置逐条拒绝且指明字段；
+# 回写前整份校验、原子替换；watch 失败 fail-static。
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+import yaml
+
+from rl_limiter import fleetconfig
+
+BASE = """\
+total_egress_mbps: 300
+nodes:
+  - name: node1
+    url: http://10.0.0.1:8090
+    token: tok1
+  - name: node2
+    url: http://10.0.0.2:8090
+    token: tok2
+    console_url: http://pub.example:8092
+"""
+
+
+@pytest.fixture
+def yml(tmp_path):
+    p = tmp_path / "fleet.yaml"
+    p.write_text(BASE, encoding="utf-8")
+    return p
+
+
+def test_load_fills_defaults(yml):
+    cfg = fleetconfig.load(str(yml))
+    assert cfg.total_egress_mbps == 300.0
+    assert cfg.poll_interval_s == 2.0
+    assert cfg.alloc_interval_s == 15.0
+    assert cfg.offline_after == 3
+    assert cfg.alloc.min_share_ratio == 0.2
+    assert cfg.alloc.min_quota_mbps == 0.5
+    assert [n.name for n in cfg.nodes] == ["node1", "node2"]
+    # url 尾部斜杠归一；console_url 缺省为空（调用方回退到 url）。
+    assert cfg.nodes[0].console_url == ""
+    assert cfg.nodes[1].console_url == "http://pub.example:8092"
+
+
+@pytest.mark.parametrize("mutate, keyword", [
+    ({"total_egress_mbps": -1}, "total_egress_mbps"),
+    ({"alloc_interval_s": 5}, "alloc_interval_s"),
+    ({"poll_interval_s": 0}, "poll_interval_s"),
+    ({"offline_after": 0}, "offline_after"),
+    ({"offline_after": 1.5}, "offline_after"),
+    ({"allocation": {"min_share_ratio": 0.6}}, "min_share_ratio"),
+    ({"allocation": {"smooth_alpha": 0}}, "smooth_alpha"),
+    ({"allocation": {"min_quota_mbps": 0}}, "min_quota_mbps"),
+    ({"allocation": {"press_boost": 0.5}}, "press_boost"),
+    ({"allocation": {"nope": 1}}, "nope"),
+    ({"bogus_key": 1}, "bogus_key"),
+])
+def test_rejects_invalid_fields(mutate, keyword):
+    raw = yaml.safe_load(BASE)
+    raw.update(mutate)
+    with pytest.raises(ValueError) as ei:
+        fleetconfig.from_raw(raw, source="测试")
+    assert keyword in str(ei.value)
+
+
+def test_rejects_bad_nodes():
+    for nodes, kw in [
+        ([{"name": "a b", "url": "http://x:1"}], "name"),
+        ([{"name": "n1", "url": "ftp://x"}], "url"),
+        ([{"name": "n1", "url": "http://x:1"},
+          {"name": "n1", "url": "http://y:1"}], "重复"),
+        ([{"name": "n1", "url": "http://x:1", "extra": 1}], "extra"),
+        ("not-a-list", "列表"),
+    ]:
+        with pytest.raises(ValueError) as ei:
+            fleetconfig.from_raw({"nodes": nodes}, source="测试")
+        assert kw in str(ei.value)
+
+
+def test_empty_token_is_allowed():
+    """token 为空合法（只读观测节点），校验不拒绝——提醒在运行时打。"""
+    cfg = fleetconfig.from_raw(
+        {"nodes": [{"name": "n1", "url": "http://x:1"}]}, source="测试")
+    assert cfg.nodes[0].token == ""
+
+
+# ---------------------------------------------------------------------------
+# 回写
+# ---------------------------------------------------------------------------
+
+def test_set_total_quota_roundtrip(yml):
+    fleetconfig.set_total_quota(str(yml), 500)
+    cfg = fleetconfig.load(str(yml))
+    assert cfg.total_egress_mbps == 500.0
+    # 其它段原样保留。
+    assert [n.name for n in cfg.nodes] == ["node1", "node2"]
+    # 0 = 删键（纯观察）。
+    fleetconfig.set_total_quota(str(yml), 0)
+    assert fleetconfig.load(str(yml)).total_egress_mbps == 0.0
+    assert "total_egress_mbps" not in yml.read_text(encoding="utf-8")
+
+
+def test_set_total_quota_refuses_broken_yaml(yml):
+    yml.write_text("nodes: [", encoding="utf-8")
+    before = yml.read_text(encoding="utf-8")
+    with pytest.raises(fleetconfig.FleetConfigError):
+        fleetconfig.set_total_quota(str(yml), 100)
+    assert yml.read_text(encoding="utf-8") == before
+
+
+# ---------------------------------------------------------------------------
+# 热更轮询
+# ---------------------------------------------------------------------------
+
+async def _run_watch_once(yml, poke, applied):
+    task = asyncio.ensure_future(fleetconfig.watch(
+        str(yml), applied.append,
+        __import__("logging").getLogger("t"), poke=poke, interval_s=60))
+    # 首轮由 poke 触发。
+    poke.set()
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if applied:
+            break
+    return task
+
+
+async def test_watch_applies_and_fail_static(tmp_path):
+    yml = tmp_path / "fleet.yaml"
+    yml.write_text(BASE, encoding="utf-8")
+    poke = asyncio.Event()
+    applied: list = []
+    task = await _run_watch_once(yml, poke, applied)
+    try:
+        assert applied and applied[-1].total_egress_mbps == 300.0
+        # 热更字段变化 → 再次回调。
+        yml.write_text(BASE.replace("300", "600"), encoding="utf-8")
+        poke.set()
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if len(applied) >= 2:
+                break
+        assert applied[-1].total_egress_mbps == 600.0
+        # 文件写坏 → fail-static：不回调、不崩。
+        yml.write_text("nodes: [", encoding="utf-8")
+        poke.set()
+        await asyncio.sleep(0.1)
+        assert len(applied) == 2
+        assert not task.done()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
