@@ -526,8 +526,8 @@ def build_app(
         limits_sec = {
             "title": "限额登记（可改，热生效）",
             "hint": "修改经写 API 回写 YAML，数秒内热生效——需先在页头填入"
-                    " API 令牌（RL_API_TOKEN）。这是配置里**唯一**开放修改"
-                    "的部分；回写会重写整份 YAML，文件里的手写注释不保留。",
+                    " API 令牌（RL_API_TOKEN）。这是配置里唯一开放修改的"
+                    "部分；回写会重写整份 YAML，文件里的手写注释不保留。",
             "rows": rows,
         }
         if not writable:
@@ -542,7 +542,7 @@ def build_app(
         if runtime_info:
             sections.append({
                 "title": "运行参数（启动时定型，只读）",
-                "hint": "这些字段改了**不热生效**：编辑 YAML/环境变量后"
+                "hint": "这些字段改了不热生效：编辑 YAML/环境变量后"
                         "重启 rl-limiter。负载均衡配置（监听端口/后端）的"
                         "唯一权威是 haproxy.cfg，rl-limiter 与本页面都"
                         "绝不写它。",
