@@ -177,6 +177,16 @@ async def _amain(cfg, log: logging.Logger,
     # 实例总限速的执行者：出向 HTB（基线形态），或 ifb 闭环的入向总闸
     # （本分支形态）。两者都没有时页面置灰、写接口 409（见 webconsole）。
     inst_executable = shaper is not None or (gov is not None and in_mode_ifb)
+    # 调节视图的数据源：闭环控制器把全部调节量（目标/动态总闸/各端口
+    # 动态上限/实测流入）摊成快照里的 regulation 字段，页面据此渲染
+    # "调节视图"卡。没有控制器（基线形态）不注入，卡保持隐藏。
+    # ctl 在下方才赋值——与 version_fn 同一套延迟求值闭包的约定。
+    regulation_fn = None
+    if gov is not None:
+        def regulation_fn():
+            return gov.regulation_view(
+                list(ctl.frontends()), ctl.request_limits(),
+                ctl.instance_quota_mbps)
     hub: webconsole.StatusHub | None = None
     if console_port:
         hub = webconsole.StatusHub(
@@ -184,7 +194,8 @@ async def _amain(cfg, log: logging.Logger,
             version_fn=lambda: ctl.version,
             haproxy=cfg.haproxy,
             degraded_fn=lambda: col.degraded,
-            instance_quota_executable=inst_executable)
+            instance_quota_executable=inst_executable,
+            regulation_fn=regulation_fn)
 
     # sampler：监控循环每拍喂给控制台（内存实时曲线）与监控数据落盘器
     # （分钟粒度 JSONL）——同一拍、同一份数据，两个出口。
@@ -679,13 +690,17 @@ def main() -> None:
     # 实例视图的**入向**包统计要采哪张网卡（"-" = 显式禁用）。出向的包/
     # 丢包由 tc 按 frontend 统计，不走这里。默认跟随限速网卡——两者本来
     # 就该是同一张（客户端流量进出的那张），分开设只会给人配错的机会。
+    # 出向 tc 关闭的闭环形态（RL_TC_IFACE=-）跟随**入向**执行网卡：闭环
+    # 的调节对象就是那张卡，网卡口径的带宽/包统计必须对着它才有意义。
     raw_nic = (os.environ.get(ENV_NIC) or "").strip()
     if raw_nic == "-":
         nic = ""
     elif raw_nic:
         nic = netdev.resolve_iface(raw_nic, log)
     else:
-        nic = tc_iface or netdev.resolve_iface("", log)
+        nic = (tc_iface
+               or (raw_in_iface if raw_in_iface != "-" else "")
+               or netdev.resolve_iface("", log))
 
     # 启动即输出完整配置摘要：现场排障时第一条要看的日志，可直接核对
     # 受管清单、限额基准与两个配置文件的路径。

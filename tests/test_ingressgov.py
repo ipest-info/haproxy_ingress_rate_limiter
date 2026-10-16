@@ -67,13 +67,15 @@ def test_deadband_no_action():
 
 
 def test_under_target_recovers_in_small_steps_to_max():
-    """流量低了逐步上调（+5%×上限/次），爬回上限后回到静态语义。"""
+    """流量低了逐步上调（+5%×**当前值**/次，乘性），爬回上限后回到静态
+    语义。锚上限的加性步在动态值远低于上限时是一步翻倍的巨步，会与
+    下调形成极限环（带宽一会高一会低）——所以必须锚当前值。"""
     g = gov()
     feed(g, 80.0)
     g.adjust_once([fe()], LIMITS)      # 10 → 9
     feed(g, 10.0)                      # 远低于目标 → 该松了
     assert g.adjust_once([fe()], LIMITS)
-    assert g.current()["fe_main"] == pytest.approx(9.0 + 0.5)
+    assert g.current()["fe_main"] == pytest.approx(9.0 * 1.05)
     # 一路爬回 10（上限封顶），到顶后 current() 清空=静态全开。
     for _ in range(10):
         g.adjust_once([fe()], LIMITS)
@@ -181,10 +183,10 @@ def test_instance_deadband_and_recovery():
     # 死区：总出向落在 [0.85, 1.0]×40 → 不动。
     feed_many(g, {"fe_main": 38.0})
     assert not g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
-    # 低了 → +5%×上限/步爬回；到顶退出动态（None = 全开）。
+    # 低了 → +5%×当前值/步（乘性）爬回；到顶退出动态（None = 全开）。
     feed_many(g, {"fe_main": 10.0})
     assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
-    assert g.current_instance() == pytest.approx(9.5)
+    assert g.current_instance() == pytest.approx(9.0 * 1.05)
     for _ in range(5):
         g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
     assert g.current_instance() is None
@@ -299,3 +301,63 @@ def test_instance_floor_anchors_to_landing():
         g.adjust_once([fe(quota=0.0)], {}, inst_target=40.0)
     # 旧语义下限 = 0.1×40 = 4.0；新语义 = max(0.1, 0.1×1.65) = 0.165。
     assert g.current_instance() == pytest.approx(0.165, rel=0.01)
+
+
+def test_instance_up_step_anchors_to_current_not_max():
+    """上调锚**当前值**（乘性），绝对步长下限 0.1Mbps。
+
+    回归：此前上调是 step_up×上限 的加性步。总闸落位后收敛在上限的
+    几十分之一刻度（ACK 杠杆），那一步等于一步翻倍——上冲过头→出向
+    猛涨→猛降回来，稳定的极限环（页面上带宽一会高一会低）。乘性锚
+    当前值后两个方向步长对称，流量稳定时收敛进死区不再折腾。"""
+    g = gov()
+    feed_many(g, {"fe_main": 200.0})
+    g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0,
+                  ingress_now_mbps=0.9)          # 落位 0.99
+    assert g.current_instance() == pytest.approx(0.99)
+    # 低了 → 上调一步：0.99 + max(0.1, 0.99×0.05) = 1.09（绝对下限
+    # 兜底生效）。旧算法是 0.99 + 0.05×10 = 1.49，一步 +50%。
+    feed_many(g, {"fe_main": 10.0})
+    assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
+    assert g.current_instance() == pytest.approx(1.09)
+    # 再上一步：1.09 + max(0.1, 0.0545) = 1.19——步幅跟着当前值的
+    # 刻度走，不会随上限/目标的刻度跳变。
+    assert g.adjust_once([fe(quota=0.0)], LIMITS, inst_target=40.0)
+    assert g.current_instance() == pytest.approx(1.19)
+
+
+# ---------------------------------------------------------------------------
+# 调节视图数据源
+# ---------------------------------------------------------------------------
+
+def test_regulation_view_exposes_all_loop_values():
+    """regulation_view 把两个环的全部调节量摊平（Mbps）：实例环的
+    目标/动态总闸/上限/观测/实测流入/落位标记 + 每个受调端口的
+    目标/动态上限/登记上限/观测。"""
+    g = gov()
+    feed_many(g, {"fe_main": 200.0})
+    g.adjust_once([fe(quota=40.0)], LIMITS, inst_target=50.0,
+                  ingress_now_mbps=2.0)
+    v = g.regulation_view([fe(quota=40.0)], LIMITS, inst_target=50.0)
+    i = v["instance"]
+    assert i["target_mbps"] == 50.0
+    assert i["gate_mbps"] == pytest.approx(2.2)       # 2.0×1.1 落位
+    assert i["gate_max_mbps"] == 10.0
+    assert i["ingress_mbps"] == 2.0                   # 最近一轮的实测缓存
+    assert i["egress_mbps"] == pytest.approx(200.0)
+    assert i["landed"] is True
+    f = v["frontends"]["fe_main"]
+    assert f["target_mbps"] == 40.0 and f["max_mbps"] == 10.0
+    assert f["cap_mbps"] == pytest.approx(9.0)        # 单端口环也收紧了
+    assert f["egress_mbps"] == pytest.approx(200.0)
+
+
+def test_regulation_view_none_when_no_loop_active():
+    """没实例目标、也没有任何"登记了入向上限 + 出向目标"的端口：没有
+    环在工作，返回 None（页面的调节视图卡保持隐藏）。"""
+    g = gov()
+    assert g.regulation_view([fe(quota=0.0)], LIMITS, inst_target=0.0) is None
+    # 没被调过的端口 cap_mbps=None（静态/全开），但视图照常给出。
+    v = g.regulation_view([fe(quota=40.0)], LIMITS, inst_target=0.0)
+    assert v["instance"] is None
+    assert v["frontends"]["fe_main"]["cap_mbps"] is None

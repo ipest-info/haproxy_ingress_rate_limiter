@@ -23,9 +23,14 @@ police 只掐请求流（体量远小于响应流），响应路径零排队—�
   - 超了（> high_ratio）：下调。降幅与超出比例成正比（超得越多降得
     越快）但**封顶 step_down_max**（默认单次最多 -10%），下限
     floor_ratio×上限（默认 10%——再低新请求基本进不来，等于误伤）。
-  - 低了（< low_ratio）：上调固定小步 step_up×上限（默认 +5%），
-    封顶回到登记的上限（request_limits.mbps）。流量退潮后入向上限
-    会逐步爬回全开。
+  - 低了（< low_ratio）：上调小步 step_up×**当前值**（默认 +5%，
+    绝对下限 0.1Mbps 免得贴地时爬不动），封顶回到登记的上限
+    （request_limits.mbps）。流量退潮后入向上限会逐步爬回全开。
+    上调必须锚定当前值而不是上限：入向因 ACK 杠杆比出向小一两个
+    数量级，动态值收敛在上限的几十分之一处，step_up×上限在那个
+    刻度上是一步翻倍的巨步——上冲过头→猛降回来→再上冲，稳定的
+    极限环（带宽一会高一会低，实测抓到）。两个方向都乘性锚定当前
+    值后步长对称，流量稳定时动态值收敛到死区内不动。
   - 变化小于 apply_epsilon（默认 2%）不下发：入向规则是整组重建的，
     琐碎变化只会白白清零 tc 统计。
 
@@ -69,7 +74,7 @@ class IngressGovConfig:
     # 死区下/上边界（相对出向目标的比例）。
     low_ratio: float = 0.85
     high_ratio: float = 1.0
-    # 上调步长（相对登记上限 max_mbps 的比例，加性）。
+    # 单次上调步长（相对当前值的比例，乘性；绝对下限 0.1Mbps）。
     step_up: float = 0.05
     # 单次下调的最大降幅（相对当前值的比例，乘性封顶）。
     step_down_max: float = 0.10
@@ -113,6 +118,10 @@ class IngressGovernor:
         self._inst_anchor: "float | None" = None
         # 全部 frontend 出向 mean10 之和（bytes/s），实例级环的观测值。
         self._mean_total = 0.0
+        # 最近一轮调节时的实测流入带宽（Mbps；None = 还没有实测）。
+        # 只为调节视图展示留的缓存：IFB 的速率测量是差分计数器，只能
+        # 有一个读者（run_governor），页面要看的话读这里的缓存。
+        self._last_ingress_mbps: "float | None" = None
 
     # ---- 监控循环的 sampler 链挂点（每拍一次） ----
 
@@ -162,6 +171,46 @@ class IngressGovernor:
                                                conn_rate=rl.conn_rate)
         return out
 
+    def regulation_view(self, frontends: list, limits: dict,
+                        inst_target: float = 0.0) -> "dict | None":
+        """调节视图的数据源（控制台快照的 regulation 字段，单位 Mbps）。
+
+        把闭环的全部调节量摆出来：实例级环的目标/动态总闸/上限/观测/
+        实测流入，以及每个受调端口的目标/动态上限/登记上限/观测。没有
+        任何环在工作（没实例目标也没受管端口）返回 None，页面的调节
+        视图卡保持隐藏。
+        """
+        targets = {f.name: f.quota_mbps for f in frontends if f.limited}
+        fes = {}
+        for name, rl in limits.items():
+            if rl.mbps <= 0:
+                continue
+            t = targets.get(name)
+            if not t or t <= 0:
+                continue
+            fes[name] = {
+                "target_mbps": t,
+                "max_mbps": rl.mbps,
+                # None = 没被调节过（静态值下发，等于全开到登记上限）。
+                "cap_mbps": self._cur.get(name),
+                "egress_mbps": round(
+                    self._mean.get(name, 0.0) * 8 / 1e6, 3),
+            }
+        inst = None
+        if self._instance_capable and inst_target and inst_target > 0:
+            inst = {
+                "target_mbps": inst_target,
+                # None = 全开（生效值即 gate_max_mbps）。
+                "gate_mbps": self._cur_inst,
+                "gate_max_mbps": self._instance_max(limits, inst_target),
+                "ingress_mbps": self._last_ingress_mbps,
+                "egress_mbps": round(self._mean_total * 8 / 1e6, 3),
+                "landed": self._inst_anchor is not None,
+            }
+        if inst is None and not fes:
+            return None
+        return {"instance": inst, "frontends": fes}
+
     # ---- 调节 ----
 
     def adjust_once(self, frontends: list, limits: dict,
@@ -175,6 +224,8 @@ class IngressGovernor:
         面实测的当前入向线上速率（IFB 根 qdisc 差分；None = 没有实测）
         ——总闸首次收紧时的落位参考。
         """
+        if ingress_now_mbps is not None:
+            self._last_ingress_mbps = ingress_now_mbps
         if degraded:
             # 采样失联：mean10 是陈旧值，按它调只会调错。保持现状。
             return False
@@ -209,11 +260,17 @@ class IngressGovernor:
                            (ratio - self._cfg.high_ratio) * 0.5)
                 new = max(floor, cur * (1.0 - down))
             elif ratio < self._cfg.low_ratio and cur < max_mbps:
-                new = min(max_mbps, cur + max_mbps * self._cfg.step_up)
+                # 乘性上调锚当前值（与下调对称），绝对步长下限 0.1Mbps
+                # ——纯乘性在贴地的动态值上永远迈不过 apply_epsilon。
+                new = min(max_mbps,
+                          cur + max(0.1, cur * self._cfg.step_up))
             else:
                 continue                      # 死区（或已到顶）
 
-            if abs(new - cur) < cur * self._cfg.apply_epsilon:
+            # epsilon 不拦"封顶回上限"的最后一步：那一步的语义是退出
+            # 动态、回到静态全开，不放行的话乘性上调的末步永远小于
+            # epsilon，动态值会永远卡在上限脚下差一口气。
+            if new < max_mbps and abs(new - cur) < cur * self._cfg.apply_epsilon:
                 continue                      # 变化太小，不值得重建规则
             self._cur[name] = new
             changed = True
@@ -270,8 +327,17 @@ class IngressGovernor:
                                  if self._inst_anchor is not None else floor)
                     new = max(floor_eff, cur * (1.0 - down))
             elif ratio < self._cfg.low_ratio and cur < max_inst:
-                new = min(max_inst, cur + max_inst * self._cfg.step_up)
-            if new != cur and abs(new - cur) >= cur * self._cfg.apply_epsilon:
+                # 同单端口环：乘性上调锚当前值。没登记 request_limits 时
+                # max_inst 退化为出向目标，总闸收敛在它的几十分之一
+                # （ACK 杠杆），step_up×max_inst 在那个刻度上是一步翻倍
+                # 的巨步——上冲→出向猛涨→猛降，极限环（实测抓到：出向
+                # 在目标上下来回摆）。
+                new = min(max_inst,
+                          cur + max(0.1, cur * self._cfg.step_up))
+            # 同单端口环：封顶回上限（=退出动态、全开）的最后一步不受
+            # epsilon 拦截。
+            if new != cur and (new >= max_inst or
+                               abs(new - cur) >= cur * self._cfg.apply_epsilon):
                 self._cur_inst = None if new >= max_inst else new
                 changed = True
                 self._log.info(
