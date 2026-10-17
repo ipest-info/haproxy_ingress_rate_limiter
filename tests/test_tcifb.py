@@ -202,6 +202,30 @@ async def test_instance_bits_builds_hierarchy_with_all_frontends():
     assert all("1:ffff" in c for c in f.muts("class", "add", "1:1f90"))
 
 
+# 与 8Mbit 总闸一致的 IFB 实况：层级结构齐全（兜底/总闸/端口类 + 分类
+# 规则），只差速率时走原位变更。
+INST_CLASSES_8M = """\
+class htb 1:1 root prio 0 rate 100Gbit ceil 100Gbit burst 8Mb cburst 8Mb
+class htb 1:ffff root prio 0 rate 8Mbit ceil 8Mbit burst 10000b cburst 10000b
+class htb 1:1f90 parent 1:ffff leaf 1f90: prio 0 rate 8Mbit ceil 8Mbit burst 10000b cburst 10000b
+"""
+
+
+async def test_instance_gate_change_goes_in_place():
+    """总闸动态值变化（闭环每轮调整的常态）→ IFB 上原位 class change，
+    **绝不整树重建**。
+
+    事故回归：旧实现每轮调整都 qdisc del root + 整树重建，rtnetlink
+    事件风暴反复触发宿主机 systemd-networkd 的断言崩溃（hashmap.c
+    core dump），其重启抖断业务网卡。见 tcshaper.instance_change_cmds。"""
+    sh, f = shaper(redirect_out=REDIRECT_PRESENT, classes=INST_CLASSES_8M)
+    res = await sh.reconcile([fe()], LIMITS, instance_bits=int(9e6))
+    assert res.ok and res.changed
+    assert f.muts("class", "change", IFB)
+    assert not f.muts("qdisc", "del"), f.muts("qdisc", "del")
+    assert not f.muts("class", "add")
+
+
 async def test_instance_bits_without_rules_keeps_running():
     """只有实例目标、一个 request_limits 都没登记：不是 teardown——
     总闸本身就是执行面，全部端口挂进去只受总闸管。"""
