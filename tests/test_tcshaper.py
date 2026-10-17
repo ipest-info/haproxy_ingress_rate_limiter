@@ -707,21 +707,75 @@ async def test_instance_mode_consistent_state_is_noop():
     assert fake.mutations() == []
 
 
-async def test_instance_mode_quota_change_rebuilds_not_rate_change():
-    """层级模式下改任何限额都整树重建：各类的保证值按比例联动，逐个
-    class change 会经过"父子约束被破坏"的中间态。"""
+async def test_instance_mode_quota_change_is_in_place():
+    """层级模式下结构没变、只有端口限额变了 → 原位 class change，
+    **绝不整树重建**。
+
+    回归（一次生产事故）：旧实现"任何差异都整树重建"，闭环每轮调整
+    都触发 qdisc del root + 整树重建的 rtnetlink 事件风暴，反复触发
+    宿主机 systemd-networkd 的断言崩溃（hashmap.c core dump），其
+    重启抖断业务网卡。"""
     sh, fake = shaper(classes=INST_CLASSES_OK, filters=FILTERS_OK)
     res = await sh.reconcile([fe(port=8080, quota=80.0)], INST)
-    assert res.ok and res.changed and res.action == "rebuild"
+    assert res.ok and res.changed and res.action == "rate-change"
     cmds = [" ".join(c) for c in fake.mutations()]
-    assert not any("class change" in c for c in cmds), "层级模式没有快路径"
+    assert all("class change" in c for c in cmds), cmds
+    assert not any("qdisc del" in c for c in cmds), cmds
+    # 端口类挂在聚合父类下，父类本身没漂移不动它。
+    assert any("parent 1:ffff classid 1:1f90 htb" in c for c in cmds), cmds
+    assert not any("classid 1:ffff htb" in c for c in cmds), cmds
 
 
-async def test_instance_quota_change_rebuilds():
-    """总限速本身变了同样重建（父类 ceil 与全部保证值都要重算）。"""
+async def test_instance_quota_change_is_in_place_parent_only():
+    """总闸值变了（闭环每轮调整的常态）而端口布局不变 → 只 change
+    聚合父类一条命令。"""
     sh, fake = shaper(classes=INST_CLASSES_OK, filters=FILTERS_OK)
     res = await sh.reconcile([fe(port=8080, quota=40.0)], INST * 2)
+    assert res.ok and res.changed and res.action == "rate-change"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    assert len(cmds) == 1 and "class change" in cmds[0], cmds
+    assert "classid 1:ffff htb" in cmds[0], cmds
+
+
+async def test_instance_in_place_order_shrink_children_first():
+    """收紧（新总闸更小）：先改子类再改父类——不经过"子类保证值之和
+    大于父类 rate"的超卖中间态。"""
+    sh, fake = shaper(classes=INST_CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile([fe(port=8080, quota=30.0)], INST // 2)
+    assert res.ok and res.action == "rate-change"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    assert len(cmds) == 2, cmds
+    assert "classid 1:1f90" in cmds[0], cmds     # 子类在前
+    assert "classid 1:ffff" in cmds[1], cmds     # 父类在后
+
+
+async def test_instance_in_place_order_grow_parent_first():
+    """放宽（新总闸更大）：先父后子，同样避开超卖中间态。"""
+    sh, fake = shaper(classes=INST_CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile([fe(port=8080, quota=60.0)], INST * 2)
+    assert res.ok and res.action == "rate-change"
+    cmds = [" ".join(c) for c in fake.mutations()]
+    assert len(cmds) == 2, cmds
+    assert "classid 1:ffff" in cmds[0], cmds     # 父类在前
+    assert "classid 1:1f90" in cmds[1], cmds
+
+
+async def test_instance_structure_change_still_rebuilds():
+    """结构变了（新增端口）→ 仍整树重建：原位路径只处理速率漂移。"""
+    sh, fake = shaper(classes=INST_CLASSES_OK, filters=FILTERS_OK)
+    res = await sh.reconcile(
+        [fe(port=8080, quota=40.0), fe(name="fe_b", port=9090, quota=10.0)],
+        INST)
     assert res.ok and res.changed and res.action == "rebuild"
+
+
+async def test_instance_in_place_failure_is_loud():
+    """原位变更命令失败 → ok=False + error（下一轮兜底重试），
+    不假装成功。"""
+    sh, fake = shaper(classes=INST_CLASSES_OK, filters=FILTERS_OK,
+                      fail_on=("class change",))
+    res = await sh.reconcile([fe(port=8080, quota=40.0)], INST * 2)
+    assert not res.ok and res.error
 
 
 async def test_legacy_nic_tree_is_rebuilt():
