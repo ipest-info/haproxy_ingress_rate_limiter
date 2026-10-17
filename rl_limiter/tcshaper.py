@@ -478,6 +478,39 @@ def rate_change_cmd(iface: str, port: int, rate_bits_per_s: int) -> list[str]:
             "classid", classid_for(port), "htb", *_htb_rate_args(rate_bits_per_s)]
 
 
+def instance_change_cmds(iface: str, instance_bits: int,
+                         parent_drifted: bool,
+                         drifted_ports: dict[int, tuple[int, int]],
+                         shrinking: bool) -> list[list[str]]:
+    """层级模式的原位变更命令序列（结构不动，只 `tc class change`）。
+
+    这条路径是一次生产事故换来的，别退回"任何差异都整树重建"：整树
+    重建 = `qdisc del root` + 重建全部类/过滤器，一瞬间几十条 rtnetlink
+    消息——闭环每轮调整都重建的话，这个事件风暴反复触发宿主机
+    systemd-networkd 的已知断言崩溃（hashmap.c core dump），它重启时
+    的链路重配置会抖断业务网卡；重建还清零 tc 统计、有瞬时丢包风险。
+    原位变更每轮只有 N+1 条轻量消息，且统计连续。
+
+    顺序有讲究：HTB 的聚合上限依赖"子类保证值之和 ≤ 父类 rate"，
+    **收紧**（新总闸更小）先改子类再改父类、**放宽**先父后子——两个
+    方向都不会出现"保证值超卖"的瞬间窗口。
+    """
+    parent_cid = classid_for(INSTANCE_PARENT_MINOR)
+    parent_cmd = ["tc", "class", "change", "dev", iface,
+                  "parent", ROOT_HANDLE, "classid", parent_cid, "htb",
+                  *_htb_rate_args(instance_bits)]
+    port_cmds = [
+        ["tc", "class", "change", "dev", iface, "parent", parent_cid,
+         "classid", classid_for(port), "htb",
+         *_htb_rate_ceil_args(rate, ceil)]
+        for port, (rate, ceil) in sorted(drifted_ports.items())]
+    if not parent_drifted:
+        return port_cmds
+    if shrinking:
+        return port_cmds + [parent_cmd]
+    return [parent_cmd] + port_cmds
+
+
 # `tc class show` 的一行形如（端口 8080 = 0x1f90）：
 #   class htb 1:1f90 root prio 0 rate 40Mbit ceil 40Mbit burst 50000b cburst 50000b
 #
@@ -819,39 +852,72 @@ class TcShaper:
                                   cbursts: dict[int, int],
                                   filtered: set[int],
                                   ceils: dict[int, int]) -> TcResult:
-        """层级模式的收敛：一致就不动，任何差异都整树重建。
+        """层级模式的收敛：结构一致只做原位变更，结构变了才整树重建。
+
+        **结构**（端口类/过滤器集合、聚合父类与兜底类的存在、兜底类的
+        速率与 cburst）一致时，速率层面的漂移——总闸值变了（闭环每轮
+        调整的常态）、端口限额变了、cburst 偏小——全部走
+        `tc class change` 原位修（`_htb_rate*_args` 会把 burst/cburst
+        一起重写）。例行调整绝不能整树重建：代价与事故教训见
+        instance_change_cmds 的注释。
 
         比对的是 **ceil**（等于 min(限额, 总限速)，稳定）加 rate（缩放
         出来的保证值——instance_layout 是确定性的，同一份配置算出的
         rate 每次都一样，所以也能精确比）。cburst 只判偏小，理由同平铺
-        模式。兜底类按平铺口径核（线速 + cburst）：从旧版"网卡总限速"
-        树升级上来时它的 rate 是缩放值，正好判不一致触发重建换到新结构。
+        模式。兜底类按平铺口径核（线速 + cburst）且归入**结构**：它不
+        挂在总闸下，原位路径不碰它，不一致只能靠重建修——从旧版"网卡
+        总限速"树升级上来时它的 rate 是缩放值，正好触发重建换到新结构。
         """
         ports_layout = instance_layout(frontends, instance_bits)
         want_ports = set(ports_layout)
         have_ports = set(classes) - {DEFAULT_CLASS_MINOR,
                                      INSTANCE_PARENT_MINOR}
-        consistent = (
+        structure_ok = (
             DEFAULT_CLASS_MINOR in classes
             and INSTANCE_PARENT_MINOR in classes
             and have_ports == want_ports
             and filtered == want_ports
-            and classes.get(INSTANCE_PARENT_MINOR) == instance_bits
-            and ceils.get(INSTANCE_PARENT_MINOR) == instance_bits
             and classes.get(DEFAULT_CLASS_MINOR) == DEFAULT_CLASS_RATE_BPS
-            and not _cburst_too_small(cbursts.get(INSTANCE_PARENT_MINOR),
-                                      instance_bits)
             and not _cburst_too_small(cbursts.get(DEFAULT_CLASS_MINOR),
                                       DEFAULT_CLASS_RATE_BPS)
         )
-        if consistent:
-            for port, (rate, ceil) in ports_layout.items():
+        if structure_ok:
+            parent_drifted = (
+                classes.get(INSTANCE_PARENT_MINOR) != instance_bits
+                or ceils.get(INSTANCE_PARENT_MINOR) != instance_bits
+                or _cburst_too_small(cbursts.get(INSTANCE_PARENT_MINOR),
+                                     instance_bits))
+            drifted_ports = {
+                port: (rate, ceil)
+                for port, (rate, ceil) in ports_layout.items()
                 if (classes.get(port) != rate or ceils.get(port) != ceil
-                        or _cburst_too_small(cbursts.get(port), ceil)):
-                    consistent = False
-                    break
-        if consistent:
-            return TcResult(ok=True, changed=False, frontends=names)
+                    or _cburst_too_small(cbursts.get(port), ceil))}
+            if not parent_drifted and not drifted_ports:
+                return TcResult(ok=True, changed=False, frontends=names)
+            shrinking = (classes.get(INSTANCE_PARENT_MINOR) or 0) \
+                > instance_bits
+            try:
+                for argv in instance_change_cmds(
+                        self.iface, instance_bits, parent_drifted,
+                        drifted_ports, shrinking):
+                    await self._tc(argv)
+            except TcError as e:
+                self._log.error(
+                    "tc 层级限速原位调整失败，**限速可能未按新配置生效**，"
+                    "将在下一轮重试 iface=%s instance_quota=%dbit err=%s",
+                    self.iface, instance_bits, e)
+                return TcResult(ok=False, changed=False, frontends=names,
+                                error=str(e))
+            self._log.warning(
+                "已就地调整 tc 层级限速（未重建队列树，统计连续、存量"
+                "连接立刻按新限额跑） iface=%s 总闸=%dbit%s changed=%s",
+                self.iface, instance_bits,
+                "（已改）" if parent_drifted else "（未动）",
+                ";".join(f"{p:x}={r}/{c}bit"
+                         for p, (r, c) in sorted(drifted_ports.items()))
+                or "(仅总闸)")
+            return TcResult(ok=True, changed=True, frontends=names,
+                            action="rate-change")
 
         try:
             for argv, fatal in _instance_rebuild_cmds(self.iface, frontends,
