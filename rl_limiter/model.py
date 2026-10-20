@@ -350,6 +350,24 @@ class ControllerConfig:
 
 
 @dataclass(**SLOTS)
+class LvsConfig:
+    """本机 LVS（IPVS）director 的接线（基础设施配置，启动时定型）。
+
+    与 NodeConfig（HAProxy 形态）对位：LVS 的采样与受管清单都来自
+    内核（/proc/net/ip_vs* + ipvsadm），没有 socket / 配置文件路径可
+    配——唯一的外部依赖是 ipvsadm 可执行文件。
+    """
+
+    name: str = "lvs"             # 展示名（日志/页面）
+    ipvsadm_path: str = "ipvsadm"  # ipvsadm 可执行文件（默认 PATH 查找）
+    timeout_s: float = 0.5        # 单次 ipvsadm 子进程超时
+
+    def endpoint(self) -> str:
+        """人类可读的采样端点描述（与 NodeConfig.endpoint 同用途）。"""
+        return "ipvs:/proc/net/ip_vs"
+
+
+@dataclass(**SLOTS)
 class NodeConfig:
     """本机 HAProxy 的连接配置（基础设施配置，启动时定型）。
 

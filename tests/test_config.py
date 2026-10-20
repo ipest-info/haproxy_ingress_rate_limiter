@@ -1,8 +1,8 @@
 # tests.test_config —— 配置解析/默认值/校验（YAML = 接线 + 限额登记）。
 #
-# 负载均衡配置（监听端口、模式、后端服务器）**不在 YAML 里**——那些以
-# haproxy.cfg 为唯一权威（解析见 tests/test_cfgparse.py）。这里只覆盖
-# YAML 自身的三类内容：haproxy 接线段、quotas 限额登记、运行参数。
+# 受管清单（虚拟服务 VIP:端口）**不在 YAML 里**——那些以内核 IPVS
+# 实况表为唯一权威（见 tests/test_ipvs.py）。这里只覆盖 YAML 自身的
+# 三类内容：lvs 接线段、quotas 限额登记、运行参数。
 # 每条拒绝路径都用 match 断言把"错误信息要点名字段"这一契约固定下来——
 # 运维应当不必翻代码就能改对。
 
@@ -17,14 +17,13 @@ from rl_limiter import config, model
 VALID = """\
 log_level: debug
 tick_interval_s: 1.0
-haproxy:
-  name: haproxy
-  socket_path: /run/haproxy/admin.sock
-  cfg_path: /etc/haproxy/haproxy.cfg
+lvs:
+  name: lvs-director-1
+  ipvsadm_path: /usr/sbin/ipvsadm
   timeout_ms: 250
 quotas:
-  fe_main: 40
-  fe_api: 8.5
+  vs_10.0.0.1_8080: 40
+  vs_10.0.0.1_8443: 8.5
 """
 
 
@@ -34,25 +33,27 @@ def load_from(tmp_path, text=VALID):
     return config.load(str(p))
 
 
-def minimal(hap="{socket_path: /run/h.sock, cfg_path: /etc/haproxy/haproxy.cfg}",
-            quotas="{fe_a: 8}", extra=""):
-    return f"haproxy: {hap}\nquotas: {quotas}\n{extra}"
+def minimal(lvs=None, quotas="{fe_a: 8}", extra=""):
+    head = f"lvs: {lvs}\n" if lvs is not None else ""
+    return f"{head}quotas: {quotas}\n{extra}"
 
 
 def test_load_full_config(tmp_path):
     cfg = load_from(tmp_path)
     assert cfg.log_level == "debug"
-    assert cfg.haproxy.socket_path == "/run/haproxy/admin.sock"
-    assert cfg.haproxy.cfg_path == "/etc/haproxy/haproxy.cfg"
-    assert cfg.haproxy.timeout_s == 0.25          # ms → s
-    assert cfg.quotas == {"fe_main": 40.0, "fe_api": 8.5}
+    assert cfg.lvs.name == "lvs-director-1"
+    assert cfg.lvs.ipvsadm_path == "/usr/sbin/ipvsadm"
+    assert cfg.lvs.timeout_s == 0.25              # ms → s
+    assert cfg.quotas == {"vs_10.0.0.1_8080": 40.0,
+                          "vs_10.0.0.1_8443": 8.5}
 
 
 def test_defaults_filled(tmp_path):
     cfg = load_from(tmp_path, minimal())
     assert cfg.log_level == config.DEFAULT_LOG_LEVEL
     assert cfg.tick_interval_s == config.DEFAULT_TICK_INTERVAL_S
-    assert cfg.haproxy.timeout_s == config.DEFAULT_TIMEOUT_MS / 1000.0
+    assert cfg.lvs.name == "lvs" and cfg.lvs.ipvsadm_path == "ipvsadm"
+    assert cfg.lvs.timeout_s == config.DEFAULT_TIMEOUT_MS / 1000.0
 
 
 def test_empty_quotas_is_valid(tmp_path):
@@ -106,45 +107,47 @@ def test_tick_interval_locked_to_one_second(tmp_path):
 def test_error_message_contains_path(tmp_path):
     """所有校验错误都要带上配置文件路径，方便多配置文件部署时定位。"""
     p = tmp_path / "config.yaml"
-    p.write_text("log_level: loud\nhaproxy: {socket_path: /run/h.sock, "
-                 "cfg_path: /etc/haproxy/haproxy.cfg}\n", encoding="utf-8")
+    p.write_text("log_level: loud\nquotas: {}\n", encoding="utf-8")
     with pytest.raises(ValueError, match=str(p)):
         config.load(str(p))
 
 
 # ---------------------------------------------------------------------------
-# HAProxy 接线段（采样通道二选一 + cfg_path 必填）
+# LVS 接线段（字段极少：采样与清单都来自内核）
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("hap,match", [
-    ("{socket_path: /run/h.sock, host: 10.0.0.1, port: 9999, "
-     "cfg_path: /etc/haproxy/haproxy.cfg}", r"只能二选一"),
-    ("{cfg_path: /etc/haproxy/haproxy.cfg}", r"host 不能为空"),
-    ("{socket_path: run/h.sock, cfg_path: /etc/haproxy/haproxy.cfg}",
-     r"必须是绝对路径"),
-    ("{socket_path: /" + "x" * 120 + ", cfg_path: /etc/haproxy/haproxy.cfg}",
-     r"过长"),
-    ("{socket_path: /run/h.sock}", r"cfg_path 不能为空"),
-    ("{socket_path: /run/h.sock, cfg_path: etc/haproxy.cfg}",
-     r"cfg_path 必须是绝对路径"),
+@pytest.mark.parametrize("lvs,match", [
+    ("{name: 'bad name'}", r"lvs.name 非法"),
+    ("{ipvsadm_path: ''}", r"ipvsadm_path 不能为空"),
+    ("{timeout_ms: abc}", r"timeout_ms 必须是整数"),
+    ("{nope: 1}", r"不认识的键"),
+    ("[a]", r"lvs 必须是键值映射"),
 ])
-def test_haproxy_wiring_validation(tmp_path, hap, match):
+def test_lvs_wiring_validation(tmp_path, lvs, match):
     with pytest.raises(ValueError, match=match):
-        load_from(tmp_path, minimal(hap=hap))
+        load_from(tmp_path, minimal(lvs=lvs))
 
 
-def test_tcp_wiring_accepted(tmp_path):
-    """远程只读观测形态：填 host/port 走内网 TCP。"""
-    cfg = load_from(tmp_path, minimal(
-        hap="{host: 10.0.0.11, port: 9999, cfg_path: /etc/haproxy/haproxy.cfg}"))
-    assert cfg.haproxy.is_unix is False
-    assert cfg.haproxy.endpoint() == "10.0.0.11:9999"
+def test_lvs_section_fully_optional(tmp_path):
+    """lvs 段可整段省略：全部字段有默认值（采样来源是内核，没有必填
+    的接线信息）。"""
+    cfg = load_from(tmp_path, "quotas: {}\n")
+    assert cfg.lvs.endpoint() == "ipvs:/proc/net/ip_vs"
+
+
+def test_haproxy_section_rejected_with_migration_hint(tmp_path):
+    """HAProxy 形态的接线段在 LVS 分支必须显式拒绝并指路——静默忽略
+    会让运维以为 stats socket 还在被使用。"""
+    with pytest.raises(ValueError) as ei:
+        load_from(tmp_path, "haproxy: {socket_path: /run/h.sock}\n")
+    msg = str(ei.value)
+    assert "haproxy" in msg and "lvs" in msg and "ip_vs" in msg
 
 
 def test_shipped_example_config_is_valid():
     """随仓库发布的示例配置必须能被真实加载——它是运维的起点。"""
     cfg = config.load("deploy/config/limiter.example.yaml")
-    assert cfg.haproxy.cfg_path.startswith("/")
+    assert cfg.lvs.ipvsadm_path
     assert cfg.quotas, "示例配置应至少演示一条限额登记"
 
 

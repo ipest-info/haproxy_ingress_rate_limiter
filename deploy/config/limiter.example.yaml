@@ -1,23 +1,26 @@
-# rl-limiter YAML 配置示例（安装到 /etc/rl-limiter/config.yaml，-c 指定）。
+# rl-limiter YAML 配置示例（LVS 形态；安装到 /etc/rl-limiter/config.yaml）。
 #
-# 架构要点（单 HAProxy 模型）：一个 rl-limiter 实例管**一台**与它同机的
-# HAProxy。**haproxy.cfg 是负载均衡配置的唯一权威**——监听端口、模式、
-# 后端服务器由运维直接写在 cfg 里并自行 reload；rl-limiter 只**读** cfg
-# （cfg_path），解析出 frontend/listen 清单，与下面 quotas 登记的限额
-# 合并后：
-#   - 把限额下发到本机网卡的内核 tc（HTB，按监听端口分类）——真实限速；
-#   - 每秒经 stats socket 采样各 frontend 的带宽，做持续超限告警。
+# 架构要点：一个 rl-limiter 实例管**一台**与它同机的 LVS（IPVS）
+# director（NAT/FULLNAT 模式）。**内核 IPVS 实况表是受管清单的唯一
+# 权威**——虚拟服务（VIP:端口）由 keepalived / ipvsadm 维护；
+# rl-limiter 只**读**内核（/proc/net/ip_vs + ipvsadm --stats），把
+# 清单与下面 quotas 登记的限额合并后：
+#   - 把限额下发到本机网卡的内核 tc（HTB，按虚拟服务端口分类）；
+#   - 每秒采样各虚拟服务的带宽，做持续超限告警。
 #
 # 这份 YAML 因此只有四类内容：
-#   1. haproxy 段——本机 HAProxy 的接线（stats socket + cfg 路径）；
-#   2. quotas 段——限额登记（frontend 名 → Mbps）；
+#   1. lvs 段——接线（可整段省略，字段都有默认值）；
+#   2. quotas 段——限额登记（虚拟服务合成名 vs_<VIP>_<端口> → Mbps）；
 #   3. instance_quota_mbps——可选的实例总限速；
 #   4. 运行参数（log_level、tick_interval_s）。
 #
-# 热更新：运行期轮询本文件与 haproxy.cfg 的内容（默认 5s），quotas/
-# instance_quota_mbps 或 cfg 内容变化即热生效（改 cfg 后记得 reload HAProxy；
-# rl-limiter 会自动跟上）。haproxy 接线段与 log_level 启动时定型，改了
-# 需重启本服务。
+# 热更新：运行期轮询本文件与内核 IPVS 表（默认 5s），quotas/
+# instance_quota_mbps 或虚拟服务增删即热生效。lvs 接线段与 log_level
+# 启动时定型，改了需重启本服务。
+#
+# 主备（keepalived VRRP）：两台 director 都装 rl-limiter、用同一份
+# 本文件。keepalived 的 virtual_server 在主备都进内核表，所以备机的
+# 受管清单与主机一致、tc 规则常驻空转，VIP 漂移即生效（docs/11）。
 #
 # 除了直接编辑本文件，限额（quotas / instance_quota_mbps）也可以经控制台页面
 # 或带鉴权的写 API 修改（需设 RL_API_TOKEN，见 docs/07）——那条路最终
@@ -30,44 +33,31 @@ log_level: info                 # debug | info | warn | error
 tick_interval_s: 1.0            # 采样节拍（秒）；只支持 1.0，见校验说明
 
 # ---------------------------------------------------------------------------
-# 本机 HAProxy 的接线。重启生效。
-#
-# 采样通道二选一（校验强制恰好给一种）：
-#   - socket_path（**同机部署，推荐**）：本机 unix stats socket 绝对路径。
-#     haproxy.cfg 的 global 段需有：
-#       stats socket /run/haproxy/admin.sock mode 660 level user
-#     不占任何网络端口，访问权由文件属主/属组控制。
-#   - host + port（远程只读观测）：内网 TCP stats socket。
-#       stats socket ipv4@<内网IP>:9999 level user
-#     注意这种形态下 rl-limiter 不在 HAProxy 本机，**无法做 tc 限速**
-#     （tc 作用在本机网卡上），一般只用于纯监控。
-#
-# cfg_path 必填：受管 frontend 清单（监听端口、模式）从这份 cfg 解析。
-# 采样还要求 cfg 的 defaults 段带 `option contstats`——否则长连接的字节
-# 数只在会话结束时一次性入账，秒级带宽曲线会脉冲式跳变。
+# 本机 LVS（IPVS）接线。重启生效。全部字段可省略（整段不写也行）：
+# 采样与受管清单都来自内核，没有 socket/配置文件路径要配，唯一外部
+# 依赖是 ipvsadm 可执行文件（读 --stats 的按服务字节数用）。
 # ---------------------------------------------------------------------------
-haproxy:
-  name: haproxy                 # 实例名（日志/控制台展示用）
-  socket_path: /run/haproxy/admin.sock
-  cfg_path: /etc/haproxy/haproxy.cfg
-  timeout_ms: 500               # 单次 runtime API 命令超时（连接 + 读写）
-  # 远程观测形态改用（与 socket_path 二选一，不可混填）：
-  # host: 10.0.0.11
-  # port: 9999
+lvs:
+  name: lvs-director-1          # 展示名（日志/控制台）
+  # ipvsadm_path: /usr/sbin/ipvsadm   # 默认 PATH 查找
+  # timeout_ms: 500                   # 单次 ipvsadm 子进程超时
 
 # ---------------------------------------------------------------------------
-# 限额登记：frontend 名（= haproxy.cfg 里 frontend/listen 段的名字）→
-# 限额（Mbps，≥ 0）。
+# 限额登记：虚拟服务合成名 vs_<VIP>_<端口>（内核表里每个 VIP:端口
+# 自动对应一个）→ 限额（Mbps，≥ 0）。
 #
-#   - cfg 里有、这里登记了正限额 → 限速（tc）+ 监控 + 超限告警；
-#   - cfg 里有、这里没登记 → **只监控不限速**（启动时会 warn 一次）；
-#   - cfg 里有、这里**显式写 0** → 同样不限速，但不再 warn——这是
-#     "运维确认过不限速"的正规写法（临时解除限速且保留登记行）；
-#   - 这里登记、cfg 里没有 → 该条目被忽略并 warn（段被删了或名字拼错）。
+#   - 表里有、这里登记了正限额 → 限速（tc）+ 监控 + 超限告警；
+#   - 表里有、这里没登记 → **只监控不限速**（启动时会 warn 一次）；
+#   - 表里有、这里**显式写 0** → 同样不限速，但不再 warn——这是
+#     "运维确认过不限速"的正规写法；
+#   - 这里登记、表里没有 → 该条目被忽略并 warn（服务被删或名字拼错）。
+#
+# v1 边界：多个 VIP 共用同一端口时 tc 无法按源端口区分，只有名序第一
+# 个服务参与限速、其余只监控（启动 error 点名，见 docs/11）。
 # ---------------------------------------------------------------------------
 quotas:
-  fe_main: 40                   # 40 Mbps
-  fe_api: 8                     # 8 Mbps
+  vs_10.0.0.1_8080: 40          # 40 Mbps
+  vs_10.0.0.1_8443: 8           # 8 Mbps
 
 # ---------------------------------------------------------------------------
 # 实例总限速（可选，Mbps）：本机 HAProxy 全部 frontend 出向流量合计的

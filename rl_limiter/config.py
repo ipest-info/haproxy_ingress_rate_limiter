@@ -75,7 +75,8 @@ class ServiceConfig:
     dynamic_ingress: "ingressgov.IngressGovConfig" = field(
         default_factory=lambda: ingressgov.IngressGovConfig())
     # 本机 HAProxy 的接线（stats socket + cfg 路径）。
-    haproxy: model.NodeConfig = field(default_factory=model.NodeConfig)
+    # 本机 LVS（IPVS）接线。采样与受管清单都来自内核实况，字段很少。
+    lvs: model.LvsConfig = field(default_factory=model.LvsConfig)
     # 限额登记：frontend 名 → 限额（Mbps，≥ 0；0 = 显式不限速）。
     quotas: dict[str, float] = field(default_factory=dict)
 
@@ -148,7 +149,14 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
             f"instance_quota_mbps 必须是数字（Mbps），"
             f"当前值 {inst_raw!r}") from None
 
-    cfg.haproxy = _parse_haproxy(raw.get("haproxy") or {})
+    # HAProxy 形态的接线段在 LVS 分支不存在：静默忽略会让运维以为
+    # stats socket 还在被使用。显式拒绝并指路。
+    if "haproxy" in raw:
+        raise ValueError(
+            "字段 'haproxy' 在 LVS 形态下不存在——采样与受管清单均来自"
+            "内核 IPVS（/proc/net/ip_vs + ipvsadm），接线改在 'lvs' 段"
+            "配置（可省略，全部字段有默认值）")
+    cfg.lvs = _parse_lvs(raw.get("lvs") or {})
 
     req_raw = raw.get("request_limits") or {}
     if not isinstance(req_raw, dict):
@@ -225,35 +233,33 @@ def _parse_dynamic_ingress(d: Any) -> ingressgov.IngressGovConfig:
     return g
 
 
-def _parse_haproxy(h: Any) -> model.NodeConfig:
-    """解析本机 HAProxy 的接线段。"""
+def _parse_lvs(h: Any) -> model.LvsConfig:
+    """解析本机 LVS（IPVS）的接线段。全部字段可省略。"""
     if not isinstance(h, dict):
         raise ValueError(
-            f"haproxy 必须是键值映射，实际是 {type(h).__name__}")
-
-    port_raw = h.get("port", 0) or 0
-    try:
-        port = int(port_raw)
-    except (TypeError, ValueError):
-        raise ValueError(f"haproxy.port 必须是整数，当前值 {port_raw!r}") from None
-
+            f"lvs 必须是键值映射，实际是 {type(h).__name__}")
+    known = {"name", "ipvsadm_path", "timeout_ms"}
+    unknown = set(h) - known
+    if unknown:
+        raise ValueError(
+            f"lvs 有不认识的键 {sorted(unknown)}，可用：{sorted(known)}")
     timeout_raw = h.get("timeout_ms", DEFAULT_TIMEOUT_MS)
     try:
         timeout_ms = int(timeout_raw)
     except (TypeError, ValueError):
         raise ValueError(
-            f"haproxy.timeout_ms 必须是整数，当前值 {timeout_raw!r}") from None
-    # 非正超时若穿透到网络层会让每次采样立即失败，按缺失处理回落默认值。
+            f"lvs.timeout_ms 必须是整数，当前值 {timeout_raw!r}") from None
+    # 非正超时会让每次 ipvsadm 调用立即失败，按缺失处理回落默认值。
     if timeout_ms <= 0:
         timeout_ms = DEFAULT_TIMEOUT_MS
-
-    return model.NodeConfig(
-        name=str(h.get("name", "haproxy") or "haproxy").strip(),
-        host=str(h.get("host", "") or "").strip(),
-        port=port,
+    return model.LvsConfig(
+        name=str(h.get("name", "lvs") or "lvs").strip(),
+        # 显式写空字符串交给校验拒绝（静默回落默认值会掩盖笔误）；
+        # null/缺失才回落默认。
+        ipvsadm_path=str(h["ipvsadm_path"]).strip()
+        if h.get("ipvsadm_path") is not None and "ipvsadm_path" in h
+        else "ipvsadm",
         timeout_s=timeout_ms / 1000.0,
-        socket_path=str(h.get("socket_path", "") or "").strip(),
-        cfg_path=str(h.get("cfg_path", "") or "").strip(),
     )
 
 
@@ -275,7 +281,7 @@ def _validate(cfg: ServiceConfig) -> None:
             f"速率差分与 10 秒窗口、超限持续秒数均以「1 拍 = 1 秒」为前提，"
             f"改成别的值会让速率口径与告警阈值整体失真")
 
-    _validate_haproxy(cfg.haproxy)
+    _validate_lvs(cfg.lvs)
 
     if cfg.instance_quota_mbps < 0:
         raise ValueError(
@@ -290,9 +296,9 @@ def _validate(cfg: ServiceConfig) -> None:
     for name, rl in cfg.request_limits.items():
         if not _NAME_RE.match(name):
             raise ValueError(
-                f"request_limits 的键 {name!r} 非法——应为 haproxy.cfg 里"
-                f"的 frontend/listen 段名（字母、数字、点、下划线、连字符，"
-                f"长度 1-64）")
+                f"request_limits 的键 {name!r} 非法——应为 IPVS 虚拟服务的"
+                f"合成名 vs_<VIP>_<端口>（字母、数字、点、下划线、"
+                f"连字符，长度 1-64）")
         if rl.mbps < 0:
             raise ValueError(
                 f"request_limits.{name}.mbps 不能为负数（当前值 "
@@ -310,8 +316,8 @@ def _validate(cfg: ServiceConfig) -> None:
     for name, mbps in cfg.quotas.items():
         if not _NAME_RE.match(name):
             raise ValueError(
-                f"quotas 的键 {name!r} 非法——应为 haproxy.cfg 里的 "
-                f"frontend/listen 段名（字母、数字、点、下划线、连字符，"
+                f"quotas 的键 {name!r} 非法——应为 IPVS 虚拟服务的合成名 "
+                f"vs_<VIP>_<端口>（字母、数字、点、下划线、连字符，"
                 f"长度 1-64）")
         if mbps < 0:
             raise ValueError(
@@ -351,53 +357,11 @@ def _validate(cfg: ServiceConfig) -> None:
             f"{g.apply_epsilon}）——太大的死区会让调节永远下发不出去")
 
 
-def _validate_haproxy(n: model.NodeConfig) -> None:
-    """校验本机 HAProxy 的接线段（采样通道二选一 + cfg 路径）。"""
-    if not _NAME_RE.match(n.name):
+def _validate_lvs(n: model.LvsConfig) -> None:
+    if not _NAME_RE.match(n.name or ""):
         raise ValueError(
-            f"haproxy.name 非法（当前值 {n.name!r}）——只允许字母、数字、"
-            f"点、下划线、连字符，长度 1-64")
-    # 采样通道二选一：本机 unix socket（同机部署）或内网 TCP（远程观测）。
-    # 两者都给会产生"到底连哪个"的二义，一个都不给则根本无法接线。
-    if n.socket_path and (n.host or n.port):
-        raise ValueError(
-            f"haproxy: socket_path 与 host/port 只能二选一（当前 "
-            f"socket_path={n.socket_path!r}、host={n.host!r}、port={n.port!r}）"
-            f"——同机部署填 socket_path（本机 unix stats socket），"
-            f"远程只读观测填 host/port（内网 TCP stats socket）")
-    if not n.socket_path:
-        if not n.host:
-            raise ValueError(
-                "haproxy: host 不能为空——远程观测形态下它是 stats socket 的"
-                "内网地址；同机部署请改填 socket_path"
-                "（本机 unix stats socket 路径）")
-        if n.port < 1 or n.port > 65535:
-            raise ValueError(
-                f"haproxy: port 必须在 1-65535 范围内，当前值 {n.port!r}")
-    elif not n.socket_path.startswith("/"):
-        # 相对路径的解析结果取决于服务的工作目录（systemd 下通常是 /），
-        # 同一份配置在不同启动方式下会连到不同的位置——必须写绝对路径。
-        raise ValueError(
-            f"haproxy: socket_path 必须是绝对路径（当前值 {n.socket_path!r}）"
-            f"——相对路径的解析依赖服务的工作目录，同一份配置换个启动方式"
-            f"就会连到别处")
-    elif len(n.socket_path.encode("utf-8")) > _UNIX_PATH_MAX:
-        # AF_UNIX 的 sun_path 是定长数组（Linux 上 108 字节含结尾 NUL）。
-        # 超长路径要到 connect() 才报 "AF_UNIX path too long"，而采样
-        # 每秒一次——那会变成每秒一条看不懂的告警。启动时拦下。
-        raise ValueError(
-            f"haproxy: socket_path 过长"
-            f"（{len(n.socket_path.encode('utf-8'))} 字节，上限 "
-            f"{_UNIX_PATH_MAX}）——unix socket 路径长度受内核 sun_path 限制，"
-            f"请换用更短的路径（如 /run/haproxy/admin.sock）")
-
-    # cfg_path：受管 frontend 清单的来源，必填。存在性/可读性在引导时
-    # 检查（cfgparse.load_frontends 直接读），这里只拦结构性错误。
-    if not n.cfg_path:
-        raise ValueError(
-            "haproxy: cfg_path 不能为空——受管 frontend 清单（监听端口、"
-            "模式）从本机 haproxy.cfg 直接解析而来，必须给出它的路径"
-            "（如 /etc/haproxy/haproxy.cfg）")
-    if not n.cfg_path.startswith("/"):
-        raise ValueError(
-            f"haproxy: cfg_path 必须是绝对路径（当前值 {n.cfg_path!r}）")
+            f"lvs.name 非法（当前值 {n.name!r}）——只允许字母、数字、"
+            f"点、下划线、连字符，长度 1~64")
+    if not n.ipvsadm_path:
+        raise ValueError("lvs.ipvsadm_path 不能为空字符串"
+                         "（不需要自定义时直接省略该字段）")

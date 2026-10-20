@@ -181,7 +181,6 @@ def test_canonical_is_order_insensitive_and_quota_sensitive():
 def write_yaml(tmp_path, cfg_path, quotas_line="fe_main: 40"):
     y = tmp_path / "config.yaml"
     y.write_text(
-        f"haproxy:\n  socket_path: /run/h.sock\n  cfg_path: {cfg_path}\n"
         f"quotas:\n  {quotas_line}\n", encoding="utf-8")
     return y
 
@@ -255,9 +254,8 @@ async def test_watch_warns_on_wiring_change(tmp_path, caplog):
     async def change_log_level():
         await asyncio.sleep(0.06)
         yaml_file.write_text(
-            f"log_level: debug\nhaproxy:\n  socket_path: /run/h.sock\n"
-            f"  cfg_path: {cfg_file}\nquotas:\n  fe_main: 40\n",
-            encoding="utf-8")
+            "log_level: debug\nlvs:\n  name: lvs2\nquotas:\n"
+            "  fe_main: 40\n", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING, logger="t.cfgparse"):
         change = asyncio.ensure_future(change_log_level())
@@ -307,8 +305,8 @@ async def test_watch_pushes_on_instance_quota_change(tmp_path):
     boot = cfgparse.load_frontends(str(cfg_file), {"fe_main": 40}, log)
 
     yaml_file.write_text(
-        f"instance_quota_mbps: 500\nhaproxy:\n  socket_path: /run/h.sock\n"
-        f"  cfg_path: {cfg_file}\nquotas:\n  fe_main: 40\n", encoding="utf-8")
+        "instance_quota_mbps: 500\nquotas:\n  fe_main: 40\n",
+        encoding="utf-8")
     got = await run_watch_once(cfg_file, yaml_file, boot)
     assert got and got[-1].instance_quota_mbps == 500.0
 
@@ -331,9 +329,8 @@ async def test_watch_pushes_on_request_limits_change(tmp_path):
     boot = cfgparse.load_frontends(str(cfg_file), {"fe_main": 40}, log)
 
     yaml_file.write_text(
-        f"haproxy:\n  socket_path: /run/h.sock\n  cfg_path: {cfg_file}\n"
-        f"quotas:\n  fe_main: 40\n"
-        f"request_limits:\n  fe_main: {{mbps: 10, conn_rate: 200}}\n",
+        "quotas:\n  fe_main: 40\n"
+        "request_limits:\n  fe_main: {mbps: 10, conn_rate: 200}\n",
         encoding="utf-8")
     got = await run_watch_once(cfg_file, yaml_file, boot)
     assert got and got[-1].request_limits["fe_main"].mbps == 10.0
@@ -369,9 +366,7 @@ async def test_watch_uses_injected_section_loader(tmp_path):
     标注）——LVS 分支接内核实况表的切口。"""
     yml = tmp_path / "config.yaml"
     yml.write_text(
-        "haproxy:\n  socket_path: /run/h.sock\n"
-        "  cfg_path: /nonexistent\nquotas:\n  vs_10.0.0.1_8080: 40\n",
-        encoding="utf-8")
+        "quotas:\n  vs_10.0.0.1_8080: 40\n", encoding="utf-8")
     sections = [cfgparse.ParsedSection(
         name="vs_10.0.0.1_8080", kind="virtual_server",
         binds=[("10.0.0.1", 8080)], mode="tcp")]

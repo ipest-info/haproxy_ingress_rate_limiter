@@ -264,9 +264,6 @@ from rl_limiter import config as configmod
 TOKEN = "test-token-123"
 
 BASE_YAML = """\
-haproxy:
-  socket_path: /run/haproxy/admin.sock
-  cfg_path: /etc/haproxy/haproxy.cfg
 quotas:
   fe_a: 8
 """
