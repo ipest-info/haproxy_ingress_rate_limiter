@@ -81,6 +81,18 @@ from . import model
 ROOT_HANDLE = "1:"
 # 兜底类的次要号：没被任何 filter 匹配到的流量（SSH、监控、后端方向的
 # 连接…）都落在这里，按线速跑，等于不整形。
+# ---------------------------------------------------------------------------
+# LVS NAT 模式下出向 sport 分类为何成立（本分支的关键前提）
+# ---------------------------------------------------------------------------
+# ip_vs 的 OUT 方向 un-NAT（把 RS 源地址改回 VIP:vport）发生在 netfilter
+# （LOCAL_OUT/FORWARD 链），而 egress qdisc 在设备出队之前、晚于
+# netfilter——tc 在出口网卡上看到的出向包源地址**已经是 VIP:vport**，
+# 按 sport 分类与 HAProxy 形态逐包等价。自证：
+#   tcpdump -i <客户端侧网卡> -nn src port <vport> | head
+# FULLNAT 同理：发往客户端方向的源仍是 VIP:vport。
+# 入向（闭环）同样成立：ingress qdisc 在 PREROUTING（IPVS DNAT）之前，
+# 按 dst=VIP:vport 匹配请求流不受 NAT 影响。
+
 DEFAULT_CLASS_MINOR = 1
 # 兜底类的速率。取一个远高于任何真实网卡的值 = 实际不构成约束。
 DEFAULT_CLASS_RATE_BPS = 100_000_000_000  # 100 Gbit/s
@@ -705,14 +717,16 @@ class TcShaper:
         if not bad:
             return
         lo, hi = ephemeral_range()
-        self._log.warning(
-            "以下 frontend 的监听端口落在本机临时端口范围内，**单网卡部署时"
-            "限速可能偶发失准**：HAProxy 连后端用的临时源端口可能撞上监听"
-            "端口，那条连接的出向流量会被误判进该 frontend 的限速类。"
-            "两条出路：把监听端口挪到 %d 以下，或用两张网卡、只在客户端侧"
-            "那张上限速（见 docs/02-闭环限速原理.md） frontends=%s "
-            "ephemeral_range=%d-%d",
-            lo, key, lo, hi)
+        # LVS NAT 下 director 不占本机临时端口转发（保留客户端源端口），
+        # 残留风险只有本机主动外连（keepalived 健康检查、监控、SSH）在
+        # 单网卡时撞上虚拟服务端口——双网卡 NAT（前后网隔离）无此问题，
+        # 故降为 info。
+        self._log.info(
+            "以下虚拟服务的端口落在本机临时端口范围内：**单网卡 director"
+            " 上**本机主动外连（keepalived 健康检查/监控等）的临时源端口"
+            "可能撞上它被误限。双网卡 NAT 形态（推荐）前后网隔离，无此"
+            "问题，可忽略本条 services=%s ephemeral_range=%d-%d",
+            key, lo, hi)
 
     async def class_stats(self) -> dict[int, TcClassStat]:
         """读回各 HTB 类的统计，按监听端口索引（监控用，只读）。

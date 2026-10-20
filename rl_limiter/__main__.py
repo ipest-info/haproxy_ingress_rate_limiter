@@ -501,6 +501,19 @@ async def _amain(cfg, log: logging.Logger,
             fes = list(ctl.frontends())
             if not inst_bits:
                 fes = [f for f in fes if f.limited]
+            else:
+                # 层级模式按端口建类（classid 次要号=端口）：同端口的
+                # 多个虚拟服务只留名序第一个代表，否则重复 classid 的
+                # tc 命令会失败。限速语义的裁剪已在 ipvs.
+                # resolve_port_conflicts 处 error 过，这里只是防御。
+                seen: set = set()
+                uniq = []
+                for f in sorted(fes, key=lambda x: x.name):
+                    if f.bind_port in seen:
+                        continue
+                    seen.add(f.bind_port)
+                    uniq.append(f)
+                fes = uniq
             return fes, inst_bits
 
         tasks.append(asyncio.create_task(

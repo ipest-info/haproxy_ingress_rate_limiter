@@ -507,15 +507,17 @@ def test_ephemeral_range_falls_back_when_unreadable():
 
 
 async def test_ephemeral_conflict_warns_but_does_not_block(caplog):
-    """只告警不拒绝：两网卡部署下监听端口落在临时范围内是完全安全的，
-    因为后端流量根本不经过被限速的那张网卡——不该一刀切拦住。"""
+    """只提示不拒绝：双网卡 NAT 部署下端口落在临时范围内完全安全
+    （后端流量不经过被限速的那张网卡）；LVS NAT 转发也不占本机临时
+    端口，残留风险只有单网卡上本机主动外连——降为 info 提示。"""
     import logging
     sh, _ = shaper()
     sh._log = logging.getLogger("t.eph")
-    with caplog.at_level(logging.WARNING, logger="t.eph"):
+    with caplog.at_level(logging.INFO, logger="t.eph"):
         res = await sh.reconcile([fe("bad", port=40000)])
-    assert res.ok, "只告警，不阻断"
-    assert any("临时端口范围" in r.getMessage() for r in caplog.records)
+    assert res.ok, "只提示，不阻断"
+    recs = [r for r in caplog.records if "临时端口范围" in r.getMessage()]
+    assert recs and recs[0].levelno == logging.INFO
 
 
 # ---------------------------------------------------------------------------
