@@ -21,7 +21,7 @@
 | `request_limits` | 入向限速登记：`{名: {mbps, conn_rate}}` |
 | `instance_quota_mbps` / `instance_quota_bytes_per_s` | 实例出向总目标（0=不限） |
 | `instance_quota_executable` | 本机是否有实例总限速的执行者（false 时 PUT 会 409） |
-| `haproxy` | `{name, endpoint, unix, degraded}`——degraded=true 表示采样失联，各速率为陈旧值 |
+| `source` / `haproxy` | `{kind, name, endpoint, unix, degraded}`——采样源视图；`source` 是中性新键，`haproxy` 为历史别名（同一内容，永久保留）；degraded=true 表示采样失联 |
 | `latest` | 最新一拍快照（结构同 /api/history 的元素），没采到过为 null |
 
 ### GET /api/history

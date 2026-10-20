@@ -1,13 +1,18 @@
 # haproxy_ingress_rate_limiter
 
-带宽按量计费场景下的入口限速与监控系统：**一个 rl-limiter 实例管一台与
-它同机的 HAProxy**。本分支的形态是**双网卡 + 闭环动态限速**：
+带宽按量计费场景下的入口限速与监控系统（**LVS 分支**）：一个
+rl-limiter 实例管一台与它同机的 **LVS（IPVS）director**（NAT/FULLNAT
+模式，双向流量都过本机）。核心能力：
 
-- 填写的限速值是**出向带宽的判断基准**，但不直接整形出向；
-- 出向超过基准时，**动态收紧入向（请求方向）带宽**把出向间接压回目标
-  （执行面：客户端侧网卡 ingress 重定向到 IFB，HTB 平稳整形）；
-- 调整刻意**平缓**：死区 + 乘性小步 + 按实测流入落位，宁可收敛慢也不
-  振荡。响应路径零排队，没被掐的请求全速完成。
+- **按虚拟服务（VIP:端口）限出向带宽**：NAT 下出向包 un-NAT 后源即
+  VIP:vport，内核 tc（HTB）按端口分类直接整形，改限额 `tc class
+  change` 热生效；另有实例总限速（层级模式总闸）；
+- **受管清单 = 内核 IPVS 实况表**：keepalived/ipvsadm 维护虚拟服务，
+  rl-limiter 只读（/proc/net/ip_vs + ipvsadm --stats），增删服务热跟进；
+- **主备开箱即用**：keepalived 主备都装 IPVS 表、rl-limiter 两台同
+  配置部署——备机规则空转、VIP 漂移限速零窗口接管（docs/11）；
+- 继承自 HAProxy 分支的可选能力：入向闭环动态限速、多机总控
+  （rl-fleet 总量按需分配）。
 
 限速逻辑整体在**内核 tc**：rl-limiter 进程只做采样、决策与下发，它
 短暂宕机不影响已生效的限速。监控侧提供内置 Web 控制台（实时曲线、
@@ -24,14 +29,14 @@
 
 ## 快速开始
 
-**本地演示**（Linux 主机，内核需有 ifb/HTB；Docker Desktop 不行，原因
-见 docs/09）：
+**本地演示**（Linux 主机，先 `modprobe ip_vs ip_vs_rr`；内核还需
+HTB。Docker Desktop 的精简内核多半不行，入口自检会直接说）：
 
 ```bash
-make demo-up          # 三节点 + 后端 + 压测，双网卡拓扑
+modprobe ip_vs ip_vs_rr && make demo-up   # 主备 director 对 + 后端 + 压测 + 总控
 open http://127.0.0.1:8090        # node1 控制台（令牌 demo-token）
-# 实例页设"实例总限速"=40 → curl -X PUT localhost:8084/concurrency \
-#   -d '{"concurrency": 900}' 加压 → 看"调节视图"收敛
+# 配置页给 vs_10.211.1.100_8080 设限额 → 看带宽被压住；
+# docker compose -f docker-compose-demo.yml stop node1 → 看 VIP 漂移零窗口接管
 make demo-down
 ```
 
@@ -53,6 +58,7 @@ make demo-down
 | [08 内核参数调优](docs/08-内核参数调优.md) | tune-kernel.sh：参数表、容器里哪些改不动、怎么验证生效 |
 | [09 排障指南](docs/09-排障指南.md) | 按症状查：启动失败、限速没生效、振荡、采样失联、高并发 |
 | [10 总控制台](docs/10-总控制台.md) | **多机总量控制**：rl-fleet 汇总数十台节点并把总流出带宽按需分配为各节点的出向目标 |
+| [11 LVS 主备与 NAT 形态](docs/11-LVS主备与NAT形态.md) | **本分支核心**：NAT 流量路径与限速点、keepalived 主备部署（备机空转/漂移即生效）、已知边界 |
 
 ## 系统组成
 

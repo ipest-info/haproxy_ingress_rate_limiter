@@ -1,25 +1,28 @@
 # 05 DockerCompose 演示
 
-一键起一套完整的双网卡闭环环境：三台节点（每台 = Ubuntu 24.04 +
-HAProxy 2.8 + 同机 rl-limiter）、模拟业务后端、可调并发压测服务。
-仅供体验与验证，不是生产形态（生产见 [04 部署指南](04-部署指南.md)）。
+一键起一套完整的 **LVS-NAT 主备**环境：一对 keepalived 主备 director
+（每台 = IPVS NAT + 同机 rl-limiter）、模拟业务后端、可调并发压测、
+总控。仅供体验与验证，不是生产形态（生产见 [04 部署指南](04-部署指南.md)
+与 [11 LVS 主备与 NAT 形态](11-LVS主备与NAT形态.md)）。
 
 ## 1. 拓扑
 
 ```
-loadgen ══ frontnet 10.211.1.0/24（客户端侧）══► node1/2/3 :8080（fe_main）
-                                                   │ 入向整形在 eth-front（按网段自动定位）
-                                                   ▼
-            backnet 10.211.2.0/24（后端侧）═════► web :9000（随机大小响应）
+loadgen ══ frontnet 10.211.1.0/24 ══► VIP 10.211.1.100:8080（VRRP 漂移）
+                                        │ node1(主,.11) / node2(备,.12)
+                                        │ IPVS NAT 转发（主备都装表）
+                                        ▼
+           backnet 10.211.2.0/24 ◄══ web 10.211.2.20:9000
+           （web 默认网关 = 后端侧 VIP 10.211.2.100，随 VRRP 一起漂）
 ```
 
-- compose 的双网络模拟生产的双物理网卡：frontnet = 客户端侧（闭环整形
-  在这侧），backnet = 后端侧（绝不被误伤）；
-- 节点容器内网卡名不稳定，入口脚本按 `RL_FRONT_SUBNET=10.211.1.` 定位
-  客户端侧网卡并导出 `RL_TC_IN_IFACE`；
-- 每个节点：`RL_TC_IFACE=-`（出向不整形）、`RL_TC_IN_MODE=ifb`、
-  闭环 `dynamic_ingress.enabled=true`（demo 调节周期 5s）、控制台
-  写 API 令牌 `demo-token`。
+- keepalived 同时管两个 VIP：客户端入口 + 后端回程网关——这是
+  LVS-NAT HA 的教科书形态；virtual_server 主备**都**下发，备机的
+  rl-limiter 清单与 tc 规则与主机完全一致（主备对称，docs/11）；
+- 每台 director：出向 HTB 在客户端侧网卡直接限速（NAT 双向都过）；
+  限额键 `vs_10.211.1.100_8080`；
+- **宿主机前提**：`modprobe ip_vs ip_vs_rr`（容器里 modprobe 不了，
+  入口自检失败会直接说）。
 
 ## 2. 起停
 
@@ -33,8 +36,7 @@ make demo-down      # 收场（没有数据库，无需清理数据卷）
 
 | 地址 | 是什么 |
 | ---- | ---- |
-| `localhost:8080` / `8082` / `8083` | 三台节点的 fe_main（可直接 curl 体验限速） |
-| `127.0.0.1:8090` / `8092` / `8093` | 三台节点各自的控制台 |
+| `127.0.0.1:8090` / `8092` | 主/备 director 的控制台 |
 | `localhost:8084` | loadgen 控制端口（GET /status、PUT /concurrency、PUT /big） |
 | `127.0.0.1:8095` | **总控制台 rl-fleet**（多机总量控制，玩法见 [10 总控制台](10-总控制台.md) §5） |
 
@@ -42,31 +44,35 @@ make demo-down      # 收场（没有数据库，无需清理数据卷）
 节点会**启动即失败**并在日志里写明三条出路——这是刻意行为，见
 [09 排障指南](09-排障指南.md)。
 
-## 3. 闭环演示 SOP（看着调节视图压流量）
+## 3. 限速与主备漂移演示 SOP
 
-1. **起环境**，打开 node1 控制台 `http://127.0.0.1:8090`，页头填入
-   API 令牌 `demo-token`；
-2. **设实例出向目标**：实例页"实例总限速"填 40（Mbps）保存——或在
-   "配置"页改，两处等价；此时 demo 默认不登记任何端口限额，总闸上限
-   退化为目标值；
-3. **加压**：
-   ```bash
-   curl -X PUT localhost:8084/concurrency -d '{"concurrency": 900}'
-   ```
-4. **看"调节视图（闭环动态限速）"卡**（设了目标且闭环在跑才出现）：
-   - 出向总带宽先冲高（无限制时三节点合计可达数百 Mbps）；
-   - 第一轮收紧：总闸**落位**到实测流入×1.1（日志里有"入向总闸落位"
-     一行）；
-   - 之后小步下调，约 1 分钟出向压到目标附近，稳态在死区
-     [0.85, 1.0]×目标内，总闸只做零星微调；
-5. **退潮**：把并发改回 60，看总闸按 +5%/次爬升、出向回落后控制器
-   逐步松闸直到全开；
-6. 顺手看"tc 实况（调试）"面板：期望配置行会标出
-   `实例出向目标=40Mbps→入向总闸 X.XMbps（动态）`，与 IFB 上
-   `tc class show` 的原始输出对照。
+**限速（出向 HTB 直接整形，NAT 主路径）**：
 
-端口级闭环同理：给 fe_main 登记 `quotas`（出向目标）+
-`request_limits.mbps`（入向上限）即可，配置页一站式改。
+1. 起环境，打开 node1 控制台 `http://127.0.0.1:8090`，页头填 API 令牌
+   `demo-token`；
+2. 加压：`curl -X PUT localhost:8084/concurrency -d '{"concurrency": 400}'`
+   ——loadgen 打的是 VIP，流量全部落在当前主机（node1）；
+3. "虚拟服务"页给 `vs_10.211.1.100_8080` 设限额 40（Mbps）保存——或
+   在"配置"页改，两处等价。几秒内热生效：带宽曲线被压到 40 的限额
+   参考线下，"tc 实况"面板能看到 HTB 类与 `tc class change` 的痕迹；
+4. 改限额走 `tc class change` 原位变更：存量连接立刻按新限额跑。
+
+**主备漂移（本分支的核心卖点，docs/11）**：
+
+1. 看 node2 控制台 `http://127.0.0.1:8092`：清单与 node1 完全一致
+   （keepalived 主备都装 IPVS 表）、带宽全为 0（备机没有 VIP 流量）、
+   tc 规则同样就位——这就是"备机空转"；
+2. `docker compose -f docker-compose-demo.yml stop node1`：
+   VRRP 把两个 VIP 漂到 node2，loadgen 流量无缝切过去；node2 的曲线
+   立刻出现流量，**限额照样生效（规则早已就位，零窗口期）**；
+3. 总控 `http://127.0.0.1:8095`：node1 变离线（配额冻结记账），需求
+   与配额转移到 node2；
+4. `docker compose -f docker-compose-demo.yml start node1`：node1 以
+   更高 priority 抢回 MASTER，流量漂回来。
+
+入向闭环（可选能力）在 LVS demo 里默认不开（`RL_TC_IN_IFACE=-`，
+NAT 下出向直接限速已是完整路径）；要体验闭环请看 HAProxy 分支
+（claude/dual-nic-ingress-limit）的 demo。
 
 ## 4. loadgen 与 web 的调节
 
