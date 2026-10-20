@@ -1,89 +1,41 @@
 #!/usr/bin/env bash
-# deploy/docker/node-entrypoint.sh —— 一台节点容器的入口：在同一个容器
-# （= 生产上的同一台服务器）里把 HAProxy 与 rl-limiter 一起拉起来。
+# deploy/docker/node-entrypoint.sh —— 一台 LVS director 容器的入口：在
+# 同一个容器（= 生产上的同一台服务器）里把 keepalived 与 rl-limiter
+# 一起拉起来。
 #
-# 生产上这两个进程由 systemd 各自管理（haproxy.service 与
-# rl-limiter.service，后者 After=haproxy.service，见
-# deploy/systemd/rl-limiter.service）。容器里没有 systemd，用这个脚本
-# 承担同样的职责：
-#   1. 备好运行环境再启动：tc 限速自检 → 内核参数调优 → FD 预检。
-#      这三项都必须在 HAProxy 起来**之前**做完——内核参数改晚了对已经
-#      建好的监听套接字不生效（backlog 在 listen() 那一刻就定死了），
-#      FD 不够则 HAProxy 根本起不来；
-#   2. 起 HAProxy，等它把 unix stats socket 建出来——rl-limiter 启动
-#      即采样，socket 还没出现会白白刷一轮采样失败告警；
-#   3. 再起 rl-limiter（-c 指定本机 YAML 配置，只采本机）；
-#   4. 任一进程退出就整体退出（对齐 systemd Restart=always 的语义：
-#      带着半残状态继续跑比重启更危险），由 compose 的 restart 策略拉起；
-#   5. 转发 SIGTERM/SIGINT 给两个子进程，docker stop 能干净收场。
+# 生产上这两个进程由 systemd 各自管理（keepalived.service 与
+# rl-limiter.service）。容器里没有 systemd，用这个脚本承担同样的职责：
+#   1. 备好运行环境再启动：tc 限速自检 → ip_vs 自检 → NAT 转发
+#      sysctl → 内核参数调优。全部在数据面起来**之前**做完；
+#   2. 起 keepalived（VRRP 主备漂 VIP + 下发 virtual_server 到内核
+#      IPVS 表；主备**都**装表，这是 rl-limiter 主备对称的前提）；
+#      RL_DEMO_HA=0 时退化为单机：直接 ipvsadm 建服务、VIP=本机地址；
+#   3. 等内核 IPVS 表出现（rl-limiter 的受管清单来源）；
+#   4. 起 rl-limiter（-c 指定本机 YAML 配置，只采本机）；
+#   5. 任一进程退出就整体退出（对齐 systemd Restart=always 的语义），
+#      由 compose 的 restart 策略拉起；转发 SIGTERM/SIGINT 干净收场。
 set -euo pipefail
 
-# 带参数时直接执行参数，不走 HAProxy 节点那套。
+# 带参数时直接执行参数，不走 director 那套。
 #
-# 本镜像身兼两职：既是"HAProxy 节点"（不带参数 = 默认角色），也被 web /
-# loadgen 等**只借用它的 Python 环境**的服务复用。后者在 compose 里用
-# `command:` 指定要跑的程序，而 `command:` 覆盖的是 CMD、**不是
-# ENTRYPOINT**——没有这个分支，它们会连同 haproxy 一起被拉起来，且因为
-# 没有 cfg/YAML 模板而反复失败重启，症状是
-#   rl-limiter: [Errno 2] No such file or directory: '/etc/rl-limiter/config.yaml'
-# 而真正该跑的 random_web.py / loadgen.py 一次都没执行。
+# 本镜像身兼两职：既是"LVS director"（不带参数 = 默认角色），也被
+# web / loadgen 等**只借用它的 Python 环境**的服务复用（compose 用
+# `command:` 指定要跑的程序，覆盖的是 CMD、不是 ENTRYPOINT）。
 if [ "$#" -gt 0 ]; then
     exec "$@"
 fi
 
-# 只读挂进来的配置模板 → 复制成容器内可写的真实配置。
-# 为什么要复制：演示的玩法就是"进容器改 cfg / 改 YAML 看热生效"，而
-# compose 的单文件 bind mount 是只读的、也无法被编辑器的原子替换覆盖
-# （rename 跨挂载点会失败，sed -i 会换 inode 让容器看到旧文件）。复制
-# 一份到容器自己的文件系统后，形态就和生产上"都是本机普通文件"一致了。
-# rl-limiter 对两份文件都**只读**（轮询内容做热更新），从不改写它们。
-HAPROXY_TEMPLATE=${HAPROXY_TEMPLATE:-/etc/rl-limiter/haproxy-template.cfg}
-HAPROXY_CFG=${HAPROXY_CFG:-/etc/haproxy/haproxy.cfg}
 RL_YAML_TEMPLATE=${RL_YAML_TEMPLATE:-/etc/rl-limiter/config-template.yaml}
 RL_YAML=${RL_YAML:-/etc/rl-limiter/config.yaml}
-HAPROXY_SOCK=${HAPROXY_SOCK:-/run/haproxy/admin.sock}
-HAPROXY_PIDFILE=${HAPROXY_PIDFILE:-/run/haproxy/master.pid}
-SOCK_WAIT_S=${SOCK_WAIT_S:-30}
+KEEPALIVED_TEMPLATE=${KEEPALIVED_TEMPLATE:-/etc/rl-limiter/keepalived-template.conf}
+KEEPALIVED_CONF=/etc/keepalived/keepalived.conf
+IPVS_WAIT_S=${IPVS_WAIT_S:-30}
 
 log() { echo "$(date -Is) ENTRYPOINT $*" >&2; }
 
-mkdir -p "$(dirname "$HAPROXY_SOCK")" "$(dirname "$HAPROXY_CFG")"
-
-# 旧版（v3.1 首版）把 cfg 直接挂在这里。留一条兼容路径：升级过程中
-# "新镜像 + 旧 compose" 的组合不至于起不来。
-LEGACY_CFG=/usr/local/etc/haproxy/haproxy.cfg
-
-# 配置来源判定必须发生在启动 HAProxy **之前**：让 haproxy 自己去撞
-# "文件不存在"再退出，暴露给运维的是一条含糊的"HAProxy 提前退出了"，
-# 真正原因（挂载点对不上）被埋在上一行 ALERT 里，且整个容器会无限
-# 重启刷屏。这里提前判定并直接说清楚。
-if [ -f "$HAPROXY_TEMPLATE" ]; then
-    cp "$HAPROXY_TEMPLATE" "$HAPROXY_CFG"
-    log "已从模板生成可写配置 template=$HAPROXY_TEMPLATE cfg=$HAPROXY_CFG"
-elif [ -f "$LEGACY_CFG" ] && [ "$LEGACY_CFG" != "$HAPROXY_CFG" ]; then
-    cp "$LEGACY_CFG" "$HAPROXY_CFG"
-    log "警告：用的是旧版挂载点 $LEGACY_CFG。请把 compose 里的挂载改成" \
-        "$HAPROXY_TEMPLATE（复制成本机普通文件后才能进容器改配置演示" \
-        "热生效，只读单文件 bind mount 做不到）"
-elif [ -f "$HAPROXY_CFG" ]; then
-    # 注意：Ubuntu 的 haproxy 包**自带**一份 /etc/haproxy/haproxy.cfg，
-    # 所以这条分支很容易在"忘了挂模板"时静默命中——haproxy 会正常起来、
-    # stats socket 也有（发行版默认配置里就有那一行），看着一切正常，
-    # 实际却没有演示的监听端口，rl-limiter 也解析不到任何 frontend。
-    log "未挂载模板，沿用镜像内已有的配置 cfg=$HAPROXY_CFG" \
-        "（若非有意为之，请检查 compose 是否挂了 $HAPROXY_TEMPLATE）"
-else
-    log "致命：找不到 HAProxy 配置。已依次查找："
-    log "  模板（compose 应挂在这里）: $HAPROXY_TEMPLATE"
-    log "  旧版挂载点               : $LEGACY_CFG"
-    log "  容器内配置               : $HAPROXY_CFG"
-    log "最常见的原因是**镜像与 compose 版本不匹配**（compose 已更新、" \
-        "镜像还是旧的）。请重建镜像：docker compose up -d --build"
-    exit 1
-fi
-
-# rl-limiter 的 YAML 配置：同样从模板复制（理由同上——演示要能进容器
-# 改 quotas 看热生效）。没挂模板但容器里已有一份也放行（自定义镜像）。
+# rl-limiter 的 YAML 配置：从只读挂载的模板复制成容器内可写文件
+# （演示要能进容器改 quotas 看热生效；写 API 的原子替换也需要本机
+# 普通文件）。rl-limiter 对它只读轮询，从不改写模板。
 if [ -f "$RL_YAML_TEMPLATE" ]; then
     cp "$RL_YAML_TEMPLATE" "$RL_YAML"
     log "已从模板生成 rl-limiter 配置 template=$RL_YAML_TEMPLATE yaml=$RL_YAML"
@@ -93,100 +45,64 @@ elif [ ! -f "$RL_YAML" ]; then
     exit 1
 fi
 
-# 可选：就地覆盖 global 里的 maxconn / maxpipes。
-#
-# 为什么需要它：模板里的默认值按"**默认不该成为限制**"给到 100 万连接，
-# 对应 400 万 fd，而宿主机 `fs.nr_open` 默认只有 1048576（容器里改不动）。
-# 生产机器该按这个默认值来，但 compose 演示往往跑在开发机上，起不来。
-# 于是演示环境用这两个变量把量级降下来——**降的是演示，不是默认值**，
-# 模板本身仍然是那份可以直接抄去生产的骨架。
-#
-# 只改 global 段里的这两条指令，别的一个字节不动。
-override_directive() {
-    local name=$1 val=$2
-    if ! grep -qE "^[[:space:]]*$name[[:space:]]+[0-9]+" "$HAPROXY_CFG"; then
-        log "警告：cfg 里没有 $name 指令，${name^^} 覆盖被忽略"
-        return 0
-    fi
-    sed -i -E "s/^([[:space:]]*)$name[[:space:]]+[0-9]+/\1$name $val/" "$HAPROXY_CFG"
-    log "已覆盖 $name=$val（模板默认值被本机环境变量替换）"
-}
-if [ -n "${HAPROXY_MAXCONN:-}" ]; then
-    override_directive maxconn "$HAPROXY_MAXCONN"
-fi
-if [ -n "${HAPROXY_MAXPIPES:-}" ]; then
-    override_directive maxpipes "$HAPROXY_MAXPIPES"
-fi
-# nbthread：模板刻意不写（2.8 不指定 = 自动等于可用 CPU 数，独占机器
-# 上这是对的）。但**同机多实例的演示**里它是负载放大器：3 节点 × 核数
-# 线程 + loadgen 分片 + web，在小核数宿主机上线程数轻松超配数倍，上下
-# 文切换把 loadavg 推高。演示用 HAPROXY_NBTHREAD 显式压小；模板里没有
-# 该指令，插到 global 段首行之后。
-if [ -n "${HAPROXY_NBTHREAD:-}" ]; then
-    if grep -qE "^[[:space:]]*nbthread[[:space:]]+[0-9]+" "$HAPROXY_CFG"; then
-        override_directive nbthread "$HAPROXY_NBTHREAD"
-    else
-        sed -i -E "0,/^global[[:space:]]*$/s//global\n    nbthread $HAPROXY_NBTHREAD/" "$HAPROXY_CFG"
-        log "已插入 nbthread=$HAPROXY_NBTHREAD（同机多实例的演示形态，压住线程超配）"
-    fi
-fi
-
-# 限速自检：限速由内核 tc（HTB）执行，不再走 HAProxy 的 bwlim。
-# 限速静默失效是本项目最不能接受的故障（用户以为限住了，实际没有），
-# 所以这里在真正启动之前就把三个前提逐个验掉，缺哪个说哪个。
-#
-# 之所以要在**运行期**验而不是只在构建镜像时验：前两项取决于宿主机内核
-# 与容器的 capability，构建时根本看不到。
+# 限速自检：限速由内核 tc（HTB）执行。限速静默失效是本项目最不能接受
+# 的故障，所以在真正启动之前把三个前提逐个验掉，缺哪个说哪个。
 tc_selfcheck() {
     if ! command -v tc >/dev/null 2>&1; then
         log "致命：找不到 tc（iproute2）。限速由内核 tc 执行，没有它本节点"
         log "致命：**完全不会限速**。镜像多半是旧的，请重建：docker compose up -d --build"
         return 1
     fi
-    # CAP_NET_ADMIN：容器默认不带，compose 里要写 cap_add: [NET_ADMIN]。
-    # 用 lo 上加一个再删掉来实测，比解析 capsh 输出可靠。
     if ! tc qdisc add dev lo root handle 9999: pfifo >/dev/null 2>&1; then
         log "致命：没有 CAP_NET_ADMIN，无法操作 tc（本节点将不会限速）。"
         log "致命：请在 compose 的本服务下加：cap_add: [\"NET_ADMIN\"]"
         return 1
     fi
     tc qdisc del dev lo root >/dev/null 2>&1 || true
-    # 内核有没有 HTB 调度器。iproute2 装了不代表内核带 sch_htb——精简内核
-    # （容器优化型发行版、部分云厂商镜像）经常把它裁掉，届时 tc 会报
-    # "Specified qdisc kind is unknown"，限速一样是静默失效。
     if ! tc qdisc add dev lo root handle 9999: htb >/dev/null 2>&1; then
         log "致命：内核不支持 HTB 调度器（sch_htb），限速无法工作。"
-        log "致命：宿主机上执行 modprobe sch_htb；若内核根本没编译该模块，"
-        log "致命：需要换一个带完整 net/sched 的内核。"
+        log "致命：宿主机上执行 modprobe sch_htb。"
         return 1
     fi
     tc qdisc del dev lo root >/dev/null 2>&1 || true
     log "限速自检通过：tc 可用、有 CAP_NET_ADMIN、内核支持 HTB"
     return 0
 }
-# ---- 双网卡：按网段定位客户端侧网卡 -------------------------------------
-# compose 给容器接两个网络时，容器内 eth0/eth1 的先后顺序**不可靠**
-# （接入顺序受网络名排序影响，且各 compose 版本行为不一），所以不能
-# 写死网卡名——按 IP 网段找才稳：RL_FRONT_SUBNET 给出客户端侧网段前缀
-# （如 "10.211.1."），脚本据此解析出网卡名并导出 RL_TC_IFACE（出向
-# HTB）与 RL_TC_IN_IFACE（入向 police）。两者都在客户端侧那张上——
-# 后端流量在另一张网卡上，物理隔开、绝不误伤。
-# 显式给的 RL_TC_IFACE / RL_TC_IN_IFACE 优先（含 "-" 关闭）。
-iface_by_subnet() {
-    # $1 = IP 前缀（如 10.211.1.）。输出第一个地址匹配的网卡名。
-    ip -o -4 addr show scope global 2>/dev/null         | awk -v p="$1" 'index($4, p) == 1 { print $2; exit }'
-}
-if [ "${RL_TC_IFACE:-}" = "-" ] && [ -z "${RL_FRONT_SUBNET:-}" ]; then
-    # 监控-only 模式：入向限速也随之默认关闭（除非显式指定）——
-    # 沙箱/CI 内核缺 tc 模块时整个节点退化为纯监控。
-    # （给了 RL_FRONT_SUBNET 则走下面的网段解析：RL_TC_IFACE=- 只关
-    # 出向，入向网卡照常按网段定位——本分支的闭环形态就是这样跑的。）
-    if [ -z "${RL_TC_IN_IFACE:-}" ]; then
-        export RL_TC_IN_IFACE="-"
+
+# ip_vs 自检：与 tc 自检同一铁律——内核没有 ip_vs 模块（容器里
+# modprobe 不了，必须宿主机加载）时**现在就失败**，而不是让
+# rl-limiter 起来之后读不到受管清单反复报错。
+ipvs_selfcheck() {
+    if ! command -v ipvsadm >/dev/null 2>&1; then
+        log "致命：找不到 ipvsadm。镜像多半是旧的，请重建镜像。"
+        return 1
     fi
-elif [ -n "${RL_FRONT_SUBNET:-}" ]; then
-    front_if=$(iface_by_subnet "$RL_FRONT_SUBNET")
-    if [ -z "$front_if" ]; then
+    if ! ipvsadm -Ln >/dev/null 2>&1; then
+        log "致命：内核 IPVS 不可用（ipvsadm -Ln 失败）。"
+        log "致命：请在**宿主机**上执行：modprobe ip_vs ip_vs_rr"
+        log "致命：（容器里无法 modprobe；Docker Desktop(Mac/Win) 的精简"
+        log "致命：虚拟机内核可能根本没有该模块，需换 Linux 主机。）"
+        return 1
+    fi
+    log "IPVS 自检通过：内核 ip_vs 可用"
+    return 0
+}
+
+# ---- 双网卡：按网段定位客户端侧/后端侧网卡 ------------------------------
+# 容器内 eth0/eth1 的先后顺序不可靠，按 IP 网段找才稳。
+iface_by_subnet() {
+    ip -o -4 addr show scope global 2>/dev/null \
+        | awk -v p="$1" 'index($4, p) == 1 { print $2; exit }'
+}
+addr_by_subnet() {
+    ip -o -4 addr show scope global 2>/dev/null \
+        | awk -v p="$1" 'index($4, p) == 1 { split($4, a, "/"); print a[1]; exit }'
+}
+
+FRONT_IF=""; BACK_IF=""
+if [ -n "${RL_FRONT_SUBNET:-}" ]; then
+    FRONT_IF=$(iface_by_subnet "$RL_FRONT_SUBNET")
+    if [ -z "$FRONT_IF" ]; then
         log "致命：按网段 $RL_FRONT_SUBNET 找不到客户端侧网卡——compose 的"
         log "致命：networks 配置与 RL_FRONT_SUBNET 对不上。容器内地址："
         ip -o -4 addr show scope global 2>/dev/null | while read -r line; do
@@ -194,48 +110,55 @@ elif [ -n "${RL_FRONT_SUBNET:-}" ]; then
         done
         exit 1
     fi
-    export RL_TC_IFACE="${RL_TC_IFACE:-$front_if}"
-    export RL_TC_IN_IFACE="${RL_TC_IN_IFACE:-$front_if}"
-    log "双网卡：已按网段 $RL_FRONT_SUBNET 定位客户端侧网卡 iface=$front_if"         "RL_TC_IFACE=$RL_TC_IFACE RL_TC_IN_IFACE=$RL_TC_IN_IFACE"         "（- = 该方向不做 tc）"
+    # NAT 模式双向都过 director：出向 HTB 就在客户端侧网卡上直接限速。
+    export RL_TC_IFACE="${RL_TC_IFACE:-$FRONT_IF}"
+    log "双网卡：已按网段 $RL_FRONT_SUBNET 定位客户端侧网卡 iface=$FRONT_IF" \
+        "RL_TC_IFACE=$RL_TC_IFACE（- = 出向不做 tc）"
+fi
+if [ -n "${RL_BACK_SUBNET:-}" ]; then
+    BACK_IF=$(iface_by_subnet "$RL_BACK_SUBNET")
+    [ -n "$BACK_IF" ] || { log "致命：按网段 $RL_BACK_SUBNET 找不到后端侧网卡"; exit 1; }
 fi
 
 if [ "${RL_TC_IFACE:-}" = "-" ]; then
-    if [ -n "${RL_TC_IN_IFACE:-}" ] && [ "${RL_TC_IN_IFACE}" != "-" ]; then
-        log "出向 tc 整形已关闭（RL_TC_IFACE=-）；限速走入向" \
-            "（$RL_TC_IN_IFACE，模式=${RL_TC_IN_MODE:-ifb}，闭环：按出向带宽动态压入向）"
-    else
-        log "警告：已显式关闭 tc 限速（RL_TC_IFACE=-），本节点只做监控"
-    fi
+    log "警告：已显式关闭出向 tc 整形（RL_TC_IFACE=-），本节点只做监控"
 elif ! tc_selfcheck; then
     exit 1
 fi
+ipvs_selfcheck || exit 1
 
-# 入向整形（ifb 模式）的预检：与出向 tc 自检同一铁律——内核没有 ifb
-# 模块（Docker Desktop 的精简虚拟机内核是重灾区）时**现在就失败**，
-# 而不是让 rl-limiter 起来之后每轮下发报错、看起来在限速其实没有。
-# rl-limiter 自己启动时还会再建真正的设备（双保险），这里先拦住并把
-# 处置说清楚。
+# 入向整形（ifb 模式）预检：只有显式接了入向网卡才检（LVS NAT 的主
+# 路径是出向 HTB，入向闭环是可选能力）。
 if [ -n "${RL_TC_IN_IFACE:-}" ] && [ "${RL_TC_IN_IFACE}" != "-" ] \
         && [ "${RL_TC_IN_MODE:-ifb}" = "ifb" ]; then
     if ip link add __rlifbchk type ifb >/dev/null 2>&1; then
         ip link del __rlifbchk >/dev/null 2>&1 || true
         log "入向整形自检通过：内核支持 ifb"
     else
-        log "致命：内核无法创建 ifb 设备（入向平稳整形 RL_TC_IN_MODE=ifb"
-        log "致命：依赖 ifb 模块；Docker Desktop(Mac/Win) 的精简虚拟机内核"
-        log "致命：常缺）。处置：改设 RL_TC_IN_MODE=police（丢包式入向限速，"
-        log "致命：实例总闸不可用）；或换带通用内核的 Linux 主机；确实不要"
-        log "致命：入向限速则设 RL_TC_IN_IFACE=-。"
+        log "致命：内核无法创建 ifb 设备（RL_TC_IN_MODE=ifb 依赖 ifb 模块）。"
+        log "致命：改设 RL_TC_IN_MODE=police，或换带通用内核的 Linux 主机，"
+        log "致命：或设 RL_TC_IN_IFACE=- 关闭入向限速。"
         exit 1
     fi
 fi
 
-# 内核参数调优：HAProxy 的 maxconn/backlog 配得再大，也会被内核默认值在
-# 下面削掉——最典型的是 net.core.somaxconn（默认 4096）给 cfg 里的
-# `backlog 65536` 封顶，配置写着 65536、实际生效 4096，没有任何告警。
-# 这一步在启动 HAProxy **之前**做，逐项读回校验；容器里设不了的会明确
-# 列出来并给出宿主机命令。设不全不阻断启动——它影响的是性能上限，
-# 不像 tc 那样关系到"限速有没有生效"。详见 docs/08-内核参数调优.md。
+# NAT 转发前提：转发开不了整个 NAT 不通，写不动就致命——这不是性能
+# 调优，是功能开关。vs.conntrack 让 IPVS 连接也进 conntrack（NAT 回程
+# 依赖）。net.* 按 netns 隔离，容器内可写（需 CAP_NET_ADMIN）。
+set_sysctl() {
+    local key=$1 val=$2 path
+    path="/proc/sys/${key//./\/}"
+    if ! echo "$val" > "$path" 2>/dev/null || [ "$(cat "$path")" != "$val" ]; then
+        log "致命：设不了 $key=$val（NAT 转发的功能前提）。确认容器有"
+        log "致命：CAP_NET_ADMIN，且运行时没把 /proc/sys 挂成只读。"
+        return 1
+    fi
+}
+set_sysctl net.ipv4.ip_forward 1 || exit 1
+set_sysctl net.ipv4.vs.conntrack 1 || exit 1
+log "NAT 转发 sysctl 已就位 ip_forward=1 vs.conntrack=1"
+
+# 内核参数调优（性能项，设不全不阻断——详见 docs/08）。
 TUNE_KERNEL=${TUNE_KERNEL:-/usr/local/bin/tune-kernel.sh}
 if [ "${RL_TUNE_KERNEL:-1}" = "0" ]; then
     log "已跳过内核参数调优（RL_TUNE_KERNEL=0）"
@@ -245,81 +168,77 @@ else
     log "警告：找不到 $TUNE_KERNEL，跳过内核参数调优（镜像多半是旧的）"
 fi
 
-# FD 预检：HAProxy 需要 maxconn×2 + maxpipes×2 + 34 个 fd（管道那两个是
-# splice 用的），给不够它**拒绝启动**并留下
-#   [ALERT] Cannot raise FD limit to 4000034, limit is 4096.
-# 然后容器进入重启循环刷屏。这里提前把账算给运维看。
-#
-# 比的是**硬上限**：HAProxy 自己会把软上限抬到硬上限，所以软上限低不要紧。
-fd_preflight() {
-    local maxconn maxpipes need hard
-    maxconn=$(awk '$1=="maxconn" && $2 ~ /^[0-9]+$/ {print $2; exit}' "$HAPROXY_CFG")
-    # 没写 maxconn 时 haproxy 自己按 ulimit 反推，没有可核对的目标值。
-    [ -n "${maxconn:-}" ] || return 0
-    maxpipes=$(awk '$1=="maxpipes" && $2 ~ /^[0-9]+$/ {print $2; exit}' "$HAPROXY_CFG")
-    # 不写 maxpipes 时的默认值就是 maxconn/4。
-    [ -n "${maxpipes:-}" ] || maxpipes=$((maxconn / 4))
-    need=$((maxconn * 2 + maxpipes * 2 + 34))
-    hard=$(ulimit -Hn)
-    [ "$hard" = unlimited ] && return 0
-    if [ "$hard" -lt "$need" ]; then
-        log "致命：文件描述符上限不够 maxconn=$maxconn maxpipes=$maxpipes"
-        log "致命：需要 $need 个 fd（maxconn×2 + maxpipes×2 + 34），当前硬上限只有 $hard，"
-        log "致命：HAProxy 会直接拒绝启动。compose 里给本服务加："
-        log "致命：    ulimits:"
-        log "致命：      nofile: {soft: $need, hard: $need}"
-        log "致命：裸机 systemd 则在 **haproxy 自己的** unit 里设 LimitNOFILE=$need。"
-        return 1
-    fi
-    log "FD 预检通过 need=$need hard=$hard maxconn=$maxconn maxpipes=$maxpipes"
-}
-fd_preflight || exit 1
+KEEPALIVED_PID=""
+if [ "${RL_DEMO_HA:-1}" = "1" ] && [ -f "$KEEPALIVED_TEMPLATE" ]; then
+    # 主备形态：keepalived 管 VRRP（漂 VIP）+ virtual_server（下发
+    # IPVS 表，**主备都装**——这是 rl-limiter 主备对称的前提）。
+    # 模板里的网卡名占位符按本机实际网卡替换（容器内名字不可靠）。
+    [ -n "$FRONT_IF" ] || { log "致命：HA 形态需要 RL_FRONT_SUBNET 定位客户端侧网卡"; exit 1; }
+    [ -n "$BACK_IF" ] || { log "致命：HA 形态需要 RL_BACK_SUBNET 定位后端侧网卡"; exit 1; }
+    sed -e "s/@FRONT_IF@/$FRONT_IF/g" \
+        -e "s/@BACK_IF@/$BACK_IF/g" \
+        -e "s/@STATE@/${KEEPALIVED_STATE:-BACKUP}/g" \
+        -e "s/@PRIORITY@/${KEEPALIVED_PRIORITY:-100}/g" \
+        "$KEEPALIVED_TEMPLATE" > "$KEEPALIVED_CONF"
+    log "启动 keepalived state=${KEEPALIVED_STATE:-BACKUP}" \
+        "priority=${KEEPALIVED_PRIORITY:-100} front=$FRONT_IF back=$BACK_IF"
+    # -n 前台、-l 日志到控制台、-D 详细。
+    keepalived -n -l -D -f "$KEEPALIVED_CONF" &
+    KEEPALIVED_PID=$!
+else
+    # 单机退化形态（RL_DEMO_HA=0）：直接 ipvsadm 建服务，VIP=本机
+    # 客户端侧地址。LVS_SERVICE/LVS_BACKENDS 由 compose 提供。
+    vip=${LVS_VIP:-$(addr_by_subnet "${RL_FRONT_SUBNET:-}")}
+    port=${LVS_PORT:-8080}
+    [ -n "$vip" ] || { log "致命：单机形态定不出 VIP（设 LVS_VIP 或 RL_FRONT_SUBNET）"; exit 1; }
+    ipvsadm -C
+    ipvsadm -A -t "$vip:$port" -s rr
+    for be in ${LVS_BACKENDS:-}; do
+        # be 形如 名字:端口 或 IP:端口；名字经 getent 解析。
+        host=${be%:*}; bport=${be##*:}
+        beip=$(getent hosts "$host" | awk '{print $1; exit}')
+        [ -n "$beip" ] || beip=$host
+        ipvsadm -a -t "$vip:$port" -r "$beip:$bport" -m
+        log "已登记后端 $beip:$bport（NAT）"
+    done
+    log "单机形态：IPVS 服务已建 vip=$vip:$port"
+fi
 
-# -W: master-worker（与生产的 systemd 形态一致，reload 走 SIGUSR2）
-# -db: 不后台化，让 master 进程留在前台受本脚本管理
-log "启动 HAProxy cfg=$HAPROXY_CFG"
-haproxy -W -db -f "$HAPROXY_CFG" &
-HAPROXY_PID=$!
-# 自己写 master pid：`-p` 在 -db 模式下不落盘，而"改 cfg 后 reload"要
-# 靠它定位该给谁发 SIGUSR2（容器里没有 systemctl reload haproxy）。
-echo "$HAPROXY_PID" > "$HAPROXY_PIDFILE"
-
-# 等 stats socket 就绪：这是 rl-limiter 的采样入口，没它启动就是白转。
+# 等内核 IPVS 表出现至少一个服务（keepalived 下发有先后）：rl-limiter
+# 表为空也能起（warn），但演示体验上等一等更干净；等不到也不失败。
 waited=0
-while [ ! -S "$HAPROXY_SOCK" ]; do
-    if ! kill -0 "$HAPROXY_PID" 2>/dev/null; then
-        log "HAProxy 在建立 stats socket 之前就退出了，放弃启动"
-        wait "$HAPROXY_PID" || true
-        exit 1
+while [ "$waited" -lt "$IPVS_WAIT_S" ]; do
+    if ipvsadm -Ln 2>/dev/null | grep -qE '^(TCP|UDP)'; then
+        log "内核 IPVS 表已就绪（等待 ${waited}s）"
+        break
     fi
-    if [ "$waited" -ge "$SOCK_WAIT_S" ]; then
-        log "等待 HAProxy stats socket 超时 sock=$HAPROXY_SOCK timeout_s=$SOCK_WAIT_S"
-        kill "$HAPROXY_PID" 2>/dev/null || true
+    if [ -n "$KEEPALIVED_PID" ] && ! kill -0 "$KEEPALIVED_PID" 2>/dev/null; then
+        log "keepalived 在下发 virtual_server 之前就退出了，放弃启动"
         exit 1
     fi
     sleep 1
     waited=$((waited + 1))
 done
-log "HAProxy stats socket 已就绪 sock=$HAPROXY_SOCK waited_s=$waited"
 
 log "启动 rl-limiter（同机模式）yaml=$RL_YAML"
 rl-limiter -c "$RL_YAML" &
 RL_PID=$!
 
 terminate() {
-    log "转发停止信号给 HAProxy 与 rl-limiter"
-    kill -TERM "$RL_PID" "$HAPROXY_PID" 2>/dev/null || true
+    log "转发停止信号给 keepalived 与 rl-limiter"
+    kill -TERM "$RL_PID" ${KEEPALIVED_PID:+$KEEPALIVED_PID} 2>/dev/null || true
 }
 trap terminate TERM INT
 
 # 任一子进程退出即整体退出（半残状态不如重启）。
-# `|| status=$?` 不可省：set -e 下，子进程非零退出或信号打断 wait 都会
-# 让脚本在这一行直接中止，收不到状态、也跑不到下面的收尾。
 status=0
-wait -n "$HAPROXY_PID" "$RL_PID" || status=$?
+if [ -n "$KEEPALIVED_PID" ]; then
+    wait -n "$KEEPALIVED_PID" "$RL_PID" || status=$?
+else
+    wait "$RL_PID" || status=$?
+fi
 log "子进程退出或收到信号，容器整体退出交由 compose restart 拉起 exit_status=$status"
 terminate
-# 等两个子进程真正收尾；它们的退出码在这里无意义，用首个退出者的状态。
-wait "$HAPROXY_PID" 2>/dev/null || true
+[ -n "$KEEPALIVED_PID" ] && wait "$KEEPALIVED_PID" 2>/dev/null || true
 wait "$RL_PID" 2>/dev/null || true
 exit "$status"

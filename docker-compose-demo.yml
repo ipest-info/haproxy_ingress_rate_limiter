@@ -1,347 +1,139 @@
-# docker compose 一键演示环境：三台 **Ubuntu 24.04 节点**（每台 =
-# HAProxy + 同机 rl-limiter）+ 模拟业务后端 + 可调并发压测服务。
-# 详细玩法见 docs/05-DockerCompose演示.md。
+# docker compose 一键演示环境（LVS 分支）：**一对 keepalived 主备
+# director**（每台 = LVS NAT + 同机 rl-limiter）+ 模拟业务后端 + 可调
+# 并发压测 + 总控。详细玩法见 docs/05-DockerCompose演示.md。
 #
+#   前提：宿主机内核已加载 IPVS —— modprobe ip_vs ip_vs_rr
+#        （Docker Desktop(Mac/Win) 精简内核可能没有，入口自检会直接失败）
 #   启动：docker compose -f docker-compose-demo.yml up -d --build
-#   控制台：http://localhost:8090 / :8092 / :8093（每台节点各一个）
-#   观察：docker compose -f docker-compose-demo.yml logs -f node1 loadgen
-#   调并发：curl -X PUT http://localhost:8084/concurrency -d '{"concurrency": 32}'
-#   长连接大文件下载：curl -X PUT http://localhost:8084/big -d '{"per_target": 2}'
+#   控制台：http://127.0.0.1:8090（node1）/ :8092（node2）/ :8095（总控）
+#   主备漂移演示：docker compose -f docker-compose-demo.yml stop node1
+#        → VIP 漂到 node2，流量与限速零窗口接管（node2 的 tc 规则早已就位）
 #   收场：docker compose -f docker-compose-demo.yml down
 #
-# 部署形态：**rl-limiter 与 HAProxy 同机**。每个 node 容器 = 生产上的
-# 一台 ECS：容器内同时跑 haproxy 与 rl-limiter，rl-limiter 通过本机
-# unix socket（/run/haproxy/admin.sock）只采本机那台 HAProxy——stats
-# socket 不占任何网络端口，容器之间也无需互相可达。
+# 拓扑（LVS-NAT 教科书形态；两个 VIP 由 VRRP 一起漂）：
 #
-# 配置来源只有两个本地文件（没有数据库）：
-#   - haproxy.cfg（挂 deploy/docker/haproxy-base.cfg 为模板）——负载
-#     均衡配置的**唯一权威**：监听端口、模式、后端服务器都写在这里，
-#     改完 reload HAProxy 即生效，rl-limiter 只读它解析受管清单；
-#   - rl-limiter 的 YAML（挂 deploy/docker/limiter-node.yaml 为模板）——
-#     stats socket 接线 + quotas 限额登记（**默认不登记 = 全部端口不
-#     限速**，demo 起来后用控制台/写 API 给 fe_main 设限额来观察限速）。
-# 两份文件的内容都被 rl-limiter 轮询（5s），改了即热生效。
+#   loadgen ══ frontnet 10.211.1.0/24 ══► VIP 10.211.1.100:8080
+#                                           │ 当前主机（node1 主 / node2 备）
+#                                           │ IPVS NAT 转发
+#                                           ▼
+#              backnet 10.211.2.0/24 ◄══ web 10.211.2.20:9000
+#              （web 默认网关 = 后端侧 VIP 10.211.2.100——NAT 回程必经
+#                当前主机，这正是回程网关也要随 VRRP 漂移的原因）
 #
-# 拓扑（三台 TCP L4 节点，各自独立）：
-#   loadgen ==打散==> node1:8080、node2:8080、node3:8080（各自 fe_main）
-#                          └──> web:9000（随机大小响应）
-#   node{1,2,3} 内的 rl-limiter ──show stat──> 本机 unix socket（不出容器）
-#   node{1,2,3} 内的 rl-limiter ──轮询──> 本机 haproxy.cfg + YAML（热更新）
-# 限速（登记限额后）由各台机器的内核 tc 在本机执行。每个控制台只展示
-# 本机那台 HAProxy（只读监控；改配置 = 进容器改那两份文件）。
+# 部署形态：每个 node 容器 = 生产上的一台 director：容器内同时跑
+# keepalived（VRRP + 下发 virtual_server）与 rl-limiter。**主备都装
+# IPVS 表、都建 tc 规则**——备机空转、漂移即生效（docs/11）。
+#
+# 配置来源只有两个（没有数据库）：内核 IPVS 实况表（keepalived 维护，
+# rl-limiter 只读）+ rl-limiter 的 YAML（挂 deploy/docker/
+# limiter-node.yaml 为模板；**默认不登记限额 = 只监控**，起来后用控制
+# 台/写 API 给 vs_10.211.1.100_8080 设限额观察限速）。
 
 services:
-  # ---- HAProxy 后端：模拟业务 web 服务（每次请求返回随机大小响应）----
+  # ---- 模拟业务后端：随机大小响应。默认网关指向后端侧 VIP——
+  # NAT 回程必须经当前主 director，这条路由是 LVS-NAT 的结构性要求。----
   web:
     build: .
-    command: python3 tools/random_web.py --port 9000
-    # net.* 按 network namespace 隔离，compose 可直接声明——web/loadgen
-    # 不经过节点入口脚本（tune-kernel 只在节点里跑），不在这里给就全是
-    # 发行版默认值：实测 5000 并发下 accept 队列（somaxconn 封顶）75 秒
-    # 溢出 3.1 万次，丢掉的 SYN 变成节点 HAProxy 的重试风暴。
+    command: >-
+      bash -c "ip route replace default via 10.211.2.100
+      && exec python3 tools/random_web.py --port 9000"
+    cap_add:
+      - NET_ADMIN                # 改默认路由用
     sysctls:
       net.core.somaxconn: 65536
       net.ipv4.tcp_max_syn_backlog: 65536
       net.ipv4.tcp_tw_reuse: 1
       net.ipv4.tcp_max_tw_buckets: 2097152
     environment:
-      # 响应体大小区间（字节）：默认 256 KiB ~ 2 MiB，可按需覆盖。
-      # 小文件为主、大小随机（与 loadgen 的慢客户端短连接场景配套）。
       WEB_MIN_BYTES: ${WEB_MIN_BYTES:-4096}
       WEB_MAX_BYTES: ${WEB_MAX_BYTES:-262144}
-      # /big 大文件下载端点的默认大小：512 MiB（40 Mbps 限速下约 100s
-      # 下完），供长连接大文件场景（loadgen 的 big worker）使用。
       WEB_BIG_BYTES: ${WEB_BIG_BYTES:-536870912}
-      # 服务进程数：默认自动=CPU 核数（单进程 asyncio 只能吃满一个核，
-      # 压测拉满时后端先成瓶颈——SO_REUSEPORT 分片见 random_web.py）。
       WEB_PROCS: ${WEB_PROCS:-0}
-    networks: [backnet]          # 后端只在后端侧网络：节点经 eth-back 访问它
+    networks:
+      backnet:
+        ipv4_address: 10.211.2.20
     restart: unless-stopped
 
-  # ---- 三台节点：Ubuntu 24.04 + HAProxy 2.8(发行版自带) + 同机 rl-limiter。
-  # 每个容器 = 生产上的一台 ECS，各管各的。挂进去的 haproxy-base.cfg 是
-  # **完整的** haproxy.cfg（含 fe_main 监听端口与后端），limiter-node.yaml
-  # 登记限额。stats socket 是容器内的 unix socket，不映射也无需互通。
-  node1:
-    build:
-      context: .
-    # 限速由内核 tc 执行，容器默认没有操作网络设备的权限，必须显式给。
-    # 少了它 rl-limiter 一启动就会因为 tc 权限不足而退出（入口脚本会
-    # 明确报出来，不会静默地"没在限速"）。
+  # ---- 主备 director（keepalived VRRP）。两台配置只差 STATE/PRIORITY，
+  # rl-limiter 的 YAML 模板同一份——主备对称是刻意的设计。 ----
+  node1: &director
+    build: .
     cap_add:
-      - NET_ADMIN
-    # tune-kernel.sh 在入口脚本里仍会逐项核验并报告，但有些运行时把
-    # 容器的 /proc/sys 挂成只读（日志里整排"调不动"）——net.* 是按
-    # network namespace 隔离的，compose 在创建期声明最可靠。端口区间
-    # 下界**保持 32768**：tc 按源端口分类，下探会撞监听端口（见
-    # tune-kernel.sh 里 ip_local_port_range 的说明）。
-    sysctls:
-      net.core.somaxconn: 65536
-      net.ipv4.tcp_max_syn_backlog: 65536
-      net.ipv4.tcp_tw_reuse: 1
-      net.ipv4.tcp_max_tw_buckets: 2097152
-      net.ipv4.tcp_fin_timeout: 15
-      net.ipv4.ip_local_port_range: 32768 65535
-    # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
-    # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
-    # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
-    #
-    # 这里用的是**演示量级**：haproxy-base.cfg 的默认值是 100 万连接
-    # （= 400 万 fd），而宿主机 `fs.nr_open` 默认只有 1048576、且**容器里
-    # 改不动**，开发机上直接起不来。所以演示用下面的 HAPROXY_MAXCONN /
-    # HAPROXY_MAXPIPES 降到 10 万（= 400034 fd）——降的是演示，模板本身
-    # 仍然是那份可以直接抄去生产的骨架。生产机器请按 docs/08 把
-    # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
-    #
-    # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
-    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §1。
-    ulimits:
-      nofile:
-        soft: 524288
-        hard: 524288
+      - NET_ADMIN                # tc 限速 + VRRP + 改 sysctl
     volumes:
-      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
       - ./deploy/docker/limiter-node.yaml:/etc/rl-limiter/config-template.yaml:ro
-    environment:
-      # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
-      HAPROXY_MAXCONN: "100000"
-      HAPROXY_MAXPIPES: "100000"
-      # 同机 3 节点的演示：不压 nbthread 的话每台 HAProxy 线程数=宿主机
-      # 核数，3 台加 loadgen 分片轻松超配数倍，上下文切换推高 loadavg。
-      # 生产独占机器请删掉它用模板默认（自动=核数）。
-      HAPROXY_NBTHREAD: ${HAPROXY_NBTHREAD:-2}
-      RL_CONSOLE_PORT: "8090"
-      # 双网卡：按网段定位客户端侧网卡（compose 接两个网络时 eth0/eth1
-      # 的先后顺序不可靠，入口脚本按 IP 网段找）。入向限速（request_
-      # limits）落在客户端侧那张上。
+      - ./deploy/docker/keepalived-node.conf:/etc/rl-limiter/keepalived-template.conf:ro
+    environment: &director-env
+      # 按网段定位两张网卡（容器内网卡名不可靠）：客户端侧 = 出向 HTB
+      # 的限速网卡；后端侧给 keepalived 的回程 VIP 用。
       RL_FRONT_SUBNET: "10.211.1."
-      # 闭环形态：**出向不做 tc 整形**，限速全靠入向 police——入向上限
-      # 由 dynamic_ingress 按实测出向带宽（对照 quotas 目标）动态调节。
-      # 显式关掉出向（- = 该方向不做 tc），入向网卡仍按上面的网段定位。
-      RL_TC_IFACE: "-"
-      # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
-      # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
-      RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
-      # 演示需要从宿主机打开控制台，故绑 0.0.0.0；宿主机侧只映射到回环
-      # （下方 ports）。生产默认是 127.0.0.1，控制台无鉴权，切勿裸奔。
-      RL_CONSOLE_BIND: 0.0.0.0
-      # 写 API（页面/API 改限额）的演示令牌。生产上请生成随机值
-      # （openssl rand -hex 24），不设则写接口整体 403、页面只读。
+      RL_BACK_SUBNET: "10.211.2."
+      # LVS NAT 主路径是出向 HTB 直接限速；入向闭环（ifb）是可选能力，
+      # demo 不开，免得对宿主机内核多一个 ifb 模块要求。
+      RL_TC_IN_IFACE: "-"
+      KEEPALIVED_STATE: MASTER
+      KEEPALIVED_PRIORITY: "150"
+      RL_CONSOLE_PORT: "8090"
+      RL_CONSOLE_BIND: 0.0.0.0   # 演示从宿主机打开；宿主机侧只映射回环
       RL_API_TOKEN: demo-token
+      RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
+    networks:
+      frontnet:
+        ipv4_address: 10.211.1.11
+      backnet:
+        ipv4_address: 10.211.2.11
     ports:
-      - "8080:8080"              # hap-1 / fe_main（宿主机可 curl 体验限速）
-      - "127.0.0.1:8090:8090"    # hap-1 的控制台
+      - "127.0.0.1:8090:8090"    # node1 控制台
     depends_on:
-      web:
-        condition: service_started
-    networks: [frontnet, backnet]   # 双网卡：客户端侧 + 后端侧
+      - web
     restart: unless-stopped
 
   node2:
-    build:
-      context: .
-    # 限速由内核 tc 执行，容器默认没有操作网络设备的权限，必须显式给。
-    # 少了它 rl-limiter 一启动就会因为 tc 权限不足而退出（入口脚本会
-    # 明确报出来，不会静默地"没在限速"）。
-    cap_add:
-      - NET_ADMIN
-    # tune-kernel.sh 在入口脚本里仍会逐项核验并报告，但有些运行时把
-    # 容器的 /proc/sys 挂成只读（日志里整排"调不动"）——net.* 是按
-    # network namespace 隔离的，compose 在创建期声明最可靠。端口区间
-    # 下界**保持 32768**：tc 按源端口分类，下探会撞监听端口（见
-    # tune-kernel.sh 里 ip_local_port_range 的说明）。
-    sysctls:
-      net.core.somaxconn: 65536
-      net.ipv4.tcp_max_syn_backlog: 65536
-      net.ipv4.tcp_tw_reuse: 1
-      net.ipv4.tcp_max_tw_buckets: 2097152
-      net.ipv4.tcp_fin_timeout: 15
-      net.ipv4.ip_local_port_range: 32768 65535
-    # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
-    # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
-    # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
-    #
-    # 这里用的是**演示量级**：haproxy-base.cfg 的默认值是 100 万连接
-    # （= 400 万 fd），而宿主机 `fs.nr_open` 默认只有 1048576、且**容器里
-    # 改不动**，开发机上直接起不来。所以演示用下面的 HAPROXY_MAXCONN /
-    # HAPROXY_MAXPIPES 降到 10 万（= 400034 fd）——降的是演示，模板本身
-    # 仍然是那份可以直接抄去生产的骨架。生产机器请按 docs/08 把
-    # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
-    #
-    # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
-    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §1。
-    ulimits:
-      nofile:
-        soft: 524288
-        hard: 524288
-    volumes:
-      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
-      - ./deploy/docker/limiter-node.yaml:/etc/rl-limiter/config-template.yaml:ro
+    <<: *director
     environment:
-      # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
-      HAPROXY_MAXCONN: "100000"
-      HAPROXY_MAXPIPES: "100000"
-      # 同机 3 节点的演示：不压 nbthread 的话每台 HAProxy 线程数=宿主机
-      # 核数，3 台加 loadgen 分片轻松超配数倍，上下文切换推高 loadavg。
-      # 生产独占机器请删掉它用模板默认（自动=核数）。
-      HAPROXY_NBTHREAD: ${HAPROXY_NBTHREAD:-2}
-      RL_CONSOLE_PORT: "8090"
-      # 双网卡：按网段定位客户端侧网卡（compose 接两个网络时 eth0/eth1
-      # 的先后顺序不可靠，入口脚本按 IP 网段找）。入向限速（request_
-      # limits）落在客户端侧那张上。
-      RL_FRONT_SUBNET: "10.211.1."
-      # 闭环形态：**出向不做 tc 整形**，限速全靠入向 police——入向上限
-      # 由 dynamic_ingress 按实测出向带宽（对照 quotas 目标）动态调节。
-      # 显式关掉出向（- = 该方向不做 tc），入向网卡仍按上面的网段定位。
-      RL_TC_IFACE: "-"
-      # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
-      # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
-      RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
-      RL_CONSOLE_BIND: 0.0.0.0
-      # 写 API（页面/API 改限额）的演示令牌。生产上请生成随机值
-      # （openssl rand -hex 24），不设则写接口整体 403、页面只读。
-      RL_API_TOKEN: demo-token
+      <<: *director-env
+      KEEPALIVED_STATE: BACKUP
+      KEEPALIVED_PRIORITY: "100"
+    networks:
+      frontnet:
+        ipv4_address: 10.211.1.12
+      backnet:
+        ipv4_address: 10.211.2.12
     ports:
-      - "8082:8080"              # hap-2 / fe_main
-      - "127.0.0.1:8092:8090"    # hap-2 的控制台
-    depends_on:
-      web:
-        condition: service_started
-    networks: [frontnet, backnet]   # 双网卡：客户端侧 + 后端侧
-    restart: unless-stopped
+      - "127.0.0.1:8092:8090"    # node2 控制台
 
-  node3:
-    build:
-      context: .
-    # 限速由内核 tc 执行，容器默认没有操作网络设备的权限，必须显式给。
-    # 少了它 rl-limiter 一启动就会因为 tc 权限不足而退出（入口脚本会
-    # 明确报出来，不会静默地"没在限速"）。
-    cap_add:
-      - NET_ADMIN
-    # tune-kernel.sh 在入口脚本里仍会逐项核验并报告，但有些运行时把
-    # 容器的 /proc/sys 挂成只读（日志里整排"调不动"）——net.* 是按
-    # network namespace 隔离的，compose 在创建期声明最可靠。端口区间
-    # 下界**保持 32768**：tc 按源端口分类，下探会撞监听端口（见
-    # tune-kernel.sh 里 ip_local_port_range 的说明）。
-    sysctls:
-      net.core.somaxconn: 65536
-      net.ipv4.tcp_max_syn_backlog: 65536
-      net.ipv4.tcp_tw_reuse: 1
-      net.ipv4.tcp_max_tw_buckets: 2097152
-      net.ipv4.tcp_fin_timeout: 15
-      net.ipv4.ip_local_port_range: 32768 65535
-    # FD 需求 = maxconn × 2 + maxpipes × 2 + 34（管道那一项是 splice 用的，
-    # 本项目开着 splice）。给不够 HAProxy **拒绝启动**；入口脚本会在启动前
-    # 按 cfg 里的实际值预检一遍并直接报出该改成多少，不必去 ALERT 里翻。
-    #
-    # 这里用的是**演示量级**：haproxy-base.cfg 的默认值是 100 万连接
-    # （= 400 万 fd），而宿主机 `fs.nr_open` 默认只有 1048576、且**容器里
-    # 改不动**，开发机上直接起不来。所以演示用下面的 HAPROXY_MAXCONN /
-    # HAPROXY_MAXPIPES 降到 10 万（= 400034 fd）——降的是演示，模板本身
-    # 仍然是那份可以直接抄去生产的骨架。生产机器请按 docs/08 把
-    # fs.nr_open 抬上去，然后不设这两个变量、直接用模板默认值。
-    #
-    # 内核参数（somaxconn、conntrack 等）由入口脚本的 tune-kernel.sh 处理，
-    # 不走 compose 的 sysctls: —— 原因见 docs/08-内核参数调优.md §1。
-    ulimits:
-      nofile:
-        soft: 524288
-        hard: 524288
-    volumes:
-      - ./deploy/docker/haproxy-base.cfg:/etc/rl-limiter/haproxy-template.cfg:ro
-      - ./deploy/docker/limiter-node.yaml:/etc/rl-limiter/config-template.yaml:ro
-    environment:
-      # 演示量级：把模板里 100 万连接的默认值降到 10 万，见上面 ulimits 注释。
-      HAPROXY_MAXCONN: "100000"
-      HAPROXY_MAXPIPES: "100000"
-      # 同机 3 节点的演示：不压 nbthread 的话每台 HAProxy 线程数=宿主机
-      # 核数，3 台加 loadgen 分片轻松超配数倍，上下文切换推高 loadavg。
-      # 生产独占机器请删掉它用模板默认（自动=核数）。
-      HAPROXY_NBTHREAD: ${HAPROXY_NBTHREAD:-2}
-      RL_CONSOLE_PORT: "8090"
-      # 双网卡：按网段定位客户端侧网卡（compose 接两个网络时 eth0/eth1
-      # 的先后顺序不可靠，入口脚本按 IP 网段找）。入向限速（request_
-      # limits）落在客户端侧那张上。
-      RL_FRONT_SUBNET: "10.211.1."
-      # 闭环形态：**出向不做 tc 整形**，限速全靠入向 police——入向上限
-      # 由 dynamic_ingress 按实测出向带宽（对照 quotas 目标）动态调节。
-      # 显式关掉出向（- = 该方向不做 tc），入向网卡仍按上面的网段定位。
-      RL_TC_IFACE: "-"
-      # 监控数据落盘（分钟粒度 JSONL，按天轮转；容器形态下随容器生命周期，
-      # 要长期保留可把 /var/log/rl-limiter 挂成宿主机卷）。
-      RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
-      RL_CONSOLE_BIND: 0.0.0.0
-      # 写 API（页面/API 改限额）的演示令牌。生产上请生成随机值
-      # （openssl rand -hex 24），不设则写接口整体 403、页面只读。
-      RL_API_TOKEN: demo-token
-    ports:
-      - "8083:8080"              # hap-3 / fe_main
-      - "127.0.0.1:8093:8090"    # hap-3 的控制台
-    depends_on:
-      web:
-        condition: service_started
-    networks: [frontnet, backnet]   # 双网卡：客户端侧 + 后端侧
-    restart: unless-stopped
-
-  # ---- 客户端群：可在线调节并发数的压测服务（模拟并发带宽）----
+  # ---- 压测：打 VIP（不是某台 director 的实址——这正是主备演示的
+  # 关键：stop node1 后流量自动跟着 VIP 走到 node2）。 ----
   loadgen:
     build: .
-    # 三个入口各是一台独立节点：worker 轮转绑定入口，每台节点各自被
-    # 本机 tc 压在自己的限额内、互不影响。
     command: >-
       python3 tools/loadgen.py
-      --target http://node1:8080/,http://node2:8080/,http://node3:8080/
+      --target http://10.211.1.100:8080/
       --control-port 8081
-    # 并发上限是 10240（loadgen.py 的 MAX_CONCURRENCY），每个 worker 一条
-    # 连接 ≈ 一个 fd：nofile 要盖过上限并留出控制端口/日志等的余量，
-    # 否则并发拉高时 worker 建连报 EMFILE。
     ulimits:
       nofile:
         soft: 16384
         hard: 16384
-    # 短连接场景 loadgen 是 TIME_WAIT/临时端口压力最大的一侧（客户端先
-    # 关，TIME_WAIT 全在它这边：实测 5000 并发挂 4 万个）。默认端口区间
-    # 每目标仅 ~2.8 万个、tw_reuse=2 仅回环生效——满速时临时端口耗尽，
-    # 建连重试风暴会表现为**节点**的 SYN 负载。客户端侧没有 tc 按源端口
-    # 分类的顾虑，端口区间可以放心下探到 1024。
     sysctls:
       net.ipv4.tcp_tw_reuse: 1
       net.ipv4.ip_local_port_range: 1024 65535
       net.ipv4.tcp_max_tw_buckets: 2097152
     environment:
-      # 初始并发：LOADGEN_CONCURRENCY=32 docker compose up -d 即可改；
-      # 运行中用控制端口在线调节（见文件头速查）。
-      LOADGEN_CONCURRENCY: ${LOADGEN_CONCURRENCY:-1000}
-      # 压测进程数：默认自动=CPU 核数（单进程 asyncio 只能吃满一个核，
-      # 上万并发靠多进程分片；1 = 旧的单进程行为）。
-      LOADGEN_PROCS: ${LOADGEN_PROCS:-0}
-      # 每请求限读 100 KB/s（模拟终端用户的下载速度；0 = 不限）。
-      # 1000 并发 × ≤100KB/s ≈ ≤800 Mbps 的聚合压力，仍远超各入口限额。
+      LOADGEN_CONCURRENCY: ${LOADGEN_CONCURRENCY:-200}
       LOADGEN_PER_REQ_KBS: ${LOADGEN_PER_REQ_KBS:-100}
-      # 长连接大文件下载场景：每个入口 N 条长连接循环下载 /big（默认
-      # 每入口 1 条）。验证 tc 对存量长连接的持续限速与限额
-      # 调整（reload + hard-stop）对在途下载的影响。
-      # 默认 0：主场景是小文件短连接。要演示长连接大文件限速再开
-      # （运行中 PUT /big 也行）。
-      LOADGEN_BIG_PER_TARGET: ${LOADGEN_BIG_PER_TARGET:-0}
+      LOADGEN_PROCS: ${LOADGEN_PROCS:-0}
     ports:
-      - "8084:8081"   # 控制端口（宿主机 8084）：GET /status、PUT /concurrency
+      - "8084:8081"   # 控制端口：GET /status、PUT /concurrency、PUT /big
     depends_on:
       - node1
       - node2
-      - node3
-    networks: [frontnet]         # 客户端群只在客户端侧网络
+    networks: [frontnet]
     restart: unless-stopped
 
-  # ---- 总控制台（rl-fleet）：汇总三台节点的流量，把总流出带宽按需
-  # 分配为各节点的实例出向目标（节点闭环再转成入向限速）。
-  # 玩法：打开 http://localhost:8095（令牌 demo-token），设总带宽后
-  # 加压观察三节点配额此消彼长、总出向被压在参考线下。 ----
+  # ---- 总控（rl-fleet）：登记主备两台。按需分配天然适配主备不对称
+  # 流量（备机需求≈0 只占保底，漂移后配额跟着需求走）。 ----
   fleet:
     build: .
-    # 模板只读挂载 + 启动时拷到可写路径：总控的写 API 要整份重写这份
-    # YAML，bind-mount 的单文件 os.replace 会失败，必须先拷贝。
     command: >-
       bash -c "cp /etc/rl-limiter/fleet-template.yaml /etc/rl-limiter/fleet.yaml
       && exec rl-fleet -c /etc/rl-limiter/fleet.yaml"
@@ -349,26 +141,20 @@ services:
       - ./deploy/docker/fleet.yaml:/etc/rl-limiter/fleet-template.yaml:ro
     environment:
       RL_CONSOLE_PORT: "8095"
-      # 演示从宿主机打开；宿主机侧仍只映射到回环（下方 ports）。
       RL_CONSOLE_BIND: 0.0.0.0
-      # 总控自己写 API 的令牌（改总带宽用）——与节点令牌是两回事，
-      # demo 里恰好同值。
       RL_API_TOKEN: demo-token
     ports:
-      - "127.0.0.1:8095:8095"    # 总控制台
+      - "127.0.0.1:8095:8095"
     depends_on:
       - node1
       - node2
-      - node3
-    # 管理面走后端侧网络：轮询/下发不混入客户端侧被整形的流量。
     networks: [backnet]
     restart: unless-stopped
 
-# 双网络拓扑 = 每台节点双网卡（分支 1 的部署前提）：
-#   frontnet 客户端侧（loadgen ↔ 节点）：出向 HTB 与入向 police 都在
-#            节点的这张网卡上；
-#   backnet  后端侧（节点 ↔ web）：后端流量物理隔开，绝不会被误伤。
-# 网段固定：入口脚本按 RL_FRONT_SUBNET 前缀定位客户端侧网卡名。
+# 双网络 = LVS-NAT 的标准双网卡形态：frontnet 客户端侧（VIP、出向
+# HTB 限速都在这侧），backnet 后端侧（NAT 到 RS 的流量与回程）。
+# 网段固定：入口脚本按前缀定位网卡，keepalived 模板里的 VIP/RS 地址
+# 也写死在这两个段里。
 networks:
   frontnet:
     ipam:

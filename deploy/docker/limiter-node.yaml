@@ -1,59 +1,27 @@
-# deploy/docker/limiter-node.yaml —— compose 演示里每台节点的 rl-limiter
-# 配置（入口脚本把它复制成容器内的 /etc/rl-limiter/config.yaml）。
+# deploy/docker/limiter-node.yaml —— compose 演示里每台 LVS director 的
+# rl-limiter 配置（入口脚本把它复制成容器内的 /etc/rl-limiter/config.yaml）。
 #
-# 负载均衡配置**不在这里**：监听端口/后端服务器写在 haproxy-base.cfg
-# （容器内 /etc/haproxy/haproxy.cfg，唯一权威）。这份 YAML 只登记
-# 接线与限额；字段说明见 deploy/config/limiter.example.yaml。
+# 受管清单**不在这里**：虚拟服务（VIP:端口）由 keepalived 下发进内核
+# IPVS 表（唯一权威），rl-limiter 只读内核。这份 YAML 只登记接线与
+# 限额；字段说明见 deploy/config/limiter.example.yaml。
+#
+# 主备两台用**同一份**本文件——这是主备对称设计的一部分（docs/11）。
 
 log_level: info
 tick_interval_s: 1.0
 
-haproxy:
-  name: haproxy
-  socket_path: /run/haproxy/admin.sock
-  cfg_path: /etc/haproxy/haproxy.cfg
-  timeout_ms: 500
+# lvs 接线段整段可省（全部默认值）；写出来是演示字段在哪。
+lvs:
+  name: lvs-demo
 
-# 实例出向总带宽目标（可选）：本形态下它不驱动出向 HTB，而是实例级
-# 闭环的目标——总出向超了就收紧 IFB 上的入向总闸（页面"实例总限速"
-# 卡设置的就是它，热生效）。
-# instance_quota_mbps: 60
-
-# 出向带宽**目标**：frontend 名（= cfg 里的段名）→ Mbps。
-# **端口默认不限速**：不登记就只监控。本分支（闭环形态）里这个数字
-# 不驱动出向 HTB（compose 已把出向 tc 关掉，RL_TC_IFACE=-），而是
-# dynamic_ingress 闭环的**目标值**：实测出向带宽超过它就压入向、低于
-# 它就松入向。要启用限速：用控制台（页头填 API 令牌 demo-token）或
-# 写 API 登记，或直接改容器内 /etc/rl-limiter/config.yaml（解开下面
-# 的示例行，并同时解开 request_limits——闭环两样都要）。改动一个轮询
-# 周期（5s）内热生效。
+# 出向带宽限额：虚拟服务合成名 vs_<VIP>_<端口> → Mbps。
+# **默认不登记 = 只监控**。demo 起来后用控制台（页头填 API 令牌
+# demo-token）或写 API 登记，或直接改容器内 /etc/rl-limiter/config.yaml
+# （解开下面示例行），一个轮询周期（5s）内热生效。
+# NAT 模式双向都过 director：这里的限额由出向 HTB 直接执行（与
+# HAProxy 基线同一套 tc 机制）。
 quotas: {}
-#   fe_main: 40
+#   vs_10.211.1.100_8080: 40
 
-# 请求方向（入向）限速：双网卡形态（demo 的 compose 已是双网络拓扑，
-# 客户端侧网卡由入口脚本按 RL_FRONT_SUBNET 自动定位）。默认不登记 =
-# 入向也不限速；启用闭环时解开下面的示例。
-#   mbps      入向带宽的**上限**（闭环的起点与封顶）：动态调节在
-#             [floor_ratio×mbps, mbps] 区间内活动。入向主要是 GET 请求
-#             + 回传 ACK（ACK 约为下载带宽的 1/40~1/20），10 Mbps 对
-#             40M 的出向目标留足了全开时的余量；
-#   conn_rate 每秒新建连接上限（静态，不参与闭环——这是防滥用阈值）。
-#             demo 的压测是短连接，1000 并发 ÷ 3 节点 ≈ 每节点 200~300
-#             conn/s 的供给——设 150 能明显看到 SYN 速率闸在工作。
-request_limits: {}
-#   fe_main:
-#     mbps: 10
-#     conn_rate: 150
-
-# 入向动态限速（闭环）：按实测出向带宽（10s 均值）对照 quotas 目标，
-# 平缓调整入向 police 上限——超了小步压、低了小步松、目标附近不动。
-# 开着无妨：quotas/request_limits 没登记时它没有可调的对象，不做任何
-# 动作。其余参数用默认值（调节周期 15s、死区 [0.85, 1.0]×目标、上调
-# +5%/次、下调封顶 -10%/次、下限 10%×上限、变化 <2% 不下发），字段
-# 语义与算法见 rl_limiter/ingressgov.py。本段启动时定型，改了要重启。
-dynamic_ingress:
-  enabled: true
-  # 下载型业务的入向主要是 ACK，杠杆很高（入向 1Mbps 的 ACK 可驱动
-  # 约 70Mbps 出向），均衡点远低于直觉——下限要留得足够低，否则会
-  # "压到下限、出向仍高于目标"（详见 docs/02 §3）。
-  floor_ratio: 0.05
+# 实例总限速（可选，Mbps）：全部虚拟服务出向合计的总闸（tc 层级模式）。
+# instance_quota_mbps: 90

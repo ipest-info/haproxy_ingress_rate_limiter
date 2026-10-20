@@ -22,8 +22,8 @@ allocation:
   min_share_ratio: 0.2
 
 nodes:
-  # url = 总控访问节点控制台的地址（容器内网络）；console_url = 页面
-  # 上"跳到该节点控制台"的链接（从宿主机浏览器打开，用宿主机映射）。
+  # 主备 director 都登记：按需分配天然适配——备机需求≈0 只占保底份额，
+  # VIP 漂移后需求转移、配额跟着走（docs/11）。
   - name: node1
     url: http://node1:8090
     token: demo-token
@@ -32,7 +32,3 @@ nodes:
     url: http://node2:8090
     token: demo-token
     console_url: http://localhost:8092
-  - name: node3
-    url: http://node3:8090
-    token: demo-token
-    console_url: http://localhost:8093
