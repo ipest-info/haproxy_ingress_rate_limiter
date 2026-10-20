@@ -132,7 +132,9 @@ class NodePoller:
             # （demand_ewma 为 None = 新节点首次联通，无均值可丢。）
             s.demand_ewma_mbps = None
             self._log.warning("节点恢复在线，重新纳入分配 node=%s", s.name)
-        hap = ov.get("haproxy") or {}
+        # "source" 是中性新键，"haproxy" 是历史别名——两个都认，
+        # 节点侧新旧版本混跑时总控照常工作。
+        hap = ov.get("source") or ov.get("haproxy") or {}
         s.degraded = bool(hap.get("degraded"))
         s.executable = bool(ov.get("instance_quota_executable", True))
         try:

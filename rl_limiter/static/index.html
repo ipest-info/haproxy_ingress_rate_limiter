@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>rl-limiter 控制台</title>
+<title>rl-limiter 控制台（LVS）</title>
 <!-- 空 favicon：不写这行浏览器会去请求 /favicon.ico，控制台没这个路由，
      于是每次打开页面都在控制台留一条 404 —— 排障时那条无关的红字很干扰。 -->
 <link rel="icon" href="data:,">
@@ -294,7 +294,7 @@ input:focus, select:focus {
 <header><div class="wrap">
   <h1>rl-limiter</h1>
   <span class="badge"><span class="dot" id="sse-dot" style="background:var(--critical)"></span><span id="sse-text">连接中…</span></span>
-  <span class="meta">HAProxy <b id="hap-name">–</b></span>
+  <span class="meta">LVS <b id="hap-name">–</b></span>
   <span class="meta" id="hap-endpoint-wrap">端点 <b id="hap-endpoint">–</b></span>
   <span class="grow"></span>
   <span class="meta">配置版本 <b id="cfg-version">–</b></span>
@@ -316,7 +316,7 @@ input:focus, select:focus {
 
 <nav class="tabs"><div class="wrap">
   <button data-tab="instance" aria-selected="true">实例</button>
-  <button data-tab="frontend" aria-selected="false">监听端口</button>
+  <button data-tab="frontend" aria-selected="false">虚拟服务</button>
   <button data-tab="config" aria-selected="false">配置</button>
   <button data-tab="logs" aria-selected="false">日志</button>
 </div></nav>
@@ -340,7 +340,7 @@ input:focus, select:focus {
           <div><div class="stat-l">流入带宽（5s 均值）</div><div class="stat-v" id="i-rin">–<small>Mbps</small></div></div>
           <div><div class="stat-l">流出带宽（5s 均值）</div><div class="stat-v" id="i-rout">–<small>Mbps</small></div></div>
           <div><div class="stat-l">连接上限</div><div class="stat-v" id="i-maxconn">–</div></div>
-          <div><div class="stat-l">HAProxy 空闲率</div><div class="stat-v" id="i-idle">–<small>%</small></div></div>
+          <div><div class="stat-l">采样源空闲率</div><div class="stat-v" id="i-idle">–<small>%</small></div></div>
         </div>
       </div>
     </div>
@@ -360,7 +360,7 @@ input:focus, select:focus {
         </span>
       </div>
       <div class="card-body">
-        <div class="hint" id="inst-quota-hint">本机 HAProxy **全部** frontend 出向流量合计的总闸
+        <div class="hint" id="inst-quota-hint">本机 LVS **全部**虚拟服务出向流量合计的总闸
           （含未登记限额、只监控的段）：设置后 tc 切换为层级模式，各
           frontend 自己的限额仍各自生效；SSH/监控等系统流量**不在**总闸内、
           不受影响。修改经写 API 回写 YAML 后数秒内热生效——需先在页头
@@ -370,13 +370,13 @@ input:focus, select:focus {
 
     <div class="card">
       <div class="card-head"><span class="card-title">连接视图</span>
-        <span class="hint">来源：HAProxy <code>show info</code> + 全部 frontend 汇总</span></div>
+        <span class="hint">来源：内核 IPVS 统计 + 全部虚拟服务汇总</span></div>
       <div class="card-body"><div class="chart-grid" id="i-conn-charts"></div></div>
     </div>
 
     <div class="card">
       <div class="card-head"><span class="card-title">带宽视图</span>
-        <span class="hint">带宽为 HAProxy 应用层口径；数据包为网卡口径</span></div>
+        <span class="hint">带宽为 IPVS 统计口径；数据包为网卡口径</span></div>
       <div class="card-body"><div class="chart-grid" id="i-bw-charts"></div></div>
     </div>
 
@@ -422,8 +422,8 @@ input:focus, select:focus {
   <!-- ============ 监听端口视图 ============ -->
   <section class="tabpage" id="page-frontend">
     <div id="frontends"></div>
-    <div class="hint" style="padding:2px 4px">监听端口清单来自本机 haproxy.cfg 的解析
-      （要增删端口/后端请改 cfg 并 reload HAProxy，页面不提供入口）；
+    <div class="hint" style="padding:2px 4px">虚拟服务清单来自本机内核 IPVS 实况表
+      （增删 VIP:端口 请经 keepalived / ipvsadm 操作，页面不提供入口）；
       限额存放在 YAML 的 quotas 段——在卡片右上角修改（0 = 显式不限速，
       "删除登记"= 回到只监控不限速），经写 API 回写 YAML 后数秒内热生效，
       需先在页头填入 API 令牌（RL_API_TOKEN）。</div>
@@ -750,7 +750,7 @@ function buildInstanceCharts() {
   const conn = $("#i-conn-charts"), bw = $("#i-bw-charts");
   state.instCharts = [
     makeChart(conn, {
-      title: "实例新建连接数", source: "show info / frontend 汇总",
+      title: "实例新建连接数", source: "IPVS 统计 / 虚拟服务汇总",
       fmt: fmtRate, unit: "个/秒", points: pts,
       series: [
         {key: "conn_new", label: "每秒新建连接数", color: "--s-out"},
@@ -758,7 +758,7 @@ function buildInstanceCharts() {
       ],
     }),
     makeChart(conn, {
-      title: "实例总连接数", source: "show info / frontend 汇总",
+      title: "实例总连接数", source: "IPVS 统计 / 虚拟服务汇总",
       fmt: fmtInt, unit: "个", points: pts,
       series: [
         {key: "conn", label: "并发连接数", color: "--s-total"},
@@ -767,7 +767,7 @@ function buildInstanceCharts() {
       ],
     }),
     makeChart(bw, {
-      title: "实例带宽统计", source: "HAProxy 应用层口径 · 5s 滚动均值",
+      title: "实例带宽统计", source: "IPVS 统计口径 · 5s 滚动均值",
       fmt: fmtMbps, unit: "Mbps", points: pts,
       series: [
         {key: "rin5", label: "流入带宽", color: "--s-in"},
@@ -851,7 +851,7 @@ function ensureCard(name) {
   const grid = $(".fe-charts", card), pts = () => fe.buf;
   fe.charts = [
     makeChart(grid, {
-      title: "新建连接数", source: "conn_tot / dcon+dses+dreq 差分",
+      title: "新建连接数", source: "IPVS Conns 差分",
       fmt: fmtRate, unit: "个/秒", points: pts,
       series: [
         {key: "conn_new", label: "每秒新建连接数", color: "--s-out"},
@@ -859,7 +859,7 @@ function ensureCard(name) {
       ],
     }),
     makeChart(grid, {
-      title: "总连接数", source: "scur / h1_open_connections",
+      title: "总连接数", source: "IPVS ActiveConn/InActConn",
       fmt: fmtInt, unit: "个", points: pts,
       series: [
         {key: "conn", label: "并发连接数", color: "--s-total"},
@@ -868,7 +868,7 @@ function ensureCard(name) {
       ],
     }),
     makeChart(grid, {
-      title: "带宽统计", source: "bin / bout 差分（应用层）· 5s 滚动均值",
+      title: "带宽统计", source: "IPVS InBytes/OutBytes 差分 · 5s 滚动均值",
       fmt: fmtMbps, unit: "Mbps", points: pts,
       series: [
         {key: "rin5", label: "流入带宽", color: "--s-in"},

@@ -129,7 +129,8 @@ class StatusHub:
         self,
         service_version: str,
         version_fn: Callable[[], int],
-        haproxy: model.NodeConfig | None = None,
+        source=None,
+        haproxy: "model.NodeConfig | None" = None,
         degraded_fn: Callable[[], bool] | None = None,
         instance_quota_executable: bool = True,
         regulation_fn: Callable[[], dict | None] | None = None,
@@ -137,7 +138,10 @@ class StatusHub:
         self._service_version = service_version
         self._version_fn = version_fn
         # 本机 HAProxy 的接线视图（启动时定型，与 RuntimeClient 一致）。
-        self._haproxy = haproxy or model.NodeConfig()
+        # 采样源的接线视图：LVS 形态传 source=LvsConfig；haproxy= 参数
+        # 保留为兼容别名（兄弟分支/旧调用方）。
+        self._source = source if source is not None \
+            else (haproxy or model.NodeConfig())
         # 采样是否处于降级（collector.degraded 闭包）。
         self._degraded_fn = degraded_fn if degraded_fn is not None else (lambda: False)
         self._history: collections.deque[dict[str, Any]] = collections.deque(
@@ -177,13 +181,19 @@ class StatusHub:
             for name, rl in (getattr(cfg, "request_limits", {}) or {}).items()
         }
 
-    def _haproxy_view(self) -> dict[str, Any]:
-        """本机 HAProxy 视图：接线 + 采样健康。"""
-        n = self._haproxy
+    def _source_view(self) -> dict[str, Any]:
+        """采样源视图：接线 + 采样健康。
+
+        对外 JSON 里同时挂在 "source"（中性新键）与 "haproxy"（历史
+        别名，永久保留——fleet 等既有消费方在用）两个键下，值是同一个
+        dict。kind 标明形态，页面据此换文案。
+        """
+        n = self._source
         return {
+            "kind": "lvs",
             "name": n.name,
             "endpoint": n.endpoint(),
-            "unix": n.is_unix,
+            "unix": bool(getattr(n, "is_unix", False)),
             "degraded": bool(self._degraded_fn()),
         }
 
@@ -226,8 +236,10 @@ class StatusHub:
             "config_version": self._version_fn(),
             "units": units,
             "instance": _instance_view(instance),
-            "haproxy": self._haproxy_view(),
         }
+        src = self._source_view()
+        snap["source"] = src
+        snap["haproxy"] = src          # 历史别名（API 兼容）
         if self._regulation_fn is not None:
             reg = self._regulation_fn()
             if reg:
@@ -282,7 +294,9 @@ class StatusHub:
             "request_limits": self._request_limits,
             "instance_quota_bytes_per_s": self._instance_quota_mbps * 1e6 / 8.0,
             "instance_quota_executable": self._instance_quota_executable,
-            "haproxy": self._haproxy_view(),
+            "source": self._source_view(),
+            # 历史别名（API 兼容）：与 source 同一份内容。
+            "haproxy": self._source_view(),
             "latest": self._history[-1] if self._history else None,
         }
 
@@ -315,10 +329,10 @@ def render_prometheus(hub: StatusHub) -> str:
         lines.append(f"{name}{lab} {value}")
 
     m("rl_limiter_info", 1, "服务元信息（值恒为 1，信息在标签里）",
-      {"version": o["service_version"], "haproxy": o["haproxy"]["name"]})
+      {"version": o["service_version"], "haproxy": o["source"]["name"]})
     m("rl_limiter_config_version", o["config_version"], "当前配置的内容校验和")
     m("rl_limiter_uptime_seconds", round(o["uptime_s"], 1), "服务运行秒数")
-    m("rl_limiter_haproxy_degraded", int(o["haproxy"]["degraded"]),
+    m("rl_limiter_haproxy_degraded", int(o["source"]["degraded"]),
       "采样是否失联（1=失联，此时各速率为陈旧值）")
     m("rl_limiter_instance_quota_bytes_per_second",
       o.get("instance_quota_bytes_per_s", 0),
@@ -647,9 +661,9 @@ def build_app(
         known = known_frontends_fn() if known_frontends_fn is not None else None
         if known is not None and name not in known:
             return web.json_response(
-                {"error": f"haproxy.cfg 里没有名为 {name!r} 的 frontend/"
-                          f"listen 段（是不是拼错了？）。当前解析到的段："
-                          f"{sorted(known)}"},
+                {"error": f"内核 IPVS 表里没有名为 {name!r} 的虚拟服务"
+                          f"（合成名 vs_<VIP>_<端口>，是不是拼错了？）。"
+                          f"当前表里的服务：{sorted(known)}"},
                 status=400)
         async with write_lock:
             try:
@@ -769,9 +783,9 @@ def build_app(
         known = known_frontends_fn() if known_frontends_fn is not None else None
         if known is not None and name not in known:
             return web.json_response(
-                {"error": f"haproxy.cfg 里没有名为 {name!r} 的 frontend/"
-                          f"listen 段（是不是拼错了？）。当前解析到的段："
-                          f"{sorted(known)}"},
+                {"error": f"内核 IPVS 表里没有名为 {name!r} 的虚拟服务"
+                          f"（合成名 vs_<VIP>_<端口>，是不是拼错了？）。"
+                          f"当前表里的服务：{sorted(known)}"},
                 status=400)
         async with write_lock:
             try:

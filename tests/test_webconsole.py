@@ -115,12 +115,28 @@ def test_degraded_suppresses_over_flag():
     assert h.history()[-1]["units"]["fe_a"]["over"] is False
 
 
-def test_haproxy_view_reports_endpoint_and_health():
-    h = hub(haproxy=model.NodeConfig(name="hap", socket_path="/run/h.sock"),
-            degraded_fn=lambda: True)
-    v = h.overview()["haproxy"]
-    assert v == {"name": "hap", "endpoint": "/run/h.sock",
-                 "unix": True, "degraded": True}
+def test_source_view_reports_endpoint_and_health():
+    """采样源视图：source 新键与 haproxy 历史别名同值（API 兼容），
+    kind 标明形态。"""
+    h = hub(source=model.LvsConfig(name="lvs1"), degraded_fn=lambda: True)
+    o = h.overview()
+    v = o["source"]
+    assert v == {"kind": "lvs", "name": "lvs1",
+                 "endpoint": "ipvs:/proc/net/ip_vs",
+                 "unix": False, "degraded": True}
+    assert o["haproxy"] == v
+
+    # haproxy= 参数仍可用（兄弟分支/旧调用方的兼容别名）。
+    h2 = hub(haproxy=model.NodeConfig(name="hap", socket_path="/run/h.sock"))
+    assert h2.overview()["source"]["name"] == "hap"
+
+
+def test_snapshot_carries_source_and_alias():
+    h = hub(source=model.LvsConfig(name="lvs1"))
+    h.record(1.0, [usage()])
+    snap = h.history()[-1]
+    assert snap["source"]["kind"] == "lvs"
+    assert snap["haproxy"] == snap["source"]
 
 
 def test_overview_exposes_frontend_config():

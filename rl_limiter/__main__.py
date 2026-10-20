@@ -25,7 +25,7 @@ import sys
 
 from . import cfgparse
 from . import config as configmod
-from . import haproxy, ingressgov, metricslog, model
+from . import ingressgov, ipvs as ipvsmod, metricslog, model
 from . import netdev
 from . import tcifb as tcifbmod
 from . import tcingress as tcinmod
@@ -132,7 +132,7 @@ async def _amain(cfg, log: logging.Logger,
     """
     # --- 与本机 HAProxy 的 runtime API 客户端（只读采样）。单 HAProxy
     # 模型下只有一个，同机形态走本机 unix socket。
-    client = haproxy.RuntimeClient.from_node(cfg.haproxy, log)
+    client = ipvsmod.IpvsClient.from_config(cfg.lvs, log)
 
     # tc 队列统计 → 监控。tc 按 classid（= 监听端口）索引，这里换成
     # frontend 名再交给采集器——采集器只认名字，不必知道端口这回事。
@@ -192,7 +192,7 @@ async def _amain(cfg, log: logging.Logger,
         hub = webconsole.StatusHub(
             SERVICE_VERSION,
             version_fn=lambda: ctl.version,
-            haproxy=cfg.haproxy,
+            source=cfg.lvs,
             degraded_fn=lambda: col.degraded,
             instance_quota_executable=inst_executable,
             regulation_fn=regulation_fn)
@@ -247,7 +247,7 @@ async def _amain(cfg, log: logging.Logger,
     ctl.seed(seed_cfg)
     if hub is not None:
         hub.update_config(seed_cfg)
-    log.info("已用 haproxy.cfg + YAML 限额完成引导（监控单位=frontend） "
+    log.info("已用内核 IPVS 实况表 + YAML 限额完成引导（监控单位=虚拟服务） "
              "version=%s frontends=%d instance_quota=%gMbps detail=%s",
              seed_version, len(boot_frontends), cfg.instance_quota_mbps,
              _summarize_frontends(boot_frontends))
@@ -299,9 +299,10 @@ async def _amain(cfg, log: logging.Logger,
     tasks.append(asyncio.create_task(
         ctl.run(config_queue, tick_interval_s), name="monitor-loop"))
     tasks.append(asyncio.create_task(
-        cfgparse.watch(cfg.haproxy.cfg_path, yaml_path, source_queue,
+        cfgparse.watch("(ipvs)", yaml_path, source_queue,
                        boot_frontends, log,
                        boot_instance_quota_mbps=cfg.instance_quota_mbps,
+                       section_loader=lambda: ipvsmod.load_sections(),
                        boot_request_limits=cfg.request_limits,
                        poke=cfg_poke),
         name="cfg-watch"))
@@ -374,8 +375,10 @@ async def _amain(cfg, log: logging.Logger,
         # 只展示不提供写入口。
         runtime_info = [
             {"label": "YAML 配置文件", "value": yaml_path or "（未指定）"},
-            {"label": "haproxy.cfg", "value": cfg.haproxy.cfg_path},
-            {"label": "HAProxy stats 接口", "value": cfg.haproxy.endpoint()},
+            {"label": "受管清单来源",
+             "value": "内核 IPVS 实况表（/proc/net/ip_vs + ipvsadm "
+                      "--stats；keepalived 主备都装表，备机清单一致）"},
+            {"label": "LVS 采样通道", "value": cfg.lvs.endpoint()},
             {"label": "采样周期 tick_interval_s",
              "value": f"{cfg.tick_interval_s:g}s"},
             {"label": "日志级别 log_level", "value": cfg.log_level},
@@ -546,9 +549,8 @@ async def _amain(cfg, log: logging.Logger,
                 name="ingress-governor"))
 
     log.info("rl-limiter 服务已启动，监控循环开始运行 instance=%s "
-             "endpoint=%s cfg=%s frontends=%d version=%s",
-             cfg.haproxy.name, cfg.haproxy.endpoint(),
-             cfg.haproxy.cfg_path,
+             "endpoint=%s 虚拟服务=%d version=%s",
+             cfg.lvs.name, cfg.lvs.endpoint(),
              len(boot_frontends), SERVICE_VERSION)
 
     # 等待退出信号；任一常驻任务意外结束（本应永续运行）也触发整体退出，
@@ -580,23 +582,20 @@ async def _amain(cfg, log: logging.Logger,
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="rl-limiter",
-        description="HAProxy 入口带宽限速与监控：以本机 haproxy.cfg 为负载"
-                    "均衡配置的唯一权威，解析出受管监听端口清单，把 YAML 里"
-                    "登记的限额下发到内核 tc（HTB，按源端口分类），并每秒"
-                    "采样各 frontend 的下行带宽做持续超限告警",
-        epilog="一个实例管一台同机的 HAProxy。配置来源是两个本地文件："
-               "-c 指定的 YAML（接线 + 限额 quotas）与其中 haproxy.cfg_path "
-               "指向的 haproxy.cfg（监听端口/模式，由运维直接编辑，"
-               "rl-limiter 只读不写）；运行期轮询两者，内容变化即热生效。"
-               "限速网卡用 RL_TC_IFACE 指定（默认取默认路由的出口网卡，"
-               "设 - 则关闭限速、只保留监控）。"
+        description="LVS（IPVS）入口带宽限速与监控：以本机内核 IPVS 实况"
+               "表为受管清单的唯一权威（keepalived/ipvsadm 维护虚拟服务，"
+               "rl-limiter 只读不写）；限额登记在 -c 指定的 YAML（quotas："
+               "vs_<VIP>_<端口> → Mbps），运行期轮询两者，内容变化即热"
+               "生效。限速由内核 tc 执行：出向 HTB（NAT 模式双向都过"
+               " director）按虚拟服务端口分类；限速网卡用 RL_TC_IFACE 指定"
+               "（默认取默认路由的出口网卡，设 - 则关闭出向整形）。"
                "Web 控制台：设置 RL_CONSOLE_PORT 启用，RL_CONSOLE_BIND 指定"
                "监听地址（默认 127.0.0.1——控制台无鉴权）；控制台同端口的 "
                "/metrics 提供 Prometheus 抓取。"
                "监控数据落盘：设 RL_METRICS_LOG=<文件路径> 启用（分钟粒度 "
                "JSONL，按天轮转，RL_METRICS_LOG_DAYS 定保留天数，默认 90）。"
-               "实例监控视图的入向数据包统计取自 /proc/net/dev，RL_NIC 指定"
-               "网卡（默认跟随限速网卡，设 - 则禁用）。")
+               "主备（keepalived VRRP）：两台 director 都部署本服务、同一份"
+               "配置——备机规则空转、VIP 漂移即生效，见 docs/11。")
     parser.add_argument(
         "-c", "--config", default="/etc/rl-limiter/config.yaml",
         help="YAML 配置文件路径（默认 %(default)s）")
@@ -689,19 +688,23 @@ def main() -> None:
     # 读到并解析出受管清单；读不到就启动失败，而不是带着空清单装作在跑。
     # （运行期 cfg 短暂不可读走 fail-static，那是另一回事——见 cfgparse.watch。）
     try:
-        boot_frontends = cfgparse.load_frontends(
-            cfg.haproxy.cfg_path, cfg.quotas, log)
-    except OSError as e:
+        boot_frontends = ipvsmod.load_frontends(cfg.quotas, log)
+    except ipvsmod.IpvsUnavailableError as e:
         print(
-            f"rl-limiter: 读不到 haproxy.cfg：{cfg.haproxy.cfg_path}（{e}）。\n"
-            f"  haproxy.cfg 是负载均衡配置的唯一权威，启动时必须可读；\n"
-            f"  请核对 YAML 里 haproxy.cfg_path 的路径与文件权限。",
+            f"rl-limiter: {e}。\n"
+            f"  内核 IPVS 实况表是受管清单的唯一权威，启动时必须可读；\n"
+            f"  请先在本机执行 modprobe ip_vs ip_vs_rr（容器部署则在"
+            f"宿主机上执行），\n"
+            f"  Docker Desktop(Mac/Win) 等精简内核可能没有该模块。",
             file=sys.stderr)
         raise SystemExit(1)
+    except ipvsmod.IpvsError as e:
+        print(f"rl-limiter: 读取内核 IPVS 表失败：{e}", file=sys.stderr)
+        raise SystemExit(1)
     if not boot_frontends:
-        log.warning("haproxy.cfg 里没有解析到任何带监听端口的 frontend/"
-                    "listen——服务照常启动，之后 cfg 内容变化会被轮询接上 "
-                    "cfg_path=%s", cfg.haproxy.cfg_path)
+        log.warning("内核 IPVS 表里没有任何虚拟服务——服务照常启动"
+                    "（keepalived 尚未下发 virtual_server、或这是刚起的"
+                    "备机，均属正常），之后表内容变化会被轮询接上")
 
     # 请求方向（入向）限速：双网卡形态，执行网卡 = 客户端侧那张，只认
     # RL_TC_IN_IFACE 显式指定（绝不自动探测——入向 police 放错网卡会误伤
@@ -816,8 +819,8 @@ def main() -> None:
         "yaml=%s cfg=%s instance=%s endpoint=%s log_level=%s "
         "tick_interval_s=%s instance_quota=%s request_limits=%d "
         "frontends=%d detail=%s",
-        args.config, cfg.haproxy.cfg_path,
-        cfg.haproxy.name, cfg.haproxy.endpoint(),
+        args.config, "(ipvs)",
+        cfg.lvs.name, cfg.lvs.endpoint(),
         cfg.log_level,
         getattr(cfg, "tick_interval_s", 1.0),
         (f"{cfg.instance_quota_mbps:g}Mbps" if cfg.instance_quota_mbps

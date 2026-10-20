@@ -169,3 +169,19 @@ async def test_remove_node_keeps_quota_untouched(fake, poller):
     poller.set_nodes([FleetNode(name="n1", url=fake.url, token="t")])
     assert [s.name for s in poller.states()] == ["n1"]
     assert fake.puts == []                 # 移除绝不触发任何下发
+
+
+async def test_poll_reads_source_or_haproxy_alias(fake, poller):
+    """节点 overview 的采样源视图：只给新键 source / 只给旧键 haproxy /
+    两者都给，degraded 都要读得到（节点新旧版本混跑时总控照常工作）。"""
+    poller.set_nodes([FleetNode(name="n1", url=fake.url, token="t")])
+    base = overview_payload(degraded=True)
+    # 只给 source。
+    fake.payload = dict(base)
+    fake.payload["source"] = fake.payload.pop("haproxy")
+    await poller.poll_once()
+    assert poller.states()[0].degraded is True
+    # 只给 haproxy（旧节点）。
+    fake.payload = overview_payload(degraded=False)
+    await poller.poll_once()
+    assert poller.states()[0].degraded is False
