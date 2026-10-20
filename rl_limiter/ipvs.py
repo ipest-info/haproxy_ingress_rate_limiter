@@ -213,3 +213,192 @@ def parse_proc_ip_vs_stats(text: str) -> model.InstanceStat:
             return model.InstanceStat(cum_conns=conns, idle_pct=100)
     raise IpvsParseError(
         "/proc/net/ip_vs_stats 内容不符合预期（没有找到合计数据行）")
+
+
+# ---------------------------------------------------------------------------
+# 受管清单 loader（对应基线里 haproxy.cfg 的角色）
+# ---------------------------------------------------------------------------
+
+def load_sections(proc_path: str = "/proc/net/ip_vs") -> list:
+    """内核 IPVS 实况表 → ParsedSection 清单（cfgparse 的通用形状）。
+
+    文件不存在 = 内核没加载 ip_vs 模块，抛 IpvsUnavailableError：引导期
+    由 __main__ 转成启动失败（宁可起不来，也不要"以为在限速"）；watch
+    期由 fail-static 兜住。
+    """
+    from . import cfgparse
+    try:
+        with open(proc_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        raise IpvsUnavailableError(
+            f"{proc_path} 不存在：内核没有加载 ip_vs 模块"
+            "（modprobe ip_vs ip_vs_rr；Docker Desktop 等精简内核可能"
+            "没有该模块）") from None
+    except OSError as e:
+        raise IpvsError(f"读 {proc_path} 失败：{e}") from None
+    return [cfgparse.ParsedSection(name=s.name, kind="virtual_server",
+                                   binds=[(s.vip, s.port)], mode=s.proto)
+            for s in parse_proc_ip_vs(text)]
+
+
+def resolve_port_conflicts(frontends: list, log,
+                           _warned: "set | None" = None) -> list:
+    """v1 已知边界：tc 按端口分类（classid 次要号=端口、filter 只匹配
+    端口），多个 VIP 共用同一端口时执行面无法区分。
+
+    裁决：同端口按名序第一个保留限额，其余强制 quota=0（只监控）。
+    **监控不受影响**——IPVS 的字节数本来就按服务分开统计；被裁掉的只
+    是 tc 执行面。error 级日志（这是限速语义被裁剪，不是普通提醒），
+    经 _warned 去重。
+    """
+    warned = _warned if _warned is not None else set()
+    by_port: dict = {}
+    for f in sorted(frontends, key=lambda x: x.name):
+        by_port.setdefault(f.bind_port, []).append(f)
+    out = []
+    for port, group in by_port.items():
+        keep = group[0]
+        out.append(keep)
+        for extra in group[1:]:
+            if extra.quota_mbps > 0:
+                key = f"portconflict:{port}:{extra.name}"
+                if key not in warned:
+                    warned.add(key)
+                    log.error(
+                        "同端口有多个虚拟服务，tc 按端口分类无法区分："
+                        "仅 %s 参与限速，%s 改为只监控不限速（v1 已知"
+                        "边界，见 docs/11；监控仍按服务精确） port=%d",
+                        keep.name, extra.name, port)
+                extra = type(extra)(name=extra.name,
+                                    bind_port=extra.bind_port,
+                                    quota_mbps=0.0,
+                                    bind_address=extra.bind_address,
+                                    mode=extra.mode)
+            out.append(extra)
+    return sorted(out, key=lambda f: f.name)
+
+
+def load_frontends(quotas: dict, log, _warned: "set | None" = None,
+                   proc_path: str = "/proc/net/ip_vs") -> list:
+    """受管清单一步到位：内核表 → 合并限额 → 同端口冲突裁决。"""
+    from . import cfgparse
+    fes = cfgparse.load_frontends_from(
+        lambda: load_sections(proc_path), quotas, log, _warned)
+    return resolve_port_conflicts(fes, log, _warned)
+
+
+# ---------------------------------------------------------------------------
+# 采样客户端（鸭子类型对齐 haproxy.RuntimeClient）
+# ---------------------------------------------------------------------------
+
+async def _run_ipvsadm(argv: list) -> "tuple[int, str, str]":
+    """默认的子进程执行器（测试注入 runner 替身）。"""
+    import asyncio
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE)
+    out, err = await proc.communicate()
+    return (proc.returncode or 0, out.decode("utf-8", errors="replace"),
+            err.decode("utf-8", errors="replace"))
+
+
+class IpvsClient:
+    """IPVS 的采样客户端，与 haproxy.RuntimeClient 鸭子类型等价：
+    collector 只认 async show_stat() / show_info() 两个方法。
+
+    show_stat 每拍（1s）跑一次 ipvsadm 子进程取按服务字节数——成本
+    见模块头注释；show_info 只读 proc 文件（µs 级），collector 的
+    gather 并发契约不受影响。
+    """
+
+    def __init__(self, ipvsadm_path: str = "ipvsadm",
+                 timeout_s: float = 0.5,
+                 log=None,
+                 proc_path: str = "/proc/net/ip_vs",
+                 stats_path: str = "/proc/net/ip_vs_stats",
+                 runner=None):
+        import logging as _logging
+        self._ipvsadm = ipvsadm_path
+        self._timeout_s = timeout_s
+        self._log = log if log is not None else _logging.getLogger(
+            "rl_limiter.ipvs")
+        self._proc_path = proc_path
+        self._stats_path = stats_path
+        self._runner = runner if runner is not None else _run_ipvsadm
+        # 最近一拍的 Σ(Active+InAct)，show_info 的"当前连接数"用它
+        # （/proc/net/ip_vs_stats 只有累计值，没有当前并发）。
+        self._last_conn_sum = 0
+
+    @classmethod
+    def from_config(cls, lvs, log=None) -> "IpvsClient":
+        return cls(ipvsadm_path=lvs.ipvsadm_path, timeout_s=lvs.timeout_s,
+                   log=log)
+
+    def endpoint(self) -> str:
+        """人类可读的端点描述（日志用，与 RuntimeClient 对位）。"""
+        return f"ipvs({self._proc_path})"
+
+    def _read(self, path: str) -> str:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            raise IpvsUnavailableError(
+                f"{path} 不存在：内核没有加载 ip_vs 模块"
+                "（modprobe ip_vs）") from None
+        except OSError as e:
+            raise IpvsError(f"读 {path} 失败：{e}") from None
+
+    async def show_stat(self) -> list:
+        """全部虚拟服务的采样行（与 RuntimeClient.show_stat 同形状）。"""
+        import asyncio
+        services = parse_proc_ip_vs(self._read(self._proc_path))
+        argv = [self._ipvsadm, "-Ln", "--stats", "--exact"]
+        try:
+            rc, out, err = await asyncio.wait_for(
+                self._runner(argv), self._timeout_s)
+        except asyncio.TimeoutError:
+            raise IpvsCommandError(
+                f"ipvsadm 超时（>{self._timeout_s:g}s）：{' '.join(argv)}"
+            ) from None
+        if rc != 0:
+            raise IpvsCommandError(
+                f"ipvsadm 执行失败 rc={rc}：{err.strip() or '无 stderr'}"
+                "（需要 CAP_NET_ADMIN；确认 ipvsadm 已安装、内核已加载"
+                " ip_vs）")
+        stats = parse_ipvsadm_stats(out)
+        rows = []
+        conn_sum = 0
+        for s in services:
+            # 两次读取之间规则变了（竞态）：stats 对不上的服务本拍字节
+            # 取 0——collector 把它当新基线/回绕处理，不值得抛错。
+            conns, in_b, out_b = stats.get((s.proto, s.vip, s.port),
+                                           (0, 0, 0))
+            conn_cur = s.active_conn + s.inact_conn
+            conn_sum += conn_cur
+            rows.append(model.FrontendStat(
+                name=s.name,
+                bytes_out=out_b,
+                conn_cur=conn_cur,
+                bytes_in=in_b,
+                conn_tot=conns,
+                # 活跃/空闲拆分借 open_* 字段表达（见 model property）：
+                # open_conns=Active+InAct、open_streams=Active。
+                open_conns=conn_cur,
+                open_streams=s.active_conn,
+                mode=s.proto,
+            ))
+        self._last_conn_sum = conn_sum
+        return rows
+
+    async def show_info(self) -> model.InstanceStat:
+        """实例级指标（与 RuntimeClient.show_info 同形状）。
+
+        IPVS 没有 maxconn 水位线与空闲率概念：max_conn=0（页面不画
+        水位线）、idle_pct=100（永不触发"忙"的告警样式）。
+        """
+        inst = parse_proc_ip_vs_stats(self._read(self._stats_path))
+        inst.curr_conns = self._last_conn_sum
+        return inst
