@@ -338,3 +338,54 @@ async def test_watch_pushes_on_request_limits_change(tmp_path):
     got = await run_watch_once(cfg_file, yaml_file, boot)
     assert got and got[-1].request_limits["fe_main"].mbps == 10.0
     assert got[-1].request_limits["fe_main"].conn_rate == 200
+
+
+# ---------------------------------------------------------------------------
+# 受管清单来源注入（LVS 等非 haproxy.cfg 来源的通用入口）
+# ---------------------------------------------------------------------------
+
+def test_load_frontends_from_injected_loader_equals_file_path(tmp_path):
+    """注入 loader 与读文件两条路产出完全相同的清单。"""
+    text = "frontend fe_a\n    bind :8080\n    mode tcp\n"
+    p = tmp_path / "haproxy.cfg"
+    p.write_text(text, encoding="utf-8")
+    log = logging.getLogger("t")
+    via_file = cfgparse.load_frontends(str(p), {"fe_a": 40.0}, log)
+    via_loader = cfgparse.load_frontends_from(
+        lambda: cfgparse.parse_haproxy_cfg(text), {"fe_a": 40.0}, log)
+    assert cfgparse.canonical(via_file) == cfgparse.canonical(via_loader)
+
+
+def test_build_frontends_accepts_udp_mode():
+    """IPVS 的虚拟服务可以是 UDP：mode 原样保留而不是回落 tcp。"""
+    sec = cfgparse.ParsedSection(name="vs_10.0.0.1_53", kind="virtual_server",
+                                 binds=[("10.0.0.1", 53)], mode="udp")
+    fes = cfgparse.build_frontends([sec], {}, logging.getLogger("t"))
+    assert fes[0].mode == "udp"
+
+
+async def test_watch_uses_injected_section_loader(tmp_path):
+    """watch 传 section_loader 时受管清单来自回调（cfg_path 只是日志
+    标注）——LVS 分支接内核实况表的切口。"""
+    yml = tmp_path / "config.yaml"
+    yml.write_text(
+        "haproxy:\n  socket_path: /run/h.sock\n"
+        "  cfg_path: /nonexistent\nquotas:\n  vs_10.0.0.1_8080: 40\n",
+        encoding="utf-8")
+    sections = [cfgparse.ParsedSection(
+        name="vs_10.0.0.1_8080", kind="virtual_server",
+        binds=[("10.0.0.1", 8080)], mode="tcp")]
+    q: asyncio.Queue = asyncio.Queue()
+    poke = asyncio.Event()
+    task = asyncio.ensure_future(cfgparse.watch(
+        "/nonexistent", str(yml), q, [], logging.getLogger("t"),
+        interval_s=60, poke=poke, section_loader=lambda: list(sections)))
+    try:
+        poke.set()
+        cfg = await asyncio.wait_for(q.get(), timeout=2)
+        assert [f.name for f in cfg.frontends] == ["vs_10.0.0.1_8080"]
+        assert cfg.frontends[0].quota_mbps == 40.0
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

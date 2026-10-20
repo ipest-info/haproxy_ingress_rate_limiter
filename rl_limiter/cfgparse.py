@@ -194,7 +194,7 @@ def build_frontends(
                     s.name, addr or "*", port, s.name)
         out.append(model.FrontendConfig(
             name=s.name, bind_address=addr, bind_port=port,
-            mode=s.mode if s.mode in ("tcp", "http") else "tcp",
+            mode=s.mode if s.mode in ("tcp", "http", "udp") else "tcp",
             quota_mbps=quota))
 
     for name in sorted(set(quotas) - seen):
@@ -215,9 +215,24 @@ def load_frontends(cfg_path: str, quotas: dict[str, float],
     文件读不到/读错按异常抛出，调用方决定是启动失败（引导阶段）还是
     保留当前配置（watch 阶段的 fail-static）。
     """
-    with open(cfg_path, "r", encoding="utf-8", errors="replace") as f:
-        text = f.read()
-    return build_frontends(parse_haproxy_cfg(text), quotas, log, _warned)
+    def _loader() -> list[ParsedSection]:
+        with open(cfg_path, "r", encoding="utf-8", errors="replace") as f:
+            return parse_haproxy_cfg(f.read())
+    return load_frontends_from(_loader, quotas, log, _warned)
+
+
+def load_frontends_from(loader, quotas: dict[str, float],
+                        log: logging.Logger,
+                        _warned: set[str] | None = None
+                        ) -> list[model.FrontendConfig]:
+    """受管清单来源的通用入口：loader() → list[ParsedSection] → 合并限额。
+
+    loader 是注入的回调（抛异常 = 本轮加载失败，由调用方决定启动失败
+    还是 fail-static）。基线的 haproxy.cfg、LVS 分支的内核 IPVS 实况表
+    都从这里走——build_frontends 的合并/告警语义只依赖 ParsedSection
+    的形状，与来源无关。
+    """
+    return build_frontends(loader(), quotas, log, _warned)
 
 
 def canonical(frontends: list[model.FrontendConfig],
@@ -252,9 +267,14 @@ async def watch(
     boot_instance_quota_mbps: float = 0.0,
     boot_request_limits: "dict | None" = None,
     poke: "asyncio.Event | None" = None,
+    section_loader=None,
 ) -> None:
-    """常驻任务：轮询 haproxy.cfg 与 YAML 配置文件，内容变化就把新
+    """常驻任务：轮询受管清单来源与 YAML 配置文件，内容变化就把新
     ControllerConfig 投入 queue（监控循环热应用，tc/告警基准随之更新）。
+
+    受管清单默认读 cfg_path（haproxy.cfg）；传 section_loader（返回
+    list[ParsedSection] 的回调）则以它为来源——LVS 分支用它接内核
+    IPVS 实况表，cfg_path 仅用于日志标注。
 
     - 变更判定用**解析结果**的规范化字符串比较，而不是文件 mtime——
       触发 reload 的运维动作常伴随 touch/原子替换，mtime 变了内容没变
@@ -290,7 +310,11 @@ async def watch(
                          # 入向动态限速参数启动时定型：改了要重启才生效，
                          # 塞进这个元组让变化触发下面的"需重启"提醒。
                          repr(svc.dynamic_ingress))
-            frontends = load_frontends(cfg_path, quotas, log, warned)
+            if section_loader is not None:
+                frontends = load_frontends_from(section_loader, quotas,
+                                                log, warned)
+            else:
+                frontends = load_frontends(cfg_path, quotas, log, warned)
         except Exception as e:
             log.warning(
                 "重读配置失败，保留当前配置继续运行（fail-static），下一轮"

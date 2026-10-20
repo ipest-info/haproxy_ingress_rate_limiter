@@ -90,16 +90,21 @@ class FrontendStat:
     def active_conns(self) -> int:
         """活跃连接数：有在途请求/流的连接。
 
-        mode tcp 下没有流的概念，每条连接都在传数据，全部计为活跃。
+        判据是 open_conns 是否有值，而不是 mode：HAProxy 形态下只有
+        http 段才有 h1_open_*（tcp 段恒 0，回落 conn_cur，行为不变）；
+        IPVS 形态借同一对字段表达 ActiveConn/InActConn（open_conns=
+        Active+InAct、open_streams=Active），tcp/udp 模式也能拆出
+        活跃/空闲。
         """
-        if self.mode == "http" and self.open_conns:
+        if self.open_conns:
             return min(self.open_streams, self.open_conns)
         return self.conn_cur
 
     @property
     def idle_conns(self) -> int:
-        """空闲连接数：建立着但当前没有在途流（HTTP keep-alive 等待中）。"""
-        if self.mode == "http" and self.open_conns:
+        """空闲连接数：建立着但当前没有在途流/请求（HTTP keep-alive
+        等待中；IPVS 口径 = InActConn）。"""
+        if self.open_conns:
             return max(0, self.open_conns - self.open_streams)
         return 0
 
