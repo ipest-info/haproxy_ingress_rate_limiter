@@ -213,6 +213,7 @@ def _parse_dynamic_ingress(d: Any) -> ingressgov.IngressGovConfig:
             f"dynamic_ingress 有不认识的键 {sorted(unknown)}"
             f"（支持 {sorted(known)}）")
     g.enabled = bool(d.get("enabled", g.enabled))
+    g.explicit = "enabled" in d
     for key in ("interval_s", "low_ratio", "high_ratio", "step_up",
                 "step_down_max", "floor_ratio", "apply_epsilon"):
         if key in d:

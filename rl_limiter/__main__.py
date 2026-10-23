@@ -175,9 +175,11 @@ async def _amain(cfg, log: logging.Logger,
                  cfg.dynamic_ingress.step_up,
                  cfg.dynamic_ingress.step_down_max,
                  cfg.dynamic_ingress.floor_ratio)
-    elif cfg.dynamic_ingress.enabled:
+    elif cfg.dynamic_ingress.enabled and cfg.dynamic_ingress.explicit:
+        # 只对 YAML 里**手写** enabled: true 的告警；默认开（出厂值）
+        # 而入向未接线的形态（纯监控、基线出向 HTB）不该被刷警告。
         log.warning("dynamic_ingress.enabled=true 但入向限速未接线"
-                    "（RL_TC_IN_IFACE 未设或为 -），动态调节不会运行")
+                    "（RL_TC_IN_IFACE=-），动态调节不会运行")
 
     # 实例总限速的执行者：出向 HTB（基线形态），或 ifb 闭环的入向总闸
     # （本分支形态）。两者都没有时页面置灰、写接口 409（见 webconsole）。
