@@ -19,7 +19,7 @@ log_level: debug
 tick_interval_s: 1.0
 haproxy:
   name: haproxy
-  socket_path: /run/haproxy/admin.sock
+  socket_path: /var/lib/haproxy/stats
   cfg_path: /etc/haproxy/haproxy.cfg
   timeout_ms: 250
 quotas:
@@ -42,7 +42,7 @@ def minimal(hap="{socket_path: /run/h.sock, cfg_path: /etc/haproxy/haproxy.cfg}"
 def test_load_full_config(tmp_path):
     cfg = load_from(tmp_path)
     assert cfg.log_level == "debug"
-    assert cfg.haproxy.socket_path == "/run/haproxy/admin.sock"
+    assert cfg.haproxy.socket_path == "/var/lib/haproxy/stats"
     assert cfg.haproxy.cfg_path == "/etc/haproxy/haproxy.cfg"
     assert cfg.haproxy.timeout_s == 0.25          # ms → s
     assert cfg.quotas == {"fe_main": 40.0, "fe_api": 8.5}

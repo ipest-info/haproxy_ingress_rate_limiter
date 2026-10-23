@@ -127,7 +127,7 @@ check_stats_socket() {
 
          请在 global 段加上这一行（然后 systemctl reload haproxy）：
 
-             stats socket /run/haproxy/admin.sock mode 660 level user
+             stats socket /var/lib/haproxy/stats mode 660 level user
 
          本脚本**不会替你改 haproxy.cfg**：那是你的生产配置，
          我们一个字节都不碰。

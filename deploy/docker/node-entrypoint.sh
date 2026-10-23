@@ -41,7 +41,7 @@ HAPROXY_TEMPLATE=${HAPROXY_TEMPLATE:-/etc/rl-limiter/haproxy-template.cfg}
 HAPROXY_CFG=${HAPROXY_CFG:-/etc/haproxy/haproxy.cfg}
 RL_YAML_TEMPLATE=${RL_YAML_TEMPLATE:-/etc/rl-limiter/config-template.yaml}
 RL_YAML=${RL_YAML:-/etc/rl-limiter/config.yaml}
-HAPROXY_SOCK=${HAPROXY_SOCK:-/run/haproxy/admin.sock}
+HAPROXY_SOCK=${HAPROXY_SOCK:-/var/lib/haproxy/stats}
 HAPROXY_PIDFILE=${HAPROXY_PIDFILE:-/run/haproxy/master.pid}
 SOCK_WAIT_S=${SOCK_WAIT_S:-30}
 
