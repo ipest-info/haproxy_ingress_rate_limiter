@@ -13,7 +13,7 @@
 #
 # 前置条件：
 #   1. 本机 haproxy.cfg 的 global 段有
-#        stats socket /run/haproxy/admin.sock mode 660 level user
+#        stats socket /var/lib/haproxy/stats mode 660 level user
 #      defaults 段有 option contstats（长连接的秒级带宽依赖它）。
 #   2. 专用用户并加入 haproxy 组（socket 的 mode 660 靠属组授权）：
 #        useradd --system --no-create-home --shell /usr/sbin/nologin rl-limiter

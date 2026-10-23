@@ -35,7 +35,7 @@ tick_interval_s: 1.0            # 采样节拍（秒）；只支持 1.0，见校
 # 采样通道二选一（校验强制恰好给一种）：
 #   - socket_path（**同机部署，推荐**）：本机 unix stats socket 绝对路径。
 #     haproxy.cfg 的 global 段需有：
-#       stats socket /run/haproxy/admin.sock mode 660 level user
+#       stats socket /var/lib/haproxy/stats mode 660 level user
 #     不占任何网络端口，访问权由文件属主/属组控制。
 #   - host + port（远程只读观测）：内网 TCP stats socket。
 #       stats socket ipv4@<内网IP>:9999 level user
@@ -48,7 +48,7 @@ tick_interval_s: 1.0            # 采样节拍（秒）；只支持 1.0，见校
 # ---------------------------------------------------------------------------
 haproxy:
   name: haproxy                 # 实例名（日志/控制台展示用）
-  socket_path: /run/haproxy/admin.sock
+  socket_path: /var/lib/haproxy/stats
   cfg_path: /etc/haproxy/haproxy.cfg
   timeout_ms: 500               # 单次 runtime API 命令超时（连接 + 读写）
   # 远程观测形态改用（与 socket_path 二选一，不可混填）：
