@@ -1,7 +1,8 @@
 # 生产形态样例：**host 网络**单节点部署（容器交付 + 宿主机网络栈）。
 #
 #   启动：docker compose -f docker-compose-host.yml up -d --build
-#   控制台：http://127.0.0.1:8090（默认只绑回环，远程看用 SSH 隧道）
+#   控制台：http://<本机内网地址>:8090（默认绑 0.0.0.0，读接口无鉴权，
+#           用防火墙/安全组限制来源；只想本机访问改 RL_CONSOLE_BIND）
 #   收场：docker compose -f docker-compose-host.yml down
 #
 # 为什么是 host 网络：bridge 形态每个包要走 veth→网桥→conntrack/NAT，
