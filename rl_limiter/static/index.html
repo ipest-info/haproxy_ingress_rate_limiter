@@ -388,8 +388,10 @@ input:focus, select:focus {
     <div class="card" id="reg-card" hidden>
       <div class="card-head">
         <span class="card-title">调节视图（闭环动态限速）</span>
-        <span class="hint">单位一律 Mbps。出向观测为 HAProxy 应用层 10s 均值
-          （控制环的观测值）；总闸/实测流入/网卡带宽为链路层口径。</span>
+        <span class="hint">单位一律 Mbps。出向总观测为网卡口径（客户端侧
+          网卡流出 10s 均值，与按量计费同口径；设备数据缺席时回退 HAProxy
+          应用层口径）；端口级观测为 HAProxy 口径（网卡无法按端口拆）；
+          总闸/实测流入同为链路层口径。</span>
       </div>
       <div class="card-body">
         <div class="stats">
@@ -677,7 +679,7 @@ function ensureRegCard() {
   const grid = $("#reg-charts"), pts = () => state.regBuf;
   state.regCharts = [
     makeChart(grid, {
-      title: "出向总带宽 vs 目标", source: "HAProxy 口径 · 控制环观测值",
+      title: "出向总带宽 vs 目标", source: "网卡口径（客户端侧流出）· 控制环观测值",
       fmt: fmtNum, unit: "Mbps", points: pts,
       series: [{key: "egress", label: "出向总观测（10s 均值）", color: "--s-out"}],
       ref: () => {

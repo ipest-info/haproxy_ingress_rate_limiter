@@ -412,3 +412,76 @@ def test_update_config_reenable_resumes():
     feed(g, 80.0)
     assert g.adjust_once([fe()], LIMITS)
     assert g.current()["fe_main"] == pytest.approx(9.0)
+
+
+# ---------------------------------------------------------------------------
+# 实例环的观测口径 = 网卡（客户端侧执行网卡流出），不参考 HAProxy
+# ---------------------------------------------------------------------------
+
+def nic_inst(rate_out_mbps, name="eth0"):
+    return model.InstanceUsage(nics=[model.NicUsage(
+        name=name, rate_out_bps=rate_out_mbps * 1e6 / 8)])
+
+
+def gov_nic(**kw):
+    cfg = ingressgov.IngressGovConfig(enabled=True, **kw)
+    return ingressgov.IngressGovernor(cfg, log, obs_nic="eth0")
+
+
+def test_instance_loop_observes_nic_not_haproxy():
+    """HAProxy 口径说没超（求和 10）、网卡口径说超了（80）：实例环必须
+    按网卡观测收紧——按量计费计的是网卡。"""
+    g = gov_nic()
+    g.record(0.0, [usage(mean_mbps=10.0)], nic_inst(80.0))
+    assert g.adjust_once([fe()], LIMITS, inst_target=40.0,
+                         ingress_now_mbps=1.0)
+    assert g.current_instance() is not None, "网卡口径超标必须收紧总闸"
+
+
+def test_instance_loop_nic_under_target_no_action():
+    """网卡口径在死区内、HAProxy 口径虚高：实例环不动作（不被应用层
+    口径带偏）。端口级环没有出向目标登记时同样不动。"""
+    g = gov_nic()
+    g.record(0.0, [usage(mean_mbps=80.0)], nic_inst(38.0))  # 0.95×40 死区
+    assert not g.adjust_once([], {}, inst_target=40.0)
+    assert g.current_instance() is None
+
+
+def test_instance_loop_runs_while_haproxy_degraded():
+    """HAProxy 采样失联（degraded）：实例环凭网卡观测照常收紧，端口级
+    环冻结——生产里 stats socket 权限坏掉时总闸不能跟着失明。"""
+    g = gov_nic()
+    g.record(0.0, [usage(mean_mbps=80.0)], nic_inst(80.0))
+    assert g.adjust_once([fe()], LIMITS, inst_target=40.0,
+                         ingress_now_mbps=1.0, degraded=True)
+    assert g.current_instance() is not None, "实例环（网卡观测）应继续工作"
+    assert g.current() == {}, "端口级环（HAProxy 观测）必须冻结"
+
+
+def test_instance_loop_falls_back_to_haproxy_without_nics(caplog):
+    """从未收到设备数据（RL_NIC=-）：回退 HAProxy 口径并 warn 一次。"""
+    import logging as _logging
+    g = ingressgov.IngressGovernor(
+        ingressgov.IngressGovConfig(enabled=True),
+        _logging.getLogger("t.fallback"), obs_nic="eth0")
+    g.record(0.0, [usage(mean_mbps=80.0)], None)
+    with caplog.at_level(_logging.WARNING, logger="t.fallback"):
+        assert g.adjust_once([fe()], LIMITS, inst_target=40.0,
+                             ingress_now_mbps=1.0)
+        g.record(0.0, [usage(mean_mbps=80.0)], None)
+        g.adjust_once([fe()], LIMITS, inst_target=40.0, ingress_now_mbps=1.0)
+    hits = [r for r in caplog.records if "回退 HAProxy" in r.getMessage()]
+    assert len(hits) == 1, "回退告警只该出现一次"
+    assert g.current_instance() is not None
+
+
+def test_nic_observation_prefers_named_card():
+    """多卡时按名取观测网卡（eth0），不被其它卡（eth1 流量更高）带偏。"""
+    g = gov_nic()
+    inst = model.InstanceUsage(nics=[
+        model.NicUsage(name="eth1", rate_out_bps=200e6 / 8),
+        model.NicUsage(name="eth0", rate_out_bps=38.0 * 1e6 / 8),
+    ])
+    g.record(0.0, [], inst)
+    assert not g.adjust_once([], {}, inst_target=40.0), \
+        "eth0 在死区内就不该动作，哪怕 eth1 流量爆表"
