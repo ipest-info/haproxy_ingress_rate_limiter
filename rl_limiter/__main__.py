@@ -64,10 +64,10 @@ DEFAULT_APPLY_PERIOD_S = 30.0
 # 权限（CAP_NET_ADMIN）操作哪张网卡。
 ENV_TC_IFACE = "RL_TC_IFACE"
 
-# 实例监控视图里**入向**数据包统计要采样的网卡（/proc/net/dev）。
-# 出向的包数/丢包数已由 tc 按 frontend 精确统计（见 tcshaper），不需要
-# 网卡口径；入向 tc 的出方向队列看不到，只能从这里取。
-# 不设则跟随 RL_TC_IFACE；设为 "-" 表示禁用入向包统计。
+# 实例监控视图按设备监控的网卡（/proc/net/dev：带宽/数据包/丢包，页面
+# 每设备一块视图）。逗号分隔可给多张（首卡为"锚点"，老的单卡字段镜像
+# 它）；不设 = 本机全部物理网卡（探测不到物理网卡时回退跟随执行网卡）；
+# 设为 "-" 表示禁用设备统计。
 ENV_NIC = "RL_NIC"
 
 # 请求方向（入向）限速的执行网卡 = **客户端侧**那张（双网卡形态）。
@@ -387,7 +387,7 @@ async def _amain(cfg, log: logging.Logger,
             {"label": "出向限速网卡 RL_TC_IFACE",
              "value": (shaper.iface if shaper is not None
                        else "-（出向 tc 整形已关闭）")},
-            {"label": "入向包统计网卡 RL_NIC",
+            {"label": "设备监控网卡 RL_NIC",
              "value": nic or "-（已禁用）"},
             {"label": "监控数据落盘 RL_METRICS_LOG",
              "value": ((os.environ.get(ENV_METRICS_LOG) or "").strip()
@@ -602,8 +602,9 @@ def main() -> None:
                "/metrics 提供 Prometheus 抓取。"
                "监控数据落盘：设 RL_METRICS_LOG=<文件路径> 启用（分钟粒度 "
                "JSONL，按天轮转，RL_METRICS_LOG_DAYS 定保留天数，默认 90）。"
-               "实例监控视图的入向数据包统计取自 /proc/net/dev，RL_NIC 指定"
-               "网卡（默认跟随限速网卡，设 - 则禁用）。")
+               "实例监控视图按设备统计网卡带宽/数据包（/proc/net/dev），"
+               "RL_NIC 指定网卡（逗号分隔可多张；默认 = 本机全部物理网卡，"
+               "设 - 则禁用）。")
     parser.add_argument(
         "-c", "--config", default="/etc/rl-limiter/config.yaml",
         help="YAML 配置文件路径（默认 %(default)s）")
@@ -820,20 +821,35 @@ def main() -> None:
         log.info("监控数据落盘已启用（分钟粒度 JSONL，按天轮转） path=%s "
                  "retention_days=%d", raw_mlog, mlog_days)
 
-    # 实例视图的**入向**包统计要采哪张网卡（"-" = 显式禁用）。出向的包/
-    # 丢包由 tc 按 frontend 统计，不走这里。默认跟随限速网卡——两者本来
-    # 就该是同一张（客户端流量进出的那张），分开设只会给人配错的机会。
-    # 出向 tc 关闭的闭环形态（RL_TC_IFACE=-）跟随**入向**执行网卡：闭环
-    # 的调节对象就是那张卡，网卡口径的带宽/包统计必须对着它才有意义。
+    # 实例视图按**设备**监控哪些网卡（带宽/包/丢包，页面每设备一块
+    # 视图）。"-" = 显式禁用；逗号分隔多张（显式顺序保留，首卡是老的
+    # 单卡字段镜像的"锚点"）。默认：本机全部**物理**网卡（双网卡机器
+    # eth0/eth1 都在列，锚点 = 执行网卡排最前）；容器等探测不到物理
+    # 网卡时回退老逻辑——跟随出向整形网卡，出向关闭（默认闭环形态）
+    # 时跟随入向执行网卡（闭环的调节对象就是那张卡）。
     raw_nic = (os.environ.get(ENV_NIC) or "").strip()
+    anchor = (tc_iface
+              or (raw_in_iface if raw_in_iface != "-" else ""))
     if raw_nic == "-":
         nic = ""
     elif raw_nic:
-        nic = netdev.resolve_iface(raw_nic, log)
+        seen: list[str] = []
+        for part in raw_nic.split(","):
+            part = part.strip()
+            if part and part not in seen:
+                seen.append(part)
+        nic = ",".join(seen)
     else:
-        nic = (tc_iface
-               or (raw_in_iface if raw_in_iface != "-" else "")
-               or netdev.resolve_iface("", log))
+        phys = netdev.list_physical_ifaces()
+        if phys:
+            ordered = (([anchor] if anchor in phys else [])
+                       + [n for n in phys if n != anchor])
+            nic = ",".join(ordered)
+        else:
+            nic = anchor or netdev.resolve_iface("", log)
+    if nic:
+        log.info("实例视图的设备监控网卡 nics=%s（首卡为锚点，老的单卡"
+                 "字段镜像它；改用 RL_NIC=<卡1,卡2> 显式指定）", nic)
 
     # 启动即输出完整配置摘要：现场排障时第一条要看的日志，可直接核对
     # 受管清单、限额基准与两个配置文件的路径。

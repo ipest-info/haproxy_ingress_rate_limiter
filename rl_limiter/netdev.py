@@ -107,6 +107,29 @@ def default_iface(route_path: str = PROC_NET_ROUTE,
     return ""
 
 
+SYS_CLASS_NET = "/sys/class/net"
+
+
+def list_physical_ifaces(sys_path: str = SYS_CLASS_NET) -> list[str]:
+    """枚举本机的**物理**网卡（名字典序）。
+
+    判据是 /sys/class/net/<网卡>/device 是否存在：物理设备挂在总线上有
+    device 符号链接，虚拟设备（lo、ifb、veth、网桥、bond、tun…）没有。
+    这比按名字前缀黑名单可靠——命名方案（eth0/ens33/enp1s0）各发行版
+    不同，而 device 链接的语义是内核保证的。
+
+    容器里常见返回空列表（容器网卡是 veth，没有 device）——调用方此时
+    回退到"跟随执行网卡"的老逻辑，不该因此没得监控。
+    """
+    import os
+    try:
+        names = os.listdir(sys_path)
+    except OSError:
+        return []
+    return sorted(n for n in names
+                  if os.path.exists(os.path.join(sys_path, n, "device")))
+
+
 def resolve_iface(configured: str, log: logging.Logger | None = None) -> str:
     """定下本次运行要采样哪张网卡。
 

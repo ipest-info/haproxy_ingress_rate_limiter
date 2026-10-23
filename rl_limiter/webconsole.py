@@ -112,6 +112,17 @@ def _instance_view(inst) -> dict[str, Any]:
         "drop_out_ps": inst.drop_out_ps,
         "nic_rate_in_bytes_per_s": inst.nic_rate_in_bps,
         "nic_rate_out_bytes_per_s": inst.nic_rate_out_bps,
+        # 设备视图：受监控网卡逐卡一条（上面的 nic_*/pkts_/drop_ 标量
+        # 是首卡镜像，老消费方继续用；页面的实例面板按这里逐设备画图）。
+        "nics": [{
+            "name": n.name,
+            "rate_in_bytes_per_s": n.rate_in_bps,
+            "rate_out_bytes_per_s": n.rate_out_bps,
+            "pkts_in_ps": n.pkts_in_ps,
+            "pkts_out_ps": n.pkts_out_ps,
+            "drop_in_ps": n.drop_in_ps,
+            "drop_out_ps": n.drop_out_ps,
+        } for n in inst.nics],
         "idle_pct": inst.idle_pct,
         "degraded": inst.degraded,
     }
@@ -391,6 +402,29 @@ def render_prometheus(hub: StatusHub) -> str:
             v = inst.get(key)
             if v is not None:
                 m(pname, v, help_)
+
+        # 设备视图：逐卡带 nic 标签。上面的无标签 nic_* 指标是首卡镜像
+        # （历史口径，永久保留）；多网卡机器按标签区分每张卡。
+        nic_metrics = [
+            ("rate_in_bytes_per_s", "rl_limiter_device_rate_in_bytes_per_second",
+             "设备入向速率（链路层、整机）"),
+            ("rate_out_bytes_per_s", "rl_limiter_device_rate_out_bytes_per_second",
+             "设备出向速率（链路层、整机）"),
+            ("pkts_in_ps", "rl_limiter_device_packets_in_per_second",
+             "设备每秒入包数"),
+            ("pkts_out_ps", "rl_limiter_device_packets_out_per_second",
+             "设备每秒出包数"),
+            ("drop_in_ps", "rl_limiter_device_drops_in_per_second",
+             "设备每秒入向丢包数"),
+            ("drop_out_ps", "rl_limiter_device_drops_out_per_second",
+             "设备每秒出向丢包数"),
+        ]
+        for key, pname, help_ in nic_metrics:
+            first_nic = True
+            for n in inst.get("nics") or []:
+                m(pname, n.get(key, 0), help_ if first_nic else "",
+                  {"nic": n["name"]})
+                first_nic = False
 
     return "\n".join(lines) + "\n"
 

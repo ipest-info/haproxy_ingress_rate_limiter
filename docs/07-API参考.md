@@ -48,7 +48,12 @@
     "rate_in_bytes_per_s": ..., "rate_out_bytes_per_s": ...,   // HAProxy 口径
     "nic": "eth1", "pkts_in_ps": ..., "pkts_out_ps": ...,
     "drop_in_ps": ..., "drop_out_ps": ...,
-    "nic_rate_in_bytes_per_s": ..., "nic_rate_out_bytes_per_s": ...,  // 网卡口径
+    "nic_rate_in_bytes_per_s": ..., "nic_rate_out_bytes_per_s": ...,  // 网卡口径（首卡镜像）
+    "nics": [        // 设备视图：受监控网卡逐卡一条（上面的 nic/pkts_/drop_/
+                     // nic_rate_* 标量是首卡镜像，历史口径永久保留）
+      {"name": "eth0", "rate_in_bytes_per_s": ..., "rate_out_bytes_per_s": ...,
+       "pkts_in_ps": ..., "pkts_out_ps": ..., "drop_in_ps": ..., "drop_out_ps": ...}
+    ],
     "idle_pct": ..., "degraded": false
   },
   "haproxy": {"name": ..., "endpoint": ..., "unix": true, "degraded": false},

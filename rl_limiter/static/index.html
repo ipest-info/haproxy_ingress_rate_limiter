@@ -337,8 +337,8 @@ input:focus, select:focus {
           <div><div class="stat-l">活跃 / 非活跃</div><div class="stat-v" id="i-actidle">–</div></div>
           <div><div class="stat-l">每秒新建</div><div class="stat-v" id="i-new">–</div></div>
           <div><div class="stat-l">每秒丢失</div><div class="stat-v" id="i-denied">–</div></div>
-          <div><div class="stat-l">流入带宽（5s 均值）</div><div class="stat-v" id="i-rin">–<small>Mbps</small></div></div>
-          <div><div class="stat-l">流出带宽（5s 均值）</div><div class="stat-v" id="i-rout">–<small>Mbps</small></div></div>
+          <div><div class="stat-l">流入带宽（HAProxy·5s）</div><div class="stat-v" id="i-rin">–<small>Mbps</small></div></div>
+          <div><div class="stat-l">流出带宽（HAProxy·5s）</div><div class="stat-v" id="i-rout">–<small>Mbps</small></div></div>
           <div><div class="stat-l">连接上限</div><div class="stat-v" id="i-maxconn">–</div></div>
           <div><div class="stat-l">HAProxy 空闲率</div><div class="stat-v" id="i-idle">–<small>%</small></div></div>
         </div>
@@ -375,8 +375,8 @@ input:focus, select:focus {
     </div>
 
     <div class="card">
-      <div class="card-head"><span class="card-title">带宽视图</span>
-        <span class="hint">带宽为 HAProxy 应用层口径；数据包为网卡口径</span></div>
+      <div class="card-head"><span class="card-title">设备视图</span>
+        <span class="hint">按网卡设备统计（整机、链路层口径）；HAProxy 应用层口径的出向带宽见调节视图</span></div>
       <div class="card-body"><div class="chart-grid" id="i-bw-charts"></div></div>
     </div>
 
@@ -497,6 +497,7 @@ const state = {
   regCharts: [], regLatest: null, regBuilt: false,
   windowS: 300, logAfter: 0, logLevel: "INFO", tab: "instance",
   instDirty: false,          // 实例总限速输入框：用户动过后不再自动回填
+  nicNames: "",              // 受监控网卡集合（逗号串），变化即重建实例图表
 };
 const LEVELS = {DEBUG:10, INFO:20, WARNING:30, ERROR:40, CRITICAL:50};
 // 缓冲上限：1 秒一拍，服务端只留 10 分钟历史，客户端留够 20 分钟即可。
@@ -742,12 +743,17 @@ function updateRegulation(r) {
 }
 
 // ============================================================ 实例视图
-// 分组严格照 docs/06-控制台与监控.md：连接视图 = 新建 + 总连接；带宽视图 =
-// 带宽 + 数据包 + 丢弃数据包。文档里的"每秒丢弃 bit 数"没有任何数据源，
-// 不画（原因见页面底部的说明块）。
+// 连接视图 = 新建 + 总连接；带宽视图**按设备（网卡）**组织：每张受监控
+// 网卡一块带宽图（双网卡两块），数据包/丢包图逐卡成对画线。受监控网卡
+// 集合来自快照的 instance.nics（服务端 RL_NIC 决定），集合变化时整组
+// 重建。没有网卡数据时回退 HAProxy 应用层口径的旧带宽图，面板不留白。
+const NIC_COLOR_PAIRS = [["--s-in", "--s-out"], ["--s-total", "--s-idle"],
+                         ["--s-mean", "--s-bad"]];
 function buildInstanceCharts() {
   const pts = () => state.instBuf;
   const conn = $("#i-conn-charts"), bw = $("#i-bw-charts");
+  conn.innerHTML = ""; bw.innerHTML = "";
+  const nics = state.nicNames ? state.nicNames.split(",") : [];
   state.instCharts = [
     makeChart(conn, {
       title: "实例新建连接数", source: "show info / frontend 汇总",
@@ -766,31 +772,49 @@ function buildInstanceCharts() {
         {key: "idle", label: "非活跃连接数", color: "--s-idle"},
       ],
     }),
-    makeChart(bw, {
+  ];
+  if (nics.length) {
+    // 每设备一块带宽图：双网卡机器（eth0 客户侧 / eth1 后端侧）两块。
+    for (const name of nics) {
+      state.instCharts.push(makeChart(bw, {
+        title: `设备 ${name} 带宽`,
+        source: "网卡口径（整机、链路层）· 5s 滚动均值",
+        fmt: fmtMbps, unit: "Mbps", points: pts,
+        series: [
+          {key: "nin5_" + name, label: "流入带宽", color: "--s-in"},
+          {key: "nout5_" + name, label: "流出带宽", color: "--s-out"},
+        ],
+      }));
+    }
+    const pairSeries = (prefixIn, prefixOut, labIn, labOut) =>
+      nics.flatMap((name, idx) => {
+        const pair = NIC_COLOR_PAIRS[idx % NIC_COLOR_PAIRS.length];
+        return [
+          {key: prefixIn + name, label: `${name} ${labIn}`, color: pair[0]},
+          {key: prefixOut + name, label: `${name} ${labOut}`, color: pair[1]},
+        ];
+      });
+    state.instCharts.push(makeChart(bw, {
+      title: "设备数据包统计", source: "网卡口径（整机）",
+      fmt: fmtRate, unit: "包/秒", points: pts,
+      series: pairSeries("npin_", "npout_", "入包", "出包"),
+    }));
+    state.instCharts.push(makeChart(bw, {
+      title: "设备丢弃数据包统计", source: "网卡口径（整机）",
+      fmt: fmtRate, unit: "包/秒", points: pts,
+      series: pairSeries("ndin_", "ndout_", "丢入包", "丢出包"),
+    }));
+  } else {
+    // 没有网卡数据源（RL_NIC=- 或探测失败）：回退 HAProxy 应用层口径。
+    state.instCharts.push(makeChart(bw, {
       title: "实例带宽统计", source: "HAProxy 应用层口径 · 5s 滚动均值",
       fmt: fmtMbps, unit: "Mbps", points: pts,
       series: [
         {key: "rin5", label: "流入带宽", color: "--s-in"},
         {key: "rout5", label: "流出带宽", color: "--s-out"},
       ],
-    }),
-    makeChart(bw, {
-      title: "实例数据包统计", source: "网卡口径（整机）",
-      fmt: fmtRate, unit: "包/秒", points: pts,
-      series: [
-        {key: "pin", label: "每秒流入数据包数", color: "--s-in"},
-        {key: "pout", label: "每秒流出数据包数", color: "--s-out"},
-      ],
-    }),
-    makeChart(bw, {
-      title: "实例丢弃数据包统计", source: "网卡口径（整机）",
-      fmt: fmtRate, unit: "包/秒", points: pts,
-      series: [
-        {key: "din", label: "每秒丢失入包数", color: "--s-bad"},
-        {key: "dout", label: "每秒丢失出包数", color: "--s-idle"},
-      ],
-    }),
-  ];
+    }));
+  }
 }
 
 function updateInstance(i) {
@@ -809,9 +833,10 @@ function updateInstance(i) {
   set("#i-maxconn", i.max_conn ? fmtInt(i.max_conn) : "–");
   set("#i-idle", fmtInt(i.idle_pct), "%");
   $("#inst-degraded").hidden = !i.degraded;
-  $("#inst-nic-note").textContent = i.nic
-    ? `数据包统计取自网卡 ${i.nic}（整机口径，含 HAProxy 之外的流量）`
-    : "未采集网卡数据：数据包/丢包曲线为空（可用 RL_NIC 指定网卡）";
+  const nicList = (i.nics || []).map(n => n.name).join("、");
+  $("#inst-nic-note").textContent = nicList
+    ? `带宽/数据包按设备统计：${nicList}（整机口径，含 HAProxy 之外的流量）`
+    : "未采集网卡数据：设备带宽/数据包曲线回退 HAProxy 口径（可用 RL_NIC 指定网卡）";
 }
 
 // ============================================================ frontend 卡片
@@ -967,18 +992,40 @@ function applySnapshot(snap, live) {
   }
   const i = snap.instance;
   if (i && Object.keys(i).length) {
-    state.instBuf.push({
+    const nics = i.nics || [];
+    const row = {
       ts: snap.ts,
       conn_new: i.conn_new_ps, conn_denied: i.conn_denied_ps,
       conn: i.conn, active: i.active_conns, idle: i.idle_conns,
       rin: i.rate_in_bytes_per_s, rout: i.rate_out_bytes_per_s,
       pin: i.pkts_in_ps, pout: i.pkts_out_ps,
       din: i.drop_in_ps, dout: i.drop_out_ps,
-    });
+    };
+    // 设备视图：逐卡展平成带网卡名后缀的键，图表按键名直接取。
+    for (const n of nics) {
+      row["nin_" + n.name] = n.rate_in_bytes_per_s;
+      row["nout_" + n.name] = n.rate_out_bytes_per_s;
+      row["npin_" + n.name] = n.pkts_in_ps;
+      row["npout_" + n.name] = n.pkts_out_ps;
+      row["ndin_" + n.name] = n.drop_in_ps;
+      row["ndout_" + n.name] = n.drop_out_ps;
+    }
+    state.instBuf.push(row);
     if (state.instBuf.length > BUF_MAX) state.instBuf.shift();
     const ie = state.instBuf[state.instBuf.length - 1];
     ie.rin5 = roll5(state.instBuf, "rin");
     ie.rout5 = roll5(state.instBuf, "rout");
+    for (const n of nics) {
+      ie["nin5_" + n.name] = roll5(state.instBuf, "nin_" + n.name);
+      ie["nout5_" + n.name] = roll5(state.instBuf, "nout_" + n.name);
+    }
+    // 受监控网卡集合变化（含首帧）时重建实例图表：设备图是按当前集合
+    // 动态生成的。
+    const names = nics.map(n => n.name).join(",");
+    if (names !== state.nicNames) {
+      state.nicNames = names;
+      buildInstanceCharts();
+    }
     if (live) {
       updateInstance(i);
       if (state.tab === "instance") for (const ch of state.instCharts) drawChart(ch);

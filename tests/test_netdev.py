@@ -87,3 +87,19 @@ def test_default_iface_returns_empty_when_nothing_available(tmp_path):
 def test_resolve_iface_prefers_explicit_configuration():
     """多网卡机器上自动探测未必选对，运维显式指定必须优先。"""
     assert netdev.resolve_iface("eth7") == "eth7"
+
+
+def test_list_physical_ifaces_filters_virtual(tmp_path):
+    """物理网卡的判据是 /sys/class/net/<卡>/device 存在：lo/ifb/veth 等
+    虚拟设备没有 device 链接，不该进设备监控清单。"""
+    for name, physical in [("eth1", True), ("eth0", True),
+                           ("lo", False), ("ifbrl0", False)]:
+        d = tmp_path / name
+        (d / "device").mkdir(parents=True) if physical else d.mkdir()
+    assert netdev.list_physical_ifaces(str(tmp_path)) == ["eth0", "eth1"]
+
+
+def test_list_physical_ifaces_missing_sysfs_returns_empty(tmp_path):
+    """容器里 /sys/class/net 读不到或全是 veth：返回空，调用方回退
+    跟随执行网卡的老逻辑。"""
+    assert netdev.list_physical_ifaces(str(tmp_path / "nope")) == []
