@@ -166,8 +166,12 @@ async def _amain(cfg, log: logging.Logger,
         # 全段支持改 YAML 热生效），关着时 run_governor 只睡不调，随时
         # 可拉起，不用重启。接线本身（RL_TC_IN_IFACE 环境变量）仍是
         # 启动定型：没接线就没有执行面，控制器无处下发。
-        gov = ingressgov.IngressGovernor(cfg.dynamic_ingress, log,
-                                         instance_capable=in_mode_ifb)
+        gov = ingressgov.IngressGovernor(
+            cfg.dynamic_ingress, log, instance_capable=in_mode_ifb,
+            # 实例环的观测口径 = 客户端侧执行网卡的流出速率（设备视图
+            # 里按名取；按量计费计的是网卡，闭环盯网卡而不是 HAProxy
+            # 应用层字节）。
+            obs_nic=getattr(ingress, "iface", ""))
         if cfg.dynamic_ingress.enabled:
             log.info("入向动态限速已启用：按出向带宽（目标=quotas 登记值"
                      "%s）平缓调节入向上限 interval=%gs 死区=[%g, %g] "

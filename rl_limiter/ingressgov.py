@@ -101,8 +101,16 @@ class IngressGovernor:
 
     def __init__(self, cfg: IngressGovConfig,
                  log: logging.Logger | None = None,
-                 instance_capable: bool = True):
+                 instance_capable: bool = True,
+                 obs_nic: str = ""):
         self._cfg = cfg
+        # 实例环的观测网卡（客户端侧执行网卡）：观测口径是**网卡**的
+        # 流出字节差分（链路层、整机），不是 HAProxy 应用层字节——
+        # 按量计费计的是网卡，闭环就该盯网卡；网卡读数是本地文件差分，
+        # 也没有 stats socket 应答时延抖动。按名匹配快照里的设备视图，
+        # 找不到退首卡（锚点），完全没有设备数据（RL_NIC=-）才回退
+        # HAProxy 口径求和（warn 一次）。
+        self._obs_nic = obs_nic
         self._log = log if log is not None else logging.getLogger(
             "rl_limiter.ingressgov")
         # frontend 名 → 当前动态入向上限（Mbps）。**不在这里 = 静态**
@@ -124,8 +132,14 @@ class IngressGovernor:
         # 均衡点高一个量级，总闸会贴着它卡死、出向永远压不到目标
         # （e2e 实测抓到）。下限必须跟流入刻度走。
         self._inst_anchor: "float | None" = None
-        # 全部 frontend 出向 mean10 之和（bytes/s），实例级环的观测值。
+        # 全部 frontend 出向 mean10 之和（bytes/s）——HAProxy 口径，
+        # 端口级环的观测来源；实例环只在网卡观测不可用时回退它。
         self._mean_total = 0.0
+        # 实例环的网卡口径观测：观测网卡流出速率的 10s 滑动均值。
+        from .window import SlidingWindow
+        self._nic_win = SlidingWindow(10)
+        self._nic_seen = False      # 是否收到过设备数据（决定回退与否）
+        self._warned_nic_fallback = False
         # 最近一轮调节时的实测流入带宽（Mbps；None = 还没有实测）。
         # 只为调节视图展示留的缓存：IFB 的速率测量是差分计数器，只能
         # 有一个读者（run_governor），页面要看的话读这里的缓存。
@@ -174,6 +188,22 @@ class IngressGovernor:
         for u in usages:
             self._mean[u.name] = u.mean10_bps
         self._mean_total = sum(u.mean10_bps for u in usages)
+        # 实例环的网卡口径观测：观测网卡（客户端侧执行网卡）的流出
+        # 速率入 10s 窗口。按名匹配，找不到退首卡（锚点网卡）。单卡
+        # 采样失败时 collector 已按 fail-static 填了沿用值，这里照推。
+        nics = getattr(instance, "nics", None) if instance is not None else None
+        if nics:
+            sel = next((n for n in nics if n.name == self._obs_nic),
+                       nics[0])
+            self._nic_win.push(sel.rate_out_bps)
+            self._nic_seen = True
+
+    def _egress_total_bps(self) -> float:
+        """实例环的出向总观测（bytes/s）：网卡口径优先，设备数据整体
+        缺席（RL_NIC=- 或从未采到）才回退 HAProxy 口径求和。"""
+        if self._nic_seen:
+            return self._nic_win.mean()
+        return self._mean_total
 
     # ---- 下发侧取值 ----
 
@@ -249,7 +279,9 @@ class IngressGovernor:
                 "gate_mbps": self._cur_inst,
                 "gate_max_mbps": self._instance_max(limits, inst_target),
                 "ingress_mbps": self._last_ingress_mbps,
-                "egress_mbps": round(self._mean_total * 8 / 1e6, 3),
+                # 观测口径与实例环一致：网卡流出 10s 均值（回退 HAProxy）。
+                "egress_mbps": round(self._egress_total_bps() * 8 / 1e6, 3),
+                "egress_source": "nic" if self._nic_seen else "haproxy",
                 "landed": self._inst_anchor is not None,
             }
         if inst is None and not fes:
@@ -275,9 +307,14 @@ class IngressGovernor:
             return False
         if ingress_now_mbps is not None:
             self._last_ingress_mbps = ingress_now_mbps
-        if degraded:
-            # 采样失联：mean10 是陈旧值，按它调只会调错。保持现状。
+        if degraded and not self._nic_seen:
+            # HAProxy 采样失联且没有网卡观测可用：全部观测都是陈旧值，
+            # 按它调只会调错。保持现状。
             return False
+        # degraded 但有网卡观测：端口级环冻结（观测来自 HAProxy，是陈旧
+        # 值），实例环照常——它的观测是网卡口径（本地文件差分，与
+        # stats socket 失联无关）。采样权限坏掉的场景里总闸不能跟着失明。
+        port_frozen = degraded
         targets = {f.name: f.quota_mbps for f in frontends if f.limited}
         changed = False
 
@@ -292,6 +329,8 @@ class IngressGovernor:
                     "静态值下发）", name)
 
         for name, rl in limits.items():
+            if port_frozen:
+                break                         # 端口级观测（HAProxy）陈旧，冻结
             if rl.mbps <= 0:
                 continue                      # 没登记入向带宽，无物可调
             target = targets.get(name)
@@ -336,7 +375,13 @@ class IngressGovernor:
             max_inst = self._instance_max(limits, inst_target)
             floor = max_inst * self._cfg.floor_ratio
             cur = self._cur_inst if self._cur_inst is not None else max_inst
-            mean_mbps = self._mean_total * 8 / 1e6
+            if not self._nic_seen and not self._warned_nic_fallback:
+                self._warned_nic_fallback = True
+                self._log.warning(
+                    "实例环的网卡口径观测不可用（RL_NIC=- 或设备数据"
+                    "从未采到），回退 HAProxy 应用层口径求和——建议恢复"
+                    "设备采样：按量计费的口径是网卡")
+            mean_mbps = self._egress_total_bps() * 8 / 1e6
             ratio = mean_mbps / inst_target
             new = cur
             if ratio > self._cfg.high_ratio:

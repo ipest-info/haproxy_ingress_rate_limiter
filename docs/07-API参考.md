@@ -63,7 +63,9 @@
       "gate_mbps": 0.58,         // 入向总闸当前值；null = 全开
       "gate_max_mbps": 40.0,     // 总闸上限
       "ingress_mbps": 1.1,       // 最近一轮实测流入；null = 暂无
-      "egress_mbps": 39.6,       // 出向总观测（mean10）
+      "egress_mbps": 39.6,       // 出向总观测（10s 均值；网卡口径，
+                                 // 设备数据缺席时回退 HAProxy 口径）
+      "egress_source": "nic",    // 观测来源："nic" | "haproxy"（回退）
       "landed": true             // 是否已按实测流入落位
     },
     "frontends": {               // 受端口级闭环管的端口
