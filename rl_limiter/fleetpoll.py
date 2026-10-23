@@ -9,10 +9,12 @@
 #     /api/instance-quota（带节点令牌；失败只记 write_err，不重试——
 #     下一个分配周期自然重试）。
 #
-# 观测口径与节点闭环同源：优先 latest.regulation.instance.egress_mbps
-# （= 全部 frontend 出向 mean10 之和，节点闭环的观测值），节点还没在
-# 调（无 regulation）时退回 sum(units[].mean10_bytes_per_s)×8/1e6——
-# 两条路都是 10s 均值，总控据此分配不会追着瞬时毛刺跑。
+# 观测口径与节点闭环同源——**网卡口径**（按量计费计的是网卡字节）：
+# 优先 latest.regulation.instance.egress_mbps（节点闭环的观测值 =
+# 客户端侧网卡流出 10s 均值）；节点还没在调（无 regulation）时退
+# instance.nic_rate_out_bytes_per_s（同一张卡的瞬时差分）；连设备数据
+# 都没有（节点 RL_NIC=-）才退 HAProxy 应用层口径
+# sum(units[].mean10_bytes_per_s)。入向观测同链：网卡优先。
 #
 # 并发语义：gather + 单节点超时，一台慢/死节点绝不拖累其余节点的观测。
 
@@ -148,13 +150,23 @@ class NodePoller:
             s.ingress_mbps = float(ing) if ing is not None else 0.0
             s.landed = bool(reg.get("landed"))
         else:
-            units = latest.get("units") or {}
-            s.egress_mbps = sum(
-                float(u.get("mean10_bytes_per_s") or 0.0)
-                for u in units.values()) * 8 / 1e6
             inst = latest.get("instance") or {}
-            s.ingress_mbps = float(
-                inst.get("rate_in_bytes_per_s") or 0.0) * 8 / 1e6
+            if inst.get("nics") or inst.get("nic"):
+                # 网卡口径（与节点闭环、按量计费同源）：nic_* 标量是
+                # 节点锚点网卡（客户端侧执行网卡）的镜像。
+                s.egress_mbps = float(
+                    inst.get("nic_rate_out_bytes_per_s") or 0.0) * 8 / 1e6
+                s.ingress_mbps = float(
+                    inst.get("nic_rate_in_bytes_per_s") or 0.0) * 8 / 1e6
+            else:
+                # 节点连设备数据都没有（RL_NIC=-）：退 HAProxy 应用层
+                # 口径，分配仍能工作，只是口径与计费略有出入。
+                units = latest.get("units") or {}
+                s.egress_mbps = sum(
+                    float(u.get("mean10_bytes_per_s") or 0.0)
+                    for u in units.values()) * 8 / 1e6
+                s.ingress_mbps = float(
+                    inst.get("rate_in_bytes_per_s") or 0.0) * 8 / 1e6
             s.landed = None
 
     # ---- 下发 ----

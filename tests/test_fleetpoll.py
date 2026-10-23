@@ -99,8 +99,28 @@ async def test_poll_extracts_regulation_fields(fake, poller):
     assert s.landed is True and s.error == ""
 
 
-async def test_poll_falls_back_to_units_sum(fake, poller):
-    """节点还没在调（无 regulation）：退回 units mean10 求和口径。"""
+async def test_poll_falls_back_to_nic_rates(fake, poller):
+    """节点还没在调（无 regulation）但有设备数据：退**网卡口径**瞬时
+    差分（与节点闭环、按量计费同口径），不碰 HAProxy 应用层字节。"""
+    ov = overview_payload(with_regulation=False)
+    ov["latest"]["instance"].update({
+        "nic": "eth0",
+        "nics": [{"name": "eth0"}],
+        "nic_rate_out_bytes_per_s": 60e6 / 8,     # 60 Mbps（≠ units 的 50）
+        "nic_rate_in_bytes_per_s": 3e6 / 8,       # 3 Mbps（≠ HAProxy 的 2）
+    })
+    fake.payload = ov
+    poller.set_nodes([FleetNode(name="n1", url=fake.url, token="t")])
+    await poller.poll_once()
+    s = poller.states()[0]
+    assert s.egress_mbps == pytest.approx(60.0), "必须取网卡口径"
+    assert s.ingress_mbps == pytest.approx(3.0)
+    assert s.landed is None
+
+
+async def test_poll_falls_back_to_units_sum_without_nics(fake, poller):
+    """无 regulation 且连设备数据都没有（节点 RL_NIC=-）：最后才退
+    HAProxy 应用层口径（units mean10 求和），分配仍能工作。"""
     fake.payload = overview_payload(with_regulation=False)
     poller.set_nodes([FleetNode(name="n1", url=fake.url, token="t")])
     await poller.poll_once()
