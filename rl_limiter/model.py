@@ -339,7 +339,7 @@ class NodeConfig:
 
     - **本机 unix socket（同机部署，推荐）**：rl-limiter 与 HAProxy 装在
       同一台服务器上，haproxy.cfg 写
-      `stats socket /run/haproxy/admin.sock mode 660 level user`，配置里
+      `stats socket /var/lib/haproxy/stats mode 660 level user`，配置里
       填 socket_path。stats socket 完全不占网络端口，访问权靠文件属主/
       属组控制——同机形态下这是最小攻击面的接法。
     - **内网 TCP（远程只读观测，兼容保留）**：haproxy.cfg 写

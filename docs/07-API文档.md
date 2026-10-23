@@ -91,7 +91,7 @@ curl -s http://127.0.0.1:8090/api/overview
   "instance_quota_bytes_per_s": 100000000.0,
   "haproxy": {
     "name": "haproxy",
-    "endpoint": "/run/haproxy/admin.sock",
+    "endpoint": "/var/lib/haproxy/stats",
     "unix": true,                   // true = 本机 unix socket，false = 内网 TCP
     "degraded": false               // true = 采样失联
   },

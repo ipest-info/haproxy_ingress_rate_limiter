@@ -4,7 +4,7 @@
 **每个 node 容器 = 生产上的一台 ECS**：基于 **Ubuntu 24.04 LTS**，容器内
 同时跑发行版自带的 **HAProxy 2.8**（TCP L4 转发）与**同机的
 rl-limiter**——rl-limiter 通过容器内的 unix socket
-（`/run/haproxy/admin.sock`）只采本机那台 HAProxy，stats socket
+（`/var/lib/haproxy/stats`）只采本机那台 HAProxy，stats socket
 不占任何网络端口、也无需跨容器可达。限速由各节点的**内核 tc（HTB）**
 执行。**端口默认不限速**：demo 起来后先给 fe_main 登记限额（最快的
 方式是控制台，见下文"改限额"），再观察限速效果。
@@ -91,7 +91,7 @@ make demo-logs    # 看各入口吞吐被压在 40 Mbps 的过程 + 各节点日
 
 ```bash
 docker compose exec node1 ps -eo comm | sort -u | grep -E 'haproxy|rl-limiter'
-docker compose exec node1 ls -l /run/haproxy/admin.sock   # 采样用的本机 socket
+docker compose exec node1 ls -l /var/lib/haproxy/stats   # 采样用的本机 socket
 docker compose exec node1 haproxy -v                      # Ubuntu 24.04 自带 2.8.x
 docker compose exec node1 tc class show dev eth0          # tc 速率类（1:1f90 = 8080）
 ```

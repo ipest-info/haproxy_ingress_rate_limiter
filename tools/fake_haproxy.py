@@ -3,8 +3,8 @@
 #
 # 用途：在没有真实 HAProxy 的开发机上模拟一台受控节点的 stats socket。
 # 两种形态与真实部署一一对应：
-#   --unix-path /run/haproxy/admin.sock  → 同机部署（haproxy.cfg 的
-#       `stats socket /run/haproxy/admin.sock mode 660 level user`）
+#   --unix-path /var/lib/haproxy/stats  → 同机部署（haproxy.cfg 的
+#       `stats socket /var/lib/haproxy/stats mode 660 level user`）
 #   --port 19991                         → 跨机集中监控（haproxy.cfg 的
 #       `stats socket ipv4@<内网IP>:9999 level user`）
 # rl-limiter 连上来后：
@@ -160,7 +160,7 @@ async def amain(args: argparse.Namespace) -> None:
         f"{f.name}:{f.rate_bps:.0f}" for f in fake.frontends.values())
     if args.unix_path:
         # 同机部署形态：模拟 haproxy.cfg 的
-        # `stats socket /run/haproxy/admin.sock mode 660 level user`。
+        # `stats socket /var/lib/haproxy/stats mode 660 level user`。
         # 残留的旧 socket 文件会让 bind 直接失败（"Address already in
         # use"），先清掉——演示工具，不必为此要求手工 rm。
         path = pathlib.Path(args.unix_path)

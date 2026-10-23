@@ -10,7 +10,7 @@
 # stats socket 用 level user（只读）即够。
 #
 # 接线有两种形态（见 model.NodeConfig）：同机部署走本机 unix stats
-# socket（`stats socket /run/haproxy/admin.sock mode 660 level user`，
+# socket（`stats socket /var/lib/haproxy/stats mode 660 level user`，
 # 不占网络端口、按文件权限授权，推荐）；跨机监控走内网 TCP stats socket
 # （`stats socket ipv4@<内网IP>:9999 level user`）。两者只有"怎么建连"
 # 一步不同，命令语义与回包解析完全一致。
