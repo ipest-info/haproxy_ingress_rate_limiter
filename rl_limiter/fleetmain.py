@@ -25,7 +25,9 @@ try:
 except Exception:                                      # pragma: no cover
     SERVICE_VERSION = "dev"
 
-DEFAULT_CONSOLE_BIND = "127.0.0.1"
+# 与节点侧同款默认：绑全部地址（监控页内网直达），写接口靠令牌闸住，
+# 读接口无鉴权由防火墙限制来源；要收紧设 RL_CONSOLE_BIND=127.0.0.1。
+DEFAULT_CONSOLE_BIND = "0.0.0.0"
 
 
 async def _amain(cfg: "fleetconfig.FleetConfig",
@@ -136,7 +138,8 @@ def main() -> None:
                     "闭环再转成入向限速）。配置只有一个本地 YAML（节点"
                     "清单 + 总带宽 + 分配参数），轮询热生效。Web 控制台："
                     "设 RL_CONSOLE_PORT 启用，RL_CONSOLE_BIND 指定监听"
-                    "地址（默认 127.0.0.1——读接口无鉴权）；改总带宽的"
+                    "地址（默认 0.0.0.0——读接口无鉴权，用防火墙限制"
+                    "来源）；改总带宽的"
                     "写 API 用 RL_API_TOKEN 鉴权。")
     parser.add_argument(
         "-c", "--config", default="/etc/rl-limiter/fleet.yaml",

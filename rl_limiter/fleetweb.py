@@ -5,7 +5,8 @@
 #     广播给 SSE 订阅者；overview/history 是 REST 拉取口径；
 #   - build_fleet_app ≙ build_app：静态页 + 只读 API + 写 API（总带宽，
 #     令牌鉴权，回写 fleet YAML 热生效）；
-#   - run_fleet_console ≙ run_console：默认只绑回环，绑非回环打 WARN。
+#   - run_fleet_console ≙ run_console：出厂默认绑 0.0.0.0（fleetmain 的
+#     DEFAULT_CONSOLE_BIND），绑非回环打 WARN 提醒防火墙限源。
 #
 # 安全边界与节点侧相同：读接口无鉴权（节点清单里的 token **绝不出现**
 # 在任何读接口里）；写接口必须令牌。
