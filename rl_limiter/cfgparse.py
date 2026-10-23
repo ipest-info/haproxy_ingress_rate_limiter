@@ -252,6 +252,8 @@ async def watch(
     boot_instance_quota_mbps: float = 0.0,
     boot_request_limits: "dict | None" = None,
     poke: "asyncio.Event | None" = None,
+    dyn_ingress_cb=None,
+    boot_dynamic_ingress=None,
 ) -> None:
     """常驻任务：轮询 haproxy.cfg 与 YAML 配置文件，内容变化就把新
     ControllerConfig 投入 queue（监控循环热应用，tc/告警基准随之更新）。
@@ -262,8 +264,10 @@ async def watch(
     - 任一文件读不到或解析失败：保留当前配置继续运行（fail-static），
       warn 后下一轮再试——cfg 正在被原子替换的瞬间读到半份文件属于
       预期内抖动；
-    - YAML 里除 quotas 以外的字段（接线、日志级别）启动时定型，运行期
-      改动不热生效（检测到变化会提示需重启）。
+    - 限额类字段（quotas/request_limits/instance_quota_mbps）与闭环参数
+      （dynamic_ingress，经 dyn_ingress_cb 整段回调）热生效；接线与服务
+      级运行参数（haproxy 段、log_level、tick_interval_s）启动时定型，
+      运行期改动不热生效（检测到变化会提示需重启）。
     """
     from . import config as configmod  # 延迟导入避免环形依赖
 
@@ -271,6 +275,10 @@ async def watch(
                      boot_request_limits)
     warned: set[str] = set()
     last_yaml_rest: tuple | None = None
+    # di 基线从**启动配置**播种（给了的话）：否则第一轮轮询才建基线，
+    # 启动后第一个轮询周期内的修改会被当成基线静默漏掉。
+    last_di: "str | None" = (repr(boot_dynamic_ingress)
+                             if boot_dynamic_ingress is not None else None)
     while True:
         # poke 事件让写接口（控制台/API 改完配置文件后）立即触发一轮
         # 轮询，不必干等下一个周期。
@@ -286,10 +294,8 @@ async def watch(
             svc = configmod.load(yaml_path)
             quotas = dict(svc.quotas)
             yaml_rest = (svc.log_level, svc.tick_interval_s,
-                         svc.haproxy.endpoint(), svc.haproxy.cfg_path,
-                         # 入向动态限速参数启动时定型：改了要重启才生效，
-                         # 塞进这个元组让变化触发下面的"需重启"提醒。
-                         repr(svc.dynamic_ingress))
+                         svc.haproxy.endpoint(), svc.haproxy.cfg_path)
+            di_repr = repr(svc.dynamic_ingress)
             frontends = load_frontends(cfg_path, quotas, log, warned)
         except Exception as e:
             log.warning(
@@ -305,6 +311,32 @@ async def watch(
                 "检测到 YAML 里接线/运行参数发生变化（log_level、haproxy "
                 "接线等）：这些字段在进程启动时定型，热更新不生效，请重启 "
                 "rl-limiter")
+
+        # 闭环参数（dynamic_ingress）整段热更：变化即回调（装配层换给
+        # 控制器并按需 poke 下发）。与限额不同，它不走监控循环的配置
+        # 队列——控制器与监控循环本就在同一事件循环里，直接换无竞态。
+        if last_di is None:
+            last_di = di_repr
+        elif di_repr != last_di:
+            last_di = di_repr
+            if dyn_ingress_cb is not None:
+                try:
+                    dyn_ingress_cb(svc.dynamic_ingress)
+                    log.info("dynamic_ingress（闭环参数）热更新已生效 "
+                             "enabled=%s interval=%gs 死区=[%g, %g] "
+                             "step_up=%g step_down_max=%g floor=%g "
+                             "epsilon=%g",
+                             svc.dynamic_ingress.enabled,
+                             svc.dynamic_ingress.interval_s,
+                             svc.dynamic_ingress.low_ratio,
+                             svc.dynamic_ingress.high_ratio,
+                             svc.dynamic_ingress.step_up,
+                             svc.dynamic_ingress.step_down_max,
+                             svc.dynamic_ingress.floor_ratio,
+                             svc.dynamic_ingress.apply_epsilon)
+                except Exception as e:
+                    log.warning("dynamic_ingress 热更新回调失败，"
+                                "保留旧参数继续运行 err=%s", e)
 
         cur = canonical(frontends, svc.instance_quota_mbps,
                         svc.request_limits)

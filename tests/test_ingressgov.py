@@ -361,3 +361,54 @@ def test_regulation_view_none_when_no_loop_active():
     v = g.regulation_view([fe(quota=40.0)], LIMITS, inst_target=0.0)
     assert v["instance"] is None
     assert v["frontends"]["fe_main"]["cap_mbps"] is None
+
+
+# ---------------------------------------------------------------------------
+# 配置热更（update_config）：dynamic_ingress 整段支持改 YAML 热生效
+# ---------------------------------------------------------------------------
+
+def test_update_config_numeric_params_take_effect_next_round():
+    """数值参数热更：下一轮 adjust_once 直接按新参数走，动态值连续。"""
+    g = gov()
+    feed(g, 80.0)
+    assert g.adjust_once([fe()], LIMITS)
+    assert g.current()["fe_main"] == pytest.approx(9.0)   # 封顶 -10%
+    g.update_config(ingressgov.IngressGovConfig(
+        enabled=True, step_down_max=0.5))                 # 封顶放宽到 -50%
+    feed(g, 80.0)                                         # ratio=2 → 降 0.5
+    assert g.adjust_once([fe()], LIMITS)
+    assert g.current()["fe_main"] == pytest.approx(9.0 * 0.5)
+
+
+def test_update_config_disable_clears_dynamic_state():
+    """enabled 热更为 false：动态值即时清除（返回 True 让调用方 poke
+    下发侧回到静态登记值），不能冻结在最后一次的动态值上。"""
+    g = gov()
+    feed(g, 80.0)
+    assert g.adjust_once([fe()], LIMITS)
+    assert g.current()
+    assert g.update_config(ingressgov.IngressGovConfig(enabled=False))
+    assert g.current() == {}
+    assert g.current_instance() is None
+    # 关着时直接调 adjust_once 也不动作（双保险）。
+    feed(g, 80.0)
+    assert not g.adjust_once([fe()], LIMITS)
+    assert g.current() == {}
+
+
+def test_update_config_disable_without_state_needs_no_poke():
+    """关的时候本来就没有动态值：返回 False，不用白 poke 一次下发。"""
+    g = gov()
+    assert not g.update_config(ingressgov.IngressGovConfig(enabled=False))
+
+
+def test_update_config_reenable_resumes():
+    """关了再开：下一轮照常调节（状态从头收敛，不残留旧动态值）。"""
+    g = gov()
+    feed(g, 80.0)
+    g.adjust_once([fe()], LIMITS)
+    g.update_config(ingressgov.IngressGovConfig(enabled=False))
+    g.update_config(ingressgov.IngressGovConfig(enabled=True))
+    feed(g, 80.0)
+    assert g.adjust_once([fe()], LIMITS)
+    assert g.current()["fe_main"] == pytest.approx(9.0)

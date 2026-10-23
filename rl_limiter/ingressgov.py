@@ -131,6 +131,43 @@ class IngressGovernor:
         # 有一个读者（run_governor），页面要看的话读这里的缓存。
         self._last_ingress_mbps: "float | None" = None
 
+    # ---- 配置热更（cfgparse.watch 检测到 dynamic_ingress 变化时调） ----
+
+    @property
+    def enabled(self) -> bool:
+        return self._cfg.enabled
+
+    @property
+    def interval_s(self) -> float:
+        return self._cfg.interval_s
+
+    def update_config(self, cfg: IngressGovConfig) -> bool:
+        """整段替换闭环参数，热生效。
+
+        数值参数（死区/步长/周期等）直接换：下一轮 adjust_once 按新参数
+        继续，动态值连续不中断。enabled 由开到关是唯一要收拾现场的转换：
+        清掉全部动态值（各端口上限/总闸回到静态登记值），返回 True 让
+        调用方 poke 下发侧立刻 reconcile——否则闸门会冻结在最后一次的
+        动态值上，"关了闭环"变成"关在半路"。
+        """
+        old, self._cfg = self._cfg, cfg
+        if old.enabled and not cfg.enabled:
+            had = bool(self._cur) or self._cur_inst is not None
+            self._cur.clear()
+            self._cur_inst = None
+            self._inst_anchor = None
+            self._land_waited = False
+            self._log.info(
+                "闭环已按配置热更关闭（dynamic_ingress.enabled=false）%s",
+                "：动态入向上限/总闸已清除，回到静态登记值" if had
+                else "（当前没有动态值，无需回收）")
+            return had
+        if not old.enabled and cfg.enabled:
+            self._log.info("闭环已按配置热更开启"
+                           "（dynamic_ingress.enabled=true），"
+                           "下一轮调节周期生效")
+        return False
+
     # ---- 监控循环的 sampler 链挂点（每拍一次） ----
 
     def record(self, now: float, usages: list, instance=None) -> None:
@@ -232,6 +269,10 @@ class IngressGovernor:
         面实测的当前入向线上速率（IFB 根 qdisc 差分；None = 没有实测）
         ——总闸首次收紧时的落位参考。
         """
+        if not self._cfg.enabled:
+            # 热更关闭后 run_governor 本就不再调进来；这里再挡一道，防
+            # 直接调用方（测试/将来接线）在关着时误调。
+            return False
         if ingress_now_mbps is not None:
             self._last_ingress_mbps = ingress_now_mbps
         if degraded:
@@ -366,7 +407,6 @@ async def run_governor(gov: IngressGovernor,
                        desired_fn,
                        poke: asyncio.Event,
                        log: logging.Logger,
-                       interval_s: float,
                        degraded_fn=None,
                        ingress_rate_fn=None) -> None:
     """常驻任务：周期跑调节，有变化就 set 下发事件（run_ingress 被叫醒
@@ -375,9 +415,14 @@ async def run_governor(gov: IngressGovernor,
     desired_fn() 返回 (frontends, request_limits, 实例出向目标 Mbps)，
     每轮现取。ingress_rate_fn 是执行面的实测入向速率（async，bit/s 或
     None）——总闸落位用，见 adjust_once。
+
+    调节周期与开关每轮从 gov 现读（dynamic_ingress 支持 YAML 热更）：
+    enabled=false 时只睡不调，随时可被热更拉回来，任务本身不退出。
     """
     while True:
-        await asyncio.sleep(interval_s)
+        await asyncio.sleep(max(1.0, gov.interval_s))
+        if not gov.enabled:
+            continue
         try:
             frontends, limits, inst_target = desired_fn()
             degraded = bool(degraded_fn()) if degraded_fn else False

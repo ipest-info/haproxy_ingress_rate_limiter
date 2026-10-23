@@ -161,20 +161,36 @@ async def _amain(cfg, log: logging.Logger,
     # 仅 ifb 执行模式支持——police 没有层级）。挂 sampler 链吃 mean10。
     in_mode_ifb = getattr(ingress, "mode", "") == "ifb"
     gov: "ingressgov.IngressGovernor | None" = None
-    if ingress is not None and cfg.dynamic_ingress.enabled:
+    if ingress is not None:
+        # 入向接了线就创建控制器——enabled 是**热更**开关（dynamic_ingress
+        # 全段支持改 YAML 热生效），关着时 run_governor 只睡不调，随时
+        # 可拉起，不用重启。接线本身（RL_TC_IN_IFACE 环境变量）仍是
+        # 启动定型：没接线就没有执行面，控制器无处下发。
         gov = ingressgov.IngressGovernor(cfg.dynamic_ingress, log,
                                          instance_capable=in_mode_ifb)
-        log.info("入向动态限速已启用：按出向带宽（目标=quotas 登记值"
-                 "%s）平缓调节入向上限 interval=%gs 死区=[%g, %g] "
-                 "step_up=%g step_down_max=%g floor=%g",
-                 "；实例总限速=实例出向总目标（入向总闸）"
-                 if in_mode_ifb else "",
-                 cfg.dynamic_ingress.interval_s,
-                 cfg.dynamic_ingress.low_ratio,
-                 cfg.dynamic_ingress.high_ratio,
-                 cfg.dynamic_ingress.step_up,
-                 cfg.dynamic_ingress.step_down_max,
-                 cfg.dynamic_ingress.floor_ratio)
+        if cfg.dynamic_ingress.enabled:
+            log.info("入向动态限速已启用：按出向带宽（目标=quotas 登记值"
+                     "%s）平缓调节入向上限 interval=%gs 死区=[%g, %g] "
+                     "step_up=%g step_down_max=%g floor=%g"
+                     "（本段参数支持改 YAML 热生效）",
+                     "；实例总限速=实例出向总目标（入向总闸）"
+                     if in_mode_ifb else "",
+                     cfg.dynamic_ingress.interval_s,
+                     cfg.dynamic_ingress.low_ratio,
+                     cfg.dynamic_ingress.high_ratio,
+                     cfg.dynamic_ingress.step_up,
+                     cfg.dynamic_ingress.step_down_max,
+                     cfg.dynamic_ingress.floor_ratio)
+        else:
+            msg = ("闭环未启用（dynamic_ingress.enabled=false）：限额只"
+                   "登记不执行。改 YAML 的 enabled: true 即热生效，"
+                   "无需重启")
+            if cfg.instance_quota_mbps or any(f.limited
+                                              for f in boot_frontends):
+                log.warning("%s——当前已登记限速值（quotas/实例总限速），"
+                            "**它们不会被执行**", msg)
+            else:
+                log.info(msg)
     elif cfg.dynamic_ingress.enabled and cfg.dynamic_ingress.explicit:
         # 只对 YAML 里**手写** enabled: true 的告警；默认开（出厂值）
         # 而入向未接线的形态（纯监控、基线出向 HTB）不该被刷警告。
@@ -303,6 +319,20 @@ async def _amain(cfg, log: logging.Logger,
     # 不用等下一个 5s 轮询周期，页面上的修改近乎即时生效。
     cfg_poke = asyncio.Event()
 
+    # dynamic_ingress（闭环参数）整段热更：watch 检测到变化回调这里。
+    # 换给控制器 + 刷新 cfg 引用（配置页读它展示现值）；enabled 由开
+    # 到关要清动态状态，poke 下发任务立刻 reconcile（闸门回静态值）。
+    def _on_dyn_ingress(di_new) -> None:
+        cfg.dynamic_ingress = di_new
+        if gov is None:
+            if di_new.enabled:
+                log.warning("dynamic_ingress.enabled=true 但入向限速未"
+                            "接线（RL_TC_IN_IFACE=-），动态调节不会运行"
+                            "——接线是环境变量，改它需要重启")
+            return
+        if gov.update_config(di_new) and tcin_applied is not None:
+            tcin_applied.set()
+
     tasks.append(asyncio.create_task(
         ctl.run(config_queue, tick_interval_s), name="monitor-loop"))
     tasks.append(asyncio.create_task(
@@ -310,7 +340,9 @@ async def _amain(cfg, log: logging.Logger,
                        boot_frontends, log,
                        boot_instance_quota_mbps=cfg.instance_quota_mbps,
                        boot_request_limits=cfg.request_limits,
-                       poke=cfg_poke),
+                       poke=cfg_poke,
+                       dyn_ingress_cb=_on_dyn_ingress,
+                       boot_dynamic_ingress=cfg.dynamic_ingress),
         name="cfg-watch"))
     # tc 实况（控制台调试面板）：期望配置来自监控循环的当前清单，
     # 实况是 shaper 现场跑 tc show 的原始输出——页面上两边对照着看。
@@ -412,7 +444,8 @@ async def _amain(cfg, log: logging.Logger,
         ])
 
         # 配置页的分支扩展段：request_limits 可编辑（热生效）+
-        # dynamic_ingress 只读（启动时定型）。
+        # dynamic_ingress 现值展示（整段支持改 YAML 热生效；cfg.
+        # dynamic_ingress 由热更回调保持最新，这里每次请求现读）。
         def _extra_config_sections():
             limits = ctl.request_limits()
             rows = []
@@ -456,15 +489,20 @@ async def _amain(cfg, log: logging.Logger,
                         "conn_rate 恒为静态值。两个输入框各自独立保存。",
                 "rows": rows,
             }, {
-                "title": "入向动态限速 dynamic_ingress（启动时定型，只读）",
-                "hint": "按出向带宽闭环调节入向上限的控制器参数。本段启动"
-                        "时定型：改 YAML 后重启 rl-limiter 生效。",
+                "title": "入向动态限速 dynamic_ingress（可改，热生效）",
+                "hint": "按出向带宽闭环调节入向上限的控制器参数。整段支持"
+                        "热更新：直接编辑 YAML 的 dynamic_ingress 段，"
+                        "5 秒内生效，无需重启（enabled 关闭时动态值即时"
+                        "清除、回到静态登记值）。此处展示当前生效值。",
                 "kv": [
                     {"label": "enabled",
                      "value": ("true（闭环在跑）" if (di.enabled
                                and ingress is not None)
-                               else "true（但入向未接线，不运行）"
-                               if di.enabled else "false（未启用）")},
+                               else "true（但入向未接线，不运行；接线是"
+                               "环境变量 RL_TC_IN_IFACE，改它需重启）"
+                               if di.enabled
+                               else "false（已关闭——限额只登记不执行；"
+                               "改 YAML 为 true 热生效）")},
                     {"label": "调节周期 interval_s",
                      "value": f"{di.interval_s:g}s"},
                     {"label": "死区 [low_ratio, high_ratio]×目标",
@@ -544,7 +582,6 @@ async def _amain(cfg, log: logging.Logger,
                     lambda: (list(ctl.frontends()), ctl.request_limits(),
                              ctl.instance_quota_mbps),
                     tcin_applied, log,
-                    interval_s=cfg.dynamic_ingress.interval_s,
                     degraded_fn=lambda: col.degraded,
                     # 总闸落位的实测来源：IFB 根 qdisc 的 Sent 差分
                     # （仅 ifb 模式有；police 模式本就没有实例环）。
