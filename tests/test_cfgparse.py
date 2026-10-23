@@ -338,3 +338,38 @@ async def test_watch_pushes_on_request_limits_change(tmp_path):
     got = await run_watch_once(cfg_file, yaml_file, boot)
     assert got and got[-1].request_limits["fe_main"].mbps == 10.0
     assert got[-1].request_limits["fe_main"].conn_rate == 200
+
+
+async def test_watch_hot_applies_dynamic_ingress(tmp_path, caplog):
+    """dynamic_ingress 整段热更：改 YAML 后 watch 把新参数回调给装配层
+    （不再是"需重启"警告），并且不触发限额配置队列的投递。"""
+    cfg_file = tmp_path / "haproxy.cfg"
+    cfg_file.write_text("listen fe_main\n    bind :8080\n", encoding="utf-8")
+    yaml_file = write_yaml(tmp_path, cfg_file)
+    boot = cfgparse.load_frontends(str(cfg_file), {"fe_main": 40}, log)
+
+    got_cfgs = []
+    q: asyncio.Queue = asyncio.Queue()
+    task = asyncio.create_task(cfgparse.watch(
+        str(cfg_file), str(yaml_file), q, boot, log, interval_s=0.02,
+        dyn_ingress_cb=got_cfgs.append))
+    try:
+        await asyncio.sleep(0.06)   # 先让 watch 建立基线
+        yaml_file.write_text(
+            f"haproxy:\n  socket_path: /run/h.sock\n  cfg_path: {cfg_file}\n"
+            f"quotas:\n  fe_main: 40\n"
+            f"dynamic_ingress:\n  enabled: false\n  interval_s: 30\n",
+            encoding="utf-8")
+        with caplog.at_level(logging.INFO, logger="t.cfgparse"):
+            await asyncio.sleep(0.12)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert got_cfgs, "dynamic_ingress 变化必须回调热更"
+    assert got_cfgs[-1].enabled is False
+    assert got_cfgs[-1].interval_s == 30.0
+    assert q.empty(), "只改 dynamic_ingress 不该触发限额配置投递"
+    assert [r for r in caplog.records if "热更新已生效" in r.getMessage()]
+    assert not [r for r in caplog.records if "请重启" in r.getMessage()], \
+        "dynamic_ingress 已热更化，不该再提示重启"
