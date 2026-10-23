@@ -16,7 +16,9 @@
 #     画在同一条时间轴上——曲线被压在限额线下即是效果本身。
 #
 # 安全边界：**读接口无鉴权**（定位与 HAProxy 的 stats socket 相同），
-# 默认只绑回环（127.0.0.1），要放到内网必须由运维显式设 RL_CONSOLE_BIND
+# 默认绑全部地址（0.0.0.0，由 __main__ 的 DEFAULT_CONSOLE_BIND 决定）；
+# 写接口靠 RL_API_TOKEN 闸住，读接口无鉴权，用防火墙/安全组限制来源，
+# 要收紧回本机设 RL_CONSOLE_BIND=127.0.0.1
 # 并配合防火墙/安全组限制来源；绑非回环地址时会打一条 warning 留痕。
 # **写接口必须带令牌**（环境变量 RL_API_TOKEN，请求头 Authorization:
 # Bearer <token> 或 X-API-Token）；令牌未配置时写接口整体 403——改限速
@@ -848,10 +850,11 @@ async def run_console(
 ) -> None:
     """常驻任务：启动控制台 HTTP 服务并挂起到被取消，取消时干净回收。
 
-    bind 默认只绑回环：控制台暴露的是全量运行状态与日志，且写接口能改
-    限速，默认对外可达不可接受（由 RL_CONSOLE_BIND 显式放开，见
-    __main__）。绑到非回环地址时打一条 warning，让"我以为它只在本机"的
-    误配在日志里留痕。写 API 的参数含义见 build_app。
+    本函数签名的 bind 默认保守绑回环（直接调用/测试场景）；**服务层的
+    出厂默认是 0.0.0.0**（__main__ 的 DEFAULT_CONSOLE_BIND，监控页要能
+    被同网段打开），写接口靠 RL_API_TOKEN 闸住。绑到非回环地址时打一条
+    warning，提醒读接口无鉴权、需防火墙限制来源。写 API 的参数含义见
+    build_app。
     """
     runner = web.AppRunner(
         build_app(hub, logbuf, log, yaml_path=yaml_path, api_token=api_token,

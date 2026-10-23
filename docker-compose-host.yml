@@ -50,14 +50,16 @@ services:
       # 监控数据落盘挂宿主机卷，长期保留、容器重建不丢。
       - /var/log/rl-limiter:/var/log/rl-limiter
     environment:
-      # 本分支推荐形态（双网卡闭环）：出向不做 tc（RL_TC_IFACE=-），
-      # 按实测出向带宽动态压入向。RL_TC_IN_IFACE 填**客户端侧物理
-      # 网卡名**（这一项不做自动探测——放错网卡会误伤后端流量；也可
-      # 用 RL_FRONT_SUBNET=<客户端网段前缀> 让入口脚本按网段定位）。
-      # 宿主机内核需有 ifb 模块（modprobe ifb 验证）：没有则启动直接
-      # 失败，可改 RL_TC_IN_MODE=police 降级（丢包式，实例总闸不可用）。
-      # 要用单网卡出向 HTB 形态：删掉下面两行，改设
-      # RL_TC_IFACE=<出向物理网卡名>。
+      # 出厂默认即双网卡闭环形态：出向不做 tc（RL_TC_IFACE 默认 -），
+      # 入向执行网卡默认 eth0（客户端侧）、按实测出向带宽动态压入向
+      # ——宿主机接线就是 eth0 客户侧 / eth1 后端侧时，这两行可以整段
+      # 删掉。网卡命名不同（ens33/enp1s0…）时改 RL_TC_IN_IFACE 为
+      # **客户端侧物理网卡名**（不做自动探测——放错网卡会误伤后端
+      # 流量；也可用 RL_FRONT_SUBNET=<客户端网段前缀> 让入口脚本按
+      # 网段定位）。宿主机内核需有 ifb 模块（modprobe ifb 验证）：
+      # 没有则启动直接失败，可改 RL_TC_IN_MODE=police 降级（丢包式，
+      # 实例总闸不可用）。要用单网卡出向 HTB 形态：改设
+      # RL_TC_IFACE=<出向物理网卡名>、RL_TC_IN_IFACE=-。
       RL_TC_IFACE: "-"
       RL_TC_IN_IFACE: eth0
       # RL_TC_IN_MODE: ifb          # 默认 ifb（平稳整形）；老内核改 police
@@ -65,10 +67,11 @@ services:
       HAPROXY_MAXCONN: "100000"
       HAPROXY_MAXPIPES: "100000"
       RL_CONSOLE_PORT: "8090"
-      # host 网络下控制台端口直接落在宿主机上：保持默认只绑回环
-      # （127.0.0.1），远程查看走 SSH 隧道；控制台无读鉴权，切勿绑
-      # 0.0.0.0 裸奔公网。
-      RL_CONSOLE_BIND: 127.0.0.1
+      # host 网络下控制台端口直接落在宿主机上。默认绑 0.0.0.0（内网
+      # 同网段可直接打开监控页）——控制台**读接口无鉴权**，务必用
+      # 防火墙/安全组限制来源，切勿裸奔公网；写接口由 RL_API_TOKEN
+      # 闸住。只想本机访问（配 SSH 隧道）改回 127.0.0.1。
+      RL_CONSOLE_BIND: 0.0.0.0
       # 写 API（页面/API 改限额）令牌：生产请生成随机值
       # （openssl rand -hex 24）；不设则写接口整体 403、页面只读。
       # RL_API_TOKEN: "<openssl rand -hex 24>"

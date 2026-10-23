@@ -101,10 +101,14 @@ def test_env_example_has_no_mysql_vars():
     assert "RL_MYSQL" not in ENV_EXAMPLE.read_text(encoding="utf-8")
 
 
-def test_env_example_defaults_to_loopback_console():
-    """控制台无鉴权（暴露全量监控与日志），模板给的默认值必须是回环。"""
+def test_env_example_console_bind_matches_code_default():
+    """控制台默认绑 0.0.0.0（监控页内网直达，写接口靠令牌闸住）——模板
+    示例值必须与代码默认一致，且注释里要保留防火墙限制来源的提醒。"""
     text = ENV_EXAMPLE.read_text(encoding="utf-8")
-    assert re.search(r"^RL_CONSOLE_BIND=127\.0\.0\.1", text, re.M)
+    assert re.search(r"^RL_CONSOLE_BIND=0\.0\.0\.0", text, re.M)
+    from rl_limiter.__main__ import DEFAULT_CONSOLE_BIND
+    assert DEFAULT_CONSOLE_BIND == "0.0.0.0"
+    assert "防火墙" in text
 
 
 # ---------------------------------------------------------------------------
