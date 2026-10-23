@@ -170,11 +170,9 @@ class _FrontendState:
 
 
 class _InstanceState:
-    """实例视图的差分基线（show info + 全体 frontend 汇总 + 网卡）。"""
+    """实例视图的差分基线（show info + 全体 frontend 汇总）。"""
 
-    __slots__ = ("c_conn_new", "c_denied", "c_in", "c_out",
-                 "c_pkt_in", "c_pkt_out", "c_drop_in", "c_drop_out",
-                 "c_nic_in", "c_nic_out")
+    __slots__ = ("c_conn_new", "c_denied", "c_in", "c_out")
 
     def __init__(self):
         self.c_conn_new = _DiffCounter()   # Σ frontend conn_tot（不是 CumConns，
@@ -182,12 +180,24 @@ class _InstanceState:
         self.c_denied = _DiffCounter()     # Σ frontend denied_total
         self.c_in = _DiffCounter()         # Σ frontend bytes_in
         self.c_out = _DiffCounter()        # Σ frontend bytes_out
-        self.c_pkt_in = _DiffCounter()     # 网卡 rx_packets
-        self.c_pkt_out = _DiffCounter()
-        self.c_drop_in = _DiffCounter()    # 网卡 rx_dropped
-        self.c_drop_out = _DiffCounter()
-        self.c_nic_in = _DiffCounter()     # 网卡 rx_bytes（与 HAProxy 口径对照）
-        self.c_nic_out = _DiffCounter()
+
+
+class _NicState:
+    """单张网卡的差分基线（/proc/net/dev 累计值 → 每秒速率）。
+
+    每张受监控网卡一份；网卡被移出监控清单时整份丢弃（差分基线随之
+    作废，重新加入时从建基线那拍重来）。"""
+
+    __slots__ = ("c_pkt_in", "c_pkt_out", "c_drop_in", "c_drop_out",
+                 "c_bytes_in", "c_bytes_out")
+
+    def __init__(self):
+        self.c_pkt_in = _DiffCounter()     # rx_packets
+        self.c_pkt_out = _DiffCounter()    # tx_packets
+        self.c_drop_in = _DiffCounter()    # rx_dropped
+        self.c_drop_out = _DiffCounter()   # tx_dropped
+        self.c_bytes_in = _DiffCounter()   # rx_bytes（与 HAProxy 口径对照）
+        self.c_bytes_out = _DiffCounter()  # tx_bytes
 
 
 class Collector:
@@ -209,18 +219,26 @@ class Collector:
         # 只提示一次的日志去重集合。
         self._logged_unmanaged: set[str] = set()
         # --- 实例视图（监控用，不参与限速判定）---
-        # 要采样的网卡；空串 = 不采（探测失败或运维禁用），包统计整体缺席。
-        self._nic = nic
+        # 要采样的网卡：支持多张（逗号分隔，页面每设备一块视图）。空 =
+        # 不采（探测失败或运维禁用），包/网卡带宽统计整体缺席。首卡是
+        # "锚点网卡"（通常为入向执行网卡），老的单卡字段镜像它。
+        self._nics = [n for n in
+                      (s.strip() for s in (nic or "").split(","))
+                      if n and n != "-"]
+        self._nic = self._nics[0] if self._nics else ""
+        self._nic_states: dict[str, _NicState] = {}
         # 可选的异步回调，返回 {frontend 名: tcshaper.TcClassStat}。
         # None = 未启用 tc 限速（纯监控形态），相关曲线为空。
         self._tc_stats = tc_stats
         self._inst_state = _InstanceState()
         # 最近一拍的实例用量。采不到时原样留着上一拍的值（fail-static），
         # 因此这里从构造起就必须是一个可用对象而不是 None。
-        self._instance = model.InstanceUsage(nic=nic)
+        self._instance = model.InstanceUsage(nic=self._nic)
         # show info / 网卡这两条副链路的失败只记一次日志，避免每秒刷屏。
         self._logged_info_error = ""
-        self._logged_nic_error = ""
+        # 网卡读取失败的日志去重：按网卡名各记一槽（双网卡时一张失联不
+        # 该淹没另一张的首次报错）。成功一拍即清，故障恢复可再次告警。
+        self._logged_nic_errors: dict[str, str] = {}
         self._logged_tc_error = ""
 
     def set_managed(self, names: set[str]) -> None:
@@ -609,32 +627,49 @@ class Collector:
             inst.active_conns = prev.active_conns
             inst.idle_conns = prev.idle_conns
 
-        # --- 3) 网卡：数据包与丢包。HAProxy 完全不统计包，只此一途
-        # （见 netdev 模块）。整机口径，无法按 frontend 拆。
-        nic: model.NicStat | None = None
-        if self._nic:
+        # --- 3) 网卡：带宽/数据包/丢包，**逐卡**采样（双网卡形态页面每
+        # 设备一块视图）。HAProxy 完全不统计包，只此一途（见 netdev 模块）。
+        # 整机口径，无法按 frontend 拆。单卡失败只影响那张卡（fail-static
+        # 沿用它上一拍的值），不拖累其余网卡与主链路。
+        prev_by_name = {n.name: n for n in prev.nics}
+        for name in self._nics:
+            st_nic = self._nic_states.get(name)
+            if st_nic is None:
+                st_nic = self._nic_states[name] = _NicState()
             try:
-                nic = netdev.read_nic_stat(self._nic)
+                raw = netdev.read_nic_stat(name)
             except Exception as e:
-                self._log_once("nic", e,
-                               "网卡计数器读取失败，实例视图的数据包/丢包曲线"
-                               "沿用上一拍的值（其余监控不受影响）")
-        if nic is not None:
-            self._logged_nic_error = ""
-            s = self._inst_state
-            inst.pkts_in_ps = s.c_pkt_in.push(nic.rx_packets)
-            inst.pkts_out_ps = s.c_pkt_out.push(nic.tx_packets)
-            inst.drop_in_ps = s.c_drop_in.push(nic.rx_dropped)
-            inst.drop_out_ps = s.c_drop_out.push(nic.tx_dropped)
-            inst.nic_rate_in_bps = s.c_nic_in.push(nic.rx_bytes)
-            inst.nic_rate_out_bps = s.c_nic_out.push(nic.tx_bytes)
-        else:
-            inst.pkts_in_ps = prev.pkts_in_ps
-            inst.pkts_out_ps = prev.pkts_out_ps
-            inst.drop_in_ps = prev.drop_in_ps
-            inst.drop_out_ps = prev.drop_out_ps
-            inst.nic_rate_in_bps = prev.nic_rate_in_bps
-            inst.nic_rate_out_bps = prev.nic_rate_out_bps
+                key = f"{type(e).__name__}: {e}"
+                if self._logged_nic_errors.get(name) != key:
+                    self._logged_nic_errors[name] = key
+                    self._log.warning(
+                        "网卡计数器读取失败，该设备的带宽/数据包曲线沿用"
+                        "上一拍的值（其余网卡与监控不受影响） nic=%s "
+                        "err=%s", name, key)
+                held = prev_by_name.get(name)
+                inst.nics.append(held if held is not None
+                                 else model.NicUsage(name=name))
+                continue
+            self._logged_nic_errors.pop(name, None)
+            inst.nics.append(model.NicUsage(
+                name=name,
+                rate_in_bps=st_nic.c_bytes_in.push(raw.rx_bytes),
+                rate_out_bps=st_nic.c_bytes_out.push(raw.tx_bytes),
+                pkts_in_ps=st_nic.c_pkt_in.push(raw.rx_packets),
+                pkts_out_ps=st_nic.c_pkt_out.push(raw.tx_packets),
+                drop_in_ps=st_nic.c_drop_in.push(raw.rx_dropped),
+                drop_out_ps=st_nic.c_drop_out.push(raw.tx_dropped),
+            ))
+        # 老的单卡标量字段镜像首卡（锚点网卡）：对外 API 与 /metrics 的
+        # 既有键继续有值，旧消费方零改动。
+        if inst.nics:
+            first = inst.nics[0]
+            inst.pkts_in_ps = first.pkts_in_ps
+            inst.pkts_out_ps = first.pkts_out_ps
+            inst.drop_in_ps = first.drop_in_ps
+            inst.drop_out_ps = first.drop_out_ps
+            inst.nic_rate_in_bps = first.rate_in_bps
+            inst.nic_rate_out_bps = first.rate_out_bps
 
         self._instance = inst
 
@@ -646,7 +681,7 @@ class Collector:
         转移不会被静默吃掉。
         """
         key = f"{type(err).__name__}: {err}"
-        attr = {"info": "_logged_info_error", "nic": "_logged_nic_error",
+        attr = {"info": "_logged_info_error",
                 "tc": "_logged_tc_error"}[kind]
         if getattr(self, attr) == key:
             return

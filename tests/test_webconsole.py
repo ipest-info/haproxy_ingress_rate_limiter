@@ -74,6 +74,24 @@ def test_snapshot_carries_instance_view():
     assert i["idle_pct"] == 87
 
 
+def test_snapshot_instance_carries_per_device_nics():
+    """设备视图：instance.nics 逐卡一条（页面每设备一块带宽图）；老的
+    单卡标量键继续存在（首卡镜像，兼容口径）。"""
+    h = hub()
+    h.record(1.0, [usage()], model.InstanceUsage(
+        nic="eth0", nic_rate_in_bps=1000.0, nic_rate_out_bps=2000.0,
+        nics=[model.NicUsage(name="eth0", rate_in_bps=1000.0,
+                             rate_out_bps=2000.0, pkts_in_ps=10.0,
+                             pkts_out_ps=20.0, drop_in_ps=1.0),
+              model.NicUsage(name="eth1", rate_in_bps=3000.0,
+                             rate_out_bps=4000.0)]))
+    i = h.history()[-1]["instance"]
+    assert [n["name"] for n in i["nics"]] == ["eth0", "eth1"]
+    assert i["nics"][1]["rate_in_bytes_per_s"] == 3000.0
+    assert i["nics"][0]["pkts_out_ps"] == 20.0
+    assert (i["nic"], i["nic_rate_in_bytes_per_s"]) == ("eth0", 1000.0)
+
+
 def test_snapshot_without_instance_view_is_still_valid():
     """未提供实例视图（纯 frontend 采样的老接线）时快照照常成立。"""
     h = hub()

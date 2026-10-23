@@ -408,6 +408,64 @@ async def test_nic_counters_are_differenced(monkeypatch):
     assert inst.nic == "eth0"
 
 
+async def test_multi_nic_produces_per_device_usage(monkeypatch):
+    """双网卡（逗号分隔）：逐卡差分产出 NicUsage，首卡镜像到老的单卡
+    标量字段（对外 API 的兼容口径）。"""
+    frames = {
+        "eth0": [model.NicStat(iface="eth0", rx_bytes=0, rx_packets=0,
+                               rx_dropped=0, tx_bytes=0, tx_packets=0,
+                               tx_dropped=0),
+                 model.NicStat(iface="eth0", rx_bytes=1000, rx_packets=10,
+                               rx_dropped=1, tx_bytes=2000, tx_packets=20,
+                               tx_dropped=2)],
+        "eth1": [model.NicStat(iface="eth1", rx_bytes=0, rx_packets=0,
+                               rx_dropped=0, tx_bytes=0, tx_packets=0,
+                               tx_dropped=0),
+                 model.NicStat(iface="eth1", rx_bytes=3000, rx_packets=30,
+                               rx_dropped=3, tx_bytes=4000, tx_packets=40,
+                               tx_dropped=4)],
+    }
+    iters = {k: iter(v) for k, v in frames.items()}
+    monkeypatch.setattr("rl_limiter.collector.netdev.read_nic_stat",
+                        lambda name, *_a, **_kw: next(iters[name]))
+    c = collector([[st("fe_a", 0)], [st("fe_a", 0)]], nic="eth0, eth1")
+    await c.tick(0.0)
+    await c.tick(1.0)
+    inst = c.instance
+    assert [n.name for n in inst.nics] == ["eth0", "eth1"]
+    by = {n.name: n for n in inst.nics}
+    assert (by["eth0"].rate_in_bps, by["eth0"].rate_out_bps) == (1000, 2000)
+    assert (by["eth1"].rate_in_bps, by["eth1"].rate_out_bps) == (3000, 4000)
+    assert (by["eth1"].pkts_in_ps, by["eth1"].drop_out_ps) == (30, 4)
+    # 首卡镜像：老字段 = eth0 的值。
+    assert inst.nic == "eth0"
+    assert (inst.nic_rate_in_bps, inst.nic_rate_out_bps) == (1000, 2000)
+    assert (inst.pkts_in_ps, inst.drop_in_ps) == (10, 1)
+
+
+async def test_multi_nic_single_failure_holds_only_that_device(monkeypatch):
+    """一张卡读失败只冻结那张卡（沿用上一拍），另一张照常差分。"""
+    calls = {"n": 0}
+
+    def fake_read(name, *_a, **_kw):
+        calls["n"] += 1
+        if name == "eth1" and calls["n"] > 2:  # 第二拍起 eth1 失联
+            raise OSError("gone")
+        base = 0 if calls["n"] <= 2 else 1000
+        return model.NicStat(iface=name, rx_bytes=base, rx_packets=base,
+                             rx_dropped=0, tx_bytes=base, tx_packets=base,
+                             tx_dropped=0)
+
+    monkeypatch.setattr("rl_limiter.collector.netdev.read_nic_stat", fake_read)
+    c = collector([[st("fe_a", 0)], [st("fe_a", 0)]], nic="eth0,eth1")
+    await c.tick(0.0)
+    await c.tick(1.0)
+    by = {n.name: n for n in c.instance.nics}
+    assert by["eth0"].rate_in_bps == 1000, "健康卡照常差分"
+    assert by["eth1"].rate_in_bps == 0.0, "失联卡沿用上一拍（首拍基线值 0）"
+    assert len(c.instance.nics) == 2, "失联卡仍在列表里，页面曲线不消失"
+
+
 async def test_nic_disabled_leaves_packet_curves_empty():
     """未配置网卡（探测失败或显式禁用）：包统计缺席，其余照常。"""
     c = collector([[st("fe_a", 0)], [st("fe_a", 500)]], nic="")

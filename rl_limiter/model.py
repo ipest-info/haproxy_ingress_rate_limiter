@@ -289,8 +289,12 @@ class InstanceUsage:
     # --- 带宽视图（HAProxy 口径，Σ frontend 差分，bytes/s）---
     rate_in_bps: float = 0.0
     rate_out_bps: float = 0.0
-    # --- 数据包视图（网卡口径，整机范围）---
-    nic: str = ""                # 采样的网卡名；空串 = 未取到网卡数据
+    # --- 设备视图（网卡口径，整机范围）---
+    # 受监控网卡逐卡一条 NicUsage（双网卡机器两条，页面每设备一块视图）。
+    # 下面的 nic/pkts/drop/nic_rate 标量是**首卡**（锚点网卡，通常是入向
+    # 执行网卡）的镜像——老字段口径，对外 API 与 /metrics 继续喂它们。
+    nics: list = field(default_factory=list)   # list[NicUsage]
+    nic: str = ""                # 首卡网卡名；空串 = 未取到网卡数据
     pkts_in_ps: float = 0.0
     pkts_out_ps: float = 0.0
     drop_in_ps: float = 0.0      # 每秒丢失入包数（rx_dropped 差分）
@@ -300,6 +304,22 @@ class InstanceUsage:
     # --- 进程健康 ---
     idle_pct: int = 100          # HAProxy 自报空闲率，越低越忙
     degraded: bool = False       # 采样失联，本 tick 是陈旧值
+
+
+@dataclass(**SLOTS)
+class NicUsage:
+    """单张网卡本 tick 的速率视图（/proc/net/dev 累计值的每秒差分）。
+
+    口径与 InstanceUsage 的网卡标量一致：整机、链路层，含本进程之外的
+    一切流量；bytes/s 与 包/秒。双网卡形态下实例面板按设备各画一块。"""
+
+    name: str = ""
+    rate_in_bps: float = 0.0
+    rate_out_bps: float = 0.0
+    pkts_in_ps: float = 0.0
+    pkts_out_ps: float = 0.0
+    drop_in_ps: float = 0.0
+    drop_out_ps: float = 0.0
 
 
 @dataclass(**SLOTS)
