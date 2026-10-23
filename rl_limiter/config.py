@@ -389,7 +389,7 @@ def _validate_haproxy(n: model.NodeConfig) -> None:
             f"haproxy: socket_path 过长"
             f"（{len(n.socket_path.encode('utf-8'))} 字节，上限 "
             f"{_UNIX_PATH_MAX}）——unix socket 路径长度受内核 sun_path 限制，"
-            f"请换用更短的路径（如 /run/haproxy/admin.sock）")
+            f"请换用更短的路径（如 /var/lib/haproxy/stats）")
 
     # cfg_path：受管 frontend 清单的来源，必填。存在性/可读性在引导时
     # 检查（cfgparse.load_frontends 直接读），这里只拦结构性错误。

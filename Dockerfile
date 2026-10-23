@@ -13,7 +13,7 @@
 # 为什么不用 haproxy 官方镜像：官方镜像只有 haproxy 一个进程，而本项目
 # 的部署形态是"rl-limiter 与 HAProxy 装在同一台服务器上"——用 Ubuntu
 # 基础镜像装两个组件，容器形态才和生产的单台 ECS 一致（同一个文件系统、
-# 同一个 /run/haproxy/admin.sock、同一份 systemd 式的进程共存关系）。
+# 同一个 /var/lib/haproxy/stats、同一份 systemd 式的进程共存关系）。
 #
 # HAProxy 版本：Ubuntu 24.04(noble) 主仓的 haproxy 是 2.8.x LTS——
 # splice 与监控依赖的 stats 列都以 2.8 为准。构建时会打印实测版本并在
@@ -80,11 +80,13 @@ RUN python3 -m venv /opt/rl-limiter \
     && /opt/rl-limiter/bin/pip install --no-cache-dir .
 ENV PATH=/opt/rl-limiter/bin:$PATH
 
-# /run/haproxy：unix stats socket（rl-limiter 同机只读采样）+ master pid
-#   （改 cfg 后的 reload 靠它给 master 发 SIGUSR2——容器里没有 systemd）。
+# /var/lib/haproxy：unix stats socket（rl-limiter 同机只读采样；与生产
+#   chroot /var/lib/haproxy 的惯用路径一致）。
+# /run/haproxy：master pid（改 cfg 后的 reload 靠它给 master 发
+#   SIGUSR2——容器里没有 systemd）。
 # /etc/rl-limiter：只读挂进来的 cfg/YAML 模板；入口脚本把它们复制成
 #   容器内的普通文件（进容器改副本即可演示热生效，见入口脚本注释）。
-RUN mkdir -p /run/haproxy /etc/rl-limiter /etc/haproxy
+RUN mkdir -p /var/lib/haproxy /run/haproxy /etc/rl-limiter /etc/haproxy
 
 COPY deploy/docker/node-entrypoint.sh /usr/local/bin/node-entrypoint.sh
 # 内核参数调优表。入口脚本在启动 HAProxy 之前跑它——发行版的默认值

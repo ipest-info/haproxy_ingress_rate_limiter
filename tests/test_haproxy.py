@@ -291,7 +291,7 @@ def test_parse_show_info_bad_number_falls_back():
 
 class FakeUnixHAProxy(FakeHAProxy):
     """同 FakeHAProxy，但监听 unix socket——复刻同机部署下 haproxy.cfg 的
-    `stats socket /run/haproxy/admin.sock mode 660 level user`。"""
+    `stats socket /var/lib/haproxy/stats mode 660 level user`。"""
 
     def __init__(self, reply_fn, path):
         super().__init__(reply_fn)

@@ -18,7 +18,7 @@ log = logging.getLogger("t.cfgparse")
 CFG = """\
 global
     daemon
-    stats socket /run/haproxy/admin.sock mode 660 level user
+    stats socket /var/lib/haproxy/stats mode 660 level user
 
 defaults
     mode tcp

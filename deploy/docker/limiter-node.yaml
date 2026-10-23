@@ -10,7 +10,7 @@ tick_interval_s: 1.0
 
 haproxy:
   name: haproxy
-  socket_path: /run/haproxy/admin.sock
+  socket_path: /var/lib/haproxy/stats
   cfg_path: /etc/haproxy/haproxy.cfg
   timeout_ms: 500
 

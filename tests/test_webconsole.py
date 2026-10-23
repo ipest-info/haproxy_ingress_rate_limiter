@@ -265,7 +265,7 @@ TOKEN = "test-token-123"
 
 BASE_YAML = """\
 haproxy:
-  socket_path: /run/haproxy/admin.sock
+  socket_path: /var/lib/haproxy/stats
   cfg_path: /etc/haproxy/haproxy.cfg
 quotas:
   fe_a: 8
