@@ -67,7 +67,15 @@ from . import model
 class IngressGovConfig:
     """`dynamic_ingress` 配置段（启动时定型，运行期改动不热生效）。"""
 
-    enabled: bool = False
+    # **默认启用**。本分支出厂形态就是闭环（出向不整形、入向动态收紧，
+    # 接线默认 RL_TC_IN_IFACE=eth0）：闭环是限速的唯一执行者，默认不开
+    # 等于"填了限速值不执行"——真实部署踩过（页面能填限额、内核什么都
+    # 没发生）。不要闭环的形态（纯监控/基线出向 HTB）显式 enabled: false，
+    # 或根本不接入向（RL_TC_IN_IFACE=-，控制器自然不创建）。
+    enabled: bool = True
+    # enabled 是否来自 YAML 显式书写（区分"默认开"与"手写开"：入向未
+    # 接线时只有手写开才值得告警，默认开保持安静）。不参与算法。
+    explicit: bool = False
     # 调节周期。比采样（1s）长一个量级：mean10 本身要 10s 才能反映一次
     # 调整的效果，更快地调只会追着噪声跑。
     interval_s: float = 15.0

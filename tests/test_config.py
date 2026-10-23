@@ -265,9 +265,19 @@ def test_request_limits_rejections(tmp_path, text, match):
 # 入向动态限速（dynamic_ingress，闭环）
 # ---------------------------------------------------------------------------
 
-def test_dynamic_ingress_default_disabled(tmp_path):
+def test_dynamic_ingress_default_enabled(tmp_path):
+    """闭环默认启用：出厂形态（出向不整形 + 入向 eth0）下它是限速的
+    唯一执行者，默认不开等于填了限额不执行（真实部署踩过）。"""
     g = load_from(tmp_path, minimal()).dynamic_ingress
+    assert g.enabled
+    assert not g.explicit, "未手写 enabled 时 explicit=False（告警降噪用）"
+
+
+def test_dynamic_ingress_explicit_disable(tmp_path):
+    g = load_from(tmp_path, minimal() + "dynamic_ingress:\n  enabled: false\n"
+                  ).dynamic_ingress
     assert not g.enabled
+    assert g.explicit
     # 默认参数本身必须能过校验（load 成功即证明）。
     assert g.interval_s == 15.0
 
