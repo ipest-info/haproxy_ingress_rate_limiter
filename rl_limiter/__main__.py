@@ -44,19 +44,21 @@ try:
 except Exception:  # pragma: no cover - 未安装场景
     SERVICE_VERSION = "dev"
 
-# Web 控制台监听地址。默认只绑回环；要让同网段访问，由运维显式设成
-# 内网地址并配合防火墙/安全组限制来源。
+# Web 控制台监听地址。默认绑全部地址（0.0.0.0）——监控页要能被同网段
+# 直接打开；写接口始终由 RL_API_TOKEN 闸住，但读接口随之对外可见，
+# 请用防火墙/安全组限制来源；要收紧回本机，设 RL_CONSOLE_BIND=127.0.0.1。
 ENV_CONSOLE_BIND = "RL_CONSOLE_BIND"
-DEFAULT_CONSOLE_BIND = "127.0.0.1"
+DEFAULT_CONSOLE_BIND = "0.0.0.0"
 
 # tc reconcile 兜底周期（秒）：限额变更是事件驱动的即时下发，这个只用来
 # 纠正"有人手动改了 tc 规则"与重试失败的下发。
 DEFAULT_APPLY_PERIOD_S = 30.0
 
-# 限速网卡。限速由内核 tc 执行（见 tcshaper 模块），作用在这张网卡的
+# 出向限速网卡。由内核 tc 执行（见 tcshaper 模块），作用在这张网卡的
 # **出方向**上，按源端口把流量分到各 frontend 自己的 HTB 类里。
-# 不设则自动取默认路由的出口网卡；多网卡机器必须显式指定。
-# 设为 "-" 表示**关闭限速**（只保留监控），此时不做任何 tc 操作。
+# **默认关闭（"-"）**——本分支的默认形态是双网卡闭环：出向不整形，靠
+# 动态收紧入向（RL_TC_IN_IFACE）把出向带宽压回目标。要用基线的出向
+# HTB 直接整形，显式设 RL_TC_IFACE=<网卡名>。
 #
 # 这一项只能来自本机环境变量、绝不从配置文件读——它决定了以 root
 # 权限（CAP_NET_ADMIN）操作哪张网卡。
@@ -69,10 +71,13 @@ ENV_TC_IFACE = "RL_TC_IFACE"
 ENV_NIC = "RL_NIC"
 
 # 请求方向（入向）限速的执行网卡 = **客户端侧**那张（双网卡形态）。
-# 配置了 request_limits 就必须显式指定——入向 police 放错网卡会误伤
-# 后端流量，所以这一项**绝不自动探测**；设为 "-" 表示明确不做入向限速
-# （request_limits 仍会被解析但只告警不执行）。
+# **默认 eth0**（出厂默认接线：eth0 面向客户端、eth1 面向后端）；机器
+# 不是这个命名时显式指定——不做默认路由之类的自动探测，入向规则放错
+# 网卡会误伤后端流量。默认值下若本机没有 eth0：配了限速则启动失败，
+# 纯监控则告警后照常跑。设为 "-" 表示明确不做入向限速（request_limits
+# 仍会被解析但只告警不执行）。
 ENV_TC_IN_IFACE = "RL_TC_IN_IFACE"
+DEFAULT_TC_IN_IFACE = "eth0"
 # 入向限速的执行机制：
 #   ifb（默认）  重定向到 IFB 虚拟网卡 + HTB **排队整形**——平稳慢放，
 #                与出向同款机制（内核需 ifb/act_mirred/sch_htb，均为
@@ -588,10 +593,12 @@ def main() -> None:
                "-c 指定的 YAML（接线 + 限额 quotas）与其中 haproxy.cfg_path "
                "指向的 haproxy.cfg（监听端口/模式，由运维直接编辑，"
                "rl-limiter 只读不写）；运行期轮询两者，内容变化即热生效。"
-               "限速网卡用 RL_TC_IFACE 指定（默认取默认路由的出口网卡，"
-               "设 - 则关闭限速、只保留监控）。"
+               "默认形态为双网卡闭环：入向执行网卡 RL_TC_IN_IFACE 默认 "
+               "eth0（客户端侧），出向整形 RL_TC_IFACE 默认关闭（-），"
+               "设 RL_TC_IFACE=<网卡> 可改回出向 HTB 直接整形。"
                "Web 控制台：设置 RL_CONSOLE_PORT 启用，RL_CONSOLE_BIND 指定"
-               "监听地址（默认 127.0.0.1——控制台无鉴权）；控制台同端口的 "
+               "监听地址（默认 0.0.0.0——读接口无鉴权，用防火墙限制来源）；"
+               "控制台同端口的 "
                "/metrics 提供 Prometheus 抓取。"
                "监控数据落盘：设 RL_METRICS_LOG=<文件路径> 启用（分钟粒度 "
                "JSONL，按天轮转，RL_METRICS_LOG_DAYS 定保留天数，默认 90）。"
@@ -646,15 +653,15 @@ def main() -> None:
                     "禁用，只读观测不受影响；要启用请在环境变量里设置令牌"
                     "后重启", ENV_API_TOKEN)
 
-    # 限速：内核 tc（见 tcshaper 模块）。默认启用——限速是本服务的核心
-    # 职责，"静悄悄地没在限"是最不该出现的状态。显式设 RL_TC_IFACE=- 才
-    # 关闭；网卡探测不出来直接启动失败，而不是装作在限速。
+    # 出向限速：内核 tc（见 tcshaper 模块）。**默认关闭**——本分支的
+    # 默认形态是双网卡闭环（出向不整形，动态收紧入向把出向压回目标，
+    # 见 ingressgov 模块）；要出向直接整形需显式设 RL_TC_IFACE=<网卡>。
     shaper = None
     tc_iface = ""
-    raw_iface = (os.environ.get(ENV_TC_IFACE) or "").strip()
+    raw_iface = (os.environ.get(ENV_TC_IFACE) or "").strip() or "-"
     if raw_iface == "-":
-        print("rl-limiter: 已显式关闭 tc 限速（RL_TC_IFACE=-），本实例只做"
-              "监控", file=sys.stderr)
+        print("rl-limiter: 出向 tc 整形未启用（RL_TC_IFACE 默认 -，双网卡"
+              "闭环形态）；出向带宽由入向闭环间接控制", file=sys.stderr)
     else:
         iface = tcmod.resolve_iface(raw_iface, log)
         if not iface:
@@ -703,12 +710,40 @@ def main() -> None:
                     "listen——服务照常启动，之后 cfg 内容变化会被轮询接上 "
                     "cfg_path=%s", cfg.haproxy.cfg_path)
 
-    # 请求方向（入向）限速：双网卡形态，执行网卡 = 客户端侧那张，只认
-    # RL_TC_IN_IFACE 显式指定（绝不自动探测——入向 police 放错网卡会误伤
-    # 后端流量）。配置了 request_limits 却没指定网卡 → 启动失败，宁可
-    # 起不来也不要"以为限了请求方向其实没有"。
+    # 请求方向（入向）限速：双网卡形态，执行网卡 = 客户端侧那张。默认
+    # eth0（出厂接线约定），非 eth0 命名的机器显式设 RL_TC_IN_IFACE——
+    # 不做默认路由式自动探测，入向规则放错网卡会误伤后端流量。显式配置
+    # 保持铁律：建不出执行面 → 启动失败；**默认值**下本机没有 eth0 时，
+    # 配了限速同样启动失败，纯监控则降级为告警（默认值不该 brick 掉
+    # 命名不同的机器）。
     ingress = None
     raw_in_iface = (os.environ.get(ENV_TC_IN_IFACE) or "").strip()
+    in_iface_defaulted = not raw_in_iface
+    if in_iface_defaulted:
+        raw_in_iface = DEFAULT_TC_IN_IFACE
+        import subprocess
+        nic_exists = subprocess.run(
+            ["ip", "link", "show", raw_in_iface],
+            capture_output=True).returncode == 0
+        if not nic_exists:
+            if cfg.request_limits or cfg.instance_quota_mbps:
+                print(
+                    f"rl-limiter: YAML 里配置了限速"
+                    f"（request_limits {len(cfg.request_limits)} 条，"
+                    f"instance_quota_mbps="
+                    f"{cfg.instance_quota_mbps:g}），但入向执行网卡的"
+                    f"默认值 {DEFAULT_TC_IN_IFACE} 在本机不存在。\n"
+                    f"  请设 {ENV_TC_IN_IFACE}=<客户端侧网卡名> 显式指定"
+                    f"（双网卡出厂约定 eth0 面向客户端，本机命名不同时"
+                    f"必须显式给）；\n"
+                    f"  确实不需要入向限速时设 {ENV_TC_IN_IFACE}=- "
+                    f"明确关闭。", file=sys.stderr)
+                raise SystemExit(1)
+            log.warning("入向执行网卡默认值 %s 在本机不存在，入向限速不可"
+                        "用（当前未配置限速，仅监控，不影响运行）；需要"
+                        "限速时设 %s=<客户端侧网卡名>",
+                        DEFAULT_TC_IN_IFACE, ENV_TC_IN_IFACE)
+            raw_in_iface = "-"
     if raw_in_iface == "-":
         if cfg.request_limits:
             log.warning("已显式关闭入向限速（%s=-），YAML 里的 "
@@ -756,17 +791,8 @@ def main() -> None:
                 f"可选 ifb（IFB+HTB 排队整形，默认）或 police"
                 f"（超额丢包，老内核备选）。", file=sys.stderr)
             raise SystemExit(1)
-    elif cfg.request_limits:
-        print(
-            f"rl-limiter: YAML 里配置了 request_limits（请求方向限速），"
-            f"但没有指定入向执行网卡。\n"
-            f"  双网卡形态下请设 {ENV_TC_IN_IFACE}=<客户端侧网卡名>"
-            f"（这一项不做自动探测——入向 police 放错网卡会误伤后端"
-            f"流量）；\n"
-            f"  确实不需要请求方向限速时，删掉 request_limits 段或设 "
-            f"{ENV_TC_IN_IFACE}=- 明确关闭。",
-            file=sys.stderr)
-        raise SystemExit(1)
+    # （raw_in_iface 不会为空：未设时已回落默认 eth0，eth0 不存在且配了
+    # 限速的场景在上面已经启动失败。）
 
     # 监控数据落盘（可选）：设 RL_METRICS_LOG=<文件路径> 即启用。
     mlog = None
