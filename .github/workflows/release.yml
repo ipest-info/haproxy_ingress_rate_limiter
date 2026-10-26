@@ -1,19 +1,29 @@
 # 按 tag 自动构建并发布二进制。
 #
-# 触发：推送形如 v<主>.<次>.<补丁>（可带 -rcN）的 tag，例如：
-#   git tag v0.4.0 && git push origin v0.4.0
+# 触发：
+#   1. 推送形如 v<主>.<次>.<补丁>（可带 -rcN）的 tag：
+#        git tag v0.4.0 && git push origin v0.4.0
+#   2. 手动（Actions 页 Run workflow，或 API dispatch）：输入已存在的
+#      tag 名——给"工作流本身修过、tag 不想重打"的场景用。
 #
 # 发布物（挂在同名 GitHub Release 上）：
 #   rl-limiter-v<版本>-linux-x86_64.tar.gz(.sha256)
 #
-# 构建环境刻意用 manylinux2014 容器（glibc 2.17）：PyInstaller 产物
-# 要求目标机 glibc ≥ 构建机，这样 CentOS 7 / RHEL 7 及之后的一切
-# 发行版都能跑。
+# 构建刻意放在 manylinux2014 容器（glibc 2.17）里：PyInstaller 产物
+# 要求目标机 glibc ≥ 构建机，这样 CentOS 7 / RHEL 7 及之后的发行版
+# 都能跑。注意容器不能作为 job 的 container: 使用——checkout@v4 的
+# node20 需要 glibc ≥ 2.28 会直接起不来（v0.4.0 首次构建踩过）；
+# 因此 checkout 在宿主 runner 上做，构建用 docker run 进容器。
 name: release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建发布的已有 tag（如 v0.4.0）"
+        required: true
 
 permissions:
   contents: write   # 创建 Release 并上传产物
@@ -21,31 +31,38 @@ permissions:
 jobs:
   build-release:
     runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux2014_x86_64
+    env:
+      REL_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: 校验 tag 与 pyproject 版本一致
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG="${REL_TAG#v}"
           VER=$(sed -n 's/^version *= *"\(.*\)"/\1/p' pyproject.toml)
           # 允许预发布后缀：tag v0.4.0-rc1 对应 pyproject 0.4.0。
           case "$TAG" in "$VER"|"$VER"-rc*) ;; *)
-            echo "tag（$GITHUB_REF_NAME）与 pyproject.toml（$VER）不一致" >&2
+            echo "tag（$REL_TAG）与 pyproject.toml（$VER）不一致" >&2
             exit 1;;
           esac
 
-      - name: 构建发布包
+      - name: 在 manylinux2014 容器里构建发布包
         run: |
-          export PYTHON=/opt/python/cp311-cp311/bin/python3
-          VERSION="${GITHUB_REF_NAME#v}" bash deploy/release/build.sh
+          docker run --rm -v "$PWD":/src -w /src \
+            -e VERSION="${REL_TAG#v}" \
+            -e PYTHON=/opt/python/cp311-cp311/bin/python3 \
+            quay.io/pypa/manylinux2014_x86_64 \
+            bash deploy/release/build.sh
 
       - name: 创建 Release 并上传产物
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.REL_TAG }}
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
           # -rc 预发布自动标 prerelease。
-          prerelease: ${{ contains(github.ref_name, '-rc') }}
+          prerelease: ${{ contains(env.REL_TAG, '-rc') }}
           generate_release_notes: true
