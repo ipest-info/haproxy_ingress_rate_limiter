@@ -4,7 +4,7 @@
 #
 # 用法：
 #   deploy/release/build.sh              # 版本取 pyproject.toml
-#   VERSION=0.5.0 deploy/release/build.sh
+#   VERSION=0.6.0 deploy/release/build.sh
 #
 # 产物（dist/ 下）：
 #   rl-limiter-v<版本>-linux-<架构>.tar.gz          发布包

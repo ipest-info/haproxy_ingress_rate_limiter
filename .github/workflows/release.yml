@@ -8,6 +8,8 @@
 #
 # 发布物（挂在同名 GitHub Release 上）：
 #   rl-limiter-v<版本>-linux-x86_64.tar.gz(.sha256)
+#   install.sh（单独一份：运维从 releases/latest/download/install.sh
+#   取安装脚本，不依赖 main 分支上的文件）
 #
 # 构建刻意放在 manylinux2014 容器（glibc 2.17）里：PyInstaller 产物
 # 要求目标机 glibc ≥ 构建机，这样 CentOS 7 / RHEL 7 及之后的发行版
@@ -79,9 +81,14 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.REL_TAG }}
+          # tag 不存在时在**本次构建的提交**上创建（不写则 GitHub 默认打
+          # 在默认分支 HEAD 上——从其它分支 dispatch 时 tag 与产物对不上）。
+          # tag 已存在时此项不起作用。
+          target_commitish: ${{ github.sha }}
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            deploy/release/install.sh
           # -rc 预发布自动标 prerelease。
           prerelease: ${{ contains(env.REL_TAG, '-rc') }}
           generate_release_notes: true
