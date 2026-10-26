@@ -17,11 +17,11 @@
 | 字段 | 说明 |
 | ---- | ---- |
 | `service_version` / `config_version` / `uptime_s` | 版本与运行时长（config_version 是配置内容校验和，变了=热更过） |
-| `frontends` | 受管清单的配置视图：`{名: {bind_address, bind_port, mode, quota_mbps, quota_bytes_per_s, limited, ...}}` |
+| `frontends` | 端口登记的配置视图（来自 YAML ports 段）：`{名: {bind_port, ...}}`；通用形态没有端口级带宽观测，units 对应条目恒缺席 |
 | `request_limits` | 入向限速登记：`{名: {mbps, conn_rate}}` |
 | `instance_quota_mbps` / `instance_quota_bytes_per_s` | 实例出向总目标（0=不限） |
 | `instance_quota_executable` | 本机是否有实例总限速的执行者（false 时 PUT 会 409） |
-| `haproxy` | `{name, endpoint, unix, degraded}`——degraded=true 表示采样失联，各速率为陈旧值 |
+| `haproxy` | `{name, endpoint, unix, degraded}`——数据源视图（endpoint=/proc/net/snmp；键名为历史兼容保留） |
 | `latest` | 最新一拍快照（结构同 /api/history 的元素），没采到过为 null |
 
 ### GET /api/history
@@ -32,7 +32,7 @@
 {
   "ts": 1760580000.0,
   "config_version": 123456,
-  "units": {            // 按 frontend
+  "units": {            // 按端口（通用形态恒为空：无端口级应用层观测）
     "fe_main": {
       "rate_bytes_per_s": ..., "rate_in_bytes_per_s": ...,   // 瞬时（出/入）
       "mean10_bytes_per_s": ..., "ewma60_bytes_per_s": ...,  // 10s 均值 / EWMA
@@ -45,7 +45,7 @@
   "instance": {          // 整机
     "conn": ..., "active_conns": ..., "idle_conns": ..., "max_conn": ...,
     "conn_new_ps": ..., "conn_denied_ps": ...,
-    "rate_in_bytes_per_s": ..., "rate_out_bytes_per_s": ...,   // HAProxy 口径
+    "rate_in_bytes_per_s": ..., "rate_out_bytes_per_s": ...,   // 应用层口径（通用形态为 0）
     "nic": "eth1", "pkts_in_ps": ..., "pkts_out_ps": ...,
     "drop_in_ps": ..., "drop_out_ps": ...,
     "nic_rate_in_bytes_per_s": ..., "nic_rate_out_bytes_per_s": ...,  // 网卡口径（首卡镜像）
@@ -68,7 +68,7 @@
       "egress_source": "nic",    // 观测来源："nic" | "haproxy"（回退）
       "landed": true             // 是否已按实测流入落位
     },
-    "frontends": {               // 受端口级闭环管的端口
+    "frontends": {               // 端口级闭环（通用形态不启用，恒空）
       "fe_main": {"target_mbps": 40.0, "max_mbps": 10.0,
                    "cap_mbps": 5.2,    // 当前动态入向上限；null = 全开/静态
                    "egress_mbps": 38.9}

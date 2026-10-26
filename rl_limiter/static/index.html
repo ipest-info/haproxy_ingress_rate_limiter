@@ -5,20 +5,20 @@
      于是每次打开页面都在控制台留一条 404 —— 排障时那条无关的红字很干扰。 -->
 <link rel="icon" href="data:,">
 <style>
-/* 单 HAProxy 模型的控制台。三个 tab：
-     实例   —— 整台 HAProxy 的连接/带宽视图 + 实例总限速；
+/* 通用形态的控制台（一台服务器一个实例）。三个 tab：
+     实例   —— 整机连接/设备带宽视图 + 实例总限速；
      监听端口 —— 每个 frontend 一张卡片：监控曲线、配置视图与限额编辑；
      日志   —— 进程内环形缓冲的最近若干条。
    能改的只有**限额**（各 frontend 的 quota 与实例总限速）：修改经带
    令牌鉴权的写 API 回写到 YAML 后热生效。负载均衡配置（监听端口/后端）
-   仍以 haproxy.cfg 为唯一权威，页面绝不提供它的写入口。
+   只有一份本地 YAML；接线（环境变量）页面只展示不提供写入口。
 
    监控视图的分组照 docs/06-控制台与监控.md 落地，并且**只画有真实数据源的
    曲线**。拿不到的指标既不画空图、也不在页面上长篇解释为什么没有——
    那些取舍属于文档，页面只呈现真有数据的东西。
 
    每张图都标数据来源，因为口径确实不同、数值本就不该相等：
-     HAProxy  应用层字节，按 frontend 精确拆分（带宽、连接）
+     内核 TCP 计数器  整机连接统计（/proc/net/snmp）
      tc 队列  链路层字节 + 包数/丢包，按 frontend 拆分，仅出方向
      网卡     链路层，整机范围，用于入方向的包统计
  */
@@ -355,23 +355,22 @@ input:focus, select:focus {
         </span>
       </div>
       <div class="card-body">
-        <div class="hint" id="inst-quota-hint">本机 HAProxy **全部** frontend 出向流量合计的总闸
-          （含未登记限额、只监控的段）：设置后 tc 切换为层级模式，各
-          frontend 自己的限额仍各自生效；SSH/监控等系统流量**不在**总闸内、
-          不受影响。修改经写 API 回写 YAML 后数秒内热生效——需先在页头
-          填入 API 令牌（RL_API_TOKEN）。</div>
+        <div class="hint" id="inst-quota-hint">本机出向带宽目标（网卡口径，
+          与按量计费同口径；0 = 不限）：闭环按它动态收紧客户端侧网卡的
+          入向带宽，把出向间接压回目标。修改经写 API 回写 YAML 后数秒内
+          热生效——需先在页头填入 API 令牌（RL_API_TOKEN）。</div>
       </div>
     </div>
 
     <div class="card">
       <div class="card-head"><span class="card-title">连接视图</span>
-        <span class="hint">来源：HAProxy <code>show info</code> + 全部 frontend 汇总</span></div>
+        <span class="hint">来源：内核 TCP 计数器（/proc/net/snmp，整机口径）</span></div>
       <div class="card-body"><div class="chart-grid" id="i-conn-charts"></div></div>
     </div>
 
     <div class="card">
       <div class="card-head"><span class="card-title">设备视图</span>
-        <span class="hint">按网卡设备统计（整机、链路层口径）；HAProxy 应用层口径的出向带宽见调节视图</span></div>
+        <span class="hint">按网卡设备统计（整机、链路层口径，与按量计费同口径）</span></div>
       <div class="card-body"><div class="chart-grid" id="i-bw-charts"></div></div>
     </div>
 
@@ -384,8 +383,7 @@ input:focus, select:focus {
       <div class="card-head">
         <span class="card-title">调节视图（闭环动态限速）</span>
         <span class="hint">单位一律 Mbps。出向总观测为网卡口径（客户端侧
-          网卡流出 10s 均值，与按量计费同口径；设备数据缺席时回退 HAProxy
-          应用层口径）；端口级观测为 HAProxy 口径（网卡无法按端口拆）；
+          网卡流出 10s 均值，与按量计费同口径）；
           总闸/实测流入同为链路层口径。</span>
       </div>
       <div class="card-body">
@@ -421,7 +419,7 @@ input:focus, select:focus {
     <div id="cfg-sections"><div class="hint">加载中…</div></div>
     <div class="hint" style="padding:2px 4px">能改的只有限额类字段（改了经写
       API 回写 YAML 热生效）；接线/运行参数启动时定型，只读展示——改它们
-      请编辑配置文件或环境变量后重启。haproxy.cfg（监听端口、后端）绝对
+      请编辑配置文件或环境变量后重启。业务服务自己的配置绝对
       只读，页面不提供写入口。</div>
   </section>
 
@@ -733,7 +731,7 @@ function updateRegulation(r) {
 // 连接视图 = 新建 + 总连接；带宽视图**按设备（网卡）**组织：每张受监控
 // 网卡一块带宽图（双网卡两块），数据包/丢包图逐卡成对画线。受监控网卡
 // 集合来自快照的 instance.nics（服务端 RL_NIC 决定），集合变化时整组
-// 重建。没有网卡数据时回退 HAProxy 应用层口径的旧带宽图，面板不留白。
+// 重建。没有网卡数据时回退应用层口径的旧带宽图，面板不留白。
 const NIC_COLOR_PAIRS = [["--s-in", "--s-out"], ["--s-total", "--s-idle"],
                          ["--s-mean", "--s-bad"]];
 function buildInstanceCharts() {
@@ -743,7 +741,7 @@ function buildInstanceCharts() {
   const nics = state.nicNames ? state.nicNames.split(",") : [];
   state.instCharts = [
     makeChart(conn, {
-      title: "实例新建连接数", source: "show info / frontend 汇总",
+      title: "实例新建连接数", source: "内核 TCP 计数器（整机）",
       fmt: fmtRate, unit: "个/秒", points: pts,
       series: [
         {key: "conn_new", label: "每秒新建连接数", color: "--s-out"},
@@ -751,7 +749,7 @@ function buildInstanceCharts() {
       ],
     }),
     makeChart(conn, {
-      title: "实例总连接数", source: "show info / frontend 汇总",
+      title: "实例总连接数", source: "内核 TCP 计数器（整机）",
       fmt: fmtInt, unit: "个", points: pts,
       series: [
         {key: "conn", label: "并发连接数", color: "--s-total"},
@@ -794,7 +792,7 @@ function buildInstanceCharts() {
   } else {
     // 没有网卡数据源（RL_NIC=- 或探测失败）：回退 HAProxy 应用层口径。
     state.instCharts.push(makeChart(bw, {
-      title: "实例带宽统计", source: "HAProxy 应用层口径 · 5s 滚动均值",
+      title: "实例带宽统计", source: "应用层口径（本形态通常为 0）· 5s 滚动均值",
       fmt: fmtMbps, unit: "Mbps", points: pts,
       series: [
         {key: "rin5", label: "流入带宽", color: "--s-in"},
@@ -1038,28 +1036,7 @@ function applySnapshot(snap, live) {
       if (state.tab === "instance") for (const ch of state.regCharts) drawChart(ch);
     }
   }
-  for (const [name, u] of Object.entries(snap.units || {})) {
-    const fe = ensureCard(name);
-    // rout 就是限速那条链路的 rate_bytes_per_s（tc 只整形出方向），
-    // 这里统一叫 rout 是为了和 rin 成对，图表按同一套键名取值。
-    fe.buf.push({
-      ts: snap.ts,
-      rout: u.rate_bytes_per_s, rin: u.rate_in_bytes_per_s,
-      mean: u.mean10_bytes_per_s,
-      conn_new: u.conn_new_ps, conn_denied: u.conn_denied_ps,
-      conn: u.conn, active: u.active_conns, idle: u.idle_conns,
-      pkts_out: u.pkts_out_ps || 0, drop_out: u.drop_out_ps || 0,
-      overlimit: u.overlimit_ps || 0,
-    });
-    if (fe.buf.length > BUF_MAX) fe.buf.shift();
-    const feen = fe.buf[fe.buf.length - 1];
-    feen.rin5 = roll5(fe.buf, "rin");
-    feen.rout5 = roll5(fe.buf, "rout");
-    if (live) {
-      updateCard(fe, u);
-      if (state.tab === "frontend") for (const ch of fe.charts) drawChart(ch);
-    }
-  }
+  // 通用形态没有端口级应用层观测：snap.units 恒空，无卡片可画。
 }
 
 async function loadOverview() {
@@ -1090,15 +1067,6 @@ async function loadOverview() {
     iIn.value = iq || "";
   if (o.latest && o.latest.instance) updateInstance(o.latest.instance);
 
-  const names = Object.keys(o.frontends || {}).sort();
-  for (const name of names) {
-    const fe = ensureCard(name);
-    fe.conf = o.frontends[name];
-    updateCard(fe, (o.latest && o.latest.units) ? o.latest.units[name] : null);
-  }
-  for (const [name, fe] of [...state.fes]) {
-    if (!names.includes(name)) { fe.card.remove(); state.fes.delete(name); }
-  }
 }
 
 // tc 实况：/api/tc 返回 {sections: [{title, iface, desired, raw:[{label,text}]}]}

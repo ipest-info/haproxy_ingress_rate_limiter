@@ -1,7 +1,7 @@
 # 05 DockerCompose 演示
 
 一键起一套完整的双网卡闭环环境：三台节点（每台 = Ubuntu 24.04 +
-HAProxy 2.8 + 同机 rl-limiter）、模拟业务后端、可调并发压测服务。
+任意业务进程示例 random_web + 同机 rl-limiter）、可调并发压测服务。
 仅供体验与验证，不是生产形态（生产见 [04 部署指南](04-部署指南.md)）。
 
 ## 1. 拓扑
@@ -84,8 +84,6 @@ curl -X PUT localhost:8084/big -d '{"per_target": 2}'           # 每目标 N �
 
 - 三节点 + loadgen + web 挤在一台宿主机上：CPU/带宽互相挤占，绝对
   吞吐数字没有意义，**看收敛行为**（调节视图的曲线形状）；
-- 演示量级：`HAPROXY_MAXCONN` 压到 10 万（宿主机 `fs.nr_open` 默认值
-  起不来 100 万的模板默认）、`HAPROXY_NBTHREAD=2`（防三实例线程超配）；
   生产独占机器删掉这些覆盖；
 - 节点/loadgen/web 的 sysctls（somaxconn、syn_backlog、tw_reuse、端口
   区间等）在 compose 里按 netns 声明——5000 并发下不给会出现 accept
