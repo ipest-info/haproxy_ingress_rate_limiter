@@ -9,8 +9,8 @@
 #
 # 本文件被运行期轮询（5s）：total_egress_mbps、nodes、allocation、
 # offline_after 改了即热生效；log_level 与各周期字段启动时定型，改了
-# 要重启 rl-fleet。总控的写 API（页面改总带宽）只会改写
-# total_egress_mbps 一个字段，但回写会重写整份文件、手写注释不保留。
+# 要重启 rl-fleet。总控的写 API（页面改总带宽、节点管理）只改写
+# total_egress_mbps 与 nodes 两处，但回写会重写整份文件、手写注释不保留。
 
 log_level: info
 
@@ -53,18 +53,19 @@ allocation:
   # 单节点分配下限（Mbps）。绝不下发 ≤0：0 在节点语义里是"不限"。
   min_quota_mbps: 0.5
 
-# 节点清单（增删改文件即热生效）。
-nodes:
-  - name: node-sh-01
-    # 节点控制台地址（总控轮询与下发都走它）：节点侧需要
-    # RL_CONSOLE_BIND 绑到总控可达的内网地址，并用防火墙/安全组
-    # 限制只有总控能访问（节点读接口无鉴权）。
-    url: http://10.0.1.11:8090
-    # 节点写 API 的令牌 = 该节点的 RL_API_TOKEN。空 = 该节点只读观测
-    # （汇总里看得到，但不参与分配、不被下发）。
-    token: <node1 的 RL_API_TOKEN>
-    # 页面"跳到该节点控制台"的链接；内外网地址不同时填，缺省 = url。
-    console_url: ""
-  - name: node-sh-02
-    url: http://10.0.1.12:8090
-    token: <node2 的 RL_API_TOKEN>
+# 节点清单：**在总控页面「节点管理」里添加/编辑/删除**（页头填总控令牌
+# 后操作，写回本文件热生效），也可以直接编辑本段（同样热生效）。
+# 出厂为空清单，装好总控后逐台登记。每项的写法：
+#
+#   - name: node-sh-01
+#     # 节点控制台地址（总控轮询与下发都走它）：节点侧需要
+#     # RL_CONSOLE_BIND 绑到总控可达的内网地址，并用防火墙/安全组
+#     # 限制只有总控能访问（节点读接口无鉴权）。
+#     url: http://10.0.1.11:8090
+#     # 节点写 API 的令牌 = 该节点的 RL_API_TOKEN（装节点时
+#     # install.sh --token 指定的那个）。空 = 该节点只读观测
+#     # （汇总里看得到，但不参与分配、不被下发）。
+#     token: <该节点的 RL_API_TOKEN>
+#     # 页面"跳到该节点控制台"的链接；内外网地址不同时填，缺省 = url。
+#     console_url: ""
+nodes: []

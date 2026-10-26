@@ -16,7 +16,7 @@
 #   ./rl-limiter.sh uninstall   卸载（保留 /etc/rl-limiter）
 #
 # install 干这些事，每一步都会说清楚做了什么：
-#   1. 前置检查：python3 ≥ 3.9、tc 可用、内核有 HTB、systemd
+#   1. 前置检查：python3 ≥ 3.9、tc 可用、内核有 HTB、systemd、双网卡
 #   2. 建专用用户 rl-limiter（tc 权限由 unit 的 CAP_NET_ADMIN 提供）
 #   3. venv 装到 /opt/rl-limiter
 #   4. 配置文件 /etc/rl-limiter/{config.yaml,rl-limiter.env}（已存在则**不覆盖**）
@@ -99,6 +99,20 @@ preflight() {
 
     command -v systemctl >/dev/null 2>&1 && ok "systemd 可用" || {
         bad "找不到 systemctl，本脚本按 systemd 部署"; fail=1; }
+
+    # 双网卡：节点形态的硬前提（客户侧执行入向限速、后端侧走回程），
+    # 与二进制装法 install.sh 同一条规则。物理网卡 = 有 device 链接的。
+    local d phys=""
+    for d in "${SYS_CLASS_NET:-/sys/class/net}"/*; do
+        [ -e "$d/device" ] && phys="$phys ${d##*/}"
+    done
+    phys=${phys# }
+    if [ "$(echo $phys | wc -w)" -ge 2 ]; then
+        ok "双网卡：物理网卡 $phys（接线见 $ENV_FILE 的 RL_TC_IN_IFACE / RL_BACKEND_IFACE）"
+    else
+        bad "节点要求双网卡（客户侧 + 后端侧），本机物理网卡：${phys:-无}——不允许安装"
+        fail=1
+    fi
 
     return $fail
 }
