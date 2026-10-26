@@ -5,14 +5,15 @@
 #   1. **总量目标**：total_egress_mbps——全部节点出向带宽合计的目标值
 #      （0 = 纯观察模式，只汇总不下发）。可经总控的写 API 热改；
 #   2. **节点清单**（nodes 段）：每台节点的名称、控制台地址与写 API
-#      令牌。改文件热生效（增删节点不用重启总控）；
+#      令牌。改文件热生效（增删节点不用重启总控），也可经总控的写 API
+#      （页面「节点管理」）添加/编辑/删除；
 #   3. **运行参数**：轮询/分配周期、离线判定、分配算法参数（allocation
 #      段）。周期类字段启动时定型，其余热生效。
 #
 # 回写（set_total_quota）与节点侧 configstore 同一套纪律：改之前整份
 # 重新校验（写出去的配置一定能被重新加载）、临时文件 + os.replace 原子
-# 替换、手写注释会丢。总控的 YAML 只有 total_egress_mbps 一个字段开放
-# 给写 API——节点清单与算法参数属于运维操作，编辑文件即可（热生效）。
+# 替换、手写注释会丢。开放给写 API 的只有 total_egress_mbps 与 nodes
+# 两处——算法参数与周期属于运维调参，编辑文件即可（热生效/重启）。
 
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ import logging
 import os
 import re
 import tempfile
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -261,14 +263,15 @@ def _validate(cfg: FleetConfig) -> None:
         if n.name in seen:
             raise ValueError(f"nodes 里节点名重复：{n.name!r}")
         seen.add(n.name)
-        if not (n.url.startswith("http://") or n.url.startswith("https://")):
+        if (not (n.url.startswith("http://") or n.url.startswith("https://"))
+                or not urllib.parse.urlsplit(n.url).netloc):
             raise ValueError(
-                f"nodes[{i}]({n.name}).url 必须是 http(s):// 地址"
-                f"（节点控制台），当前值 {n.url!r}")
+                f"nodes[{i}]({n.name}).url 必须是 http(s)://<主机>:<端口> "
+                f"地址（节点控制台），当前值 {n.url!r}")
 
 
 # ---------------------------------------------------------------------------
-# 回写（总控写 API 唯一能改的字段：total_egress_mbps）
+# 回写（写 API 能改的只有 total_egress_mbps 与 nodes）
 # ---------------------------------------------------------------------------
 
 _HEADER = (
@@ -281,11 +284,16 @@ class FleetConfigError(ValueError):
     """回写失败（配置不合法 / 文件读写问题）。信息面向 API 调用者。"""
 
 
-def set_total_quota(path: str, total_mbps: float) -> None:
-    """设置总流出带宽（Mbps；0 = 停止分配，纯观察）。
+class NodeExistsError(FleetConfigError):
+    """添加节点时重名（不覆盖已登记的节点——要改用编辑）。"""
 
-    与节点侧 configstore 同一套纪律：改之前整份重新校验、原子替换。
-    """
+
+class NodeNotFoundError(FleetConfigError):
+    """编辑/删除的节点不在清单里。"""
+
+
+def _read_raw(path: str) -> dict:
+    """读出当前 YAML 的原始映射（回写的起点）。"""
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f.read())
@@ -300,10 +308,11 @@ def set_total_quota(path: str, total_mbps: float) -> None:
     if not isinstance(raw, dict):
         raise FleetConfigError(
             f"配置文件 {path} 顶层不是键值映射，拒绝回写（请先手工修复）")
-    if total_mbps:
-        raw["total_egress_mbps"] = total_mbps
-    else:
-        raw.pop("total_egress_mbps", None)
+    return raw
+
+
+def _write_raw(path: str, raw: dict) -> None:
+    """整份校验后原子替换（与节点侧 configstore 同一套纪律）。"""
     # 与启动完全相同的校验链：能写出去的配置一定能被重新加载。
     from_raw(raw, source="回写后的配置")
     text = _HEADER + yaml.safe_dump(
@@ -326,6 +335,96 @@ def set_total_quota(path: str, total_mbps: float) -> None:
         except OSError:
             pass
         raise FleetConfigError(f"写配置文件 {path} 失败：{e}") from None
+
+
+def set_total_quota(path: str, total_mbps: float) -> None:
+    """设置总流出带宽（Mbps；0 = 停止分配，纯观察）。"""
+    raw = _read_raw(path)
+    if total_mbps:
+        raw["total_egress_mbps"] = total_mbps
+    else:
+        raw.pop("total_egress_mbps", None)
+    _write_raw(path, raw)
+
+
+# 节点项里写 API 可设的字段（name 只在添加时给，之后不可改——改名 =
+# 删了重加，节点状态与日志都以名字为键）。
+NODE_FIELDS = ("url", "token", "console_url")
+
+
+def _node_value(key: str, v: Any) -> str:
+    if v is None:
+        return ""
+    if not isinstance(v, str):
+        raise FleetConfigError(f"{key} 必须是字符串，当前值 {v!r}")
+    v = v.strip()
+    # 令牌随请求头发给节点：空白/控制字符要么被拒、要么拼出畸形请求头。
+    if key == "token" and any(c.isspace() or ord(c) < 32 for c in v):
+        raise FleetConfigError("token 不能含空白或控制字符")
+    return v
+
+
+def _raw_nodes(raw: dict) -> list:
+    nodes = raw.get("nodes")
+    if nodes is None:
+        nodes = []
+    if not isinstance(nodes, list):
+        raise FleetConfigError(
+            "配置文件里 nodes 不是列表，拒绝回写（请先手工修复）")
+    raw["nodes"] = nodes
+    return nodes
+
+
+def _find(nodes: list, name: str) -> int:
+    for i, n in enumerate(nodes):
+        if isinstance(n, dict) and str(n.get("name", "")).strip() == name:
+            return i
+    return -1
+
+
+def add_node(path: str, name: str, fields: dict) -> None:
+    """登记一台新节点（追加到清单末尾）。重名抛 NodeExistsError——绝不
+    静默覆盖已登记节点的接线与令牌。"""
+    raw = _read_raw(path)
+    nodes = _raw_nodes(raw)
+    name = _node_value("name", name)
+    if _find(nodes, name) >= 0:
+        raise NodeExistsError(f"节点 {name!r} 已在清单里（要改请用编辑）")
+    item: dict[str, str] = {"name": name}
+    for k in NODE_FIELDS:
+        v = _node_value(k, fields.get(k))
+        if v or k != "console_url":            # console_url 空就不写
+            item[k] = v
+    nodes.append(item)
+    _write_raw(path, raw)
+
+
+def update_node(path: str, name: str, fields: dict) -> None:
+    """修改已登记节点：fields 里出现的键才改（token 给空串 = 清除令牌，
+    该节点转只读观测）；没出现的键保持原值。"""
+    raw = _read_raw(path)
+    nodes = _raw_nodes(raw)
+    i = _find(nodes, name)
+    if i < 0:
+        raise NodeNotFoundError(f"节点 {name!r} 不在清单里")
+    item = dict(nodes[i])
+    for k in NODE_FIELDS:
+        if k in fields:
+            item[k] = _node_value(k, fields[k])
+    nodes[i] = item
+    _write_raw(path, raw)
+
+
+def remove_node(path: str, name: str) -> None:
+    """从清单删除节点。只是停止轮询与下发：该节点的实例配额保持现状
+    （移除 ≠ 释放，见 fleetpoll.set_nodes）。"""
+    raw = _read_raw(path)
+    nodes = _raw_nodes(raw)
+    i = _find(nodes, name)
+    if i < 0:
+        raise NodeNotFoundError(f"节点 {name!r} 不在清单里")
+    del nodes[i]
+    _write_raw(path, raw)
 
 
 # ---------------------------------------------------------------------------

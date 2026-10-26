@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 import pytest
@@ -34,9 +35,10 @@ def snap(ts=1.0, total=300.0):
     return fleetweb.fleet_snapshot(ts, [s, off], total)
 
 
-def hub():
+def hub(nodes_fn=None):
     h = fleetweb.FleetHub("test", total_fn=lambda: 300.0,
-                          params_fn=lambda: {"min_share_ratio": 0.2})
+                          params_fn=lambda: {"min_share_ratio": 0.2},
+                          nodes_fn=nodes_fn)
     return h
 
 
@@ -71,7 +73,8 @@ async def client(tmp_path):
     yml = tmp_path / "fleet.yaml"
     yml.write_text(FLEET_YAML, encoding="utf-8")
     poke = asyncio.Event()
-    h = hub()
+    # 节点清单视图跟着 YAML 走（真实进程里是热更后的 cur["cfg"]）。
+    h = hub(nodes_fn=lambda: fleetconfig.load(str(yml)).nodes)
     h.record(snap())
     app = fleetweb.build_fleet_app(
         h, fleetweb.LogBuffer(), log,
@@ -141,3 +144,85 @@ async def test_sse_stream_delivers_latest_frame(client):
     line = await asyncio.wait_for(resp.content.readline(), timeout=2)
     assert line.startswith(b"data: ")
     resp.close()
+
+
+# ---------------------------------------------------------------------------
+# 节点清单（后台手动添加/编辑/删除）
+# ---------------------------------------------------------------------------
+
+async def test_nodes_read_view_never_leaks_tokens(client):
+    j = await (await client.get("/api/nodes")).json()
+    assert j["nodes"] == [{"name": "node1", "url": "http://10.0.0.1:8090",
+                           "console_url": "", "has_token": True}]
+    assert "t1" not in json.dumps(j)
+
+
+async def test_node_writes_require_token(client):
+    before = client.app["yml"].read_text(encoding="utf-8")
+    for method, url in (("POST", "/api/nodes"), ("PUT", "/api/nodes/node1"),
+                        ("DELETE", "/api/nodes/node1")):
+        for hdr in ({}, auth("wrong")):
+            r = await client.request(method, url, headers=hdr,
+                                     json={"name": "x", "url": "http://x:1"})
+            assert r.status == 401, (method, url)
+    assert client.app["yml"].read_text(encoding="utf-8") == before
+    assert not client.app["poke"].is_set()
+
+
+async def test_add_edit_delete_node_roundtrip(client):
+    yml, poke = client.app["yml"], client.app["poke"]
+    r = await client.post("/api/nodes", headers=auth(), json={
+        "name": "node2", "url": "http://10.0.0.2:8090", "token": "t2"})
+    assert r.status == 200, await r.text()
+    assert poke.is_set()
+    cfg = fleetconfig.load(str(yml))
+    assert [(n.name, n.token) for n in cfg.nodes] == \
+        [("node1", "t1"), ("node2", "t2")]
+    j = await (await client.get("/api/nodes")).json()
+    assert [n["name"] for n in j["nodes"]] == ["node1", "node2"]
+
+    # 重名不覆盖。
+    r = await client.post("/api/nodes", headers=auth(), json={
+        "name": "node2", "url": "http://10.0.0.99:8090"})
+    assert r.status == 409
+    assert fleetconfig.load(str(yml)).nodes[1].url == "http://10.0.0.2:8090"
+
+    # 编辑：只改给出的字段；令牌保持。
+    r = await client.put("/api/nodes/node2", headers=auth(),
+                         json={"console_url": "http://pub:8092"})
+    assert r.status == 200
+    n2 = fleetconfig.load(str(yml)).nodes[1]
+    assert (n2.console_url, n2.token) == ("http://pub:8092", "t2")
+
+    r = await client.delete("/api/nodes/node2", headers=auth())
+    assert r.status == 200
+    assert [n.name for n in fleetconfig.load(str(yml)).nodes] == ["node1"]
+
+
+@pytest.mark.parametrize("method, url, body, status", [
+    ("POST", "/api/nodes", {"name": "n2", "url": "ftp://x"}, 400),
+    ("POST", "/api/nodes", {"name": "bad name", "url": "http://x:1"}, 400),
+    ("POST", "/api/nodes", {"url": "http://x:1"}, 400),
+    ("POST", "/api/nodes", ["not", "a", "dict"], 400),
+    ("PUT", "/api/nodes/node1", {}, 400),
+    ("PUT", "/api/nodes/node1", {"name": "renamed"}, 400),
+    ("PUT", "/api/nodes/nope", {"token": "x"}, 404),
+    ("DELETE", "/api/nodes/nope", None, 404),
+])
+async def test_node_write_errors(client, method, url, body, status):
+    before = client.app["yml"].read_text(encoding="utf-8")
+    r = await client.request(method, url, headers=auth(), json=body)
+    assert r.status == status, await r.text()
+    assert "error" in await r.json()
+    assert client.app["yml"].read_text(encoding="utf-8") == before
+
+
+async def test_node_writes_disabled_without_token(tmp_path):
+    yml = tmp_path / "fleet.yaml"
+    yml.write_text(FLEET_YAML, encoding="utf-8")
+    app = fleetweb.build_fleet_app(
+        hub(), fleetweb.LogBuffer(), log, yaml_path=str(yml), api_token="")
+    async with TestClient(TestServer(app)) as c:
+        r = await c.post("/api/nodes", headers=auth(),
+                         json={"name": "n2", "url": "http://x:1"})
+        assert r.status == 403

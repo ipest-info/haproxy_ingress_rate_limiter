@@ -112,6 +112,82 @@ def test_set_total_quota_refuses_broken_yaml(yml):
     assert yml.read_text(encoding="utf-8") == before
 
 
+def test_add_node_appends_and_keeps_other_sections(yml):
+    fleetconfig.add_node(str(yml), "node3",
+                         {"url": "http://10.0.0.3:8090/", "token": " tok3 "})
+    cfg = fleetconfig.load(str(yml))
+    assert [n.name for n in cfg.nodes] == ["node1", "node2", "node3"]
+    n3 = cfg.nodes[2]
+    assert (n3.url, n3.token, n3.console_url) == \
+        ("http://10.0.0.3:8090", "tok3", "")
+    assert cfg.total_egress_mbps == 300.0
+    # 已有节点的令牌原样保留。
+    assert cfg.nodes[0].token == "tok1"
+
+
+def test_add_node_without_token_is_read_only(yml):
+    fleetconfig.add_node(str(yml), "obs", {"url": "http://10.0.0.9:8090"})
+    assert fleetconfig.load(str(yml)).nodes[-1].token == ""
+
+
+def test_add_node_into_empty_file(tmp_path):
+    p = tmp_path / "fleet.yaml"
+    p.write_text("nodes: []\n", encoding="utf-8")
+    fleetconfig.add_node(str(p), "n1", {"url": "http://x:8090"})
+    assert [n.name for n in fleetconfig.load(str(p)).nodes] == ["n1"]
+
+
+@pytest.mark.parametrize("name, fields, err", [
+    ("node1", {"url": "http://10.0.0.9:8090"}, fleetconfig.NodeExistsError),
+    ("bad name", {"url": "http://x:1"}, ValueError),
+    ("n9", {"url": "ftp://x"}, ValueError),
+    ("n9", {"url": "http://"}, ValueError),
+    ("n9", {}, ValueError),                                # 缺 url
+    ("n9", {"url": "http://x:1", "token": "a b"}, ValueError),
+    ("n9", {"url": "http://x:1", "token": 123}, ValueError),
+])
+def test_add_node_rejects_and_leaves_file_untouched(yml, name, fields, err):
+    before = yml.read_text(encoding="utf-8")
+    with pytest.raises(err):
+        fleetconfig.add_node(str(yml), name, fields)
+    assert yml.read_text(encoding="utf-8") == before
+
+
+def test_update_node_changes_only_given_fields(yml):
+    fleetconfig.update_node(str(yml), "node2", {"url": "http://10.0.0.22:8090"})
+    n2 = fleetconfig.load(str(yml)).nodes[1]
+    assert n2.url == "http://10.0.0.22:8090"
+    assert n2.token == "tok2"                         # 没给 = 不动
+    assert n2.console_url == "http://pub.example:8092"
+    # token 给空串 = 清除（转只读观测）。
+    fleetconfig.update_node(str(yml), "node2", {"token": ""})
+    assert fleetconfig.load(str(yml)).nodes[1].token == ""
+
+
+def test_update_and_remove_unknown_node(yml):
+    before = yml.read_text(encoding="utf-8")
+    with pytest.raises(fleetconfig.NodeNotFoundError):
+        fleetconfig.update_node(str(yml), "nope", {"token": "x"})
+    with pytest.raises(fleetconfig.NodeNotFoundError):
+        fleetconfig.remove_node(str(yml), "nope")
+    assert yml.read_text(encoding="utf-8") == before
+
+
+def test_remove_node(yml):
+    fleetconfig.remove_node(str(yml), "node1")
+    cfg = fleetconfig.load(str(yml))
+    assert [n.name for n in cfg.nodes] == ["node2"]
+    assert cfg.total_egress_mbps == 300.0
+
+
+def test_node_writes_refuse_broken_nodes_section(tmp_path):
+    p = tmp_path / "fleet.yaml"
+    p.write_text("nodes: oops\n", encoding="utf-8")
+    with pytest.raises(fleetconfig.FleetConfigError):
+        fleetconfig.add_node(str(p), "n1", {"url": "http://x:1"})
+    assert p.read_text(encoding="utf-8") == "nodes: oops\n"
+
+
 # ---------------------------------------------------------------------------
 # 热更轮询
 # ---------------------------------------------------------------------------

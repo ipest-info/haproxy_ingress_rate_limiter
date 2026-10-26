@@ -66,7 +66,8 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
                 k: getattr(cur["cfg"].alloc, k)
                 for k in ("min_share_ratio", "smooth_alpha", "press_ratio",
                           "press_boost", "idle_mbps", "apply_epsilon",
-                          "min_delta_mbps", "min_quota_mbps")})
+                          "min_delta_mbps", "min_quota_mbps")},
+            nodes_fn=lambda: cur["cfg"].nodes)
 
     async def poll_loop() -> None:
         """观测环：轮询全部节点 + 给控制台喂帧。"""
@@ -139,7 +140,7 @@ def main() -> None:
                     "清单 + 总带宽 + 分配参数），轮询热生效。Web 控制台："
                     "设 RL_CONSOLE_PORT 启用，RL_CONSOLE_BIND 指定监听"
                     "地址（默认 0.0.0.0——读接口无鉴权，用防火墙限制"
-                    "来源）；改总带宽的"
+                    "来源）；改总带宽、添加/编辑/删除节点的"
                     "写 API 用 RL_API_TOKEN 鉴权。")
     parser.add_argument(
         "-c", "--config", default="/etc/rl-limiter/fleet.yaml",
@@ -180,7 +181,8 @@ def main() -> None:
     api_token = (os.environ.get("RL_API_TOKEN") or "").strip()
     if console_port and not api_token:
         log.warning("未配置 RL_API_TOKEN：总控页面只读（看得到汇总，"
-                    "改不了总带宽）。需要写能力请设置令牌后重启")
+                    "改不了总带宽、加不了节点）。需要写能力请设置令牌后"
+                    "重启")
 
     try:
         cfg = fleetconfig.load(args.config)
