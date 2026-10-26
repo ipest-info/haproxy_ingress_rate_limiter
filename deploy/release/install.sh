@@ -92,6 +92,7 @@ getent group haproxy >/dev/null 2>&1 && usermod -aG haproxy rl-limiter || \
     log "提示：本机还没有 haproxy 组，装好 HAProxy 后执行：usermod -aG haproxy rl-limiter"
 
 log "systemd 单元 → $UNIT_DIR/rl-limiter.service"
+install -d -m 755 "$UNIT_DIR"
 cat > "$UNIT_DIR/rl-limiter.service" <<EOF
 # 由 install.sh（二进制发布包）生成。升级重跑 install.sh 会覆盖本文件；
 # 配置请改 $CONF_DIR/config.yaml 与 $CONF_DIR/rl-limiter.env。
