@@ -81,15 +81,11 @@ if [ "$WITH_FLEET" = 1 ] && [ ! -e "$CONF_DIR/fleet.yaml" ]; then
     install -m 640 "$HERE/config/fleet.example.yaml" "$CONF_DIR/fleet.yaml"
 fi
 
-# 专用运行用户（与 venv 装法同一套权限模型：非 root + CAP_NET_ADMIN，
-# 读 stats socket 靠 haproxy 属组）。haproxy 组不存在时跳过加组——
-# 装完再装 HAProxy 的话，手工 usermod -aG haproxy rl-limiter 即可。
+# 专用运行用户（非 root；tc 权限由 unit 的 CAP_NET_ADMIN 提供）。
 if ! id rl-limiter >/dev/null 2>&1; then
     log "创建运行用户 rl-limiter"
     useradd --system --no-create-home --shell /usr/sbin/nologin rl-limiter
 fi
-getent group haproxy >/dev/null 2>&1 && usermod -aG haproxy rl-limiter || \
-    log "提示：本机还没有 haproxy 组，装好 HAProxy 后执行：usermod -aG haproxy rl-limiter"
 
 log "systemd 单元 → $UNIT_DIR/rl-limiter.service"
 install -d -m 755 "$UNIT_DIR"
@@ -97,9 +93,9 @@ cat > "$UNIT_DIR/rl-limiter.service" <<EOF
 # 由 install.sh（二进制发布包）生成。升级重跑 install.sh 会覆盖本文件；
 # 配置请改 $CONF_DIR/config.yaml 与 $CONF_DIR/rl-limiter.env。
 [Unit]
-Description=rl-limiter - HAProxy ingress rate limiter (co-located, tc/HTB)
+Description=rl-limiter - server egress rate limiter (NIC-based, tc/HTB)
 Documentation=https://github.com/$REPO
-After=network-online.target haproxy.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -111,7 +107,6 @@ RestartSec=2
 TimeoutStopSec=15
 User=rl-limiter
 Group=rl-limiter
-SupplementaryGroups=haproxy
 # tc 下发限速必须有 CAP_NET_ADMIN（少了它启动即失败，刻意行为）。
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN

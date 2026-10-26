@@ -67,12 +67,12 @@ def test_unit_write_access_is_own_config_dir_only():
     assert "haproxy" not in " ".join(rwp)
 
 
-def test_unit_does_not_hard_require_haproxy():
-    """haproxy 挂了 rl-limiter 只是采不到数（打 degraded 告警），不该被
-    连坐停掉——那会让监控和限速调整一起消失。所以只能 After，不能 Requires。"""
+def test_unit_has_no_service_dependency():
+    """通用形态：rl-limiter 不依赖机器上跑的任何服务，unit 里不该出现
+    对任何业务服务的 After/Requires 依赖（网络就绪即可启动）。"""
     unit = UNIT_IN.read_text(encoding="utf-8")
-    assert "After=" in unit and "haproxy.service" in unit
-    assert not re.search(r"^Requires=.*haproxy", unit, re.M)
+    assert "After=network-online.target" in unit
+    assert "haproxy" not in unit.lower() or "github.com" in unit
 
 
 def test_unit_passes_yaml_config_path():

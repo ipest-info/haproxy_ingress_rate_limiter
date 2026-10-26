@@ -32,7 +32,3 @@ nodes:
     url: http://node2:8090
     token: demo-token
     console_url: http://localhost:8092
-  - name: node3
-    url: http://node3:8090
-    token: demo-token
-    console_url: http://localhost:8093

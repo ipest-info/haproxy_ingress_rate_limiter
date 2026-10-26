@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
 # deploy/bare/rl-limiter.sh —— 裸机部署 rl-limiter 的一键脚本。
 #
-# 形态：**HAProxy 与 rl-limiter 都直接跑在本机**（不进容器，也没有任何
-# 数据库）。前提是本机 HAProxy 已经装好并在跑——本脚本不碰它的安装，
-# 也**绝不改写 haproxy.cfg**（缺 stats socket 时只告诉你该加哪一行）。
+# 形态：**rl-limiter 直接跑在本机**（通用形态：不依赖机器上跑的任何
+# 服务，不进容器，也没有任何数据库）。
 #
 # 配置只有两个本机文件：
-#   /etc/haproxy/haproxy.cfg      —— 负载均衡配置的**唯一权威**（监听端口、
 #                                    后端服务器；运维直接编辑 + reload）
 #   /etc/rl-limiter/config.yaml   —— rl-limiter 的接线 + 限额登记（quotas）
 # 两份文件的内容都被 rl-limiter 轮询（5s），改了即热生效（cfg 改完记得
-# reload haproxy）。
 #
 # 用法：
 #   ./rl-limiter.sh install     装 + 起（幂等，可反复跑）
@@ -19,17 +16,17 @@
 #   ./rl-limiter.sh uninstall   卸载（保留 /etc/rl-limiter）
 #
 # install 干这些事，每一步都会说清楚做了什么：
-#   1. 前置检查：python3 ≥ 3.9、haproxy 已装、tc 可用、内核有 HTB、systemd
-#   2. 建专用用户 rl-limiter 并加入 haproxy 组（读 stats socket 靠属组）
+#   1. 前置检查：python3 ≥ 3.9、tc 可用、内核有 HTB、systemd
+#   2. 建专用用户 rl-limiter（tc 权限由 unit 的 CAP_NET_ADMIN 提供）
 #   3. venv 装到 /opt/rl-limiter
 #   4. 配置文件 /etc/rl-limiter/{config.yaml,rl-limiter.env}（已存在则**不覆盖**）
-#   5. 校验配置能真实加载（YAML + haproxy.cfg 解析各过一遍）
+#   5. 校验配置能真实加载（YAML 解析 + 端口登记派生各过一遍）
 #   6. 内核参数调优（裸机上全都能设，不像容器里那样受限）
 #   7. 装 systemd unit → daemon-reload → enable --now
 #   8. 起来之后**逐项核对**：进程在不在、socket 通不通、tc 类建了没
 #
 # 设计约束（和本项目其它地方一致）：
-#   - 已有的东西一概不覆盖（配置文件、别人的 haproxy.cfg）；
+#   - 已有的东西一概不覆盖（配置文件）；
 #   - 每一步做完都**读回来确认**，不靠"命令返回 0"当成功；
 #   - 缺什么就说缺什么、该执行什么命令，不静默降级。
 
@@ -80,12 +77,6 @@ preflight() {
     python3 -c 'import venv' 2>/dev/null && ok "python3-venv 可用" || {
         bad "缺 python3-venv（Debian/Ubuntu: apt install python3-venv）"; fail=1; }
 
-    # HAProxy：**假定已经装好**，这里只确认它在，并提示版本
-    if command -v haproxy >/dev/null 2>&1; then
-        ok "haproxy $(haproxy -v 2>/dev/null | head -1 | tr -d '\n')"
-    else
-        bad "找不到 haproxy。本脚本假定本机 HAProxy 已装好"; fail=1
-    fi
 
     # tc：限速的执行者。三个前提缺一个限速就静默失效，逐个实测。
     if ! command -v tc >/dev/null 2>&1; then
@@ -112,42 +103,6 @@ preflight() {
     return $fail
 }
 
-# haproxy.cfg 的 stats socket：rl-limiter 的采样入口，没有它什么都采不到。
-# **不自动改别人的 cfg**——那是生产配置，改坏了代价太大。缺了就把该加的
-# 那一行原样打出来，让人自己贴。
-check_stats_socket() {
-    local cfg=$1
-    [ -r "$cfg" ] || { warn "读不到 $cfg，跳过 stats socket 检查"; return 0; }
-    if grep -qE '^[[:space:]]*stats[[:space:]]+socket[[:space:]]+/' "$cfg"; then
-        ok "haproxy.cfg 里有 unix stats socket"
-        return 0
-    fi
-    bad "haproxy.cfg 的 global 段里没有 unix stats socket —— rl-limiter 采不到任何数据"
-    cat <<'EOF'
-
-         请在 global 段加上这一行（然后 systemctl reload haproxy）：
-
-             stats socket /var/lib/haproxy/stats mode 660 level user
-
-         本脚本**不会替你改 haproxy.cfg**：那是你的生产配置，
-         我们一个字节都不碰。
-EOF
-    return 1
-}
-
-# contstats：不开的话 TCP 长连接的 bytes_out 只在会话结束时一次性入账，
-# 秒级带宽曲线全是脉冲，监控数据不可用。同样只提示不代改。
-check_contstats() {
-    local cfg=$1
-    [ -r "$cfg" ] || return 0
-    if grep -qE '^[[:space:]]*option[[:space:]]+contstats' "$cfg"; then
-        ok "haproxy.cfg 里有 option contstats（长连接的秒级带宽依赖它）"
-    else
-        warn "haproxy.cfg 里没找到 option contstats——TCP 长连接的带宽曲线"
-        warn "  会脉冲式跳变。请在 defaults 段加：option contstats"
-    fi
-}
-
 # ---------------------------------------------------------------------------
 # install 的各步骤
 # ---------------------------------------------------------------------------
@@ -159,17 +114,6 @@ ensure_user() {
         useradd --system --no-create-home --shell /usr/sbin/nologin "$RL_USER" \
             || die "建用户 $RL_USER 失败"
         ok "已建用户 $RL_USER"
-    fi
-    # 读 HAProxy 的 unix stats socket 靠 haproxy 属组（socket 是 mode 660），
-    # 这样服务本身不需要 root。
-    if getent group haproxy >/dev/null 2>&1; then
-        usermod -aG haproxy "$RL_USER"
-        id -nG "$RL_USER" | tr ' ' '\n' | grep -qx haproxy \
-            && ok "$RL_USER 已在 haproxy 组里（读 stats socket 靠它）" \
-            || warn "把 $RL_USER 加进 haproxy 组失败，采样可能没权限"
-    else
-        warn "本机没有 haproxy 组。stats socket 的属组要另外确认，"
-        warn "否则 rl-limiter 读不了它（表现为持续的采样失败告警）"
     fi
 }
 
@@ -201,7 +145,6 @@ install_conf() {
         chgrp "$RL_USER" "$YAML_FILE" 2>/dev/null || true
         ok "已生成 $YAML_FILE（示例配置）"
         warn "**先编辑它**：cfg_path/socket_path 指向本机实际路径，"
-        warn "quotas 按 haproxy.cfg 里的段名登记限额，再继续。"
     fi
     if [ -f "$ENV_FILE" ]; then
         ok "$ENV_FILE 已存在，保持不动"
@@ -220,17 +163,17 @@ env_get() {
     sed -n "s/^[[:space:]]*${key}=//p" "$ENV_FILE" | tail -1 | tr -d '"'"'"
 }
 
-# 从 YAML 配置里取 haproxy 段的一个标量字段（cfg_path/socket_path）。
+# 从 YAML 配置里取顶层标量字段。
 yaml_get() {
     local key=$1
     "$VENV/bin/python" - "$YAML_FILE" "$key" <<'PY' 2>/dev/null
 import sys, yaml
 d = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
-print(((d.get("haproxy") or {}).get(sys.argv[2]) or ""))
+print((d.get(sys.argv[2]) or ""))
 PY
 }
 
-# 配置能不能真实加载：YAML 校验 + haproxy.cfg 解析各过一遍。
+# 配置能不能真实加载：YAML 校验 + 端口登记派生各过一遍。
 # 在装 unit 之前做——配置有问题时"装好了但起不来 + 重启循环"比这里的
 # 一条报错难排查得多。
 validate_conf() {
@@ -240,19 +183,14 @@ validate_conf() {
 import logging, sys
 from rl_limiter import cfgparse, config
 cfg = config.load(sys.argv[1])
-fes = cfgparse.load_frontends(cfg.haproxy.cfg_path, cfg.quotas,
+fes = cfgparse.load_frontends(cfg.ports, cfg.quotas,
                               logging.getLogger("check"))
-limited = [f for f in fes if f.limited]
-print(f"frontends={len(fes)} limited={len(limited)} "
-      f"detail={';'.join(f'{f.name}:{f.quota_mbps:g}Mbps' if f.limited else f'{f.name}:仅监控' for f in fes)}")
+print(f"ports={len(fes)} request_limits={len(cfg.request_limits)} "
+      f"instance_quota={cfg.instance_quota_mbps:g}Mbps")
 PY
     ); then
         ok "配置可加载：$out"
-        case "$out" in
-            "frontends=0 "*)
-                warn "haproxy.cfg 里没解析到任何带监听端口的 frontend/listen——"
-                warn "  服务能起，但什么都不会监控/限速。检查 cfg_path 对不对。" ;;
-        esac
+        :
     else
         bad "配置加载失败："
         printf '%s\n' "$out" | sed 's/^/         /'
@@ -300,12 +238,6 @@ verify() {
         return 1
     fi
 
-    local sock; sock=$(yaml_get socket_path)
-    if [ -n "$sock" ]; then
-        [ -S "$sock" ] && ok "HAProxy stats socket 存在（$sock）" || {
-            bad "找不到 stats socket $sock —— 采样会一直失败"; fail=1; }
-    fi
-
     local iface; iface=$(env_get RL_TC_IFACE)
     if [ "$iface" = "-" ]; then
         warn "限速已被显式关闭（RL_TC_IFACE=-），只做监控"
@@ -337,10 +269,6 @@ cmd_install() {
     ensure_user
     install_venv
     install_conf
-    local hcfg; hcfg=$(yaml_get cfg_path); hcfg=${hcfg:-/etc/haproxy/haproxy.cfg}
-    check_stats_socket "$hcfg" \
-        || warn "stats socket 这项没过，服务起来后会一直报采样失败"
-    check_contstats "$hcfg"
     validate_conf || die "配置有问题，改好 $YAML_FILE / cfg_path 后重跑 install"
     tune_kernel
     install_unit
@@ -351,7 +279,6 @@ cmd_install() {
     local rc=$?
     step "完成"
     echo "  限额配置：$YAML_FILE（改 quotas 5s 内热生效，无需重启）"
-    echo "  负载均衡：$hcfg（改完 systemctl reload haproxy，rl-limiter 自动跟上）"
     echo "  日志：    journalctl -u rl-limiter -f"
     echo "  体检：    $0 check"
     return $rc
@@ -368,9 +295,6 @@ cmd_check() {
     systemctl is-active --quiet rl-limiter && ok "服务正在运行" || {
         warn "服务未运行（$0 start）"; }
     if [ -x "$VENV/bin/rl-limiter" ] && [ -f "$YAML_FILE" ]; then
-        local hcfg; hcfg=$(yaml_get cfg_path); hcfg=${hcfg:-/etc/haproxy/haproxy.cfg}
-        check_stats_socket "$hcfg" || fail=1
-        check_contstats "$hcfg"
         validate_conf || fail=1
     fi
     step "内核参数"
