@@ -28,6 +28,14 @@
 #
 # 装完不自动启动：先核对配置，再 systemctl enable --now rl-limiter（或 rl-fleet）。
 # 升级 = 重跑本脚本（二进制覆盖、配置不动）+ systemctl restart。
+#
+# 卸载：
+#   sudo ./install.sh --uninstall [--fleet] [--purge]
+#     节点（默认）：停服务、删单元，并**清掉网卡上的 tc 限速规则**（入向
+#     钩子、IFB 设备、出向 HTB）——服务停了限速还在是刻意的，卸载不能留；
+#     --fleet 卸载总控。两种角色都卸完才删二进制。
+#     --purge  连该角色的配置一起删（config.yaml/rl-limiter.env 或
+#              fleet.yaml/rl-fleet.env）；不加则保留，重装即沿用。
 set -euo pipefail
 
 REPO="ipest-info/haproxy_ingress_rate_limiter"
@@ -41,6 +49,8 @@ DEFAULT_BACKEND_NIC=eth1
 
 WITH_FLEET=0
 DOWNLOAD=0
+UNINSTALL=0
+PURGE=0
 DOWNLOAD_TAG=""
 TOKEN=""
 CLIENT_NIC=""
@@ -74,6 +84,8 @@ take_value() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --fleet) WITH_FLEET=1 ;;
+        --uninstall) UNINSTALL=1 ;;
+        --purge) PURGE=1 ;;
         --token|--token=*)
             take_value "$@"; TOKEN=$OPTVAL; shift "$OPTSHIFT" ;;
         --client-nic|--client-nic=*)
@@ -92,7 +104,7 @@ while [ $# -gt 0 ]; do
             fi ;;
         -h|--help) usage ;;
         *) die "不认识的参数 '$1'（--token / --client-nic / --backend-nic /" \
-               "--fleet / --download [tag] / --help）" ;;
+               "--fleet / --download [tag] / --uninstall [--purge] / --help）" ;;
     esac
     shift
 done
@@ -160,6 +172,80 @@ check_node_nics() {
                "入向限速作用在客户侧网卡上，同一张卡会卡住后端回程流量"
     log "接线：客户侧 $EFF_CLIENT（入向限速执行）/ 后端侧 $EFF_BACKEND"
 }
+
+# ---- 卸载 ------------------------------------------------------------------
+# 顺序：先停服务（否则它的 30s 兜底 reconcile 会把规则建回来）→ 清 tc
+# → 删单元 → 两种角色都没了才删二进制。每一步说清楚做了什么、留了什么。
+uninstall() {
+    local svc=rl-limiter other=rl-fleet envf="$CONF_DIR/rl-limiter.env"
+    local files="config.yaml rl-limiter.env"
+    if [ "$WITH_FLEET" = 1 ]; then
+        svc=rl-fleet other=rl-limiter envf="$CONF_DIR/rl-fleet.env"
+        files="fleet.yaml rl-fleet.env"
+    fi
+    log "卸载 $svc"
+    systemctl disable --now "$svc" >/dev/null 2>&1 \
+        && log "已停止并禁用 $svc" || log "$svc 未在运行（或 systemctl 不可用）"
+
+    if [ "$WITH_FLEET" != 1 ]; then
+        # 接线以 env 文件为准（与 rl-limiter 启动时读的是同一份）。
+        local in out ifb
+        in=$(env_get "$envf" RL_TC_IN_IFACE)
+        out=$(env_get "$envf" RL_TC_IFACE)
+        ifb=$(env_get "$envf" RL_TC_IFB); ifb=${ifb:-ifbrl0}
+        [ -f "$envf" ] || warn "没有 $envf，不知道入向接在哪张网卡——只清 IFB 设备 $ifb；" \
+            "入向钩子请手工：tc qdisc del dev <客户侧网卡> ingress"
+        if ! command -v tc >/dev/null 2>&1; then
+            warn "找不到 tc，跳过清理限速规则（手工：tc qdisc del dev <网卡> ingress；ip link del $ifb）"
+        else
+            if [ -n "$in" ] && [ "$in" != "-" ] \
+                    && [ -n "$(tc qdisc show dev "$in" ingress 2>/dev/null)" ]; then
+                tc qdisc del dev "$in" ingress && log "已撤掉 $in 的入向限速钩子（ingress qdisc）" \
+                    || warn "撤 $in 的入向钩子失败——手工：tc qdisc del dev $in ingress"
+            fi
+            if ip link show "$ifb" >/dev/null 2>&1; then
+                ip link del "$ifb" && log "已删除 IFB 设备 $ifb（连同其上的整形树）" \
+                    || warn "删 IFB 设备 $ifb 失败——手工：ip link del $ifb"
+            fi
+            # 出向 HTB 只在显式接了 RL_TC_IFACE 时才是我们建的；只删 htb。
+            if [ -n "$out" ] && [ "$out" != "-" ] \
+                    && tc qdisc show dev "$out" root 2>/dev/null | grep -q htb; then
+                tc qdisc del dev "$out" root && log "已撤掉 $out 的出向 HTB 整形树" \
+                    || warn "撤 $out 的出向 HTB 失败——手工：tc qdisc del dev $out root"
+            fi
+        fi
+    fi
+
+    rm -f "$UNIT_DIR/$svc.service"
+    systemctl daemon-reload 2>/dev/null || true
+    log "已删除 $UNIT_DIR/$svc.service"
+
+    if [ -e "$UNIT_DIR/$other.service" ]; then
+        log "本机还装着 $other，保留二进制 $PREFIX/bin/rl-limiter、rl-fleet"
+    else
+        rm -f "$PREFIX/bin/rl-limiter" "$PREFIX/bin/rl-fleet"
+        log "已删除二进制 $PREFIX/bin/rl-limiter、rl-fleet"
+    fi
+
+    local f
+    if [ "$PURGE" = 1 ]; then
+        for f in $files; do rm -f "$CONF_DIR/$f"; done
+        log "已删除配置 $CONF_DIR/{${files// /,}}"
+        rmdir "$CONF_DIR" 2>/dev/null && log "已删除空目录 $CONF_DIR" || true
+    else
+        log "保留配置 $CONF_DIR/{${files// /,}}（重装即沿用；要删加 --purge）"
+    fi
+    log "刻意保留：监控落盘 /var/log/rl-limiter（计费对账数据，要删请手工）、运行用户 $RL_USER"
+    log "卸载完成"
+}
+
+if [ "$UNINSTALL" = 1 ]; then
+    [ "$DOWNLOAD" = 0 ] && [ -z "$TOKEN$CLIENT_NIC$BACKEND_NIC" ] \
+        || die "--uninstall 不能与 --download / --token / --client-nic / --backend-nic 同用"
+    uninstall
+    exit 0
+fi
+[ "$PURGE" = 0 ] || die "--purge 只用于卸载：--uninstall --purge"
 
 [ "$WITH_FLEET" = 1 ] || check_node_nics
 

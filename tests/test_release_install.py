@@ -10,7 +10,9 @@
 #   2. 客户侧/后端侧网卡相斥、必须存在；令牌与网卡写进 rl-limiter.env；
 #   3. 已有配置不覆盖，只改命令行显式给出的项；
 #   4. --fleet 只装总控（不查网卡），--token 写进 rl-fleet.env；
-#   5. --download 的参数解析与透传、临时目录用完即清。
+#   5. --download 的参数解析与透传、临时目录用完即清；
+#   6. --uninstall 停服务、清 tc 限速规则、删单元，两种角色都卸完才删
+#      二进制；--purge 才删配置。
 
 from __future__ import annotations
 
@@ -35,7 +37,23 @@ _STUBS = {
     "id": '[ "$1" = "-u" ] && echo 0; exit 0',
     "useradd": "exit 0",
     "chgrp": "exit 0",
-    "systemctl": "exit 0",
+    "systemctl": 'echo "systemctl $*" >>"$FAKE_TC_LOG"; exit 0',
+    # 假 tc/ip：记录调用；show 的输出由 FAKE_TC_INGRESS/FAKE_TC_ROOT/
+    # FAKE_IFB 控制（模拟网卡上有没有 rl-limiter 建的规则）。
+    "tc": r'''
+echo "tc $*" >>"$FAKE_TC_LOG"
+case "$*" in
+  "qdisc show dev "*" ingress")
+    [ -n "$FAKE_TC_INGRESS" ] && echo "qdisc ingress ffff: parent ffff:fff1" ;;
+  "qdisc show dev "*" root") echo "${FAKE_TC_ROOT:-qdisc mq 0: root}" ;;
+esac
+exit 0
+''',
+    "ip": r'''
+echo "ip $*" >>"$FAKE_TC_LOG"
+case "$1 $2" in "link show") [ -n "$FAKE_IFB" ] || exit 1 ;; esac
+exit 0
+''',
     # 假 curl：-w（查最新版）打印 $FAKE_LATEST；-o 下载从 $FAKE_ASSETS 拷。
     "curl": r'''
 out="" url="" w=""
@@ -96,13 +114,14 @@ def box(tmp_path):
         "tmp": tmp_path / "tmpdir",
         "assets": tmp_path / "assets",
         "curl_log": tmp_path / "curl.log",
+        "tc_log": tmp_path / "tc.log",
         "pkg": _make_pkg(tmp_path / "pkg"),
     }
     paths["tmp"].mkdir()
     paths["assets"].mkdir()
 
     def run(*args, nics=("eth0", "eth1"), virtual=("lo",), latest="",
-            script=None):
+            script=None, env=None):
         sysd = paths["sys"]
         if sysd.exists():
             shutil.rmtree(sysd)
@@ -112,6 +131,7 @@ def box(tmp_path):
             (sysd / n / "device").write_text("")
         for n in virtual:
             (sysd / n).mkdir()
+        extra = env or {}
         env = dict(os.environ,
                    PATH=f"{stubs}:{os.environ['PATH']}",
                    PREFIX=str(paths["prefix"]),
@@ -121,7 +141,8 @@ def box(tmp_path):
                    TMPDIR=str(paths["tmp"]),
                    FAKE_ASSETS=str(paths["assets"]),
                    FAKE_CURL_LOG=str(paths["curl_log"]),
-                   FAKE_LATEST=latest)
+                   FAKE_TC_LOG=str(paths["tc_log"]),
+                   FAKE_LATEST=latest, **extra)
         return subprocess.run(
             ["bash", str(script or paths["pkg"] / "install.sh"), *args],
             capture_output=True, text=True, env=env)
@@ -394,3 +415,98 @@ def test_download_checks_nics_before_downloading(box):
     r = run("--download", "v9.9.9", script=SCRIPT, nics=["eth0"])
     assert r.returncode != 0 and "双网卡" in r.stderr
     assert not paths["curl_log"].exists()
+
+
+# ---- --uninstall -----------------------------------------------------------
+
+def _calls(paths) -> list:
+    f = paths["tc_log"]
+    return f.read_text().splitlines() if f.exists() else []
+
+
+def test_uninstall_node_clears_tc_and_keeps_config(box):
+    run, paths = box
+    assert run("--token", "node-token-1").returncode == 0
+    paths["tc_log"].unlink(missing_ok=True)
+    # 卸载不查双网卡：网卡拆了也能卸。
+    r = run("--uninstall", nics=[],
+            env={"FAKE_TC_INGRESS": "1", "FAKE_IFB": "1"})
+    assert r.returncode == 0, r.stderr
+    calls = _calls(paths)
+    # 先停服务（否则它会把规则建回来），再清 tc。
+    stop = calls.index("systemctl disable --now rl-limiter")
+    assert calls.index("tc qdisc del dev eth0 ingress") > stop
+    assert "ip link del ifbrl0" in calls
+    # 出向没接（RL_TC_IFACE=-）：绝不碰 root qdisc。
+    assert not any("root" in c and "del" in c for c in calls)
+    assert not (paths["units"] / "rl-limiter.service").exists()
+    assert not (paths["prefix"] / "bin/rl-limiter").exists()
+    assert not (paths["prefix"] / "bin/rl-fleet").exists()
+    # 不加 --purge：配置保留，重装沿用。
+    assert _env(paths)["RL_API_TOKEN"] == "node-token-1"
+    assert (paths["conf"] / "config.yaml").exists()
+
+
+def test_uninstall_skips_tc_that_is_not_there(box):
+    run, paths = box
+    assert run().returncode == 0
+    r = run("--uninstall")                    # 网卡上没有规则、没有 IFB
+    assert r.returncode == 0, r.stderr
+    assert not any(" del " in c for c in _calls(paths)
+                   if c.startswith(("tc ", "ip ")))
+
+
+@pytest.mark.parametrize("root, deleted", [
+    ("qdisc htb 1: root refcnt 2 r2q 10 default 0x1", True),
+    ("qdisc mq 0: root", False),              # 不是我们建的，不动
+])
+def test_uninstall_egress_htb_only_when_ours(box, root, deleted):
+    run, paths = box
+    assert run().returncode == 0
+    envf = paths["conf"] / "rl-limiter.env"
+    envf.write_text(envf.read_text().replace("RL_TC_IFACE=-",
+                                             "RL_TC_IFACE=eth0"))
+    r = run("--uninstall", env={"FAKE_TC_ROOT": root})
+    assert r.returncode == 0, r.stderr
+    assert ("tc qdisc del dev eth0 root" in _calls(paths)) is deleted
+
+
+def test_uninstall_purge_removes_config(box):
+    run, paths = box
+    assert run().returncode == 0
+    r = run("--uninstall", "--purge")
+    assert r.returncode == 0, r.stderr
+    assert not paths["conf"].exists()         # 空了连目录一起删
+
+
+def test_uninstall_keeps_binaries_while_other_role_remains(box):
+    run, paths = box
+    assert run().returncode == 0
+    assert run("--fleet", "--token", "fleet-token-1").returncode == 0
+
+    r = run("--uninstall")
+    assert r.returncode == 0, r.stderr
+    assert (paths["prefix"] / "bin/rl-fleet").exists()
+    assert (paths["units"] / "rl-fleet.service").exists()
+
+    r = run("--uninstall", "--fleet", "--purge")
+    assert r.returncode == 0, r.stderr
+    assert "systemctl disable --now rl-fleet" in _calls(paths)
+    assert not (paths["prefix"] / "bin/rl-fleet").exists()
+    assert not (paths["conf"] / "fleet.yaml").exists()
+    assert not (paths["conf"] / "rl-fleet.env").exists()
+    # 节点那份没 purge：还在，目录也就还在。
+    assert (paths["conf"] / "rl-limiter.env").exists()
+
+
+@pytest.mark.parametrize("args", [
+    ("--uninstall", "--token", "abcdefgh1"),
+    ("--uninstall", "--download"),
+    ("--uninstall", "--client-nic", "eth0"),
+    ("--purge",),                              # 只用于卸载
+])
+def test_uninstall_rejects_install_options(box, args):
+    run, paths = box
+    r = run(*args)
+    assert r.returncode != 0 and r.stderr
+    assert not paths["conf"].exists()
