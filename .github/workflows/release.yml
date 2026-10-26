@@ -1,0 +1,51 @@
+# 按 tag 自动构建并发布二进制。
+#
+# 触发：推送形如 v<主>.<次>.<补丁>（可带 -rcN）的 tag，例如：
+#   git tag v0.4.0 && git push origin v0.4.0
+#
+# 发布物（挂在同名 GitHub Release 上）：
+#   rl-limiter-v<版本>-linux-x86_64.tar.gz(.sha256)
+#
+# 构建环境刻意用 manylinux2014 容器（glibc 2.17）：PyInstaller 产物
+# 要求目标机 glibc ≥ 构建机，这样 CentOS 7 / RHEL 7 及之后的一切
+# 发行版都能跑。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # 创建 Release 并上传产物
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux2014_x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验 tag 与 pyproject 版本一致
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER=$(sed -n 's/^version *= *"\(.*\)"/\1/p' pyproject.toml)
+          # 允许预发布后缀：tag v0.4.0-rc1 对应 pyproject 0.4.0。
+          case "$TAG" in "$VER"|"$VER"-rc*) ;; *)
+            echo "tag（$GITHUB_REF_NAME）与 pyproject.toml（$VER）不一致" >&2
+            exit 1;;
+          esac
+
+      - name: 构建发布包
+        run: |
+          export PYTHON=/opt/python/cp311-cp311/bin/python3
+          VERSION="${GITHUB_REF_NAME#v}" bash deploy/release/build.sh
+
+      - name: 创建 Release 并上传产物
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          # -rc 预发布自动标 prerelease。
+          prerelease: ${{ contains(github.ref_name, '-rc') }}
+          generate_release_notes: true

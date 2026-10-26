@@ -42,3 +42,10 @@ bare-install:
 
 bare-check:
 	deploy/bare/rl-limiter.sh check
+
+# ---------------------------------------------------------------------------
+# 发布：构建单文件二进制发布包（PyInstaller）。正式发布走 CI（打 tag
+# 自动构建上传 Release），规则与安装见 docs/11-发布与安装.md。
+# ---------------------------------------------------------------------------
+release-build:
+	bash deploy/release/build.sh
