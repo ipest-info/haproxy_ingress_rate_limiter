@@ -14,10 +14,10 @@ log = logging.getLogger("t.metricslog")
 
 
 def usage(name="fe_a", rate=0.0, mean10=0.0, conn=0, denied=0.0,
-          degraded=False):
+          degraded=False, conn_new=0.0):
     return model.FrontendUsage(
         name=name, rate_bps=rate, mean10_bps=mean10, conn_cur=conn,
-        conn_denied_ps=denied, degraded=degraded)
+        conn_denied_ps=denied, degraded=degraded, conn_new_ps=conn_new)
 
 
 def mk(tmp_path, quotas=None):
@@ -75,6 +75,7 @@ def test_unlimited_frontend_never_over(tmp_path):
 
 
 def test_instance_row_alongside_frontend_rows(tmp_path):
+    """整机行（v2）：没有设备数据时回退 HAProxy 口径，nic 置空串。"""
     m = mk(tmp_path)
     inst = model.InstanceUsage(rate_out_bps=800.0, rate_in_bps=100.0,
                                conn_cur=42)
@@ -85,7 +86,45 @@ def test_instance_row_alongside_frontend_rows(tmp_path):
     assert kinds == [("frontend", "fe_a"), ("frontend", "fe_b"),
                      ("instance", "")]
     inst_row = next(r for r in rows if r["kind"] == "instance")
-    assert inst_row["rate_avg"] == 800.0 and inst_row["conn_max"] == 42
+    assert inst_row["v"] == 2
+    assert inst_row["nic"] == "", "无设备数据 → 回退口径要留痕"
+    assert inst_row["rate_out_avg"] == 800.0
+    assert inst_row["rate_in_avg"] == 100.0
+    assert inst_row["conn_max"] == 42
+
+
+def test_instance_row_uses_client_nic_rates(tmp_path):
+    """整机行的带宽 = 客户端侧网卡口径（与按量计费、闭环观测同源），
+    不取 HAProxy 应用层字节；入/出都有 avg/max。"""
+    m = mk(tmp_path)
+
+    def inst(nic_out, nic_in):
+        return model.InstanceUsage(
+            rate_out_bps=1.0, rate_in_bps=1.0,      # HAProxy 口径（不该被取）
+            nic="eth0", nic_rate_out_bps=nic_out, nic_rate_in_bps=nic_in,
+            conn_new_ps=30.0, conn_denied_ps=2.0,
+            drop_in_ps=1.0, drop_out_ps=0.0)
+
+    m.record(60.0, [usage()], inst(8000.0, 1000.0))
+    m.record(61.0, [usage()], inst(4000.0, 3000.0))
+    m.record(120.0, [usage()])
+    r = next(x for x in read_rows(tmp_path) if x["kind"] == "instance")
+    assert r["nic"] == "eth0"
+    assert r["rate_out_avg"] == 6000.0 and r["rate_out_max"] == 8000.0
+    assert r["rate_in_avg"] == 2000.0 and r["rate_in_max"] == 3000.0
+    assert r["conn_new_pm"] == 60, "该分钟新建连接总数（L4 的 QPM 口径）"
+    assert r["denied_pm"] == 4
+    assert r["drop_in_pm"] == 2 and r["drop_out_pm"] == 0
+    assert r["degraded_s"] == 0
+
+
+def test_frontend_row_records_new_connections(tmp_path):
+    m = mk(tmp_path)
+    m.record(60.0, [usage(conn_new=5.0)])
+    m.record(61.0, [usage(conn_new=7.0)])
+    m.record(120.0, [usage()])
+    (r,) = [x for x in read_rows(tmp_path) if x["kind"] == "frontend"]
+    assert r["conn_new_pm"] == 12
 
 
 def test_close_flushes_partial_minute(tmp_path):
