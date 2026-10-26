@@ -9,6 +9,10 @@
 #        sudo ./install.sh --download            # 默认装最新 Release
 #        sudo ./install.sh --download v0.5.0     # 或指定版本
 #      （校验 .sha256 后解包安装；版本号 = release 的 tag）
+#   3. 卸载：
+#        sudo ./install.sh --uninstall           # 停服务、删二进制与单元；
+#                                                # 配置/日志/运行用户保留
+#        sudo ./install.sh --uninstall --purge   # 连配置与日志一起删
 #
 # 装什么：
 #   /usr/local/bin/rl-limiter /usr/local/bin/rl-fleet   二进制（覆盖升级）
@@ -26,6 +30,8 @@ CONF_DIR=${CONF_DIR:-/etc/rl-limiter}
 UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
 WITH_FLEET=0
 DOWNLOAD_TAG=""
+UNINSTALL=0
+PURGE=0
 
 usage() { sed -n '2,20p' "$0"; exit "${1:-0}"; }
 log()   { echo "install.sh: $*"; }
@@ -41,13 +47,44 @@ while [ $# -gt 0 ]; do
             else
                 DOWNLOAD_TAG=latest
             fi ;;
+        --uninstall) UNINSTALL=1 ;;
+        --purge) PURGE=1 ;;
         -h|--help) usage ;;
-        *) die "不认识的参数 $1（--fleet / --download [tag] / --help）" ;;
+        *) die "不认识的参数 $1（--fleet / --download [tag] / --uninstall"\
+               " [--purge] / --help）" ;;
     esac
     shift
 done
 
 [ "$(id -u)" = 0 ] || die "需要 root（写 $PREFIX/bin 与 systemd 单元）"
+
+# ---- 卸载：install.sh 装的东西 install.sh 负责删干净 --------------------
+if [ "$UNINSTALL" = 1 ]; then
+    [ "$PURGE" = 1 ] || log "卸载（配置/日志保留；连它们一起删加 --purge）"
+    for svc in rl-limiter rl-fleet; do
+        if [ -f "$UNIT_DIR/$svc.service" ]; then
+            systemctl disable --now "$svc" >/dev/null 2>&1 || true
+            rm -f "$UNIT_DIR/$svc.service"
+            log "已停止并移除 $svc.service"
+        fi
+    done
+    systemctl daemon-reload 2>/dev/null || true
+    rm -f "$PREFIX/bin/rl-limiter" "$PREFIX/bin/rl-fleet"
+    log "已删除二进制 $PREFIX/bin/rl-limiter、rl-fleet"
+    if [ "$PURGE" = 1 ]; then
+        rm -rf "$CONF_DIR" /var/log/rl-limiter
+        log "已删除配置目录 $CONF_DIR 与日志目录 /var/log/rl-limiter"
+    else
+        log "保留：配置 $CONF_DIR、日志 /var/log/rl-limiter"
+    fi
+    log "保留：运行用户 rl-limiter（不想留：userdel rl-limiter）"
+    log "注意：**网卡上的 tc 限速规则还在内核里**——服务停了限速还在，"
+    log "这是刻意的（进程宕机不该导致限速失效），卸载时要手工清："
+    log "  tc qdisc del dev <客户端侧网卡> ingress 2>/dev/null"
+    log "  ip link del ifbrl0 2>/dev/null   # IFB 设备（入向整形的执行面）"
+    log "  tc qdisc del dev <网卡> root 2>/dev/null   # 若用过出向 HTB"
+    exit 0
+fi
 
 # ---- 模式 2：先下载发布包，再对解出来的包目录递归调用自己 -------------
 if [ -n "$DOWNLOAD_TAG" ]; then
