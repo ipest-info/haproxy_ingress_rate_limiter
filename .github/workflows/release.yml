@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要构建发布的已有 tag（如 v0.4.0）"
+        description: "要发布的 tag（如 v0.4.1）。已存在：按该 tag 的代码重建；不存在：按所选分支 HEAD 构建并自动创建该 tag"
         required: true
 
 permissions:
@@ -36,7 +36,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          # dispatch 场景先按所选分支整库检出，下一步再决定是否切 tag。
+          fetch-depth: 0
+
+      - name: dispatch 场景：tag 已存在则切到它构建
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if git rev-parse -q --verify "refs/tags/$REL_TAG" >/dev/null; then
+            git checkout "refs/tags/$REL_TAG"
+            echo "tag $REL_TAG 已存在：按该 tag 的代码重建发布"
+          else
+            echo "tag $REL_TAG 不存在：按当前分支 HEAD 构建，发布时由" \
+                 "Release 动作在该提交上创建 tag"
+          fi
 
       - name: 校验 tag 与 pyproject 版本一致
         run: |
