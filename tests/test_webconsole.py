@@ -282,11 +282,10 @@ from rl_limiter import config as configmod
 TOKEN = "test-token-123"
 
 BASE_YAML = """\
-haproxy:
-  socket_path: /var/lib/haproxy/stats
-  cfg_path: /etc/haproxy/haproxy.cfg
-quotas:
-  fe_a: 8
+name: edge-01
+ports:
+  fe_a: 8080
+  fe_b: 8081
 """
 
 
@@ -320,9 +319,9 @@ def auth(token=TOKEN):
 async def test_write_requires_token(wclient):
     """没带令牌/带错令牌 → 401，文件一个字节不动。"""
     before = wclient.app["yml"].read_text(encoding="utf-8")
-    r = await wclient.put("/api/quotas/fe_a", json={"quota_mbps": 20})
+    r = await wclient.put("/api/request-limits/fe_a", json={"mbps": 20})
     assert r.status == 401
-    r = await wclient.put("/api/quotas/fe_a", json={"quota_mbps": 20},
+    r = await wclient.put("/api/request-limits/fe_a", json={"mbps": 20},
                           headers=auth("wrong"))
     assert r.status == 401
     assert wclient.app["yml"].read_text(encoding="utf-8") == before
@@ -338,67 +337,20 @@ async def test_write_disabled_without_configured_token(tmp_path):
         hub(), webconsole.LogBuffer(), __import__("logging").getLogger("t"),
         yaml_path=str(yml), api_token="")
     async with TestClient(TestServer(app)) as c:
-        r = await c.put("/api/quotas/fe_a", json={"quota_mbps": 20},
+        r = await c.put("/api/request-limits/fe_a", json={"mbps": 20},
                         headers=auth())
         assert r.status == 403
         assert "RL_API_TOKEN" in (await r.json())["error"]
 
 
-async def test_put_quota_writes_yaml_and_pokes(wclient):
+async def test_quota_endpoints_are_gone(wclient):
+    """端口级出向目标（quotas）在本形态不存在：写端点必须 404 下线，
+    而不是留着一个会把配置写坏的入口。"""
     r = await wclient.put("/api/quotas/fe_a", json={"quota_mbps": 20},
                           headers=auth())
-    assert r.status == 200
-    cfg = configmod.load(str(wclient.app["yml"]))
-    assert cfg.quotas["fe_a"] == 20.0
-    assert wclient.app["poke"].is_set(), "回写后必须 poke，热生效不等轮询"
-
-
-async def test_put_quota_accepts_bearer_header(wclient):
-    r = await wclient.put("/api/quotas/fe_a", json={"quota_mbps": 30},
-                          headers={"Authorization": f"Bearer {TOKEN}"})
-    assert r.status == 200
-    assert configmod.load(str(wclient.app["yml"])).quotas["fe_a"] == 30.0
-
-
-async def test_put_quota_zero_is_explicit_unlimited(wclient):
-    r = await wclient.put("/api/quotas/fe_a", json={"quota_mbps": 0},
-                          headers=auth())
-    assert r.status == 200
-    assert configmod.load(str(wclient.app["yml"])).quotas["fe_a"] == 0.0
-
-
-async def test_put_quota_unknown_frontend_rejected(wclient):
-    """cfg 里没有的段名 → 400 并列出现有段名：写进去也只会被 cfgparse
-    忽略并 warn，不如在门口就说清楚（多半是拼错了）。"""
-    before = wclient.app["yml"].read_text(encoding="utf-8")
-    r = await wclient.put("/api/quotas/fe_typo", json={"quota_mbps": 20},
-                          headers=auth())
-    assert r.status == 400
-    body = await r.json()
-    assert "fe_typo" in body["error"] and "fe_a" in body["error"]
-    assert wclient.app["yml"].read_text(encoding="utf-8") == before
-
-
-@pytest.mark.parametrize("body", [
-    {"quota_mbps": -1},          # 校验链拒绝（负数）
-    {"quota_mbps": "abc"},       # 不是数字
-    {"quota_mbps": True},        # bool 不是数字
-    {},                          # 缺字段
-])
-async def test_put_quota_bad_body_rejected(wclient, body):
-    r = await wclient.put("/api/quotas/fe_a", json=body, headers=auth())
-    assert r.status == 400
-
-
-async def test_delete_quota(wclient):
+    assert r.status == 404
     r = await wclient.delete("/api/quotas/fe_a", headers=auth())
-    assert r.status == 200 and (await r.json())["removed"] is True
-    assert configmod.load(str(wclient.app["yml"])).quotas == {}
-    # 再删一次：没登记，removed=False，也不 poke。
-    wclient.app["poke"].clear()
-    r = await wclient.delete("/api/quotas/fe_a", headers=auth())
-    assert (await r.json())["removed"] is False
-    assert not wclient.app["poke"].is_set()
+    assert r.status == 404
 
 
 async def test_put_and_delete_instance_quota(wclient):
@@ -513,7 +465,7 @@ async def test_instance_quota_rejected_when_egress_tc_disabled(tmp_path):
         r = await c.delete("/api/instance-quota", headers=auth())
         assert r.status == 200
         # 各 frontend 的 quotas 是这个形态下的正经限速入口，照常可写。
-        r = await c.put("/api/quotas/fe_a", json={"quota_mbps": 20},
+        r = await c.put("/api/request-limits/fe_a", json={"mbps": 20},
                         headers=auth())
         assert r.status == 200
 
@@ -530,8 +482,9 @@ def test_overview_carries_instance_quota_executable():
 # ---------------------------------------------------------------------------
 
 async def test_config_view_lists_editable_limits(wclient):
-    """配置页的可编辑段：实例总限速 + 每个 frontend 的 quotas 登记，
-    每个字段带着自己的写 API 描述（前端通用渲染、通用提交）。"""
+    """配置页的可编辑段：实例总限速（本形态唯一的出向限速入口），
+    字段带着自己的写 API 描述（前端通用渲染、通用提交）。端口级
+    quotas 行不存在——通用形态没有端口级出向目标。"""
     r = await wclient.get("/api/config-view")
     assert r.status == 200
     j = await r.json()
@@ -540,12 +493,7 @@ async def test_config_view_lists_editable_limits(wclient):
     rows = sec["rows"]
     assert rows[0]["fields"][0]["api"]["url"] == "/api/instance-quota"
     assert rows[0]["del"]["url"] == "/api/instance-quota"
-    by_label = {row["label"]: row for row in rows}
-    fea = by_label["quotas.fe_a"]
-    assert fea["fields"][0]["value"] == 8.0
-    assert fea["fields"][0]["api"] == {
-        "method": "PUT", "url": "/api/quotas/fe_a", "key": "quota_mbps"}
-    assert fea["del"]["url"] == "/api/quotas/fe_a"
+    assert not [r2 for r2 in rows if r2["label"].startswith("quotas.")]
 
 
 async def test_config_view_readonly_without_yaml():
@@ -578,8 +526,6 @@ async def test_config_view_instance_disabled_when_not_executable(tmp_path):
         inst = j["sections"][0]["rows"][0]
         assert inst["fields"][0]["disabled"] is True
         assert "执行者" in inst["fields"][0]["disabled_reason"]
-        # frontend 的 quotas 不受影响。
-        assert "disabled" not in j["sections"][0]["rows"][1]["fields"][0]
 
 
 async def test_config_view_runtime_info_and_extra_sections(tmp_path):

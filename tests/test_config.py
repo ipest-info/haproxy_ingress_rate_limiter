@@ -1,10 +1,9 @@
-# tests.test_config —— 配置解析/默认值/校验（YAML = 接线 + 限额登记）。
+# tests.test_config —— 配置解析/默认值/校验（通用形态）。
 #
-# 负载均衡配置（监听端口、模式、后端服务器）**不在 YAML 里**——那些以
-# haproxy.cfg 为唯一权威（解析见 tests/test_cfgparse.py）。这里只覆盖
-# YAML 自身的三类内容：haproxy 接线段、quotas 限额登记、运行参数。
-# 每条拒绝路径都用 match 断言把"错误信息要点名字段"这一契约固定下来——
-# 运维应当不必翻代码就能改对。
+# 本分支的 YAML 不含任何服务接线：内容是 name / 运行参数 /
+# instance_quota_mbps / ports（名字→端口，为按端口静态入向限速服务）/
+# request_limits / dynamic_ingress。每条拒绝路径都用 match 断言把
+# "错误信息要点名字段"这一契约固定下来。
 
 from __future__ import annotations
 
@@ -15,16 +14,17 @@ import pytest
 from rl_limiter import config, model
 
 VALID = """\
+name: edge-01
 log_level: debug
 tick_interval_s: 1.0
-haproxy:
-  name: haproxy
-  socket_path: /var/lib/haproxy/stats
-  cfg_path: /etc/haproxy/haproxy.cfg
-  timeout_ms: 250
-quotas:
-  fe_main: 40
-  fe_api: 8.5
+instance_quota_mbps: 800
+ports:
+  web: 8080
+  api: 8443
+request_limits:
+  web:
+    mbps: 10
+    conn_rate: 150
 """
 
 
@@ -34,154 +34,143 @@ def load_from(tmp_path, text=VALID):
     return config.load(str(p))
 
 
-def minimal(hap="{socket_path: /run/h.sock, cfg_path: /etc/haproxy/haproxy.cfg}",
-            quotas="{fe_a: 8}", extra=""):
-    return f"haproxy: {hap}\nquotas: {quotas}\n{extra}"
+def minimal(extra=""):
+    return f"instance_quota_mbps: 0\n{extra}"
 
 
 def test_load_full_config(tmp_path):
     cfg = load_from(tmp_path)
+    assert cfg.name == "edge-01"
     assert cfg.log_level == "debug"
-    assert cfg.haproxy.socket_path == "/var/lib/haproxy/stats"
-    assert cfg.haproxy.cfg_path == "/etc/haproxy/haproxy.cfg"
-    assert cfg.haproxy.timeout_s == 0.25          # ms → s
-    assert cfg.quotas == {"fe_main": 40.0, "fe_api": 8.5}
+    assert cfg.instance_quota_mbps == 800.0
+    assert cfg.ports == {"web": 8080, "api": 8443}
+    assert cfg.request_limits["web"].mbps == 10.0
+    assert cfg.request_limits["web"].conn_rate == 150
+    assert cfg.quotas == {}, "quotas 在本形态恒空（共享代码路径保留字段）"
 
 
 def test_defaults_filled(tmp_path):
-    cfg = load_from(tmp_path, minimal())
-    assert cfg.log_level == config.DEFAULT_LOG_LEVEL
-    assert cfg.tick_interval_s == config.DEFAULT_TICK_INTERVAL_S
-    assert cfg.haproxy.timeout_s == config.DEFAULT_TIMEOUT_MS / 1000.0
-
-
-def test_empty_quotas_is_valid(tmp_path):
-    """quotas 可以整段不写：所有 frontend 只监控不限速是合法形态。"""
-    cfg = load_from(tmp_path, minimal(quotas="{}"))
-    assert cfg.quotas == {}
-
-
-def test_explicit_zero_quota_means_unlimited(tmp_path):
-    """quota 显式写 0 = 确认不限速（撤掉该端口的 tc 类），必须被接受——
-    这是"临时解除限速但保留登记行"的正规写法。"""
-    cfg = load_from(tmp_path, minimal(quotas="{fe_a: 0}"))
-    assert cfg.quotas == {"fe_a": 0.0}
+    cfg = load_from(tmp_path, "")
+    assert cfg.name == "server"
+    assert cfg.log_level == "info"
+    assert cfg.tick_interval_s == 1.0
+    assert cfg.instance_quota_mbps == 0.0
+    assert cfg.ports == {} and cfg.request_limits == {}
 
 
 # ---------------------------------------------------------------------------
-# 拒绝路径
+# ports 段（名字 → 本机监听端口）
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("text,match", [
-    (minimal(quotas="{'fe bad': 8}"), r"quotas 的键"),
-    (minimal(quotas="{fe_a: -1}"), r"quotas.fe_a 不能为负数"),
-    (minimal(quotas="{fe_a: 0.000004}"), r"太小"),
-    (minimal(quotas="{fe_a: abc}"), r"quotas.fe_a 必须是数字"),
-    (minimal(quotas="[fe_a]"), r"quotas 必须是键值映射"),
-    (minimal(extra="log_level: loud\n"), r"log_level 取值非法"),
+    (minimal("ports: [8080]\n"), r"ports 必须是键值映射"),
+    (minimal("ports: {web: abc}\n"), r"ports.web 必须是整数端口号"),
+    (minimal("ports: {web: 0}\n"), r"1~65535"),
+    (minimal("ports: {web: 70000}\n"), r"1~65535"),
+    (minimal("ports: {'bad name': 8080}\n"), r"ports 的键"),
+    (minimal("ports: {a: 8080, b: 8080}\n"), r"同一个\s*端口"),
 ])
-def test_validation_rejects(tmp_path, text, match):
+def test_ports_rejections(tmp_path, text, match):
     with pytest.raises(ValueError, match=match):
         load_from(tmp_path, text)
 
 
-def test_legacy_frontends_key_rejected_with_migration_hint(tmp_path):
-    """旧形态（YAML 带 frontends 段）必须显式拒绝并指出迁移方向——
-    静默忽略会让运维以为那些负载均衡配置还生效着。"""
-    text = minimal() + (
-        "frontends:\n  - {name: fe_a, bind_port: 8080, quota_mbps: 8}\n")
-    with pytest.raises(ValueError) as ei:
-        load_from(tmp_path, text)
-    msg = str(ei.value)
-    assert "frontends" in msg and "haproxy.cfg" in msg and "quotas" in msg
+def test_request_limit_requires_port_registration(tmp_path):
+    """request_limits 的名字必须先在 ports 里登记——没有端口号 tc 不知道
+    限哪个端口，静默吞掉等于没限。"""
+    with pytest.raises(ValueError, match="没有对应的端口登记"):
+        load_from(tmp_path, minimal(
+            "request_limits: {web: {mbps: 10}}\n"))
 
+
+# ---------------------------------------------------------------------------
+# 旧形态字段：显式拒绝 + 迁移指引
+# ---------------------------------------------------------------------------
+
+def test_haproxy_section_rejected_with_migration_hint(tmp_path):
+    """本形态不依赖任何服务：haproxy 接线段必须显式拒绝并说明迁移方向，
+    静默忽略会让运维以为还在按 HAProxy 的口径监控。"""
+    with pytest.raises(ValueError) as ei:
+        load_from(tmp_path, minimal(
+            "haproxy: {socket_path: /run/h.sock, cfg_path: /etc/h.cfg}\n"))
+    msg = str(ei.value)
+    assert "haproxy" in msg and "ports" in msg and "不依赖" in msg
+
+
+def test_quotas_rejected_with_guidance(tmp_path):
+    """端口级出向目标需要端口级出向观测——通用形态没有这个数据源，
+    必须显式拒绝并指向 instance_quota_mbps / request_limits。"""
+    with pytest.raises(ValueError) as ei:
+        load_from(tmp_path, minimal("quotas: {web: 40}\n"))
+    msg = str(ei.value)
+    assert "quotas" in msg and "instance_quota_mbps" in msg
+
+
+def test_legacy_frontends_key_rejected(tmp_path):
+    with pytest.raises(ValueError, match="frontends"):
+        load_from(tmp_path, minimal(
+            "frontends:\n  - {name: fe_a, bind_port: 8080}\n"))
+
+
+def test_old_nic_quota_key_rejected_with_migration_hint(tmp_path):
+    with pytest.raises(ValueError, match="instance_quota_mbps"):
+        load_from(tmp_path, minimal("nic_quota_mbps: 100\n"))
+
+
+# ---------------------------------------------------------------------------
+# 运行参数
+# ---------------------------------------------------------------------------
 
 def test_tick_interval_locked_to_one_second(tmp_path):
     """速率差分与 10 秒窗口都以「1 拍 = 1 秒」为前提，改这个值会让速率
     口径与告警阈值整体失真。"""
     with pytest.raises(ValueError, match="只支持 1.0"):
-        load_from(tmp_path, minimal(extra="tick_interval_s: 0.5\n"))
+        load_from(tmp_path, minimal("tick_interval_s: 0.5\n"))
+
+
+def test_log_level_rejected(tmp_path):
+    with pytest.raises(ValueError, match="log_level 取值非法"):
+        load_from(tmp_path, minimal("log_level: loud\n"))
 
 
 def test_error_message_contains_path(tmp_path):
     """所有校验错误都要带上配置文件路径，方便多配置文件部署时定位。"""
     p = tmp_path / "config.yaml"
-    p.write_text("log_level: loud\nhaproxy: {socket_path: /run/h.sock, "
-                 "cfg_path: /etc/haproxy/haproxy.cfg}\n", encoding="utf-8")
+    p.write_text("log_level: loud\n", encoding="utf-8")
     with pytest.raises(ValueError, match=str(p)):
         config.load(str(p))
 
 
-# ---------------------------------------------------------------------------
-# HAProxy 接线段（采样通道二选一 + cfg_path 必填）
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("hap,match", [
-    ("{socket_path: /run/h.sock, host: 10.0.0.1, port: 9999, "
-     "cfg_path: /etc/haproxy/haproxy.cfg}", r"只能二选一"),
-    ("{cfg_path: /etc/haproxy/haproxy.cfg}", r"host 不能为空"),
-    ("{socket_path: run/h.sock, cfg_path: /etc/haproxy/haproxy.cfg}",
-     r"必须是绝对路径"),
-    ("{socket_path: /" + "x" * 120 + ", cfg_path: /etc/haproxy/haproxy.cfg}",
-     r"过长"),
-    ("{socket_path: /run/h.sock}", r"cfg_path 不能为空"),
-    ("{socket_path: /run/h.sock, cfg_path: etc/haproxy.cfg}",
-     r"cfg_path 必须是绝对路径"),
-])
-def test_haproxy_wiring_validation(tmp_path, hap, match):
-    with pytest.raises(ValueError, match=match):
-        load_from(tmp_path, minimal(hap=hap))
-
-
-def test_tcp_wiring_accepted(tmp_path):
-    """远程只读观测形态：填 host/port 走内网 TCP。"""
-    cfg = load_from(tmp_path, minimal(
-        hap="{host: 10.0.0.11, port: 9999, cfg_path: /etc/haproxy/haproxy.cfg}"))
-    assert cfg.haproxy.is_unix is False
-    assert cfg.haproxy.endpoint() == "10.0.0.11:9999"
-
-
 def test_shipped_example_config_is_valid():
-    """随仓库发布的示例配置必须能被真实加载——它是运维的起点。"""
+    """仓库自带的示例配置必须永远能通过当前校验——它是运维的起点。"""
     cfg = config.load("deploy/config/limiter.example.yaml")
-    assert cfg.haproxy.cfg_path.startswith("/")
-    assert cfg.quotas, "示例配置应至少演示一条限额登记"
+    assert cfg.log_level in ("debug", "info", "warn", "error")
 
 
 # ---------------------------------------------------------------------------
-# 单位契约：配置一律 Mbps
+# 单位换算（model 层，与配置口径一次性对齐）
 # ---------------------------------------------------------------------------
 
 def test_quota_unit_is_mbps_end_to_end():
-    """配置里填的 40 就是 40 Mbps，一路换算到 tc 与内部口径都不许错。
-
-    这条钉的是全项目最贵的一类错误：8 倍（bit/byte）与 1e6 倍（Mbps/bps）
-    的混淆。换算只发生在 FrontendConfig 的两个 property 里，这里把三个
-    口径一次性对齐。
-    """
+    """8 倍（bit/byte）与 1e6 倍（Mbps/bps）的混淆是全项目最贵的错误。"""
     fe = model.FrontendConfig(name="fe_a", bind_port=8080, quota_mbps=40)
-    assert fe.quota_mbps == 40
     assert fe.quota_bits_per_sec == 40_000_000        # 下发给 tc 的 rate
     assert fe.quota_bytes_per_sec == 5_000_000        # 内部与告警判定口径
     assert fe.limited
 
 
 def test_quota_accepts_fractions():
-    """0.5 Mbps 这种小额度是真实需求，不能因为字段是整数而被截断。"""
     fe = model.FrontendConfig(name="fe_a", bind_port=8080, quota_mbps=0.5)
     assert fe.quota_bits_per_sec == 500_000
     assert fe.quota_bytes_per_sec == 62_500
 
 
 def test_zero_quota_means_monitor_only():
-    """quota_mbps=0 表示"只监控不限速"：不建 tc 类、不做超限判定。"""
     fe = model.FrontendConfig(name="fe_a", bind_port=8080)
-    assert fe.quota_mbps == 0.0
-    assert not fe.limited
+    assert fe.quota_mbps == 0.0 and not fe.limited
 
 
 def test_quota_survives_the_dict_round_trip():
-    """控制台的配置视图走 to_dict/from_dict，单位不能在这来回里漂。"""
     fe = model.FrontendConfig(name="fe_a", bind_port=8080, quota_mbps=40.5,
                               bind_address="10.0.0.1", mode="http")
     again = model.FrontendConfig.from_dict(fe.to_dict())
@@ -193,36 +182,15 @@ def test_quota_survives_the_dict_round_trip():
 # 实例总限速（instance_quota_mbps）
 # ---------------------------------------------------------------------------
 
-def test_instance_quota_default_zero(tmp_path):
-    """不写 = 不限（平铺模式），这是既有部署升级上来的默认形态。"""
-    assert load_from(tmp_path, minimal()).instance_quota_mbps == 0.0
-
-
 def test_instance_quota_parsed(tmp_path):
-    cfg = load_from(tmp_path, minimal(extra="instance_quota_mbps: 800\n"))
-    assert cfg.instance_quota_mbps == 800.0
-
-
-def test_instance_quota_zero_explicit(tmp_path):
-    """显式写 0 = 不限，与不写等价（写 API 取消总限速时会直接删字段，
-    但手写 0 也必须合法）。"""
-    cfg = load_from(tmp_path, minimal(extra="instance_quota_mbps: 0\n"))
-    assert cfg.instance_quota_mbps == 0.0
-
-
-def test_old_nic_quota_key_rejected_with_migration_hint(tmp_path):
-    """旧字段名 nic_quota_mbps 显式拒绝并指出新名字与语义变化——静默
-    忽略会让运维以为总限速还生效着。"""
-    with pytest.raises(ValueError, match="instance_quota_mbps"):
-        load_from(tmp_path, minimal(extra="nic_quota_mbps: 800\n"))
+    assert load_from(tmp_path, minimal(
+        "instance_quota_mbps: 800\n")).instance_quota_mbps == 800.0
 
 
 @pytest.mark.parametrize("text,match", [
-    (minimal(extra="instance_quota_mbps: -1\n"),
-     r"instance_quota_mbps 不能为负数"),
-    (minimal(extra="instance_quota_mbps: 0.000004\n"), r"太小"),
-    (minimal(extra="instance_quota_mbps: abc\n"),
-     r"instance_quota_mbps 必须是数字"),
+    (minimal("instance_quota_mbps: -5\n"), r"不能为负数"),
+    (minimal("instance_quota_mbps: 0.000004\n"), r"太小"),
+    (minimal("instance_quota_mbps: abc\n"), r"必须是数字"),
 ])
 def test_instance_quota_rejections(tmp_path, text, match):
     with pytest.raises(ValueError, match=match):
@@ -230,31 +198,25 @@ def test_instance_quota_rejections(tmp_path, text, match):
 
 
 # ---------------------------------------------------------------------------
-# 请求方向限速（request_limits，双网卡形态）
+# request_limits（按端口的静态入向限速）
 # ---------------------------------------------------------------------------
 
 def test_request_limits_parsed(tmp_path):
     cfg = load_from(tmp_path, minimal(
-        extra="request_limits:\n  fe_a: {mbps: 10, conn_rate: 200}\n"
-              "  fe_b: {mbps: 5.5}\n  fe_c: {conn_rate: 50}\n"))
-    assert cfg.request_limits["fe_a"].mbps == 10.0
-    assert cfg.request_limits["fe_a"].conn_rate == 200
-    assert cfg.request_limits["fe_b"].conn_rate == 0
-    assert cfg.request_limits["fe_c"].mbps == 0.0
-
-
-def test_request_limits_default_empty(tmp_path):
-    assert load_from(tmp_path, minimal()).request_limits == {}
+        "ports: {web: 8080}\n"
+        "request_limits:\n  web: {mbps: 10, conn_rate: 150}\n"))
+    assert cfg.request_limits["web"].mbps == 10.0
+    assert cfg.request_limits["web"].conn_rate == 150
 
 
 @pytest.mark.parametrize("text,match", [
-    (minimal(extra="request_limits: [fe_a]\n"), r"request_limits 必须是键值映射"),
-    (minimal(extra="request_limits: {fe_a: 10}\n"), r"request_limits.fe_a 必须是映射"),
-    (minimal(extra="request_limits: {fe_a: {mbps: -1}}\n"), r"不能为负数"),
-    (minimal(extra="request_limits: {fe_a: {mbps: 0.000004}}\n"), r"太小"),
-    (minimal(extra="request_limits: {fe_a: {conn_rate: -5}}\n"), r"conn_rate 不能为负数"),
-    (minimal(extra="request_limits: {fe_a: {rate: 10}}\n"), r"不认识的键"),
-    (minimal(extra="request_limits: {'fe bad': {mbps: 10}}\n"), r"request_limits 的键"),
+    (minimal("ports: {w: 1}\nrequest_limits: {w: {mbps: -1}}\n"),
+     r"mbps 不能为负数"),
+    (minimal("ports: {w: 1}\nrequest_limits: {w: {conn_rate: -1}}\n"),
+     r"conn_rate 不能为负数"),
+    (minimal("ports: {w: 1}\nrequest_limits: {w: {speed: 1}}\n"),
+     r"不认识的键"),
+    (minimal("ports: {w: 1}\nrequest_limits: {w: [1]}\n"), r"必须是映射"),
 ])
 def test_request_limits_rejections(tmp_path, text, match):
     with pytest.raises(ValueError, match=match):
@@ -266,28 +228,24 @@ def test_request_limits_rejections(tmp_path, text, match):
 # ---------------------------------------------------------------------------
 
 def test_dynamic_ingress_default_enabled(tmp_path):
-    """闭环默认启用：出厂形态（出向不整形 + 入向 eth0）下它是限速的
-    唯一执行者，默认不开等于填了限额不执行（真实部署踩过）。"""
+    """闭环默认启用：出厂形态下它是限速的唯一执行者。"""
     g = load_from(tmp_path, minimal()).dynamic_ingress
     assert g.enabled
-    assert not g.explicit, "未手写 enabled 时 explicit=False（告警降噪用）"
+    assert not g.explicit
 
 
 def test_dynamic_ingress_explicit_disable(tmp_path):
-    g = load_from(tmp_path, minimal() + "dynamic_ingress:\n  enabled: false\n"
+    g = load_from(tmp_path, minimal("dynamic_ingress:\n  enabled: false\n")
                   ).dynamic_ingress
-    assert not g.enabled
-    assert g.explicit
-    # 默认参数本身必须能过校验（load 成功即证明）。
-    assert g.interval_s == 15.0
+    assert not g.enabled and g.explicit
 
 
 def test_dynamic_ingress_parsed(tmp_path):
-    g = load_from(tmp_path, minimal(extra=(
+    g = load_from(tmp_path, minimal(
         "dynamic_ingress:\n"
         "  enabled: true\n  interval_s: 30\n  low_ratio: 0.8\n"
         "  high_ratio: 1.05\n  step_up: 0.1\n  step_down_max: 0.2\n"
-        "  floor_ratio: 0.2\n  apply_epsilon: 0.05\n"))).dynamic_ingress
+        "  floor_ratio: 0.2\n  apply_epsilon: 0.05\n")).dynamic_ingress
     assert g.enabled and g.interval_s == 30.0
     assert g.low_ratio == 0.8 and g.high_ratio == 1.05
     assert g.step_up == 0.1 and g.step_down_max == 0.2
@@ -296,12 +254,10 @@ def test_dynamic_ingress_parsed(tmp_path):
 
 def test_dynamic_ingress_unknown_key_rejected(tmp_path):
     with pytest.raises(ValueError, match="不认识的键"):
-        load_from(tmp_path, minimal(
-            extra="dynamic_ingress: {enable: true}\n"))
+        load_from(tmp_path, minimal("dynamic_ingress: {enable: true}\n"))
 
 
 def test_dynamic_ingress_bad_values_rejected(tmp_path):
-    """越界参数逐条拒绝——这是刻意平缓的控制器，参数上界写死在校验里。"""
     for extra, msg in (
         ("dynamic_ingress: {interval_s: 2}", "interval_s"),
         ("dynamic_ingress: {low_ratio: 1.2, high_ratio: 1.0}", "low_ratio"),
@@ -312,4 +268,4 @@ def test_dynamic_ingress_bad_values_rejected(tmp_path):
         ("dynamic_ingress: {interval_s: x}", "必须是数字"),
     ):
         with pytest.raises(ValueError, match=msg):
-            load_from(tmp_path, minimal(extra=extra + "\n"))
+            load_from(tmp_path, minimal(extra + "\n"))

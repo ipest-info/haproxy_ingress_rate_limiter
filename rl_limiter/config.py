@@ -1,18 +1,18 @@
 # rl_limiter.config —— 服务配置的解析与校验（服务的"启动契约"层）。
 #
-# 配置来源只有一个：**本地 YAML 文件**（-c 指定）。它提供三类信息：
-#   1. **本机 HAProxy 的接线**（haproxy 段）：stats socket 怎么连（本机
-#      unix socket 或内网 TCP）、命令超时，以及 **cfg_path**——本机
-#      haproxy.cfg 的路径。负载均衡配置（监听端口、模式、后端服务器）
-#      不在 YAML 里：**haproxy.cfg 才是它们的唯一权威**，rl-limiter 从
-#      cfg 直接解析受管 frontend 清单（见 cfgparse 模块）；
-#   2. **限额登记**（quotas 段 + instance_quota_mbps）：frontend 名 →
-#      限额（Mbps），以及可选的**实例总限速**。cfg 里
-#      存在、这里登记了正限额的 frontend 参与限速（tc）与超限告警；
-#      未登记的**默认不限速**、只监控（启动记一条 info）；**显式写 0 表示
-#      "确认不限速"**——语义与不登记相同，但不再提醒，且清单收缩到
-#      全 0/全空时会把网卡上的 tc 队列树整个撤掉；
-#   3. 服务级运行参数：log_level、tick_interval_s。
+# 本分支是**通用形态**：不依赖任何具体服务（监控=双网卡设备视图 +
+# 内核 TCP 计数器，限速=客户端侧网卡入向 tc），因此配置也不再有任何
+# 服务接线。配置来源只有一个：**本地 YAML 文件**（-c 指定），内容四类：
+#   1. **实例总限速**（instance_quota_mbps）：本机出向带宽目标（Mbps，
+#      网卡口径），由闭环动态收紧入向执行。这是本形态的主限速入口；
+#   2. **端口登记**（ports 段，可选）：名字 → 本机监听端口。只为**按
+#      端口的静态入向限速**服务（request_limits 按这些名字登记），
+#      与机器上跑什么服务无关；不登记任何端口照样做整机监控与总量
+#      限速；
+#   3. **入向限速登记**（request_limits 段，可选）：ports 里的名字 →
+#      {mbps, conn_rate}，纯 tc 执行；
+#   4. 服务级运行参数：log_level、tick_interval_s、name（实例名，
+#      页面/日志展示）。
 #
 # 单位约定：**限额的配置单位一律是 Mbps**（40 = 40 Mbps，允许小数）；
 # 内部统一换算为 bytes/s（换算点只有 model.FrontendConfig 的两个
@@ -55,12 +55,10 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 @dataclass
 class ServiceConfig:
-    """一份完整的服务配置（本机 HAProxy 接线 + 限额登记）。
+    """一份完整的服务配置（通用形态：无任何服务接线）。"""
 
-    注意 frontends **不在这里**：受管 frontend 清单来自 haproxy.cfg 的
-    解析（cfgparse.load_frontends），quotas 只是给其中一部分登记限额。
-    """
-
+    # 实例名（页面/日志展示；一台机器一个 rl-limiter）。
+    name: str = "server"
     log_level: str = DEFAULT_LOG_LEVEL
     tick_interval_s: float = DEFAULT_TICK_INTERVAL_S
     # 实例总限速（Mbps；0 = 不限）。罩住本机 HAProxy **全部 frontend**
@@ -74,9 +72,12 @@ class ServiceConfig:
     # 入向 police 的带宽上限。启动时定型。见 rl_limiter/ingressgov.py。
     dynamic_ingress: "ingressgov.IngressGovConfig" = field(
         default_factory=lambda: ingressgov.IngressGovConfig())
-    # 本机 HAProxy 的接线（stats socket + cfg 路径）。
-    haproxy: model.NodeConfig = field(default_factory=model.NodeConfig)
-    # 限额登记：frontend 名 → 限额（Mbps，≥ 0；0 = 显式不限速）。
+    # 端口登记（可选）：名字 → 本机监听端口。只为按端口的静态入向限速
+    # 服务（request_limits 按这些名字登记端口清单），与跑什么服务无关。
+    ports: dict[str, int] = field(default_factory=dict)
+    # 历史字段（本形态恒空）：端口级**出向目标**需要端口级出向观测，
+    # 通用形态没有这个数据源（网卡拆不了端口），故不提供。保留字段是
+    # 为了共享代码路径（cfgparse/webconsole 等按名取限额处）零改动。
     quotas: dict[str, float] = field(default_factory=dict)
 
 
@@ -128,8 +129,25 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
             "罩全部 frontend 的出向流量合计（含未登记限额的段），SSH/"
             "监控等系统流量不再受影响——请改用新字段名")
 
+    # 旧形态的服务接线段显式拒绝 + 迁移指引：本分支是通用形态，不采样
+    # 任何服务，静默忽略会让运维以为还在按 HAProxy 的口径监控。
+    if "haproxy" in raw:
+        raise ValueError(
+            "字段 'haproxy' 已移除——本形态不依赖任何具体服务：监控是"
+            "双网卡设备视图 + 内核 TCP 计数器（/proc/net/snmp），限速是"
+            "客户端侧网卡的入向 tc。删掉 haproxy 段即可；按端口限速改在"
+            " 'ports' 段登记名字→端口，再在 request_limits 按名字登记"
+            "限额。要按 HAProxy 口径监控请用 HAProxy 形态分支")
+    if "quotas" in raw and (raw.get("quotas") or {}):
+        raise ValueError(
+            "字段 'quotas'（端口级出向带宽目标）在本形态不可用——端口级"
+            "出向观测需要服务配合，通用形态没有这个数据源（网卡无法按"
+            "端口拆分）。总量限速用 instance_quota_mbps（出向目标，闭环"
+            "执行）；按端口限请求方向用 ports + request_limits")
+
     cfg = ServiceConfig()
 
+    cfg.name = str(raw.get("name", "server") or "server").strip() or "server"
     cfg.log_level = str(raw.get("log_level", DEFAULT_LOG_LEVEL)).strip().lower()
 
     tick_raw = raw.get("tick_interval_s", DEFAULT_TICK_INTERVAL_S)
@@ -148,7 +166,17 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
             f"instance_quota_mbps 必须是数字（Mbps），"
             f"当前值 {inst_raw!r}") from None
 
-    cfg.haproxy = _parse_haproxy(raw.get("haproxy") or {})
+    ports_raw = raw.get("ports") or {}
+    if not isinstance(ports_raw, dict):
+        raise ValueError(
+            f"ports 必须是键值映射（名字 → 本机监听端口），"
+            f"实际是 {type(ports_raw).__name__}")
+    for pname, pv in ports_raw.items():
+        try:
+            cfg.ports[str(pname).strip()] = int(pv)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"ports.{pname} 必须是整数端口号，当前值 {pv!r}") from None
 
     req_raw = raw.get("request_limits") or {}
     if not isinstance(req_raw, dict):
@@ -184,17 +212,6 @@ def _parse(raw: dict[str, Any]) -> ServiceConfig:
     cfg.dynamic_ingress = _parse_dynamic_ingress(
         raw.get("dynamic_ingress") or {})
 
-    quotas_raw = raw.get("quotas") or {}
-    if not isinstance(quotas_raw, dict):
-        raise ValueError(
-            f"quotas 必须是键值映射（frontend 名 → 限额 Mbps），"
-            f"实际是 {type(quotas_raw).__name__}")
-    for name, v in quotas_raw.items():
-        try:
-            cfg.quotas[str(name).strip()] = float(v)
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"quotas.{name} 必须是数字（Mbps），当前值 {v!r}") from None
     return cfg
 
 
@@ -226,37 +243,6 @@ def _parse_dynamic_ingress(d: Any) -> ingressgov.IngressGovConfig:
     return g
 
 
-def _parse_haproxy(h: Any) -> model.NodeConfig:
-    """解析本机 HAProxy 的接线段。"""
-    if not isinstance(h, dict):
-        raise ValueError(
-            f"haproxy 必须是键值映射，实际是 {type(h).__name__}")
-
-    port_raw = h.get("port", 0) or 0
-    try:
-        port = int(port_raw)
-    except (TypeError, ValueError):
-        raise ValueError(f"haproxy.port 必须是整数，当前值 {port_raw!r}") from None
-
-    timeout_raw = h.get("timeout_ms", DEFAULT_TIMEOUT_MS)
-    try:
-        timeout_ms = int(timeout_raw)
-    except (TypeError, ValueError):
-        raise ValueError(
-            f"haproxy.timeout_ms 必须是整数，当前值 {timeout_raw!r}") from None
-    # 非正超时若穿透到网络层会让每次采样立即失败，按缺失处理回落默认值。
-    if timeout_ms <= 0:
-        timeout_ms = DEFAULT_TIMEOUT_MS
-
-    return model.NodeConfig(
-        name=str(h.get("name", "haproxy") or "haproxy").strip(),
-        host=str(h.get("host", "") or "").strip(),
-        port=port,
-        timeout_s=timeout_ms / 1000.0,
-        socket_path=str(h.get("socket_path", "") or "").strip(),
-        cfg_path=str(h.get("cfg_path", "") or "").strip(),
-    )
-
 
 def _validate(cfg: ServiceConfig) -> None:
     """语义校验。任何一条不通过都抛 ValueError，信息里点名字段、当前值与原因。"""
@@ -276,7 +262,21 @@ def _validate(cfg: ServiceConfig) -> None:
             f"速率差分与 10 秒窗口、超限持续秒数均以「1 拍 = 1 秒」为前提，"
             f"改成别的值会让速率口径与告警阈值整体失真")
 
-    _validate_haproxy(cfg.haproxy)
+    for pname, port in cfg.ports.items():
+        if not _NAME_RE.match(pname):
+            raise ValueError(
+                f"ports 的键 {pname!r} 非法——给端口起的名字（字母、数字、"
+                f"点、下划线、连字符，长度 1-64），request_limits 按它登记")
+        if not (1 <= port <= 65535):
+            raise ValueError(
+                f"ports.{pname} 端口号必须在 1~65535（当前值 {port}）")
+    seen_ports: dict[int, str] = {}
+    for pname, port in cfg.ports.items():
+        if port in seen_ports:
+            raise ValueError(
+                f"ports.{pname} 与 ports.{seen_ports[port]} 登记了同一个"
+                f"端口 {port}——一个端口一个名字，别重复")
+        seen_ports[port] = pname
 
     if cfg.instance_quota_mbps < 0:
         raise ValueError(
@@ -291,9 +291,12 @@ def _validate(cfg: ServiceConfig) -> None:
     for name, rl in cfg.request_limits.items():
         if not _NAME_RE.match(name):
             raise ValueError(
-                f"request_limits 的键 {name!r} 非法——应为 haproxy.cfg 里"
-                f"的 frontend/listen 段名（字母、数字、点、下划线、连字符，"
-                f"长度 1-64）")
+                f"request_limits 的键 {name!r} 非法——应为 ports 段登记的"
+                f"名字（字母、数字、点、下划线、连字符，长度 1-64）")
+        if name not in cfg.ports:
+            raise ValueError(
+                f"request_limits.{name} 没有对应的端口登记——先在 ports "
+                f"段写上 '{name}: <端口号>'，tc 才知道限哪个端口")
         if rl.mbps < 0:
             raise ValueError(
                 f"request_limits.{name}.mbps 不能为负数（当前值 "
@@ -352,53 +355,3 @@ def _validate(cfg: ServiceConfig) -> None:
             f"{g.apply_epsilon}）——太大的死区会让调节永远下发不出去")
 
 
-def _validate_haproxy(n: model.NodeConfig) -> None:
-    """校验本机 HAProxy 的接线段（采样通道二选一 + cfg 路径）。"""
-    if not _NAME_RE.match(n.name):
-        raise ValueError(
-            f"haproxy.name 非法（当前值 {n.name!r}）——只允许字母、数字、"
-            f"点、下划线、连字符，长度 1-64")
-    # 采样通道二选一：本机 unix socket（同机部署）或内网 TCP（远程观测）。
-    # 两者都给会产生"到底连哪个"的二义，一个都不给则根本无法接线。
-    if n.socket_path and (n.host or n.port):
-        raise ValueError(
-            f"haproxy: socket_path 与 host/port 只能二选一（当前 "
-            f"socket_path={n.socket_path!r}、host={n.host!r}、port={n.port!r}）"
-            f"——同机部署填 socket_path（本机 unix stats socket），"
-            f"远程只读观测填 host/port（内网 TCP stats socket）")
-    if not n.socket_path:
-        if not n.host:
-            raise ValueError(
-                "haproxy: host 不能为空——远程观测形态下它是 stats socket 的"
-                "内网地址；同机部署请改填 socket_path"
-                "（本机 unix stats socket 路径）")
-        if n.port < 1 or n.port > 65535:
-            raise ValueError(
-                f"haproxy: port 必须在 1-65535 范围内，当前值 {n.port!r}")
-    elif not n.socket_path.startswith("/"):
-        # 相对路径的解析结果取决于服务的工作目录（systemd 下通常是 /），
-        # 同一份配置在不同启动方式下会连到不同的位置——必须写绝对路径。
-        raise ValueError(
-            f"haproxy: socket_path 必须是绝对路径（当前值 {n.socket_path!r}）"
-            f"——相对路径的解析依赖服务的工作目录，同一份配置换个启动方式"
-            f"就会连到别处")
-    elif len(n.socket_path.encode("utf-8")) > _UNIX_PATH_MAX:
-        # AF_UNIX 的 sun_path 是定长数组（Linux 上 108 字节含结尾 NUL）。
-        # 超长路径要到 connect() 才报 "AF_UNIX path too long"，而采样
-        # 每秒一次——那会变成每秒一条看不懂的告警。启动时拦下。
-        raise ValueError(
-            f"haproxy: socket_path 过长"
-            f"（{len(n.socket_path.encode('utf-8'))} 字节，上限 "
-            f"{_UNIX_PATH_MAX}）——unix socket 路径长度受内核 sun_path 限制，"
-            f"请换用更短的路径（如 /var/lib/haproxy/stats）")
-
-    # cfg_path：受管 frontend 清单的来源，必填。存在性/可读性在引导时
-    # 检查（cfgparse.load_frontends 直接读），这里只拦结构性错误。
-    if not n.cfg_path:
-        raise ValueError(
-            "haproxy: cfg_path 不能为空——受管 frontend 清单（监听端口、"
-            "模式）从本机 haproxy.cfg 直接解析而来，必须给出它的路径"
-            "（如 /etc/haproxy/haproxy.cfg）")
-    if not n.cfg_path.startswith("/"):
-        raise ValueError(
-            f"haproxy: cfg_path 必须是绝对路径（当前值 {n.cfg_path!r}）")

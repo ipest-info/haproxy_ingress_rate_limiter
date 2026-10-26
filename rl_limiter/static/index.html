@@ -294,8 +294,8 @@ input:focus, select:focus {
 <header><div class="wrap">
   <h1>rl-limiter</h1>
   <span class="badge"><span class="dot" id="sse-dot" style="background:var(--critical)"></span><span id="sse-text">连接中…</span></span>
-  <span class="meta">HAProxy <b id="hap-name">–</b></span>
-  <span class="meta" id="hap-endpoint-wrap">端点 <b id="hap-endpoint">–</b></span>
+  <span class="meta">实例 <b id="hap-name">–</b></span>
+  <span class="meta" id="hap-endpoint-wrap">连接统计 <b id="hap-endpoint">–</b></span>
   <span class="grow"></span>
   <span class="meta">配置版本 <b id="cfg-version">–</b></span>
   <span class="meta">运行 <b id="uptime">–</b></span>
@@ -316,7 +316,6 @@ input:focus, select:focus {
 
 <nav class="tabs"><div class="wrap">
   <button data-tab="instance" aria-selected="true">实例</button>
-  <button data-tab="frontend" aria-selected="false">监听端口</button>
   <button data-tab="config" aria-selected="false">配置</button>
   <button data-tab="logs" aria-selected="false">日志</button>
 </div></nav>
@@ -333,14 +332,10 @@ input:focus, select:focus {
       </div>
       <div class="card-body">
         <div class="stats">
-          <div><div class="stat-l">并发连接数</div><div class="stat-v" id="i-conn">–</div></div>
-          <div><div class="stat-l">活跃 / 非活跃</div><div class="stat-v" id="i-actidle">–</div></div>
-          <div><div class="stat-l">每秒新建</div><div class="stat-v" id="i-new">–</div></div>
-          <div><div class="stat-l">每秒丢失</div><div class="stat-v" id="i-denied">–</div></div>
-          <div><div class="stat-l">流入带宽（HAProxy·5s）</div><div class="stat-v" id="i-rin">–<small>Mbps</small></div></div>
-          <div><div class="stat-l">流出带宽（HAProxy·5s）</div><div class="stat-v" id="i-rout">–<small>Mbps</small></div></div>
-          <div><div class="stat-l">连接上限</div><div class="stat-v" id="i-maxconn">–</div></div>
-          <div><div class="stat-l">HAProxy 空闲率</div><div class="stat-v" id="i-idle">–<small>%</small></div></div>
+          <div><div class="stat-l">并发连接数（TCP）</div><div class="stat-v" id="i-conn">–</div></div>
+          <div><div class="stat-l">每秒新建连接</div><div class="stat-v" id="i-new">–</div></div>
+          <div><div class="stat-l">流入带宽（网卡·5s）</div><div class="stat-v" id="i-rin">–<small>Mbps</small></div></div>
+          <div><div class="stat-l">流出带宽（网卡·5s）</div><div class="stat-v" id="i-rout">–<small>Mbps</small></div></div>
         </div>
       </div>
     </div>
@@ -419,16 +414,6 @@ input:focus, select:focus {
       <div class="card-body" id="tc-sections"><div class="hint">加载中…</div></div>
     </div>
 
-  </section>
-
-  <!-- ============ 监听端口视图 ============ -->
-  <section class="tabpage" id="page-frontend">
-    <div id="frontends"></div>
-    <div class="hint" style="padding:2px 4px">监听端口清单来自本机 haproxy.cfg 的解析
-      （要增删端口/后端请改 cfg 并 reload HAProxy，页面不提供入口）；
-      限额存放在 YAML 的 quotas 段——在卡片右上角修改（0 = 显式不限速，
-      "删除登记"= 回到只监控不限速），经写 API 回写 YAML 后数秒内热生效，
-      需先在页头填入 API 令牌（RL_API_TOKEN）。</div>
   </section>
 
   <!-- ============ 配置 ============ -->
@@ -824,21 +809,21 @@ function updateInstance(i) {
   const set = (id, v, unit) =>
     $(id).innerHTML = esc(v) + (unit ? `<small>${unit}</small>` : "");
   set("#i-conn", fmtInt(i.conn));
-  set("#i-actidle", fmtInt(i.active_conns) + " / " + fmtInt(i.idle_conns));
   set("#i-new", fmtRate(i.conn_new_ps), "个/秒");
-  set("#i-denied", fmtRate(i.conn_denied_ps), "个/秒");
+  // 带宽格 = 锚点网卡（首卡，客户端侧）的 5s 滚动均值。
   const itail = state.instBuf[state.instBuf.length - 1];
-  set("#i-rin", fmtMbps(itail && itail.rin5 !== undefined
-    ? itail.rin5 : i.rate_in_bytes_per_s), "Mbps");
-  set("#i-rout", fmtMbps(itail && itail.rout5 !== undefined
-    ? itail.rout5 : i.rate_out_bytes_per_s), "Mbps");
-  set("#i-maxconn", i.max_conn ? fmtInt(i.max_conn) : "–");
-  set("#i-idle", fmtInt(i.idle_pct), "%");
+  const nic0 = (i.nics && i.nics.length) ? i.nics[0] : null;
+  set("#i-rin", fmtMbps(nic0 && itail && itail["nin5_" + nic0.name] !== undefined
+    ? itail["nin5_" + nic0.name]
+    : (nic0 ? nic0.rate_in_bytes_per_s : 0)), "Mbps");
+  set("#i-rout", fmtMbps(nic0 && itail && itail["nout5_" + nic0.name] !== undefined
+    ? itail["nout5_" + nic0.name]
+    : (nic0 ? nic0.rate_out_bytes_per_s : 0)), "Mbps");
   $("#inst-degraded").hidden = !i.degraded;
   const nicList = (i.nics || []).map(n => n.name).join("、");
   $("#inst-nic-note").textContent = nicList
-    ? `带宽/数据包按设备统计：${nicList}（整机口径，含 HAProxy 之外的流量）`
-    : "未采集网卡数据：设备带宽/数据包曲线回退 HAProxy 口径（可用 RL_NIC 指定网卡）";
+    ? `带宽/数据包按设备统计：${nicList}（整机口径）；连接数为内核 TCP 计数器（整机口径）`
+    : "未采集网卡数据：设备带宽/数据包曲线为空（可用 RL_NIC 指定网卡）";
 }
 
 // ============================================================ frontend 卡片

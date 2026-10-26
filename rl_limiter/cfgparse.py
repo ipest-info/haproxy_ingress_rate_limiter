@@ -1,28 +1,13 @@
-# rl_limiter.cfgparse —— 从本机 haproxy.cfg 直接读取受管 frontend 清单。
+# rl_limiter.cfgparse —— 受管端口清单的构建与配置热更轮询（通用形态）。
 #
-# 设计原则：**haproxy.cfg 是负载均衡配置的唯一权威**。监听端口、模式、
-# 后端服务器都由运维直接写在 cfg 里（rl-limiter 不渲染、不改写、没有
-# 受管区块、没有任何默认负载均衡配置）；rl-limiter 只**读** cfg，解析出
-# 各 frontend/listen 段的 名字 + 监听端口 + 模式，再与 YAML 里登记的
-# 限额（quotas）合并成运行期配置——限速（tc 按端口分类）与监控（按
-# pxname 采样）都以此为准。
+# 本分支不解析任何服务配置：受管"端口清单"直接来自 YAML 的 ports 段
+# （名字 → 本机监听端口，运维登记，和机器上跑什么服务无关），只为按
+# 端口的静态入向限速（request_limits）提供端口号；整机监控与总量限速
+# 不需要任何端口登记。
 #
-# 解析口径（刻意保守）：
-#   - 只认 `frontend <name>` 与 `listen <name>` 两种段（backend 段没有
-#     监听端口，与限速/采样无关）；
-#   - 段内取第一条 `bind` 的地址与端口作为该段的监听端点；一个段有多条
-#     bind 时取第一条并 warn（tc 按单端口分类，多 bind 段的其余端口不在
-#     限速范围内——需要限速的端口应各自成段）；
-#   - `mode` 取段内值，缺省继承最近一个 `defaults` 段（HAProxy 语义），
-#     再缺省按 tcp（HAProxy 的默认）；
-#   - 名为 "stats" 的段、以及没有 bind 的 frontend/listen 段跳过；
-#   - 解析失败宁可少不可错：看不懂的行一律忽略（cfg 的完整语法校验是
-#     `haproxy -c` 的职责，不在这里重造）。
-#
-# 热更新（watch）：轮询 haproxy.cfg 与 YAML 配置文件的内容，任一变化就
-# 重新解析/加载并把新 ControllerConfig 投给监控循环——运维改完 cfg 并
-# reload HAProxy 后，rl-limiter 的限速与监控视图在一个轮询周期内自动
-# 跟上，不需要重启本服务。
+# watch() 轮询 YAML（5s，或被写 API poke 立即重读）：ports /
+# request_limits / instance_quota_mbps / dynamic_ingress 变化即热生效；
+# log_level / tick_interval_s 启动定型（变化提示重启）。
 
 from __future__ import annotations
 
@@ -58,70 +43,6 @@ class ParsedSection:
     kind: str                 # frontend | listen
     binds: list[tuple[str, int]] = field(default_factory=list)  # (地址, 端口)
     mode: str = ""            # 段内显式 mode；空 = 继承 defaults
-
-
-def _split_bind_endpoint(spec: str) -> tuple[str, int] | None:
-    """解析 bind 的第一个参数为 (地址, 端口)。
-
-    支持 ":8080"、"addr:8080"、"*:8080"、"ipv4@addr:8080"、"[::]:8080"。
-    unix socket（"/path" 或 "unix@..."）与 abns 没有端口，返回 None。
-    """
-    if spec.startswith("/") or spec.startswith("unix@") or spec.startswith("abns@"):
-        return None
-    m = _BIND_PORT_RE.search(spec)
-    if not m:
-        return None
-    port = int(m.group(1))
-    addr = spec[: m.start()]
-    # 剥掉协议前缀与通配地址：解析目标是"这个段听哪个端口"，地址仅作
-    # 展示；"*" 与空串等价（所有地址）。
-    if "@" in addr:
-        addr = addr.split("@", 1)[1]
-    if addr in ("*", "0.0.0.0", "::", "[::]"):
-        addr = ""
-    return (addr, port)
-
-
-def parse_haproxy_cfg(text: str) -> list[ParsedSection]:
-    """把 haproxy.cfg 文本解析成 frontend/listen 段清单（含 defaults 的
-    mode 继承）。只读取本模块需要的三样信息：段名、bind、mode。"""
-    sections: list[ParsedSection] = []
-    cur: ParsedSection | None = None
-    in_defaults = False
-    defaults_mode = ""  # 最近一个 defaults 段的 mode（HAProxy 的继承语义）
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        kw = parts[0]
-
-        if kw in _SECTION_KEYWORDS:
-            cur = None
-            in_defaults = False
-            if kw == "defaults":
-                in_defaults = True
-            elif kw in ("frontend", "listen") and len(parts) >= 2:
-                cur = ParsedSection(name=parts[1], kind=kw)
-                sections.append(cur)
-            continue
-
-        if in_defaults and kw == "mode" and len(parts) >= 2:
-            defaults_mode = parts[1]
-        elif cur is not None:
-            if kw == "bind" and len(parts) >= 2:
-                ep = _split_bind_endpoint(parts[1])
-                if ep is not None:
-                    cur.binds.append(ep)
-            elif kw == "mode" and len(parts) >= 2:
-                cur.mode = parts[1]
-
-    # mode 继承：段内没写的补 defaults 的值；仍没有则按 HAProxy 默认 tcp。
-    for s in sections:
-        if not s.mode:
-            s.mode = defaults_mode or "tcp"
-    return sections
 
 
 def build_frontends(
@@ -181,17 +102,16 @@ def build_frontends(
                     s.name, addr, port,
                     ",".join(f"{a}:{p}" for a, p in s.binds[1:]))
         quota = float(quotas.get(s.name, 0.0))
-        if quota <= 0 and s.name not in quotas:
+        if quota <= 0 and s.name not in quotas and quotas:
+            # 端口级出向限额（quotas）语义存在时才提示"谁没登记"。
+            # 通用形态 quotas 恒空——端口登记只为静态入向限速服务，
+            # 这里不该逐端口刷"未登记限额"的噪声。
             key = f"noquota:{s.name}"
             if key not in warned:
                 warned.add(key)
-                # 端口**默认不限速**：未登记限额是正常状态，不按异常
-                # 告警，只记一条 info 供排障时核对"到底限了谁"。
                 log.info(
-                    "frontend 未登记限额，默认不限速（只监控） "
-                    "section=%s bind=%s:%d（要限速可在控制台/写 API 设置，"
-                    "或在配置文件 quotas 段加一行：%s: <Mbps>）",
-                    s.name, addr or "*", port, s.name)
+                    "端口未登记出向限额，默认不限速（只监控） "
+                    "section=%s bind=%s:%d", s.name, addr or "*", port)
         out.append(model.FrontendConfig(
             name=s.name, bind_address=addr, bind_port=port,
             mode=s.mode if s.mode in ("tcp", "http") else "tcp",
@@ -207,17 +127,20 @@ def build_frontends(
     return out
 
 
-def load_frontends(cfg_path: str, quotas: dict[str, float],
+def sections_from_ports(ports: dict[str, int]) -> list[ParsedSection]:
+    """把 YAML 的 ports 登记（名字 → 本机监听端口）派生成段清单。
+
+    通用形态没有服务配置可解析：端口清单由运维直接登记，仅为按端口的
+    静态入向限速服务。bind 地址留空（= 所有地址，tc 只按端口分类）。"""
+    return [ParsedSection(name=n, kind="port", binds=[("", p)], mode="tcp")
+            for n, p in ports.items()]
+
+
+def load_frontends(ports: dict[str, int], quotas: dict[str, float],
                    log: logging.Logger,
                    _warned: set[str] | None = None) -> list[model.FrontendConfig]:
-    """读 cfg_path 并合并限额，返回受管 frontend 清单。
-
-    文件读不到/读错按异常抛出，调用方决定是启动失败（引导阶段）还是
-    保留当前配置（watch 阶段的 fail-static）。
-    """
-    with open(cfg_path, "r", encoding="utf-8", errors="replace") as f:
-        text = f.read()
-    return build_frontends(parse_haproxy_cfg(text), quotas, log, _warned)
+    """从端口登记构建受管清单（通用形态：无文件可读，纯派生）。"""
+    return build_frontends(sections_from_ports(ports), quotas, log, _warned)
 
 
 def canonical(frontends: list[model.FrontendConfig],
@@ -243,7 +166,6 @@ def checksum(frontends: list[model.FrontendConfig],
 
 
 async def watch(
-    cfg_path: str,
     yaml_path: str,
     queue: "asyncio.Queue[model.ControllerConfig]",
     boot_frontends: list[model.FrontendConfig],
@@ -255,7 +177,7 @@ async def watch(
     dyn_ingress_cb=None,
     boot_dynamic_ingress=None,
 ) -> None:
-    """常驻任务：轮询 haproxy.cfg 与 YAML 配置文件，内容变化就把新
+    """常驻任务：轮询 YAML 配置文件，内容变化就把新
     ControllerConfig 投入 queue（监控循环热应用，tc/告警基准随之更新）。
 
     - 变更判定用**解析结果**的规范化字符串比较，而不是文件 mtime——
@@ -264,9 +186,9 @@ async def watch(
     - 任一文件读不到或解析失败：保留当前配置继续运行（fail-static），
       warn 后下一轮再试——cfg 正在被原子替换的瞬间读到半份文件属于
       预期内抖动；
-    - 限额类字段（quotas/request_limits/instance_quota_mbps）与闭环参数
+    - 端口登记（ports）、request_limits/instance_quota_mbps 与闭环参数
       （dynamic_ingress，经 dyn_ingress_cb 整段回调）热生效；接线与服务
-      级运行参数（haproxy 段、log_level、tick_interval_s）启动时定型，
+      级运行参数（log_level、tick_interval_s）启动时定型，
       运行期改动不热生效（检测到变化会提示需重启）。
     """
     from . import config as configmod  # 延迟导入避免环形依赖
@@ -293,14 +215,13 @@ async def watch(
         try:
             svc = configmod.load(yaml_path)
             quotas = dict(svc.quotas)
-            yaml_rest = (svc.log_level, svc.tick_interval_s,
-                         svc.haproxy.endpoint(), svc.haproxy.cfg_path)
+            yaml_rest = (svc.log_level, svc.tick_interval_s)
             di_repr = repr(svc.dynamic_ingress)
-            frontends = load_frontends(cfg_path, quotas, log, warned)
+            frontends = load_frontends(svc.ports, quotas, log, warned)
         except Exception as e:
             log.warning(
                 "重读配置失败，保留当前配置继续运行（fail-static），下一轮"
-                "再试 cfg=%s yaml=%s err=%s", cfg_path, yaml_path, e)
+                "再试 yaml=%s err=%s", yaml_path, e)
             continue
 
         if last_yaml_rest is None:

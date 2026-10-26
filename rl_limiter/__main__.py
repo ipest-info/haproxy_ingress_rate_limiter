@@ -1,17 +1,16 @@
-# rl_limiter.__main__ —— rl-limiter 服务入口（单 HAProxy 模型）。
+# rl_limiter.__main__ —— rl-limiter 服务入口（通用形态：一台服务器一个）。
 #
-# 一个实例管**一台**与它同机的 HAProxy。**haproxy.cfg 是负载均衡配置的
-# 唯一权威**：监听端口、模式、后端服务器都由运维直接写在 cfg 里，
-# rl-limiter 只**读** cfg（cfgparse）解析出受管 frontend 清单，与 YAML
-# 里登记的限额（quotas）合并后做两件事：
+# 本分支**不依赖任何具体服务**（nginx/HAProxy/自研 TCP 服务……一概不
+# 关心），做两件事：
 #
-#   1. **限速**：把限额下发到本机网卡的内核 tc（HTB，按源端口分类）；
-#   2. **监控**：每秒经本机 unix stats socket 采样各 frontend 的
-#      bytes_out，产出带宽视图（Web 控制台实时展示）并做持续超限告警。
+#   1. **监控**：双网卡设备视图（/proc/net/dev：带宽/包/丢包）+ 内核
+#      TCP 计数器（/proc/net/snmp：并发/每秒新建连接，整机口径）；
+#   2. **限速**：实例出向带宽目标（网卡口径）由闭环动态收紧客户端侧
+#      网卡（默认 eth0）的入向带宽间接执行；另可按端口登记静态入向
+#      限速（YAML ports + request_limits，纯 tc）。
 #
-# 配置来源只有本地 YAML（-c）+ haproxy.cfg 两个文件；运行期轮询两者，
-# 内容变化即热生效（cfg 改了 reload HAProxy 后，rl-limiter 的限速与
-# 监控清单自动跟上）。文件读不到时按最后一次加载的配置继续运行
+# 配置来源只有本地 YAML（-c）一个文件；运行期轮询（5s），限额/端口/
+# 闭环参数变化即热生效。文件读不到时按最后一次加载的配置继续运行
 # （fail-static）。
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ import sys
 
 from . import cfgparse
 from . import config as configmod
-from . import haproxy, ingressgov, metricslog, model
+from . import ingressgov, metricslog, model, netsrc
 from . import netdev
 from . import tcifb as tcifbmod
 from . import tcingress as tcinmod
@@ -137,7 +136,7 @@ async def _amain(cfg, log: logging.Logger,
     """
     # --- 与本机 HAProxy 的 runtime API 客户端（只读采样）。单 HAProxy
     # 模型下只有一个，同机形态走本机 unix socket。
-    client = haproxy.RuntimeClient.from_node(cfg.haproxy, log)
+    client = netsrc.NetSource(log)
 
     # tc 队列统计 → 监控。tc 按 classid（= 监听端口）索引，这里换成
     # frontend 名再交给采集器——采集器只认名字，不必知道端口这回事。
@@ -219,7 +218,7 @@ async def _amain(cfg, log: logging.Logger,
         hub = webconsole.StatusHub(
             SERVICE_VERSION,
             version_fn=lambda: ctl.version,
-            haproxy=cfg.haproxy,
+            haproxy=netsrc.SourceDesc(cfg.name),
             degraded_fn=lambda: col.degraded,
             instance_quota_executable=inst_executable,
             regulation_fn=regulation_fn)
@@ -274,8 +273,8 @@ async def _amain(cfg, log: logging.Logger,
     ctl.seed(seed_cfg)
     if hub is not None:
         hub.update_config(seed_cfg)
-    log.info("已用 haproxy.cfg + YAML 限额完成引导（监控单位=frontend） "
-             "version=%s frontends=%d instance_quota=%gMbps detail=%s",
+    log.info("已用 YAML 完成引导（通用形态：监控=双网卡+内核计数器） "
+             "version=%s ports=%d instance_quota=%gMbps detail=%s",
              seed_version, len(boot_frontends), cfg.instance_quota_mbps,
              _summarize_frontends(boot_frontends))
 
@@ -340,7 +339,7 @@ async def _amain(cfg, log: logging.Logger,
     tasks.append(asyncio.create_task(
         ctl.run(config_queue, tick_interval_s), name="monitor-loop"))
     tasks.append(asyncio.create_task(
-        cfgparse.watch(cfg.haproxy.cfg_path, yaml_path, source_queue,
+        cfgparse.watch(yaml_path, source_queue,
                        boot_frontends, log,
                        boot_instance_quota_mbps=cfg.instance_quota_mbps,
                        boot_request_limits=cfg.request_limits,
@@ -417,8 +416,8 @@ async def _amain(cfg, log: logging.Logger,
         # 只展示不提供写入口。
         runtime_info = [
             {"label": "YAML 配置文件", "value": yaml_path or "（未指定）"},
-            {"label": "haproxy.cfg", "value": cfg.haproxy.cfg_path},
-            {"label": "HAProxy stats 接口", "value": cfg.haproxy.endpoint()},
+            {"label": "连接统计来源", "value": netsrc.PROC_NET_SNMP
+             + "（内核 TCP 计数器，整机口径）"},
             {"label": "采样周期 tick_interval_s",
              "value": f"{cfg.tick_interval_s:g}s"},
             {"label": "日志级别 log_level", "value": cfg.log_level},
@@ -595,8 +594,7 @@ async def _amain(cfg, log: logging.Logger,
 
     log.info("rl-limiter 服务已启动，监控循环开始运行 instance=%s "
              "endpoint=%s cfg=%s frontends=%d version=%s",
-             cfg.haproxy.name, cfg.haproxy.endpoint(),
-             cfg.haproxy.cfg_path,
+             cfg.name, netsrc.PROC_NET_SNMP, "-",
              len(boot_frontends), SERVICE_VERSION)
 
     # 等待退出信号；任一常驻任务意外结束（本应永续运行）也触发整体退出，
@@ -628,14 +626,13 @@ async def _amain(cfg, log: logging.Logger,
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="rl-limiter",
-        description="HAProxy 入口带宽限速与监控：以本机 haproxy.cfg 为负载"
-                    "均衡配置的唯一权威，解析出受管监听端口清单，把 YAML 里"
-                    "登记的限额下发到内核 tc（HTB，按源端口分类），并每秒"
-                    "采样各 frontend 的下行带宽做持续超限告警",
-        epilog="一个实例管一台同机的 HAProxy。配置来源是两个本地文件："
-               "-c 指定的 YAML（接线 + 限额 quotas）与其中 haproxy.cfg_path "
-               "指向的 haproxy.cfg（监听端口/模式，由运维直接编辑，"
-               "rl-limiter 只读不写）；运行期轮询两者，内容变化即热生效。"
+        description="服务器出口带宽限速与监控（通用形态，不依赖任何具体"
+                    "服务）：双网卡设备监控 + 内核 TCP 连接统计；实例出向"
+                    "目标由闭环动态收紧客户端侧网卡入向执行，另支持按端口"
+                    "的静态入向限速",
+        epilog="一台服务器一个实例。配置来源只有 -c 指定的 YAML 一个本地"
+               "文件（instance_quota_mbps / ports / request_limits / "
+               "dynamic_ingress），运行期轮询，内容变化即热生效。"
                "默认形态为双网卡闭环：入向执行网卡 RL_TC_IN_IFACE 默认 "
                "eth0（客户端侧），出向整形 RL_TC_IFACE 默认关闭（-），"
                "设 RL_TC_IFACE=<网卡> 可改回出向 HTB 直接整形。"
@@ -736,23 +733,20 @@ def main() -> None:
     level = getattr(logging, str(cfg.log_level).upper(), logging.INFO)
     logging.getLogger().setLevel(level)
 
-    # --- 引导解析：haproxy.cfg 是负载均衡配置的唯一权威，启动时必须能
-    # 读到并解析出受管清单；读不到就启动失败，而不是带着空清单装作在跑。
-    # （运行期 cfg 短暂不可读走 fail-static，那是另一回事——见 cfgparse.watch。）
+    # --- 引导：受管端口清单直接派生自 YAML 的 ports 登记（通用形态
+    # 没有服务配置可解析）。没登记端口是正常状态——整机监控与总量限速
+    # 不需要它，按端口的静态入向限速才需要。
+    boot_frontends = cfgparse.load_frontends(cfg.ports, cfg.quotas, log)
+    # 引导自检：连接统计来源必须可读（/proc/net/snmp；非 Linux/procfs
+    # 未挂载时大声失败，别带着永远 degraded 的采样装作在跑）。
     try:
-        boot_frontends = cfgparse.load_frontends(
-            cfg.haproxy.cfg_path, cfg.quotas, log)
-    except OSError as e:
-        print(
-            f"rl-limiter: 读不到 haproxy.cfg：{cfg.haproxy.cfg_path}（{e}）。\n"
-            f"  haproxy.cfg 是负载均衡配置的唯一权威，启动时必须可读；\n"
-            f"  请核对 YAML 里 haproxy.cfg_path 的路径与文件权限。",
-            file=sys.stderr)
+        with open(netsrc.PROC_NET_SNMP, encoding="ascii") as f:
+            netsrc.parse_proc_snmp_tcp(f.read())
+    except Exception as e:
+        print(f"rl-limiter: 读不到内核 TCP 计数器 {netsrc.PROC_NET_SNMP}"
+              f"（{e}）。\n  本服务依赖 Linux procfs 做整机连接统计；"
+              f"请确认运行在 Linux 且 /proc 已挂载。", file=sys.stderr)
         raise SystemExit(1)
-    if not boot_frontends:
-        log.warning("haproxy.cfg 里没有解析到任何带监听端口的 frontend/"
-                    "listen——服务照常启动，之后 cfg 内容变化会被轮询接上 "
-                    "cfg_path=%s", cfg.haproxy.cfg_path)
 
     # 请求方向（入向）限速：双网卡形态，执行网卡 = 客户端侧那张。默认
     # eth0（出厂接线约定），非 eth0 命名的机器显式设 RL_TC_IN_IFACE——
@@ -894,15 +888,14 @@ def main() -> None:
         log.info("实例视图的设备监控网卡 nics=%s（首卡为锚点，老的单卡"
                  "字段镜像它；改用 RL_NIC=<卡1,卡2> 显式指定）", nic)
 
-    # 启动即输出完整配置摘要：现场排障时第一条要看的日志，可直接核对
-    # 受管清单、限额基准与两个配置文件的路径。
+    # 启动即输出完整配置摘要：现场排障时第一条要看的日志。
     log.info(
         "服务配置加载完成，以下为完整配置摘要（排障第一条要看的日志） "
         "yaml=%s cfg=%s instance=%s endpoint=%s log_level=%s "
         "tick_interval_s=%s instance_quota=%s request_limits=%d "
         "frontends=%d detail=%s",
-        args.config, cfg.haproxy.cfg_path,
-        cfg.haproxy.name, cfg.haproxy.endpoint(),
+        args.config, "-",
+        cfg.name, netsrc.PROC_NET_SNMP,
         cfg.log_level,
         getattr(cfg, "tick_interval_s", 1.0),
         (f"{cfg.instance_quota_mbps:g}Mbps" if cfg.instance_quota_mbps

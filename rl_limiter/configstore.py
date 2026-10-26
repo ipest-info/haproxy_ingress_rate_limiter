@@ -2,8 +2,8 @@
 #
 # 这是全项目**唯一**会写配置文件的地方，而且只写 rl-limiter 自己的 YAML
 # （-c 指定的那份）——haproxy.cfg 仍然绝对只读，"rl-limiter 不改 cfg、
-# 不 reload haproxy"的承诺不变。能改的只有限额类字段：quotas 里的单个
-# frontend 限额、实例总限速 instance_quota_mbps、request_limits 里的
+# 的承诺不变。能改的只有限额类字段：实例总限速
+# instance_quota_mbps、request_limits 里的
 # 入向限速登记。接线字段（haproxy 段）、log_level、dynamic_ingress 这些
 # **不开放**给 API——它们改了要重启进程，属于运维操作。
 #
@@ -94,41 +94,6 @@ def _write_atomic(path: str, raw: dict) -> None:
         except OSError:
             pass
         raise ConfigStoreError(f"写配置文件 {path} 失败：{e}") from None
-
-
-def set_quota(path: str, name: str, quota_mbps: float) -> None:
-    """登记/修改一个 frontend 的限额（Mbps；0 = 显式不限速）。
-
-    name 是否真的存在于 haproxy.cfg 由调用方（webconsole）校验——这里
-    只管"写出去的 YAML 合法"。
-    """
-    raw = _load_raw(path)
-    quotas = raw.get("quotas")
-    if quotas is None:
-        quotas = {}
-    if not isinstance(quotas, dict):
-        raise ConfigStoreError(
-            "配置文件里的 quotas 不是键值映射，拒绝回写（请先手工修复）")
-    quotas = dict(quotas)
-    quotas[name] = quota_mbps
-    raw["quotas"] = quotas
-    _write_atomic(path, raw)
-
-
-def remove_quota(path: str, name: str) -> bool:
-    """从 quotas 里删掉一个 frontend 的登记（回到"只监控不限速"）。
-
-    返回是否真的删了（本来就没登记时返回 False，也不写文件）。
-    """
-    raw = _load_raw(path)
-    quotas = raw.get("quotas")
-    if not isinstance(quotas, dict) or name not in quotas:
-        return False
-    quotas = dict(quotas)
-    del quotas[name]
-    raw["quotas"] = quotas
-    _write_atomic(path, raw)
-    return True
 
 
 def set_instance_quota(path: str, quota_mbps: float) -> None:

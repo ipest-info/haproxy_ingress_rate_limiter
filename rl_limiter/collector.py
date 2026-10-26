@@ -40,7 +40,6 @@ import asyncio
 import logging
 
 from . import model, netdev
-from .haproxy import RuntimeClient
 from .window import Ewma, SlidingWindow
 
 # 滑动窗口容量（单位：秒）。10 秒滑动均值是已拍板的承诺口径——"10 秒均值
@@ -203,7 +202,7 @@ class _NicState:
 class Collector:
     """从本机 HAProxy 采样并产出各受管 frontend 的用量样本。"""
 
-    def __init__(self, client: RuntimeClient,
+    def __init__(self, client,
                  log: logging.Logger | None = None,
                  nic: str = "",
                  tc_stats=None):
@@ -612,7 +611,17 @@ class Collector:
         # 连接，与"丢失连接数"同源，两条曲线也才可比。
         if stats is not None:
             s = self._inst_state
-            inst.conn_new_ps = s.c_conn_new.push(sum(x.conn_tot for x in stats))
+            if stats:
+                inst.conn_new_ps = s.c_conn_new.push(
+                    sum(x.conn_tot for x in stats))
+            elif info is not None:
+                # 数据源没有按服务拆分的行（通用形态 netsrc：show_stat
+                # 恒空表）：每秒新建连接改用 show_info 的累计量差分——
+                # netsrc 把内核 PassiveOpens（整机每秒 accept 数）装在
+                # cum_conns 里。整机口径，含本机一切进程的入站连接。
+                inst.conn_new_ps = s.c_conn_new.push(info.cum_conns)
+            else:
+                inst.conn_new_ps = prev.conn_new_ps
             inst.rate_in_bps = s.c_in.push(sum(x.bytes_in for x in stats))
             inst.rate_out_bps = s.c_out.push(sum(x.bytes_out for x in stats))
             inst.conn_denied_ps = s.c_denied.push(

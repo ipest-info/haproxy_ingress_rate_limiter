@@ -539,26 +539,11 @@ def build_app(
                 "执行者，设置被禁用")
         rows.append({
             "label": "实例总限速 instance_quota_mbps",
-            "sub": "本机 HAProxy 全部 frontend 出向流量合计的总闸",
+            "sub": "本机出向带宽目标（网卡口径，闭环收紧客户端侧网卡"
+                   "入向执行）",
             "fields": [inst_field],
             "del": {"url": "/api/instance-quota", "label": "取消总限速"},
         })
-        for name, f in sorted((o.get("frontends") or {}).items()):
-            rows.append({
-                "label": f"quotas.{name}",
-                "sub": (f"监听 {f.get('bind_address') or '*'}:"
-                        f"{f.get('bind_port', '?')} 的出向限额"),
-                "fields": [{
-                    "name": "quota_mbps",
-                    "label": "Mbps（0 = 显式不限速）",
-                    "value": f.get("quota_mbps", ""),
-                    "api": {"method": "PUT",
-                            "url": f"/api/quotas/{name}",
-                            "key": "quota_mbps"},
-                }],
-                "del": {"url": f"/api/quotas/{name}",
-                        "label": "删除登记（回到只监控）"},
-            })
         limits_sec = {
             "title": "限额登记（可改，热生效）",
             "hint": "修改经写 API 回写 YAML，数秒内热生效——需先在页头填入"
@@ -670,55 +655,6 @@ def build_app(
             raise ValueError(f"quota_mbps 必须是数字（Mbps），"
                              f"当前值 {v!r}")
         return float(v)
-
-    async def handle_put_quota(request: web.Request) -> web.Response:
-        denied = _authorized(request)
-        if denied is not None:
-            return denied
-        name = request.match_info["name"]
-        try:
-            quota = await _read_quota_body(request)
-        except ValueError as e:
-            return web.json_response({"error": str(e)}, status=400)
-        known = known_frontends_fn() if known_frontends_fn is not None else None
-        if known is not None and name not in known:
-            return web.json_response(
-                {"error": f"haproxy.cfg 里没有名为 {name!r} 的 frontend/"
-                          f"listen 段（是不是拼错了？）。当前解析到的段："
-                          f"{sorted(known)}"},
-                status=400)
-        async with write_lock:
-            try:
-                await asyncio.to_thread(
-                    configstore.set_quota, yaml_path, name, quota)
-            except ValueError as e:
-                return web.json_response({"error": str(e)}, status=400)
-        if poke is not None:
-            poke.set()
-        log.warning("写 API 已修改限额并回写 YAML（cfg 轮询即将热生效） "
-                    "frontend=%s quota=%gMbps yaml=%s",
-                    name, quota, yaml_path)
-        return web.json_response({"ok": True, "frontend": name,
-                                  "quota_mbps": quota})
-
-    async def handle_delete_quota(request: web.Request) -> web.Response:
-        denied = _authorized(request)
-        if denied is not None:
-            return denied
-        name = request.match_info["name"]
-        async with write_lock:
-            try:
-                removed = await asyncio.to_thread(
-                    configstore.remove_quota, yaml_path, name)
-            except ValueError as e:
-                return web.json_response({"error": str(e)}, status=400)
-        if removed and poke is not None:
-            poke.set()
-        if removed:
-            log.warning("写 API 已删除限额登记（该 frontend 回到只监控不"
-                        "限速） frontend=%s yaml=%s", name, yaml_path)
-        return web.json_response({"ok": True, "frontend": name,
-                                  "removed": removed})
 
     async def handle_put_instance_quota(request: web.Request) -> web.Response:
         denied = _authorized(request)
@@ -855,8 +791,6 @@ def build_app(
     # 默认回环，放内网靠防火墙）。
     app.router.add_get("/metrics", handle_metrics)
     if yaml_path:
-        app.router.add_put("/api/quotas/{name}", handle_put_quota)
-        app.router.add_delete("/api/quotas/{name}", handle_delete_quota)
         app.router.add_put("/api/instance-quota", handle_put_instance_quota)
         app.router.add_delete("/api/instance-quota",
                               handle_delete_instance_quota)
