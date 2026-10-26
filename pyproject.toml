@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rl-limiter"
-version = "0.4.1"
+version = "0.5.0"
 description = "HAProxy 入口带宽限速与监控：读本机 haproxy.cfg 与 YAML 限额，经内核 tc 限速并做秒级监控"
 requires-python = ">=3.9"
 dependencies = [
