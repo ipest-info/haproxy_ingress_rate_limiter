@@ -49,12 +49,19 @@ jobs:
           esac
 
       - name: 在 manylinux2014 容器里构建发布包
+        # 容器自带的 /opt/python/* 是**静态**编译（无 libpython 共享库），
+        # PyInstaller 用不了（"Python was built without a shared
+        # library"，v0.4.0 第二次构建踩过）；改装 Miniconda 的 Python
+        # ——共享库构建、官方兼容 glibc ≥ 2.17，与 manylinux2014 的
+        # 兼容目标一致。版本钉死保证可复现。
         run: |
           docker run --rm -v "$PWD":/src -w /src \
             -e VERSION="${REL_TAG#v}" \
-            -e PYTHON=/opt/python/cp311-cp311/bin/python3 \
             quay.io/pypa/manylinux2014_x86_64 \
-            bash deploy/release/build.sh
+            bash -c 'set -e
+              curl -fsSL -o /tmp/mc.sh https://repo.anaconda.com/miniconda/Miniconda3-py311_24.7.1-0-Linux-x86_64.sh
+              bash /tmp/mc.sh -b -p /opt/conda >/dev/null
+              PYTHON=/opt/conda/bin/python3 bash deploy/release/build.sh'
 
       - name: 创建 Release 并上传产物
         uses: softprops/action-gh-release@v2
