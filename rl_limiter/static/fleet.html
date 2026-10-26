@@ -5,7 +5,7 @@
 <style>
 /* 总控制台：汇总数十台节点的流量并做总量控制。
    视觉与交互骨架照抄节点控制台（index.html）——同一套配色/卡片/图表，
-   运维在两边切换时不用重新学一遍页面。两个 tab：总览 / 日志。 */
+   运维在两边切换时不用重新学一遍页面。三个 tab：总览 / 节点管理 / 日志。 */
 :root {
   --surface-0: #f5f5f4; --surface-1: #ffffff; --surface-2: #f0efed;
   --surface-3: #e8e7e4;
@@ -158,6 +158,27 @@ input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px 
 .util i { display: block; height: 100%; background: var(--s-out); }
 .util i.hot { background: var(--warn); }
 
+[hidden] { display: none !important; }
+/* 节点管理 */
+.node-form {
+  display: grid; gap: 10px 14px;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+.node-form label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 12px; color: var(--text-secondary);
+}
+.form-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.chk { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-secondary); }
+.chk input { width: auto; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover:not(:disabled) { background: var(--accent); filter: brightness(1.08); }
+button.danger { color: var(--critical); }
+.node-table.left th, .node-table.left td { text-align: left; }
+.node-table td.ops { text-align: right; }
+.node-table td.ops button { padding: 3px 10px; font-size: 12px; }
+.node-table td.url { font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+
 #logs { max-height: 460px; overflow-y: auto;
         font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace; }
 #logs div { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
@@ -200,6 +221,7 @@ input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px 
 
 <nav class="tabs"><div class="wrap">
   <button data-tab="overview" aria-selected="true">总览</button>
+  <button data-tab="nodes" aria-selected="false">节点管理</button>
   <button data-tab="logs" aria-selected="false">日志</button>
 </div></nav>
 
@@ -244,6 +266,48 @@ input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px 
     </div>
   </section>
 
+  <section class="tabpage" id="page-nodes">
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title" id="nf-title">添加节点</span>
+        <span class="hint">写回 fleet.yaml、即时加入轮询；需页头令牌（rl-fleet 的 RL_API_TOKEN）</span>
+      </div>
+      <div class="card-body">
+        <div class="node-form">
+          <label>名称（1~64 位字母/数字/._-）
+            <input id="nf-name" maxlength="64" placeholder="node-sh-01" autocomplete="off"></label>
+          <label>节点控制台地址
+            <input id="nf-url" placeholder="http://10.0.1.11:8090" autocomplete="off"></label>
+          <label>节点令牌（该节点的 RL_API_TOKEN）
+            <input id="nf-token" type="password" placeholder="装节点时 --token 指定的值" autocomplete="new-password"></label>
+          <label>页面跳转地址（可选）
+            <input id="nf-console" placeholder="内外网地址不同时填；缺省 = 控制台地址" autocomplete="off"></label>
+        </div>
+        <div class="form-actions">
+          <label class="chk" id="nf-clear-wrap" hidden>
+            <input type="checkbox" id="nf-clear-token"> 清除令牌（改为只读观测）</label>
+          <span class="grow"></span>
+          <button id="nf-cancel" hidden>取消编辑</button>
+          <button id="nf-save" class="primary">添加节点</button>
+        </div>
+        <div class="hint" style="margin-top:10px">节点侧前提：控制台（RL_CONSOLE_PORT）绑在总控可达的内网地址，
+          并用防火墙/安全组限制只有总控能访问；令牌留空 = 只读观测（汇总里看得到，但不参与分配、不被下发）。
+          节点令牌只保存在总控的 fleet.yaml 里，页面与读接口永远只显示"已配置/未配置"。</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><span class="card-title">已登记节点</span>
+        <span class="tag" id="nl-count">–</span>
+        <span class="hint">删除只是停止轮询与下发：该节点的实例配额保持现状（不回收、不清零）</span></div>
+      <div class="card-body" style="overflow-x:auto">
+        <table class="node-table left" id="nl-table"><tbody>
+          <tr><td class="hint">加载中…</td></tr>
+        </tbody></table>
+      </div>
+    </div>
+  </section>
+
   <section class="tabpage" id="page-logs">
     <div class="card">
       <div class="card-head">
@@ -272,7 +336,8 @@ const fmt1 = (v) => (v == null || !isFinite(v) ? "–" : (+v).toFixed(1));
 
 const state = { buf: [], charts: [], windowS: 300,
                 logAfter: 0, logLevel: "INFO", tab: "overview",
-                latest: null, totalDirty: false };
+                latest: null, totalDirty: false,
+                nodesCfg: [], editing: null };
 const LEVELS = {DEBUG:10, INFO:20, WARNING:30, ERROR:40, CRITICAL:50};
 const BUF_MAX = 1200;
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name);
@@ -445,6 +510,7 @@ function applySnapshot(snap, live) {
     iIn.value = total || "";
   renderNodeTable(snap);
   if (state.tab === "overview") redrawAll();
+  if (state.tab === "nodes") renderNodeList();
 }
 
 function nodeBadge(n) {
@@ -459,7 +525,7 @@ function renderNodeTable(snap) {
   const rows = Object.entries(snap.nodes || {}).sort((a, b) => a[0] < b[0] ? -1 : 1);
   const tb = $("#node-table tbody");
   if (!rows.length) {
-    tb.innerHTML = '<tr><td class="hint">节点清单为空——在 fleet.yaml 的 nodes 段登记节点（热生效）</td></tr>';
+    tb.innerHTML = '<tr><td class="hint">节点清单为空——到「节点管理」页添加节点（或编辑 fleet.yaml 的 nodes 段，热生效）</td></tr>';
     return;
   }
   tb.innerHTML = `<tr><th>节点</th><th>状态</th><th>出向 Mbps</th><th>入向</th>
@@ -482,6 +548,102 @@ function renderNodeTable(snap) {
         <td class="err" title="${esc(err)}">${esc(err)}</td>
       </tr>`;
     }).join("");
+}
+
+// ---- 节点管理（清单来自 /api/nodes；令牌只有"有/无"，读接口不给值） ----
+async function loadNodes() {
+  try {
+    const j = await (await fetch("/api/nodes")).json();
+    state.nodesCfg = j.nodes || [];
+  } catch (e) { return; }
+  renderNodeList();
+}
+
+function renderNodeList() {
+  const tb = $("#nl-table tbody");
+  $("#nl-count").textContent = state.nodesCfg.length + " 台";
+  if (!state.nodesCfg.length) {
+    tb.innerHTML = '<tr><td class="hint">还没有登记节点——用上面的表单添加</td></tr>';
+    return;
+  }
+  const live = (state.latest && state.latest.nodes) || {};
+  tb.innerHTML = `<tr><th>节点</th><th>控制台地址</th><th>页面跳转地址</th>
+      <th>令牌</th><th>状态</th><th></th></tr>` +
+    state.nodesCfg.map(n => `<tr>
+        <td><b>${esc(n.name)}</b></td>
+        <td class="url">${esc(n.url)}</td>
+        <td class="url">${n.console_url ? esc(n.console_url) : '<span class="hint">= 控制台地址</span>'}</td>
+        <td>${n.has_token ? '<span class="tag ok">已配置</span>' : '<span class="tag">未配置 · 只读观测</span>'}</td>
+        <td>${live[n.name] ? nodeBadge(live[n.name]) : '<span class="tag">等待轮询</span>'}</td>
+        <td class="ops"><button data-edit="${esc(n.name)}">编辑</button>
+          <button class="danger" data-del="${esc(n.name)}">删除</button></td>
+      </tr>`).join("");
+}
+
+function resetNodeForm() {
+  state.editing = null;
+  for (const id of ["#nf-name", "#nf-url", "#nf-token", "#nf-console"]) $(id).value = "";
+  $("#nf-name").disabled = false;
+  $("#nf-token").placeholder = "装节点时 --token 指定的值";
+  $("#nf-clear-token").checked = false;
+  $("#nf-clear-wrap").hidden = true;
+  $("#nf-cancel").hidden = true;
+  $("#nf-title").textContent = "添加节点";
+  $("#nf-save").textContent = "添加节点";
+}
+
+function editNode(name) {
+  const n = state.nodesCfg.find(x => x.name === name);
+  if (!n) return;
+  state.editing = name;
+  $("#nf-name").value = n.name;
+  $("#nf-name").disabled = true;              // 改名 = 删了重加
+  $("#nf-url").value = n.url;
+  $("#nf-console").value = n.console_url || "";
+  $("#nf-token").value = "";
+  $("#nf-token").placeholder = n.has_token ? "留空 = 保持原令牌" : "留空 = 仍为只读观测";
+  $("#nf-clear-wrap").hidden = !n.has_token;
+  $("#nf-cancel").hidden = false;
+  $("#nf-title").textContent = "编辑节点 " + name;
+  $("#nf-save").textContent = "保存修改";
+  $("#nf-url").focus();
+}
+
+async function saveNode() {
+  const name = $("#nf-name").value.trim(), url = $("#nf-url").value.trim();
+  const token = $("#nf-token").value.trim(), cu = $("#nf-console").value.trim();
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
+    toast("名称应为 1~64 位字母/数字/._-", true); return;
+  }
+  if (!/^https?:\/\/[^\/\s]+/.test(url)) {
+    toast("控制台地址应为 http(s)://<节点地址>:<端口>，如 http://10.0.1.11:8090", true); return;
+  }
+  if (/\s/.test(token)) { toast("令牌不能含空白字符", true); return; }
+  let r;
+  if (state.editing) {
+    const body = {url, console_url: cu};
+    if ($("#nf-clear-token").checked) body.token = "";
+    else if (token) body.token = token;
+    r = await apiWrite("PUT", "/api/nodes/" + encodeURIComponent(state.editing), body);
+    if (r) toast("节点 " + name + " 已更新——下一轮轮询起按新接线访问");
+  } else {
+    if (!token && !confirm("没填节点令牌：该节点只读观测（汇总里看得到，但不参与分配、不被下发）。继续添加？"))
+      return;
+    r = await apiWrite("POST", "/api/nodes", {name, url, token, console_url: cu});
+    if (r) toast("节点 " + name + " 已添加——即时加入轮询，首次轮询成功后参与分配");
+  }
+  if (r) { resetNodeForm(); setTimeout(loadNodes, 800); }
+}
+
+async function deleteNode(name) {
+  if (!confirm(`删除节点 ${name}？\n总控将停止轮询与下发；该节点的实例配额保持现状（不回收、不清零），需要释放请到该节点上处理。`))
+    return;
+  const r = await apiWrite("DELETE", "/api/nodes/" + encodeURIComponent(name));
+  if (r) {
+    if (state.editing === name) resetNodeForm();
+    toast("节点 " + name + " 已删除");
+    setTimeout(loadNodes, 800);
+  }
 }
 
 // ---- overview / 日志 / SSE ----
@@ -529,6 +691,7 @@ function switchTab(name) {
   state.tab = name;
   for (const b of $$(".tabs button")) b.setAttribute("aria-selected", String(b.dataset.tab === name));
   for (const p of $$(".tabpage")) p.classList.toggle("on", p.id === "page-" + name);
+  if (name === "nodes") loadNodes();
   redrawAll();
 }
 for (const b of $$(".tabs button")) b.onclick = () => switchTab(b.dataset.tab);
@@ -557,6 +720,14 @@ $("#total-clear").onclick = async () => {
     setTimeout(loadOverview, 1500);
   }
 };
+$("#nf-save").onclick = saveNode;
+$("#nf-cancel").onclick = resetNodeForm;
+$("#nl-table").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.edit) editNode(b.dataset.edit);
+  else if (b.dataset.del) deleteNode(b.dataset.del);
+});
 $("#log-level").onchange = (e) => {
   state.logLevel = e.target.value;
   const min = LEVELS[state.logLevel] || 0;
@@ -571,6 +742,7 @@ $("#log-level").onchange = (e) => {
     for (const snap of h.snapshots || []) applySnapshot(snap, false);
   } catch (e) {}
   await loadOverview();
+  await loadNodes();
   redrawAll();
   await loadLogs();
   connectSSE();

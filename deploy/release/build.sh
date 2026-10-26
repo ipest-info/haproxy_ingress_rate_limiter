@@ -4,7 +4,7 @@
 #
 # 用法：
 #   deploy/release/build.sh              # 版本取 pyproject.toml
-#   VERSION=0.5.0 deploy/release/build.sh
+#   VERSION=0.6.0 deploy/release/build.sh
 #
 # 产物（dist/ 下）：
 #   rl-limiter-v<版本>-linux-<架构>.tar.gz          发布包
@@ -12,7 +12,7 @@
 #
 # 包内布局（解开即装，见 install.sh）：
 #   bin/rl-limiter  bin/rl-fleet        单文件二进制（无需目标机装 Python）
-#   config/*.yaml / rl-limiter.env.example  配置模板
+#   config/*.yaml / *.env.example       配置模板（节点 + 总控）
 #   install.sh                          安装脚本
 #
 # **glibc 兼容性**：PyInstaller 产物要求目标机 glibc ≥ 构建机 glibc。
@@ -61,6 +61,7 @@ esac
 # 配置模板 + 安装脚本随包。
 cp "$ROOT/deploy/config/limiter.example.yaml" \
    "$ROOT/deploy/config/fleet.example.yaml" \
+   "$ROOT/deploy/config/rl-fleet.env.example" \
    "$ROOT/deploy/bare/rl-limiter.env.example" "$WORK/config/"
 cp "$ROOT/deploy/release/install.sh" "$WORK/"
 chmod +x "$WORK/install.sh"

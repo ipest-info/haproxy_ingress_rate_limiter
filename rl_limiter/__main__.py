@@ -77,6 +77,13 @@ ENV_NIC = "RL_NIC"
 # 仍会被解析但只告警不执行）。
 ENV_TC_IN_IFACE = "RL_TC_IN_IFACE"
 DEFAULT_TC_IN_IFACE = "eth0"
+
+# 后端服务侧网卡（双网卡形态里面向后端服务器的那张，出厂 eth1）。它与
+# 客户端侧执行网卡**相斥**：同一张卡既当客户侧又当后端侧，入向限速就
+# 会卡住后端回程流量——启动直接失败。另外设备监控默认排序里它排第二
+# （客户侧锚点在前）。不设 = 不做相斥校验（老部署的 env 没有这一项，
+# 行为不变）；install.sh 装节点时按 --backend-nic（默认 eth1）写入。
+ENV_BACKEND_IFACE = "RL_BACKEND_IFACE"
 # 入向限速的执行机制：
 #   ifb（默认）  重定向到 IFB 虚拟网卡 + HTB **排队整形**——平稳慢放，
 #                与出向同款机制（内核需 ifb/act_mirred/sch_htb，均为
@@ -98,6 +105,23 @@ ENV_METRICS_LOG_DAYS = "RL_METRICS_LOG_DAYS"
 # 不设 = 写接口整体 403（只读部分照常）。改限速影响生产流量，绝不允许
 # "没配令牌就人人可改"。
 ENV_API_TOKEN = "RL_API_TOKEN"
+
+
+def _nic_role_conflict(client_iface: str, backend_iface: str) -> str:
+    """客户侧/后端侧网卡相斥校验：冲突返回面向运维的说明，否则空串。
+
+    client_iface 是入向执行网卡的生效值（"-" = 入向限速已关闭，此时
+    没有"客户侧执行网卡"可冲突）；backend_iface 为空 = 未登记后端侧。
+    """
+    if not backend_iface or client_iface in ("", "-"):
+        return ""
+    if client_iface != backend_iface:
+        return ""
+    return (f"客户端侧网卡（{ENV_TC_IN_IFACE}）与后端服务侧网卡"
+            f"（{ENV_BACKEND_IFACE}）都是 {client_iface}——两者必须是"
+            f"不同的网卡：入向限速作用在客户侧网卡上，同一张卡会把后端"
+            f"回程流量一起卡住。请改正 rl-limiter.env 里其中一项"
+            f"（出厂约定 eth0 客户侧 / eth1 后端侧）。")
 
 
 def _summarize_frontends(frontends: list[model.FrontendConfig]) -> str:
@@ -122,6 +146,7 @@ async def _amain(cfg, log: logging.Logger,
                  shaper: "tcmod.TcShaper | None" = None,
                  ingress: "tcinmod.TcIngress | None" = None,
                  nic: str = "",
+                 backend_iface: str = "",
                  mlog: "metricslog.MetricsLog | None" = None,
                  api_token: str = "") -> None:
     """事件循环内的主体：组装组件、引导配置、并发运行监控循环与配置源。
@@ -438,6 +463,9 @@ async def _amain(cfg, log: logging.Logger,
             {"label": "入向限速网卡 RL_TC_IN_IFACE",
              "value": (getattr(ingress, "iface", "")
                        or "-（入向限速未接线）")},
+            {"label": "后端服务侧网卡 RL_BACKEND_IFACE",
+             "value": (backend_iface + "（与客户侧网卡相斥，启动已校验）"
+                       if backend_iface else "未登记（不做相斥校验）")},
             {"label": "入向执行模式 RL_TC_IN_MODE",
              "value": (("ifb（IFB+HTB 平稳整形，设备 "
                         + getattr(ingress, "ifb", "?") + "）")
@@ -634,7 +662,9 @@ def main() -> None:
                "文件（instance_quota_mbps / ports / request_limits / "
                "dynamic_ingress），运行期轮询，内容变化即热生效。"
                "默认形态为双网卡闭环：入向执行网卡 RL_TC_IN_IFACE 默认 "
-               "eth0（客户端侧），出向整形 RL_TC_IFACE 默认关闭（-），"
+               "eth0（客户端侧），后端服务侧网卡 RL_BACKEND_IFACE（与"
+               "客户侧相斥，相同则启动失败），出向整形 RL_TC_IFACE 默认"
+               "关闭（-），"
                "设 RL_TC_IFACE=<网卡> 可改回出向 HTB 直接整形。"
                "Web 控制台：设置 RL_CONSOLE_PORT 启用，RL_CONSOLE_BIND 指定"
                "监听地址（默认 0.0.0.0——读接口无鉴权，用防火墙限制来源）；"
@@ -757,6 +787,19 @@ def main() -> None:
     ingress = None
     raw_in_iface = (os.environ.get(ENV_TC_IN_IFACE) or "").strip()
     in_iface_defaulted = not raw_in_iface
+    # 后端服务侧网卡：先于入向接线做相斥校验（比的是入向执行网卡的
+    # 生效值，含默认 eth0）。后端侧网卡本机不存在只告警——它不承担
+    # 执行，只是接线登记与监控排序。
+    backend_iface = (os.environ.get(ENV_BACKEND_IFACE) or "").strip()
+    conflict = _nic_role_conflict(raw_in_iface or DEFAULT_TC_IN_IFACE,
+                                  backend_iface)
+    if conflict:
+        print(f"rl-limiter: {conflict}", file=sys.stderr)
+        raise SystemExit(1)
+    if backend_iface and not os.path.exists(
+            os.path.join(netdev.SYS_CLASS_NET, backend_iface)):
+        log.warning("后端服务侧网卡 %s 在本机不存在（%s），请核对接线",
+                    backend_iface, ENV_BACKEND_IFACE)
     if in_iface_defaulted:
         raw_in_iface = DEFAULT_TC_IN_IFACE
         import subprocess
@@ -861,7 +904,8 @@ def main() -> None:
     # 实例视图按**设备**监控哪些网卡（带宽/包/丢包，页面每设备一块
     # 视图）。"-" = 显式禁用；逗号分隔多张（显式顺序保留，首卡是老的
     # 单卡字段镜像的"锚点"）。默认：本机全部**物理**网卡（双网卡机器
-    # eth0/eth1 都在列，锚点 = 执行网卡排最前）；容器等探测不到物理
+    # eth0/eth1 都在列，锚点 = 执行网卡排最前，登记了后端侧网卡则它
+    # 排第二）；容器等探测不到物理
     # 网卡时回退老逻辑——跟随出向整形网卡，出向关闭（默认闭环形态）
     # 时跟随入向执行网卡（闭环的调节对象就是那张卡）。
     raw_nic = (os.environ.get(ENV_NIC) or "").strip()
@@ -879,8 +923,8 @@ def main() -> None:
     else:
         phys = netdev.list_physical_ifaces()
         if phys:
-            ordered = (([anchor] if anchor in phys else [])
-                       + [n for n in phys if n != anchor])
+            head = [n for n in (anchor, backend_iface) if n and n in phys]
+            ordered = head + [n for n in phys if n not in head]
             nic = ",".join(ordered)
         else:
             nic = anchor or netdev.resolve_iface("", log)
@@ -911,6 +955,7 @@ def main() -> None:
                            console_port=console_port, logbuf=logbuf,
                            console_bind=console_bind,
                            shaper=shaper, ingress=ingress, nic=nic,
+                           backend_iface=backend_iface,
                            mlog=mlog, api_token=api_token))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass

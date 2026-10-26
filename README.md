@@ -42,8 +42,16 @@ open http://127.0.0.1:8090        # node1 控制台（令牌 demo-token）
 make demo-down
 ```
 
-**生产**：二进制一键安装（docs/11），或裸机
-`deploy/bare/rl-limiter.sh install`，或容器 host 网络
+**生产**：二进制一键安装（[docs/11](docs/11-发布与安装.md)）——节点
+必须双网卡，客户侧/后端侧网卡相斥：
+
+```bash
+curl -fL -o install.sh https://github.com/ipest-info/haproxy_ingress_rate_limiter/releases/latest/download/install.sh
+sudo bash install.sh --download --token <节点令牌> --client-nic eth0 --backend-nic eth1   # 节点
+sudo bash install.sh --download --fleet --token <总控令牌>                               # 总控（页面里添加节点）
+```
+
+或裸机 `deploy/bare/rl-limiter.sh install`，或容器 host 网络
 `docker compose -f docker-compose-host.yml up -d --build`。见
 [docs/04 部署指南](docs/04-部署指南.md)。
 
@@ -60,8 +68,8 @@ make demo-down
 | [07 API 参考](docs/07-API参考.md) | 读/写 HTTP API：字段口径、鉴权、错误码、curl 示例 |
 | [08 内核参数调优](docs/08-内核参数调优.md) | tune-kernel.sh：参数表、容器里哪些改不动、怎么验证生效 |
 | [09 排障指南](docs/09-排障指南.md) | 按症状查：启动失败、限速没生效、振荡、高并发 |
-| [10 总控制台](docs/10-总控制台.md) | **多机总量控制**：rl-fleet 汇总数十台节点并把总流出带宽按需分配为各节点的出向目标 |
-| [11 发布与安装](docs/11-发布与安装.md) | 二进制发布包：tag/Release 命名规则、CI 构建、install.sh 一键安装 |
+| [10 总控制台](docs/10-总控制台.md) | **多机总量控制**：rl-fleet 汇总数十台节点并把总流出带宽按需分配为各节点的出向目标；页面「节点管理」增删节点 |
+| [11 发布与安装](docs/11-发布与安装.md) | 二进制发布包：tag/Release 命名规则、CI 构建、install.sh 一键安装（令牌/网卡选项、双网卡检查） |
 
 ## 系统组成
 

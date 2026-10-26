@@ -3,8 +3,8 @@
 # 结构照抄节点侧 webconsole（同一套纪律，便于两边对照维护）：
 #   - FleetHub ≙ StatusHub：轮询环每拍喂一帧 fleet 快照 → 留存历史 +
 #     广播给 SSE 订阅者；overview/history 是 REST 拉取口径；
-#   - build_fleet_app ≙ build_app：静态页 + 只读 API + 写 API（总带宽，
-#     令牌鉴权，回写 fleet YAML 热生效）；
+#   - build_fleet_app ≙ build_app：静态页 + 只读 API + 写 API（总带宽、
+#     节点清单的添加/编辑/删除；令牌鉴权，回写 fleet YAML 热生效）；
 #   - run_fleet_console ≙ run_console：出厂默认绑 0.0.0.0（fleetmain 的
 #     DEFAULT_CONSOLE_BIND），绑非回环打 WARN 提醒防火墙限源。
 #
@@ -85,11 +85,14 @@ class FleetHub:
 
     def __init__(self, service_version: str,
                  total_fn: Callable[[], float],
-                 params_fn: Callable[[], dict]):
+                 params_fn: Callable[[], dict],
+                 nodes_fn: "Callable[[], list] | None" = None):
         self._service_version = service_version
-        # 当前总带宽与分配参数的延迟求值闭包（配置热更后自动跟上）。
+        # 当前总带宽、分配参数与节点清单的延迟求值闭包（配置热更后自动
+        # 跟上）。
         self._total_fn = total_fn
         self._params_fn = params_fn
+        self._nodes_fn = nodes_fn or (lambda: [])
         self._history: collections.deque = collections.deque(
             maxlen=HISTORY_TICKS)
         self._subs: set = set()
@@ -136,6 +139,14 @@ class FleetHub:
     def history(self) -> list:
         return list(self._history)
 
+    def nodes(self) -> list:
+        """节点清单的只读视图（页面「节点管理」）。令牌**只给有无**，
+        绝不给值——与快照同一条安全边界。"""
+        return [{"name": n.name, "url": n.url,
+                 "console_url": n.console_url,
+                 "has_token": bool(n.token)}
+                for n in self._nodes_fn()]
+
 
 def build_fleet_app(
     hub: FleetHub,
@@ -145,8 +156,8 @@ def build_fleet_app(
     api_token: str = "",
     poke: "asyncio.Event | None" = None,
 ) -> web.Application:
-    """组装总控的 aiohttp 应用。写 API 只有一个：总带宽（回写 fleet
-    YAML，total_egress_mbps 是配置里唯一开放给写 API 的字段）。"""
+    """组装总控的 aiohttp 应用。写 API 两组：总带宽、节点清单（都回写
+    fleet YAML，配置里只有 total_egress_mbps 与 nodes 开放给写 API）。"""
 
     index_html = (_STATIC_DIR / "fleet.html").read_bytes()
 
@@ -159,6 +170,9 @@ def build_fleet_app(
 
     async def handle_history(_request: web.Request) -> web.Response:
         return web.json_response({"snapshots": hub.history()})
+
+    async def handle_nodes(_request: web.Request) -> web.Response:
+        return web.json_response({"nodes": hub.nodes()})
 
     async def handle_logs(request: web.Request) -> web.Response:
         try:
@@ -198,7 +212,8 @@ def build_fleet_app(
         if not api_token:
             return web.json_response(
                 {"error": "未配置 RL_API_TOKEN，写接口已禁用——在 rl-fleet"
-                          " 的环境变量里设置令牌后重启即可启用"},
+                          " 的环境变量（rl-fleet.env）里设置令牌后重启即可"
+                          "启用"},
                 status=403)
         got = ""
         auth = request.headers.get("Authorization", "")
@@ -256,15 +271,97 @@ def build_fleet_app(
                     "各节点保持当前配额）yaml=%s", yaml_path)
         return web.json_response({"ok": True, "total_egress_mbps": 0})
 
+    # ---- 节点清单（后台手动添加/编辑/删除节点） ----
+
+    async def _node_write(fn, *args) -> "web.Response | None":
+        """回写节点清单的公共尾巴：串行化写、错误码映射、触发热更。"""
+        async with write_lock:
+            try:
+                await asyncio.to_thread(fn, yaml_path, *args)
+            except fleetconfig.NodeExistsError as e:
+                return web.json_response({"error": str(e)}, status=409)
+            except fleetconfig.NodeNotFoundError as e:
+                return web.json_response({"error": str(e)}, status=404)
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
+        if poke is not None:
+            poke.set()
+        return None
+
+    async def _json_body(request: web.Request) -> "dict | None":
+        try:
+            body = await request.json()
+        except Exception:
+            return None
+        return body if isinstance(body, dict) else None
+
+    async def handle_add_node(request: web.Request) -> web.Response:
+        denied = _authorized(request)
+        if denied is not None:
+            return denied
+        body = await _json_body(request)
+        if body is None or not isinstance(body.get("name"), str):
+            return web.json_response(
+                {"error": "请求体必须是 JSON：{\"name\": ..., \"url\": "
+                          "\"http://<节点>:8090\", \"token\": ..., "
+                          "\"console_url\": ...}"}, status=400)
+        name = body["name"].strip()
+        fields = {k: body[k] for k in fleetconfig.NODE_FIELDS if k in body}
+        err = await _node_write(fleetconfig.add_node, name, fields)
+        if err is not None:
+            return err
+        log.warning("写 API 已添加节点并回写 YAML（即时加入轮询）"
+                    " node=%s url=%s 令牌=%s yaml=%s", name,
+                    str(fields.get("url", "")).strip(),
+                    "有" if str(fields.get("token") or "").strip()
+                    else "无（只读观测）", yaml_path)
+        return web.json_response({"ok": True, "name": name})
+
+    async def handle_update_node(request: web.Request) -> web.Response:
+        denied = _authorized(request)
+        if denied is not None:
+            return denied
+        name = request.match_info["name"]
+        body = await _json_body(request)
+        fields = ({k: body[k] for k in fleetconfig.NODE_FIELDS if k in body}
+                  if body is not None else None)
+        if not fields:
+            return web.json_response(
+                {"error": "请求体必须是 JSON，且至少含 url / token / "
+                          "console_url 之一（token 给空串 = 清除令牌）"},
+                status=400)
+        err = await _node_write(fleetconfig.update_node, name, fields)
+        if err is not None:
+            return err
+        log.warning("写 API 已修改节点接线并回写 YAML node=%s 改了=%s "
+                    "yaml=%s", name, ",".join(sorted(fields)), yaml_path)
+        return web.json_response({"ok": True, "name": name})
+
+    async def handle_delete_node(request: web.Request) -> web.Response:
+        denied = _authorized(request)
+        if denied is not None:
+            return denied
+        name = request.match_info["name"]
+        err = await _node_write(fleetconfig.remove_node, name)
+        if err is not None:
+            return err
+        log.warning("写 API 已删除节点并回写 YAML（停止轮询与下发，其实例"
+                    "配额保持现状） node=%s yaml=%s", name, yaml_path)
+        return web.json_response({"ok": True, "name": name})
+
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/overview", handle_overview)
     app.router.add_get("/api/history", handle_history)
+    app.router.add_get("/api/nodes", handle_nodes)
     app.router.add_get("/api/logs", handle_logs)
     app.router.add_get("/api/stream", handle_stream)
     if yaml_path:
         app.router.add_put("/api/total-quota", handle_put_total)
         app.router.add_delete("/api/total-quota", handle_delete_total)
+        app.router.add_post("/api/nodes", handle_add_node)
+        app.router.add_put("/api/nodes/{name}", handle_update_node)
+        app.router.add_delete("/api/nodes/{name}", handle_delete_node)
     return app
 
 
