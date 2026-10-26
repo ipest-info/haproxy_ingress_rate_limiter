@@ -6,7 +6,8 @@
 #        tar xzf rl-limiter-v0.4.0-linux-x86_64.tar.gz
 #        cd rl-limiter-v0.4.0-linux-x86_64 && sudo ./install.sh
 #   2. 直接从 GitHub Release 下载并安装（需要能访问 github.com）：
-#        sudo ./install.sh --download v0.4.0
+#        sudo ./install.sh --download            # 默认装最新 Release
+#        sudo ./install.sh --download v0.5.0     # 或指定版本
 #      （校验 .sha256 后解包安装；版本号 = release 的 tag）
 #
 # 装什么：
@@ -33,10 +34,15 @@ die()   { echo "install.sh: 错误：$*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --fleet) WITH_FLEET=1 ;;
-        --download) shift; DOWNLOAD_TAG=${1:-} ;
-            [ -n "$DOWNLOAD_TAG" ] || die "--download 需要 tag（如 v0.4.0）" ;;
+        --download)
+            # 带 tag = 装指定版本；不带（或 latest）= 装最新 Release。
+            if [ -n "${2:-}" ] && [ "${2#-}" = "$2" ]; then
+                shift; DOWNLOAD_TAG=$1
+            else
+                DOWNLOAD_TAG=latest
+            fi ;;
         -h|--help) usage ;;
-        *) die "不认识的参数 $1（--fleet / --download <tag> / --help）" ;;
+        *) die "不认识的参数 $1（--fleet / --download [tag] / --help）" ;;
     esac
     shift
 done
@@ -45,6 +51,15 @@ done
 
 # ---- 模式 2：先下载发布包，再对解出来的包目录递归调用自己 -------------
 if [ -n "$DOWNLOAD_TAG" ]; then
+    if [ "$DOWNLOAD_TAG" = "latest" ]; then
+        # 解析最新 Release 的 tag（GitHub API，匿名访问即可）。
+        DOWNLOAD_TAG=$(curl -fsSL --retry 3 \
+            "https://api.github.com/repos/$REPO/releases/latest" \
+            | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
+        [ -n "$DOWNLOAD_TAG" ] \
+            || die "查询最新版本失败（GitHub API 不可达？）——可显式指定：--download v0.5.0"
+        log "最新版本：$DOWNLOAD_TAG"
+    fi
     ARCH=$(uname -m)
     NAME="rl-limiter-${DOWNLOAD_TAG}-linux-${ARCH}"
     URL="https://github.com/$REPO/releases/download/$DOWNLOAD_TAG/$NAME.tar.gz"
