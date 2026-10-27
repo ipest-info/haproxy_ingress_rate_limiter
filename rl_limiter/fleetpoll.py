@@ -42,6 +42,9 @@ class NodePoller:
         self._offline_after = offline_after
         self._states: "dict[str, NodeState]" = {}
         self._session: "aiohttp.ClientSession | None" = None
+        # 下发成功的回调 on_write(节点, 下发前自报配额, 新值 | None=解除)
+        # ——总控落盘用它记"谁的限速什么时候从多少改成多少"。
+        self.on_write = None
 
     # ---- 节点清单（配置热更的落点） ----
 
@@ -181,6 +184,7 @@ class NodePoller:
         await asyncio.gather(*(self._put_one(s, v) for s, v in writes))
 
     async def _put_one(self, s: NodeState, mbps: "float | None") -> None:
+        before = s.quota_mbps
         try:
             session = await self._ensure_session()
             if mbps is None:
@@ -206,6 +210,12 @@ class NodePoller:
                 s.release_pending = False
                 self._log.warning("已解除节点的实例总限速（恢复不限） "
                                   "node=%s", s.name)
+            if self.on_write is not None:
+                try:
+                    self.on_write(s, before, mbps)
+                except Exception as e:        # 记账失败不影响下发结果
+                    self._log.warning("下发记录回调失败 node=%s err=%s",
+                                      s.name, e)
         except asyncio.CancelledError:
             raise
         except Exception as e:

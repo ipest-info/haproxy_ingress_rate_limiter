@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import datetime as _dt
 import hmac
 import json
 import logging
@@ -24,7 +25,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from . import fleetconfig
+from . import fleetconfig, fleetmetrics
 from .webconsole import HISTORY_TICKS, LOGS_PAGE_LIMIT, LogBuffer  # noqa: F401
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -150,6 +151,22 @@ class FleetHub:
                 for n in self._nodes_fn()]
 
 
+def _parse_time(v: "str | None", default: float) -> float:
+    """反查参数里的时间：unix 秒，或 ISO 8601（不带时区按总控本机时区）。"""
+    if v is None or not v.strip():
+        return default
+    v = v.strip()
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    try:
+        return _dt.datetime.fromisoformat(v).timestamp()
+    except ValueError:
+        raise ValueError(f"时间 {v!r} 既不是 unix 秒也不是 ISO 8601"
+                         f"（如 2026-10-27T08:00:00+08:00）") from None
+
+
 def build_fleet_app(
     hub: FleetHub,
     logbuf: LogBuffer,
@@ -157,6 +174,7 @@ def build_fleet_app(
     yaml_path: str = "",
     api_token: str = "",
     poke: "asyncio.Event | None" = None,
+    metrics_path: str = "",
 ) -> web.Application:
     """组装总控的 aiohttp 应用。写 API 两组：总带宽、节点清单（都回写
     fleet YAML，配置里只有 total_egress_mbps 与 nodes 开放给写 API）。"""
@@ -175,6 +193,45 @@ def build_fleet_app(
 
     async def handle_nodes(_request: web.Request) -> web.Response:
         return web.json_response({"nodes": hub.nodes()})
+
+    async def handle_metrics_log(request: web.Request) -> web.Response:
+        """反查落盘数据：?from=&to=（unix 秒或 ISO 8601，缺省最近 1
+        小时）&kind=fleet,node,event&node=<名称>&limit=&format=jsonl。"""
+        if not metrics_path:
+            return web.json_response(
+                {"error": "总控未启用监控落盘——在 rl-fleet.env 里设 "
+                          "RL_METRICS_LOG=<文件路径> 后重启即可"},
+                status=404)
+        q = request.query
+        now = time.time()
+        try:
+            end = _parse_time(q.get("to"), now)
+            start = _parse_time(q.get("from"), end - 3600)
+            kinds = [k for k in (q.get("kind") or "").split(",") if k]
+            bad = [k for k in kinds if k not in fleetmetrics.KINDS]
+            if bad:
+                raise ValueError(f"kind 只能是 {','.join(fleetmetrics.KINDS)}"
+                                 f" 的组合，当前 {','.join(bad)}")
+            limit = int(q.get("limit") or fleetmetrics.QUERY_LIMIT_DEFAULT)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        if start >= end:
+            return web.json_response(
+                {"error": "from 必须早于 to"}, status=400)
+        res = await asyncio.to_thread(
+            fleetmetrics.query, metrics_path, start, end, kinds,
+            (q.get("node") or "").strip(), limit)
+        if q.get("format") == "jsonl":
+            body = "".join(json.dumps(r, ensure_ascii=False) + "\n"
+                           for r in res["rows"])
+            return web.Response(
+                text=body, content_type="application/x-ndjson",
+                charset="utf-8", headers={
+                    "Content-Disposition":
+                        f'attachment; filename="fleet-metrics-'
+                        f'{int(start)}-{int(end)}.jsonl"'})
+        res.update(start=start, end=end)
+        return web.json_response(res)
 
     async def handle_logs(request: web.Request) -> web.Response:
         try:
@@ -357,6 +414,7 @@ def build_fleet_app(
     app.router.add_get("/api/overview", handle_overview)
     app.router.add_get("/api/history", handle_history)
     app.router.add_get("/api/nodes", handle_nodes)
+    app.router.add_get("/api/metrics-log", handle_metrics_log)
     app.router.add_get("/api/logs", handle_logs)
     app.router.add_get("/api/stream", handle_stream)
     if yaml_path:
@@ -377,11 +435,13 @@ async def run_fleet_console(
     yaml_path: str = "",
     api_token: str = "",
     poke: "asyncio.Event | None" = None,
+    metrics_path: str = "",
 ) -> None:
     """常驻任务：启动总控 HTTP 服务并挂起到被取消（同 run_console）。"""
     runner = web.AppRunner(
         build_fleet_app(hub, logbuf, log, yaml_path=yaml_path,
-                        api_token=api_token, poke=poke),
+                        api_token=api_token, poke=poke,
+                        metrics_path=metrics_path),
         access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, bind, port)

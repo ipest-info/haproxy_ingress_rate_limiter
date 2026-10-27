@@ -364,6 +364,13 @@ if [ "$WITH_FLEET" = 1 ]; then
         env_set "$CONF_DIR/rl-fleet.env" RL_API_TOKEN "$TOKEN"
         log "总控写 API 令牌已写入 rl-fleet.env"
     fi
+    # 老版本生成的 rl-fleet.env 没有监控落盘这一项（连注释都没有）：补上
+    # 默认值——升级后「历史回查」才有数据。注释掉过的说明是有意关的，不动。
+    if ! grep -q "RL_METRICS_LOG=" "$CONF_DIR/rl-fleet.env"; then
+        printf '\n# 监控落盘（总带宽/限速分钟数据 + 变更事件，页面「历史回查」读它）\n%s\n' \
+            "RL_METRICS_LOG=/var/log/rl-limiter/fleet-metrics.jsonl" >>"$CONF_DIR/rl-fleet.env"
+        log "rl-fleet.env 补上监控落盘 RL_METRICS_LOG（升级自老版本）"
+    fi
     FLEET_TOKEN=$(env_get "$CONF_DIR/rl-fleet.env" RL_API_TOKEN)
     FLEET_PORT=$(env_get "$CONF_DIR/rl-fleet.env" RL_CONSOLE_PORT)
 

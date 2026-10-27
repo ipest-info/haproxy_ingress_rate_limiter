@@ -17,7 +17,7 @@ import os
 import sys
 import time
 
-from . import fleetconfig, fleetgov, fleetpoll, fleetweb
+from . import fleetconfig, fleetgov, fleetmetrics, fleetpoll, fleetweb
 
 try:
     from importlib import metadata as _metadata
@@ -36,11 +36,26 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
                  console_port: int = 0,
                  logbuf: "fleetweb.LogBuffer | None" = None,
                  console_bind: str = DEFAULT_CONSOLE_BIND,
-                 api_token: str = "") -> None:
+                 api_token: str = "",
+                 mlog: "fleetmetrics.FleetMetricsLog | None" = None) -> None:
     poller = fleetpoll.NodePoller(log, timeout_s=cfg.node_timeout_s,
                                   offline_after=cfg.offline_after)
     poller.set_nodes(cfg.nodes)
     gov = fleetgov.FleetGovernor(log)
+
+    # 监控落盘（可选）：限速变更当场记事件，分钟数据由轮询环喂。
+    if mlog is not None:
+        def _on_write(s, before, mbps):
+            if mbps is None:
+                mlog.event("release", node=s.name, from_mbps=before,
+                           to_mbps=0.0)
+            else:
+                mlog.event("quota", node=s.name, from_mbps=before,
+                           to_mbps=mbps)
+        poller.on_write = _on_write
+        mlog.event("start", version=SERVICE_VERSION,
+                   total_mbps=cfg.total_egress_mbps,
+                   nodes=[n.name for n in cfg.nodes])
 
     # 热更字段的当前视图（watch 回调整体替换；周期类字段启动定型，
     # 轮询/分配环直接用启动时的值）。
@@ -53,6 +68,8 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
         old = cur["cfg"]
         cur["cfg"] = newcfg
         poller.set_nodes(newcfg.nodes)
+        if mlog is not None:
+            _record_config_events(mlog, old, newcfg)
         if newcfg.total_egress_mbps != old.total_egress_mbps:
             log.info("总流出带宽已变更，立即重新分配%s total=%g→%gMbps",
                      "（取消总量控制：解除各节点实例总限速）"
@@ -75,14 +92,18 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
             nodes_fn=lambda: cur["cfg"].nodes)
 
     async def poll_loop() -> None:
-        """观测环：轮询全部节点 + 给控制台喂帧。"""
+        """观测环：轮询全部节点 + 给控制台/落盘喂帧。"""
         while True:
             try:
                 await poller.poll_once()
-                if hub is not None:
-                    hub.record(fleetweb.fleet_snapshot(
+                if hub is not None or mlog is not None:
+                    snap = fleetweb.fleet_snapshot(
                         time.time(), poller.states(),
-                        cur["cfg"].total_egress_mbps))
+                        cur["cfg"].total_egress_mbps)
+                    if hub is not None:
+                        hub.record(snap)
+                    if mlog is not None:
+                        mlog.record(snap)
             except asyncio.CancelledError:
                 raise
             except Exception as e:          # 常驻任务不能因单次异常退出
@@ -120,7 +141,8 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
             fleetweb.run_fleet_console(
                 console_port, hub, logbuf or fleetweb.LogBuffer(), log,
                 bind=console_bind, yaml_path=yaml_path,
-                api_token=api_token, poke=cfg_poke),
+                api_token=api_token, poke=cfg_poke,
+                metrics_path=mlog.path if mlog is not None else ""),
             name="fleet-console"))
 
     log.info("rl-fleet 总控已启动，开始轮询与分配 nodes=%d total=%gMbps "
@@ -139,6 +161,36 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await poller.close()
+        if mlog is not None:
+            mlog.close()
+
+
+def _record_config_events(mlog: "fleetmetrics.FleetMetricsLog",
+                          old: "fleetconfig.FleetConfig",
+                          new: "fleetconfig.FleetConfig") -> None:
+    """配置热更（页面/API/改 YAML 都走这里）落事件：总带宽、节点清单。
+
+    节点改了哪些字段只记字段名——令牌的值绝不落盘。
+    """
+    if new.total_egress_mbps != old.total_egress_mbps:
+        mlog.event("total", from_mbps=old.total_egress_mbps,
+                   to_mbps=new.total_egress_mbps)
+    before = {n.name: n for n in old.nodes}
+    after = {n.name: n for n in new.nodes}
+    changed = []
+    for name in sorted(set(before) & set(after)):
+        a, b = before[name], after[name]
+        fields = [k for k in ("url", "console_url", "token")
+                  if getattr(a, k) != getattr(b, k)]
+        if fields:
+            changed.append({"name": name, "fields": fields})
+    added = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    if added or removed or changed:
+        mlog.event("nodes", added=[{"name": n, "url": after[n].url,
+                                    "has_token": bool(after[n].token)}
+                                   for n in added],
+                   removed=removed, changed=changed)
 
 
 def main() -> None:
@@ -189,6 +241,7 @@ def main() -> None:
     console_bind = (os.environ.get("RL_CONSOLE_BIND") or "").strip() \
         or DEFAULT_CONSOLE_BIND
     api_token = (os.environ.get("RL_API_TOKEN") or "").strip()
+    mlog = _open_metrics_log(log)
     if console_port and not api_token:
         log.warning("未配置 RL_API_TOKEN：总控页面只读（看得到汇总，"
                     "改不了总带宽、加不了节点）。需要写能力请设置令牌后"
@@ -217,9 +270,46 @@ def main() -> None:
     try:
         asyncio.run(_amain(cfg, log, args.config,
                            console_port=console_port, logbuf=logbuf,
-                           console_bind=console_bind, api_token=api_token))
+                           console_bind=console_bind, api_token=api_token,
+                           mlog=mlog))
     except KeyboardInterrupt:
         log.info("收到中断信号，rl-fleet 退出")
+
+
+def _open_metrics_log(log: logging.Logger
+                      ) -> "fleetmetrics.FleetMetricsLog | None":
+    """监控落盘：设 RL_METRICS_LOG=<文件路径> 即启用（与节点侧同名同义；
+    同机两者都开时用不同文件名）。显式配了却打不开 → 启动失败，不静默
+    丢数据。"""
+    raw = (os.environ.get("RL_METRICS_LOG") or "").strip()
+    if not raw:
+        log.info("监控落盘未启用（RL_METRICS_LOG 未设）：总带宽/限速只在"
+                 "内存里留约 10 分钟，没法事后反查")
+        return None
+    raw_days = (os.environ.get("RL_METRICS_LOG_DAYS") or "").strip()
+    try:
+        days = (int(raw_days) if raw_days
+                else fleetmetrics.DEFAULT_RETENTION_DAYS)
+    except ValueError:
+        print(f"rl-fleet: RL_METRICS_LOG_DAYS 必须是整数，当前值 "
+              f"{raw_days!r}", file=sys.stderr)
+        raise SystemExit(1)
+    if days < 1:
+        print(f"rl-fleet: RL_METRICS_LOG_DAYS 必须 ≥ 1，当前值 {days}",
+              file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        mlog = fleetmetrics.FleetMetricsLog(raw, log, retention_days=days)
+    except OSError as e:
+        print(f"rl-fleet: 打不开监控落盘文件 {raw}（{e}）。\n  请确认目录"
+              f"存在且服务用户可写（systemd 部署时 unit 里的 "
+              f"LogsDirectory=rl-limiter 会自动创建 /var/log/rl-limiter）。",
+              file=sys.stderr)
+        raise SystemExit(1)
+    log.info("监控落盘已启用（分钟粒度 JSONL + 限速变更事件，按天轮转，"
+             "页面「历史回查」与 /api/metrics-log 可查） path=%s "
+             "retention_days=%d", raw, days)
+    return mlog
 
 
 if __name__ == "__main__":

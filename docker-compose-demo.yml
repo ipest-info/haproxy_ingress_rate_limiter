@@ -118,6 +118,8 @@ services:
       RL_CONSOLE_PORT: "8095"
       RL_CONSOLE_BIND: 0.0.0.0
       RL_API_TOKEN: demo-token
+      # 监控落盘：页面「历史回查」读它。
+      RL_METRICS_LOG: /var/log/rl-limiter/fleet-metrics.jsonl
     ports:
       - "127.0.0.1:8095:8095"
     depends_on:

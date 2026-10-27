@@ -5,7 +5,8 @@
 <style>
 /* 总控制台：汇总数十台节点的流量并做总量控制。
    视觉与交互骨架照抄节点控制台（index.html）——同一套配色/卡片/图表，
-   运维在两边切换时不用重新学一遍页面。三个 tab：总览 / 节点管理 / 日志。 */
+   运维在两边切换时不用重新学一遍页面。四个 tab：总览 / 节点管理 /
+   历史回查（读监控落盘）/ 日志。 */
 :root {
   --surface-0: #f5f5f4; --surface-1: #ffffff; --surface-2: #f0efed;
   --surface-3: #e8e7e4;
@@ -179,6 +180,23 @@ button.danger { color: var(--critical); }
 .node-table td.ops button { padding: 3px 10px; font-size: 12px; }
 .node-table td.url { font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
 
+/* 历史回查 */
+.hq-bar { display: flex; align-items: flex-end; gap: 10px 14px; flex-wrap: wrap; }
+.hq-bar label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-secondary); }
+.hq-bar input, .hq-bar select { width: auto; }
+.seg { display: inline-flex; }
+.seg button { border-radius: 0; margin-left: -1px; }
+.seg button:first-child { border-radius: 7px 0 0 7px; margin-left: 0; }
+.seg button:last-child { border-radius: 0 7px 7px 0; }
+.seg button.on { background: var(--accent-weak); color: var(--accent); border-color: var(--accent); position: relative; }
+a.btn-link { color: var(--accent); font-size: 12.5px; text-decoration: none; align-self: center; }
+a.btn-link:hover { text-decoration: underline; }
+#hq-chart { height: 220px; }
+.hq-axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+.hq-body > * + * { margin-top: 12px; }
+.ev-time { font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+.node-table td.ev-detail { white-space: normal; min-width: 260px; }
+
 #logs { max-height: 460px; overflow-y: auto;
         font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace; }
 #logs div { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
@@ -222,6 +240,7 @@ button.danger { color: var(--critical); }
 <nav class="tabs"><div class="wrap">
   <button data-tab="overview" aria-selected="true">总览</button>
   <button data-tab="nodes" aria-selected="false">节点管理</button>
+  <button data-tab="history" aria-selected="false">历史回查</button>
   <button data-tab="logs" aria-selected="false">日志</button>
 </div></nav>
 
@@ -308,6 +327,46 @@ button.danger { color: var(--critical); }
     </div>
   </section>
 
+  <section class="tabpage" id="page-history">
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">历史回查</span>
+        <span class="hint">读总控的监控落盘：分钟粒度的总带宽/出入向/各节点配额 + 限速变更事件（重启不丢，默认保留 90 天）</span>
+      </div>
+      <div class="card-body hq-body">
+        <div class="hq-bar">
+          <span class="seg" id="hq-quick">
+            <button data-h="1">最近 1 小时</button><button data-h="6">6 小时</button><button data-h="24">24 小时</button><button data-h="168">7 天</button>
+          </span>
+          <label>从<input type="datetime-local" id="hq-from"></label>
+          <label>到<input type="datetime-local" id="hq-to"></label>
+          <label>对象<select id="hq-node"><option value="">全部节点（汇总）</option></select></label>
+          <button class="primary" id="hq-go">查询</button>
+          <a class="btn-link" id="hq-dl" href="#" download>下载原始数据（JSONL）</a>
+        </div>
+        <div class="hint" id="hq-status">选个时间范围后查询</div>
+        <div class="stats" id="hq-stats"></div>
+        <div class="chart">
+          <div class="chart-h"><span class="chart-t" id="hq-chart-t">总出向 vs 总带宽目标</span>
+            <span class="chart-src">分钟粒度；虚线 = 当时生效的目标/配额</span></div>
+          <canvas id="hq-chart"></canvas>
+          <div class="hq-axis"><span id="hq-axis-l"></span><span id="hq-axis-m"></span><span id="hq-axis-r"></span></div>
+          <div class="legend" id="hq-legend"></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><span class="card-title">限速变更事件</span>
+        <span class="tag" id="hq-ev-count">–</span>
+        <span class="hint">总带宽变更、给节点下发配额、解除限速、节点清单增删改、总控启动</span></div>
+      <div class="card-body" style="overflow-x:auto">
+        <table class="node-table left" id="hq-events"><tbody>
+          <tr><td class="hint">还没有查询</td></tr>
+        </tbody></table>
+      </div>
+    </div>
+  </section>
+
   <section class="tabpage" id="page-logs">
     <div class="card">
       <div class="card-head">
@@ -337,7 +396,8 @@ const fmt1 = (v) => (v == null || !isFinite(v) ? "–" : (+v).toFixed(1));
 const state = { buf: [], charts: [], windowS: 300,
                 logAfter: 0, logLevel: "INFO", tab: "overview",
                 latest: null, totalDirty: false,
-                nodesCfg: [], editing: null };
+                nodesCfg: [], editing: null,
+                hq: {rows: [], t0: 0, t1: 0, node: "", tipX: null, loaded: false} };
 const LEVELS = {DEBUG:10, INFO:20, WARNING:30, ERROR:40, CRITICAL:50};
 const BUF_MAX = 1200;
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name);
@@ -647,6 +707,198 @@ async function deleteNode(name) {
   }
 }
 
+// ---- 历史回查（/api/metrics-log：分钟行 + 事件） ----
+const pad2 = (n) => String(n).padStart(2, "0");
+function toLocalInput(ts) {
+  const d = new Date(ts * 1000);
+  return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+function fmtTime(ts, withSec) {
+  const d = new Date(ts * 1000);
+  return `${pad2(d.getMonth()+1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+    + (withSec ? ":" + pad2(d.getSeconds()) : "");
+}
+const fmtQ = (v) => v == null ? "未知" : (+v ? fmt1(v) + " Mbps" : "不限");
+
+function hqRange(hours) {
+  const now = Math.floor(Date.now() / 1000);
+  $("#hq-from").value = toLocalInput(now - hours * 3600);
+  $("#hq-to").value = toLocalInput(now + 60);
+  for (const b of $$("#hq-quick button")) b.classList.toggle("on", +b.dataset.h === hours);
+}
+
+function hqNodeOptions() {
+  const sel = $("#hq-node"), cur = sel.value;
+  const names = state.nodesCfg.map(n => n.name);
+  if (cur && !names.includes(cur)) names.push(cur);
+  sel.innerHTML = '<option value="">全部节点（汇总）</option>' +
+    names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+  sel.value = cur;
+}
+
+function hqParams(extra) {
+  const from = Math.floor(new Date($("#hq-from").value).getTime() / 1000);
+  const to = Math.floor(new Date($("#hq-to").value).getTime() / 1000);
+  const node = $("#hq-node").value;
+  const p = new URLSearchParams({from, to, kind: node ? "node,event" : "fleet,event"});
+  if (node) p.set("node", node);
+  for (const [k, v] of Object.entries(extra || {})) p.set(k, v);
+  return {p, from, to, node};
+}
+
+async function hqQuery() {
+  const {p, from, to, node} = hqParams();
+  if (!isFinite(from) || !isFinite(to) || from >= to) {
+    toast("时间范围不对：起点要早于终点", true); return;
+  }
+  $("#hq-dl").href = "/api/metrics-log?" + hqParams({format: "jsonl", limit: 50000}).p;
+  $("#hq-status").textContent = "查询中…";
+  let r, j = {};
+  try { r = await fetch("/api/metrics-log?" + p); j = await r.json(); }
+  catch (e) { $("#hq-status").textContent = "查询失败：" + e; return; }
+  if (!r.ok) {
+    $("#hq-status").innerHTML = '<span style="color:var(--critical)">' + esc(j.error || ("HTTP " + r.status)) + "</span>";
+    state.hq = Object.assign(state.hq, {rows: [], t0: from, t1: to, node});
+    hqRender([]); return;
+  }
+  state.hq = Object.assign(state.hq, {rows: j.rows || [], t0: from, t1: to, node, loaded: true});
+  const metric = state.hq.rows.filter(x => x.kind !== "event");
+  const ev = state.hq.rows.filter(x => x.kind === "event");
+  $("#hq-status").innerHTML = `${fmtTime(from)} ~ ${fmtTime(to)}：${metric.length} 个分钟点、${ev.length} 条事件` +
+    (j.truncated ? ' <span style="color:var(--warn)">（数据太多已截断，请缩小时间范围或选单个节点）</span>' : "");
+  hqRender(ev);
+}
+
+function hqSeries() {
+  const node = state.hq.node;
+  const rows = state.hq.rows.filter(x => x.kind === (node ? "node" : "fleet"));
+  return {
+    rows, refKey: node ? "quota_mbps" : "total_mbps",
+    refLabel: node ? "配额" : "总带宽目标",
+    series: [{key: "egress_avg", label: node ? "出向均值" : "总出向均值", color: "--s-out", w: 1.6},
+             {key: "egress_max", label: "峰值", color: "--s-in", w: 1}],
+  };
+}
+
+function hqRender(ev) {
+  const node = state.hq.node, {rows, refKey} = hqSeries();
+  $("#hq-chart-t").textContent = node ? `${node} 出向 vs 配额` : "总出向 vs 总带宽目标";
+  // 区间摘要
+  const eg = rows.map(x => x.egress_avg).filter(v => v != null);
+  const mx = rows.map(x => x.egress_max).filter(v => v != null);
+  const refs = rows.map(x => x[refKey]).filter(v => v != null);
+  const st = [];
+  st.push(["出向峰值", mx.length ? fmt1(Math.max(...mx)) : "–", "Mbps"]);
+  st.push(["出向均值", eg.length ? fmt1(eg.reduce((a, b) => a + b, 0) / eg.length) : "–", "Mbps"]);
+  if (node) {
+    const s = rows.reduce((a, x) => a + (x.samples || 0), 0), o = rows.reduce((a, x) => a + (x.online_samples || 0), 0);
+    st.push(["在线率", s ? Math.round(o / s * 100) + "%" : "–", ""]);
+    st.push(["配额范围", refs.length ? `${fmtQ(Math.min(...refs))} ~ ${fmtQ(Math.max(...refs))}` : "–", ""]);
+  } else {
+    st.push(["超出总带宽的分钟", String(rows.filter(x => x.over_samples > 0).length), "分钟"]);
+    const fmtT = (v) => +v ? fmt1(v) + " Mbps" : "未设";
+    st.push(["目标范围", refs.length ? `${fmtT(Math.min(...refs))} ~ ${fmtT(Math.max(...refs))}` : "–", ""]);
+  }
+  $("#hq-stats").innerHTML = st.map(([l, v, u]) =>
+    `<div><div class="stat-l">${l}</div><div class="stat-v">${esc(v)}${u ? `<small>${u}</small>` : ""}</div></div>`).join("");
+  $("#hq-axis-l").textContent = state.hq.t0 ? fmtTime(state.hq.t0) : "";
+  $("#hq-axis-m").textContent = state.hq.t0 ? fmtTime((state.hq.t0 + state.hq.t1) / 2) : "";
+  $("#hq-axis-r").textContent = state.hq.t1 ? fmtTime(state.hq.t1) : "";
+  drawHist();
+  // 事件表（新的在上，最多 500 条）
+  const tb = $("#hq-events tbody");
+  $("#hq-ev-count").textContent = ev.length + " 条";
+  if (!ev.length) { tb.innerHTML = '<tr><td class="hint">这段时间没有限速变更事件</td></tr>'; return; }
+  const shown = ev.slice(-500).reverse();
+  tb.innerHTML = '<tr><th>时间</th><th>事件</th><th>详情</th></tr>' + shown.map(e => {
+    const [tag, cls, detail] = hqEvent(e);
+    return `<tr><td class="ev-time">${fmtTime(e.ts, true)}</td><td><span class="tag ${cls}">${tag}</span></td><td class="ev-detail">${detail}</td></tr>`;
+  }).join("") + (ev.length > 500 ? `<tr><td colspan="3" class="hint">只显示最近 500 条，完整的请下载原始数据</td></tr>` : "");
+}
+
+function hqEvent(e) {
+  switch (e.type) {
+    case "start": return ["总控启动", "", `v${esc(e.version)}，总带宽 ${esc(e.total_mbps ? fmt1(e.total_mbps) + " Mbps" : "未设")}，节点 ${esc((e.nodes || []).join("、") || "无")}`];
+    case "total": return ["总带宽变更", "warn", e.to_mbps ? `${esc(e.from_mbps ? fmt1(e.from_mbps) + " Mbps" : "未设")} → <b>${fmt1(e.to_mbps)} Mbps</b>`
+                                                     : `${esc(fmt1(e.from_mbps))} Mbps → <b>取消总量控制</b>`];
+    case "quota": return ["下发配额", "ok", `<b>${esc(e.node)}</b>：${esc(fmtQ(e.from_mbps))} → <b>${fmt1(e.to_mbps)} Mbps</b>`];
+    case "release": return ["解除限速", "alert", `<b>${esc(e.node)}</b>：${esc(fmtQ(e.from_mbps))} → <b>不限</b>`];
+    case "nodes": {
+      const parts = [];
+      if ((e.added || []).length) parts.push("新增 " + e.added.map(a => `<b>${esc(a.name)}</b>（${esc(a.url)}${a.has_token ? "" : "，无令牌"}）`).join("、"));
+      if ((e.removed || []).length) parts.push("删除 " + e.removed.map(n => `<b>${esc(n)}</b>`).join("、"));
+      if ((e.changed || []).length) parts.push("修改 " + e.changed.map(c => `<b>${esc(c.name)}</b>（${esc(c.fields.join("/"))}）`).join("、"));
+      return ["节点清单", "", parts.join("；")];
+    }
+    default: return [esc(e.type), "", esc(JSON.stringify(e))];
+  }
+}
+
+function drawHist() {
+  const cv = $("#hq-chart"), dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const {t0, t1} = state.hq, {rows, refKey, refLabel, series} = hqSeries();
+  if (!t1 || t1 <= t0) return;
+  let peak = 0;
+  for (const r of rows) {
+    for (const s of series) peak = Math.max(peak, r[s.key] || 0);
+    peak = Math.max(peak, r[refKey] || 0);
+  }
+  const top = (peak || 1) * 1.15;
+  const x = (ts) => (ts + 30 - t0) / (t1 - t0) * w;           // 分钟中点
+  const y = (v) => h - (v / top) * (h - 4) - 2;
+  g.strokeStyle = css("--grid"); g.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const yy = Math.round(h * i / 4) + .5;
+    g.beginPath(); g.moveTo(0, yy); g.lineTo(w, yy); g.stroke();
+  }
+  g.font = "10.5px sans-serif"; g.fillStyle = css("--text-muted");
+  g.fillText(fmt1(top) + " Mbps", 4, 12);
+  if (!rows.length) { g.fillText("这段时间没有数据", w / 2 - 40, h / 2); return; }
+  // 目标/配额：阶梯虚线（0 = 不限，不画）；相邻点隔 >3 分钟视为断档。
+  g.strokeStyle = css("--ref-quota"); g.setLineDash([5, 4]); g.lineWidth = 1.2;
+  g.beginPath();
+  let prev = null;
+  for (const r of rows) {
+    const v = r[refKey];
+    if (prev && v > 0 && prev[refKey] > 0 && r.ts - prev.ts <= 180) {
+      g.lineTo(x(r.ts), y(prev[refKey])); g.lineTo(x(r.ts), y(v));
+    } else if (v > 0) g.moveTo(x(r.ts), y(v));
+    prev = r;
+  }
+  if (prev && prev[refKey] > 0) g.lineTo(x(prev.ts) + w / rows.length / 2, y(prev[refKey]));
+  g.stroke(); g.setLineDash([]);
+  for (const s of series) {
+    g.strokeStyle = css(s.color); g.lineWidth = s.w;
+    g.beginPath(); prev = null;
+    for (const r of rows) {
+      const v = r[s.key];
+      if (v == null) { prev = null; continue; }
+      if (prev && r.ts - prev.ts <= 180) g.lineTo(x(r.ts), y(v)); else g.moveTo(x(r.ts), y(v));
+      prev = r;
+    }
+    g.stroke();
+  }
+  // 悬停：最近的分钟点
+  let cur = rows[rows.length - 1];
+  if (state.hq.tipX != null) {
+    let bd = Infinity;
+    for (const r of rows) { const d = Math.abs(x(r.ts) - state.hq.tipX); if (d < bd) { bd = d; cur = r; } }
+    g.strokeStyle = css("--text-muted"); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(x(cur.ts), 0); g.lineTo(x(cur.ts), h); g.stroke();
+  }
+  const leg = series.map(s => `<span><i style="background:${css(s.color)}"></i>${s.label} <b>${cur[s.key] == null ? "–" : fmt1(cur[s.key])}</b></span>`);
+  const rv = cur[refKey];
+  leg.push(`<span><i style="background:${css("--ref-quota")}"></i>${refLabel} <b>${esc(state.hq.node ? fmtQ(rv) : (+rv ? fmt1(rv) + " Mbps" : "未设"))}</b></span>`);
+  leg.push(`<span>${fmtTime(cur.ts)}</span>`);
+  $("#hq-legend").innerHTML = leg.join("");
+}
+
 // ---- overview / 日志 / SSE ----
 async function loadOverview() {
   const o = await (await fetch("/api/overview")).json();
@@ -693,6 +945,10 @@ function switchTab(name) {
   for (const b of $$(".tabs button")) b.setAttribute("aria-selected", String(b.dataset.tab === name));
   for (const p of $$(".tabpage")) p.classList.toggle("on", p.id === "page-" + name);
   if (name === "nodes") loadNodes();
+  if (name === "history") {
+    hqNodeOptions();
+    if (!state.hq.loaded) { hqRange(1); hqQuery(); } else drawHist();
+  }
   redrawAll();
 }
 for (const b of $$(".tabs button")) b.onclick = () => switchTab(b.dataset.tab);
@@ -721,6 +977,14 @@ $("#total-clear").onclick = async () => {
     setTimeout(loadOverview, 1500);
   }
 };
+for (const b of $$("#hq-quick button")) b.onclick = () => { hqRange(+b.dataset.h); hqQuery(); };
+for (const id of ["#hq-from", "#hq-to"])
+  $(id).addEventListener("input", () => { for (const b of $$("#hq-quick button")) b.classList.remove("on"); });
+$("#hq-go").onclick = hqQuery;
+$("#hq-node").onchange = hqQuery;
+$("#hq-chart").addEventListener("mousemove", (e) => { state.hq.tipX = e.offsetX; drawHist(); });
+$("#hq-chart").addEventListener("mouseleave", () => { state.hq.tipX = null; drawHist(); });
+new ResizeObserver(() => { if (state.tab === "history") drawHist(); }).observe($("#hq-chart"));
 $("#nf-save").onclick = saveNode;
 $("#nf-cancel").onclick = resetNodeForm;
 $("#nl-table").addEventListener("click", (e) => {

@@ -227,3 +227,64 @@ async def test_node_writes_disabled_without_token(tmp_path):
         r = await c.post("/api/nodes", headers=auth(),
                          json={"name": "n2", "url": "http://x:1"})
         assert r.status == 403
+
+
+# ---------------------------------------------------------------------------
+# 监控落盘反查 /api/metrics-log
+# ---------------------------------------------------------------------------
+
+async def test_metrics_log_disabled_says_how_to_enable(client):
+    r = await client.get("/api/metrics-log")
+    assert r.status == 404
+    assert "RL_METRICS_LOG" in (await r.json())["error"]
+
+
+async def test_metrics_log_query(tmp_path):
+    path = tmp_path / "fm.jsonl"
+    path.write_text("\n".join(json.dumps(x) for x in [
+        {"ts": 1000, "kind": "fleet", "total_mbps": 100},
+        {"ts": 1000, "kind": "node", "name": "a", "quota_mbps": 60},
+        {"ts": 1000, "kind": "node", "name": "b", "quota_mbps": 40},
+        {"ts": 1010, "kind": "event", "type": "quota", "node": "b"},
+        {"ts": 5000, "kind": "fleet", "total_mbps": 0},
+    ]) + "\n", encoding="utf-8")
+    app = fleetweb.build_fleet_app(hub(), fleetweb.LogBuffer(), log,
+                                   metrics_path=str(path))
+    async with TestClient(TestServer(app)) as c:
+        j = await (await c.get("/api/metrics-log",
+                               params={"from": "900", "to": "2000"})).json()
+        assert [r["kind"] for r in j["rows"]] == \
+            ["fleet", "node", "node", "event"]
+        assert (j["start"], j["end"], j["truncated"]) == (900, 2000, False)
+
+        j = await (await c.get("/api/metrics-log", params={
+            "from": "900", "to": "2000", "kind": "node,event",
+            "node": "b"})).json()
+        assert [(r["kind"], r.get("name") or r.get("type"))
+                for r in j["rows"]] == [("node", "b"), ("event", "quota")]
+
+        # ISO 8601（带时区）也认。
+        j = await (await c.get("/api/metrics-log", params={
+            "from": "1970-01-01T00:16:40+00:00",
+            "to": "1970-01-01T00:30:00+00:00", "kind": "fleet"})).json()
+        assert [r["ts"] for r in j["rows"]] == [1000]
+
+        r = await c.get("/api/metrics-log", params={
+            "from": "0", "to": "9999", "format": "jsonl"})
+        assert r.status == 200
+        assert "attachment" in r.headers["Content-Disposition"]
+        assert len((await r.text()).splitlines()) == 5
+
+
+@pytest.mark.parametrize("params", [
+    {"from": "昨天"},
+    {"kind": "fleet,bogus"},
+    {"from": "2000", "to": "1000"},
+    {"limit": "many"},
+])
+async def test_metrics_log_bad_params(tmp_path, params):
+    app = fleetweb.build_fleet_app(hub(), fleetweb.LogBuffer(), log,
+                                   metrics_path=str(tmp_path / "fm.jsonl"))
+    async with TestClient(TestServer(app)) as c:
+        r = await c.get("/api/metrics-log", params=params)
+        assert r.status == 400 and (await r.json())["error"]

@@ -8,12 +8,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import socket
 
 import aiohttp
 
-from rl_limiter import fleetconfig, fleetmain
+from rl_limiter import fleetconfig, fleetmain, fleetmetrics
 
 from .test_fleetpoll import FakeNode
 
@@ -47,9 +48,10 @@ async def test_cancel_total_releases_nodes_immediately(tmp_path):
         encoding="utf-8")
     cfg = fleetconfig.load(str(yml))
     port = _free_port()
+    mlog = fleetmetrics.FleetMetricsLog(str(tmp_path / "fm.jsonl"), log)
     task = asyncio.create_task(fleetmain._amain(
         cfg, log, str(yml), console_port=port, console_bind="127.0.0.1",
-        api_token=TOKEN))
+        api_token=TOKEN, mlog=mlog))
     base = f"http://127.0.0.1:{port}"
     hdr = {"X-API-Token": TOKEN}
     try:
@@ -85,6 +87,22 @@ async def test_cancel_total_releases_nodes_immediately(tmp_path):
             n_puts = len(node.puts)
             await asyncio.sleep(1.0)
             assert node.deletes == ["node-tok"] and len(node.puts) == n_puts
+
+            # 反查：整条变更时间线都在落盘里，按时间查得回来。
+            async with http.get(base + "/api/metrics-log",
+                                params={"kind": "event"}) as r:
+                assert r.status == 200
+                ev = (await r.json())["rows"]
+            got = [(e["type"], e.get("node"), e.get("from_mbps"),
+                    e.get("to_mbps")) for e in ev]
+            assert got == [
+                ("start", None, None, None),
+                ("total", None, 0.0, 100.0),
+                ("quota", "n1", 120.0, 100.0),   # 自报 120 → 下发 100
+                ("total", None, 100.0, 0.0),
+                ("release", "n1", 120.0, 0.0),
+            ]
+            assert "node-tok" not in json.dumps(ev)   # 令牌绝不落盘
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

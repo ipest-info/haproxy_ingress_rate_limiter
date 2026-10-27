@@ -510,3 +510,38 @@ def test_uninstall_rejects_install_options(box, args):
     r = run(*args)
     assert r.returncode != 0 and r.stderr
     assert not paths["conf"].exists()
+
+
+# ---- 总控监控落盘：新装默认开，老 env 升级补项 ---------------------------
+
+def test_fleet_install_enables_metrics_log(box):
+    run, paths = box
+    assert run("--fleet", nics=[]).returncode == 0
+    assert _env(paths, "rl-fleet.env")["RL_METRICS_LOG"] == \
+        "/var/log/rl-limiter/fleet-metrics.jsonl"
+
+
+def test_fleet_upgrade_adds_metrics_log_to_old_env(box):
+    run, paths = box
+    paths["conf"].mkdir()
+    old = "RL_CONSOLE_PORT=8095\nRL_API_TOKEN=fleet-token-1\n"
+    (paths["conf"] / "rl-fleet.env").write_text(old)
+    r = run("--fleet", nics=[])
+    assert r.returncode == 0, r.stderr
+    env = _env(paths, "rl-fleet.env")
+    assert env["RL_METRICS_LOG"] == "/var/log/rl-limiter/fleet-metrics.jsonl"
+    assert env["RL_API_TOKEN"] == "fleet-token-1"       # 其余不动
+    # 重跑不重复追加。
+    assert run("--fleet", nics=[]).returncode == 0
+    text = (paths["conf"] / "rl-fleet.env").read_text()
+    assert text.count("RL_METRICS_LOG=") == 1
+
+
+def test_fleet_upgrade_respects_disabled_metrics_log(box):
+    """注释掉过 = 有意关闭，升级不许擅自打开。"""
+    run, paths = box
+    paths["conf"].mkdir()
+    (paths["conf"] / "rl-fleet.env").write_text(
+        "RL_CONSOLE_PORT=8095\n# RL_METRICS_LOG=/var/log/x.jsonl\n")
+    assert run("--fleet", nics=[]).returncode == 0
+    assert "RL_METRICS_LOG" not in _env(paths, "rl-fleet.env")
