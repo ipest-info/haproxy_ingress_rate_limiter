@@ -38,7 +38,7 @@ def overview_payload(quota=120.0, egress_mbps=80.0, degraded=False,
 
 
 class FakeNode:
-    """可注入行为的假节点：载荷/状态码/超时开关 + PUT 记录。"""
+    """可注入行为的假节点：载荷/状态码/超时开关 + PUT/DELETE 记录。"""
 
     def __init__(self):
         self.payload = overview_payload()
@@ -46,9 +46,12 @@ class FakeNode:
         self.hang = False            # True → 挂住直到客户端超时
         self.put_status = 200
         self.puts: list = []
+        self.delete_status = 200
+        self.deletes: list = []
         app = web.Application()
         app.router.add_get("/api/overview", self._overview)
         app.router.add_put("/api/instance-quota", self._put)
+        app.router.add_delete("/api/instance-quota", self._delete)
         self.server = TestServer(app)
 
     async def _overview(self, _req):
@@ -67,6 +70,14 @@ class FakeNode:
             return web.json_response({"error": "拒绝"},
                                      status=self.put_status)
         return web.json_response({"ok": True})
+
+    async def _delete(self, req):
+        self.deletes.append(req.headers.get("X-API-Token", ""))
+        if self.delete_status != 200:
+            return web.json_response({"error": "拒绝"},
+                                     status=self.delete_status)
+        self.payload["instance_quota_mbps"] = 0      # 节点恢复不限
+        return web.json_response({"ok": True, "instance_quota_mbps": 0})
 
     @property
     def url(self):
@@ -189,3 +200,29 @@ async def test_remove_node_keeps_quota_untouched(fake, poller):
     poller.set_nodes([FleetNode(name="n1", url=fake.url, token="t")])
     assert [s.name for s in poller.states()] == ["n1"]
     assert fake.puts == []                 # 移除绝不触发任何下发
+
+
+async def test_release_sends_delete_and_clears_pending(fake, poller):
+    """写清单里值为 None 的项 = 解除：DELETE 带令牌，成功清待解除标记。"""
+    poller.set_nodes([FleetNode(name="n1", url=fake.url, token="sek")])
+    await poller.poll_once()
+    s = poller.states()[0]
+    s.release_pending = True
+    s.applied_mbps = 120.0
+    await poller.apply([(s, None)])
+    assert fake.deletes == ["sek"] and fake.puts == []
+    assert not s.release_pending and s.write_err == ""
+    assert s.applied_mbps is None
+    await poller.poll_once()
+    assert s.quota_mbps == 0.0
+
+
+async def test_release_failure_keeps_pending(fake, poller):
+    fake.delete_status = 401
+    poller.set_nodes([FleetNode(name="n1", url=fake.url, token="bad")])
+    await poller.poll_once()
+    s = poller.states()[0]
+    s.release_pending = True
+    await poller.apply([(s, None)])
+    assert "401" in s.write_err
+    assert s.release_pending                 # 下一轮重试

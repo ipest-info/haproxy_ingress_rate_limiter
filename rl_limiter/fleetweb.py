@@ -67,6 +67,8 @@ def fleet_snapshot(now: float, states: list, total_mbps: float) -> dict:
             "controllable": bool(s.token),
             "error": s.error,
             "write_err": s.write_err,
+            # 总量控制已取消、该节点的限速还没解除（离线/下发失败中）。
+            "release_pending": s.release_pending,
         }
     return {
         "ts": now,
@@ -241,8 +243,9 @@ def build_fleet_app(
         v = body.get("quota_mbps") if isinstance(body, dict) else None
         if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
             return web.json_response(
-                {"error": f"quota_mbps 必须是 ≥0 的数字（Mbps；0 = 停止"
-                          f"分配，纯观察），当前值 {v!r}"}, status=400)
+                {"error": f"quota_mbps 必须是 ≥0 的数字（Mbps；0 = 取消"
+                          f"总量控制，解除各节点实例总限速），当前值 {v!r}"},
+                status=400)
         async with write_lock:
             try:
                 await asyncio.to_thread(
@@ -251,8 +254,8 @@ def build_fleet_app(
                 return web.json_response({"error": str(e)}, status=400)
         if poke is not None:
             poke.set()
-        log.warning("写 API 已修改总流出带宽并回写 YAML（下一个分配周期"
-                    "生效） total=%gMbps yaml=%s", v, yaml_path)
+        log.warning("写 API 已修改总流出带宽并回写 YAML（立即重新分配）"
+                    " total=%gMbps yaml=%s", v, yaml_path)
         return web.json_response({"ok": True, "total_egress_mbps": float(v)})
 
     async def handle_delete_total(request: web.Request) -> web.Response:
@@ -267,8 +270,8 @@ def build_fleet_app(
                 return web.json_response({"error": str(e)}, status=400)
         if poke is not None:
             poke.set()
-        log.warning("写 API 已取消总量控制（纯观察模式：只汇总不下发；"
-                    "各节点保持当前配额）yaml=%s", yaml_path)
+        log.warning("写 API 已取消总量控制（立即解除各节点实例总限速，"
+                    "之后只汇总不下发）yaml=%s", yaml_path)
         return web.json_response({"ok": True, "total_egress_mbps": 0})
 
     # ---- 节点清单（后台手动添加/编辑/删除节点） ----

@@ -20,7 +20,11 @@
 #   - **写抑制**：相对变化 < apply_epsilon 且绝对变化 < min_delta_mbps
 #     不下发——节点每次写都整份重写自己的 YAML，琐碎变化不值得；
 #   - **下限**：分配值永远 ≥ min_quota_mbps。**绝不下发 ≤0**：0 在节点
-#     语义里是"不限"，作为份额下发等于放开那台节点。
+#     语义里是"不限"，作为份额下发等于放开那台节点；
+#   - **取消总量控制 = 解除**：total 从 >0 变为 0 时，全部在册节点标记
+#     "待解除"，逐台 DELETE 实例总限速（节点恢复不限）。离线的保持待解除，
+#     恢复在线即解；之后总控回到只汇总不下发。只认**运行期的变化**——
+#     以 0 启动的总控不碰节点（不知道节点上的限速是谁设的）。
 #
 # 单协程访问（allocate_once 只被分配环调用），无需加锁。
 
@@ -62,6 +66,9 @@ class NodeState:
     # 自报值与它不符 = 下发未生效或节点侧被手工改动）。
     applied_mbps: "float | None" = None
     write_err: str = ""
+    # 总量控制已取消、该节点的实例总限速还没解除（离线/下发失败时保持，
+    # 后续每轮重试；成功 DELETE 或重新设了总带宽即清除）。
+    release_pending: bool = False
 
 
 class FleetGovernor:
@@ -70,19 +77,29 @@ class FleetGovernor:
     def __init__(self, log: "logging.Logger | None" = None):
         self._log = log if log is not None else logging.getLogger(
             "rl_limiter.fleetgov")
+        # 上一轮的总带宽（None = 还没跑过）：用来识别"取消总量控制"
+        # 这个**变化**——以 0 启动不算取消。
+        self._last_total: "float | None" = None
 
     def allocate_once(self, states: list, total: float,
                       params: AllocConfig) -> list:
         """跑一轮分配。更新各 NodeState 的 demand_ewma/desired，返回
-        写清单 [(NodeState, 要下发的 Mbps)]（已过写抑制）。
+        写清单 [(NodeState, 要下发的 Mbps | None)]（已过写抑制；None =
+        解除该节点的实例总限速，即 DELETE）。
 
-        states 是全部在册节点；total ≤ 0 = 纯观察，不分配不下发。
+        states 是全部在册节点；total ≤ 0 = 不做总量控制：只解除取消
+        那一刻还在册节点的限速（见 _release），不分配。
         """
         log = self._log
+        cancelled = (self._last_total is not None and self._last_total > 0
+                     and total <= 0)
+        self._last_total = total
         if total <= 0:
-            for s in states:
-                s.desired_mbps = None
-            return []
+            if cancelled:
+                self._mark_release(states)
+            return self._release(states)
+        for s in states:
+            s.release_pending = False
 
         ctrl = [s for s in states
                 if s.online and s.executable and not s.degraded and s.token]
@@ -190,4 +207,33 @@ class FleetGovernor:
                 "%.1fMbps 可控节点=%d 冻结记账=%.1fMbps）",
                 s.name, base, s.desired_mbps,
                 s.demand_ewma_mbps or 0.0, pool, n, reserved)
+        return writes
+
+    def _mark_release(self, states: list) -> None:
+        """总量控制刚被取消：在册节点全部标记待解除。"""
+        later = []
+        for s in states:
+            # 无令牌的节点从没被总控控制过（也写不了），无需解除。
+            s.release_pending = bool(s.token)
+            if s.release_pending and not s.online:
+                later.append(s.name)
+        self._log.warning(
+            "总量控制已取消：解除各节点的实例总限速（恢复不限），之后只"
+            "汇总不下发 nodes=%d%s", sum(s.release_pending for s in states),
+            f"；离线节点恢复在线后再解除：{'、'.join(later)}" if later
+            else "")
+
+    def _release(self, states: list) -> list:
+        """total ≤ 0 时的写清单：待解除且可写的节点逐台 DELETE。"""
+        writes = []
+        for s in states:
+            s.desired_mbps = None
+            if not s.release_pending or not s.online:
+                continue                  # 离线：保持待解除，恢复后再解
+            if s.quota_mbps == 0:
+                s.release_pending = False  # 自报已是不限（如被手工解除）
+                continue
+            writes.append((s, None))
+            self._log.info("解除实例总限速 node=%s %.1fMbps→不限",
+                           s.name, s.quota_mbps or 0.0)
         return writes

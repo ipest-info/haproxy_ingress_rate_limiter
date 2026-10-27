@@ -232,10 +232,10 @@ button.danger { color: var(--critical); }
         <span class="card-title">总量控制</span>
         <span class="tag" id="f-total-tag">–</span>
         <span class="quota-edit">
-          <span class="hint">总流出带宽 Mbps，0 = 纯观察</span>
+          <span class="hint">总流出带宽 Mbps，0 = 不做总量控制</span>
           <input id="total-input" type="number" min="0" step="any" placeholder="Mbps">
           <button id="total-save">保存</button>
-          <button id="total-clear" title="置 0：停止分配（各节点保持当前配额），只汇总观察">取消总量控制</button>
+          <button id="total-clear" title="置 0：立即解除各节点的实例总限速（恢复不限），之后只汇总观察">取消总量控制</button>
         </span>
       </div>
       <div class="card-body">
@@ -494,7 +494,7 @@ function applySnapshot(snap, live) {
   const set = (id, v, unit) =>
     $(id).innerHTML = esc(v) + (unit ? `<small>${unit}</small>` : "");
   const total = snap.total_quota_mbps || 0;
-  $("#f-total-tag").textContent = total ? total + " Mbps" : "纯观察（未设总带宽）";
+  $("#f-total-tag").textContent = total ? total + " Mbps" : "未做总量控制（只汇总观察）";
   set("#f-total", total ? fmt1(total) : "未设", total ? "Mbps" : "");
   set("#f-egress", fmt1(snap.egress_mbps), "Mbps");
   set("#f-util", total ? Math.round(snap.egress_mbps / total * 100) + "%" : "–");
@@ -531,7 +531,8 @@ function renderNodeTable(snap) {
   tb.innerHTML = `<tr><th>节点</th><th>状态</th><th>出向 Mbps</th><th>入向</th>
       <th>配额（本轮分配）</th><th>利用率</th><th style="text-align:left">最近错误</th></tr>` +
     rows.map(([name, n]) => {
-      const quota = n.quota_mbps == null ? "–" : fmt1(n.quota_mbps);
+      const quota = (n.quota_mbps == null ? "–" : n.quota_mbps ? fmt1(n.quota_mbps) : "不限")
+        + (n.release_pending ? ' <span class="tag warn" title="总量控制已取消，该节点的实例总限速还没解除（离线或下发失败，自动重试）">待解除</span>' : "");
       const desired = n.desired_mbps == null ? "" :
         `（<span style="${Math.abs((n.desired_mbps||0)-(n.quota_mbps||0)) > 1 ? 'color:var(--warn)' : ''}">${fmt1(n.desired_mbps)}</span>）`;
       const u = n.util == null ? null : Math.min(n.util, 1.3);
@@ -701,14 +702,14 @@ $("#total-save").onclick = async () => {
   const el = $("#total-input");
   const v = parseFloat(el.value);
   if (el.value.trim() === "" || !isFinite(v) || v < 0) {
-    toast("总流出带宽必须是 ≥ 0 的数字（Mbps；0 = 纯观察）", true);
+    toast("总流出带宽必须是 ≥ 0 的数字（Mbps；0 = 取消总量控制）", true);
     return;
   }
   const r = await apiWrite("PUT", "/api/total-quota", {quota_mbps: v});
   if (r) {
     state.totalDirty = false;
-    toast(v ? "总流出带宽已设为 " + v + " Mbps——下一个分配周期按需分到各节点"
-            : "已取消总量控制（纯观察；各节点保持当前配额）");
+    toast(v ? "总流出带宽已设为 " + v + " Mbps——立即按需重新分到各节点"
+            : "已取消总量控制——正在解除各节点的实例总限速（恢复不限）");
     setTimeout(loadOverview, 1500);
   }
 };
@@ -716,7 +717,7 @@ $("#total-clear").onclick = async () => {
   const r = await apiWrite("DELETE", "/api/total-quota");
   if (r) {
     state.totalDirty = false;
-    toast("已取消总量控制（纯观察；各节点保持当前配额）");
+    toast("已取消总量控制——正在解除各节点的实例总限速（恢复不限）");
     setTimeout(loadOverview, 1500);
   }
 };

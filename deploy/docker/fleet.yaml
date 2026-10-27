@@ -6,7 +6,7 @@
 
 log_level: info
 
-# 总流出带宽目标（Mbps；0 = 纯观察，只汇总不下发）。demo 起来后在总控
+# 总流出带宽目标（Mbps；0 = 不做总量控制，只汇总不下发）。demo 起来后在总控
 # 页面（http://localhost:8095，令牌 demo-token）设一个值即可看到按需
 # 分配：三节点的实例出向目标此消彼长、总出向被压在该值之下。
 total_egress_mbps: 0

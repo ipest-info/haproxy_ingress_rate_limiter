@@ -7,7 +7,8 @@
 #     恢复在线时**重置需求 EWMA**——陈旧均值不配参与首轮分配；
 #   - 下发执行：把 fleetgov 的写清单并发 PUT 到各节点
 #     /api/instance-quota（带节点令牌；失败只记 write_err，不重试——
-#     下一个分配周期自然重试）。
+#     下一个分配周期自然重试）；值为 None 的项是"解除"，改发 DELETE
+#     （取消总量控制时，节点恢复不限）。
 #
 # 观测口径与节点闭环同源——**网卡口径**（按量计费计的是网卡字节）：
 # 优先 latest.regulation.instance.egress_mbps（节点闭环的观测值 =
@@ -172,19 +173,24 @@ class NodePoller:
     # ---- 下发 ----
 
     async def apply(self, writes: list) -> None:
-        """并发执行写清单 [(NodeState, Mbps)]。失败记 write_err 不重试
-        ——写抑制以节点自报值为基准，没写成的下一轮自然再触发。"""
+        """并发执行写清单 [(NodeState, Mbps | None)]（None = 解除）。
+        失败记 write_err 不重试——写抑制以节点自报值为基准、待解除标记
+        保留到成功为止，没写成的下一轮自然再触发。"""
         if not writes:
             return
         await asyncio.gather(*(self._put_one(s, v) for s, v in writes))
 
-    async def _put_one(self, s: NodeState, mbps: float) -> None:
+    async def _put_one(self, s: NodeState, mbps: "float | None") -> None:
         try:
             session = await self._ensure_session()
-            async with session.put(
-                    s.url + "/api/instance-quota",
-                    json={"quota_mbps": mbps},
-                    headers={"X-API-Token": s.token}) as resp:
+            if mbps is None:
+                req = session.delete(s.url + "/api/instance-quota",
+                                     headers={"X-API-Token": s.token})
+            else:
+                req = session.put(s.url + "/api/instance-quota",
+                                  json={"quota_mbps": mbps},
+                                  headers={"X-API-Token": s.token})
+            async with req as resp:
                 body = {}
                 try:
                     body = await resp.json()
@@ -196,14 +202,19 @@ class NodePoller:
                         f"{body.get('error', '') or '无错误信息'}")
             s.applied_mbps = mbps
             s.write_err = ""
+            if mbps is None:
+                s.release_pending = False
+                self._log.warning("已解除节点的实例总限速（恢复不限） "
+                                  "node=%s", s.name)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             s.write_err = str(e) or type(e).__name__
             self._log.error(
-                "下发实例配额失败（下一个分配周期自动重试）node=%s "
-                "quota=%.1fMbps err=%s%s",
-                s.name, mbps, s.write_err,
+                "%s失败（下一个分配周期自动重试）node=%s err=%s%s",
+                "解除实例总限速" if mbps is None
+                else f"下发实例配额 {mbps:.1f}Mbps ",
+                s.name, s.write_err,
                 "——401/403 请核对 fleet.yaml 里该节点的 token 与节点侧"
                 " RL_API_TOKEN 是否一致"
                 if "401" in s.write_err or "403" in s.write_err else "")

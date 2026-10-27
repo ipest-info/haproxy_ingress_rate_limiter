@@ -3,7 +3,8 @@
 # 总控的配置来源只有一个：**本地 YAML 文件**（rl-fleet -c 指定），没有
 # 数据库。它提供三类信息：
 #   1. **总量目标**：total_egress_mbps——全部节点出向带宽合计的目标值
-#      （0 = 纯观察模式，只汇总不下发）。可经总控的写 API 热改；
+#      （0 = 不做总量控制：从 >0 改成 0 时解除各节点的实例总限速，
+#      之后只汇总不下发）。可经总控的写 API 热改；
 #   2. **节点清单**（nodes 段）：每台节点的名称、控制台地址与写 API
 #      令牌。改文件热生效（增删节点不用重启总控），也可经总控的写 API
 #      （页面「节点管理」）添加/编辑/删除；
@@ -96,7 +97,8 @@ class FleetConfig:
     """一份完整的总控配置。"""
 
     log_level: str = DEFAULT_LOG_LEVEL
-    # 总流出带宽目标（Mbps；0 = 纯观察，不下发）。热生效，可经写 API 改。
+    # 总流出带宽目标（Mbps；0 = 不做总量控制，从 >0 改为 0 时解除各节点
+    # 限速）。热生效，可经写 API 改。
     total_egress_mbps: float = 0.0
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S
     alloc_interval_s: float = DEFAULT_ALLOC_INTERVAL_S
@@ -212,7 +214,7 @@ def _validate(cfg: FleetConfig) -> None:
             f"log_level 必须是 {_LOG_LEVELS} 之一，当前值 {cfg.log_level!r}")
     if cfg.total_egress_mbps < 0:
         raise ValueError(
-            f"total_egress_mbps 必须 ≥ 0（0 = 纯观察不下发），"
+            f"total_egress_mbps 必须 ≥ 0（0 = 不做总量控制），"
             f"当前值 {cfg.total_egress_mbps:g}")
     if cfg.poll_interval_s < 1:
         raise ValueError(
@@ -338,7 +340,7 @@ def _write_raw(path: str, raw: dict) -> None:
 
 
 def set_total_quota(path: str, total_mbps: float) -> None:
-    """设置总流出带宽（Mbps；0 = 停止分配，纯观察）。"""
+    """设置总流出带宽（Mbps；0 = 取消总量控制，解除各节点限速）。"""
     raw = _read_raw(path)
     if total_mbps:
         raw["total_egress_mbps"] = total_mbps

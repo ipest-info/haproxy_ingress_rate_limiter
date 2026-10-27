@@ -45,15 +45,20 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
     # 热更字段的当前视图（watch 回调整体替换；周期类字段启动定型，
     # 轮询/分配环直接用启动时的值）。
     cur = {"cfg": cfg}
+    # 总带宽变了就立刻跑一轮分配（不等 alloc_interval_s）：页面上点
+    # "取消总量控制"要马上解除各节点限速，改总带宽也该马上见效。
+    alloc_wake = asyncio.Event()
 
     def _on_change(newcfg: "fleetconfig.FleetConfig") -> None:
         old = cur["cfg"]
         cur["cfg"] = newcfg
         poller.set_nodes(newcfg.nodes)
         if newcfg.total_egress_mbps != old.total_egress_mbps:
-            log.info("总流出带宽已变更（下一个分配周期生效） "
-                     "total=%g→%gMbps",
+            log.info("总流出带宽已变更，立即重新分配%s total=%g→%gMbps",
+                     "（取消总量控制：解除各节点实例总限速）"
+                     if not newcfg.total_egress_mbps else "",
                      old.total_egress_mbps, newcfg.total_egress_mbps)
+            alloc_wake.set()
 
     cfg_poke = asyncio.Event()
 
@@ -87,7 +92,12 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
     async def alloc_loop() -> None:
         """分配环：按需切分总带宽并下发（慢速外环）。"""
         while True:
-            await asyncio.sleep(cfg.alloc_interval_s)
+            try:
+                await asyncio.wait_for(alloc_wake.wait(),
+                                       timeout=cfg.alloc_interval_s)
+            except asyncio.TimeoutError:
+                pass
+            alloc_wake.clear()
             try:
                 writes = gov.allocate_once(
                     poller.states(), cur["cfg"].total_egress_mbps,

@@ -51,6 +51,7 @@ def test_snapshot_aggregates_and_accounts_frozen():
     n1 = f["nodes"]["node1"]
     assert n1["util"] == pytest.approx(80 / 120, abs=1e-3)
     assert n1["controllable"] is True
+    assert n1["release_pending"] is False
     # 快照里绝不带令牌。
     assert "token" not in n1
     assert f["nodes"]["node2"]["online"] is False

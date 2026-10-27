@@ -140,10 +140,61 @@ def test_desired_never_at_or_below_zero():
     assert a.desired_mbps >= 0.5 and b.desired_mbps >= 0.5
 
 
-def test_total_zero_means_observe_only():
+def test_starting_at_zero_never_touches_nodes():
+    """以 total=0 启动 = 只汇总：不知道节点上的限速是谁设的，绝不解除。"""
     a = node("a", quota=100, egress=50)
-    writes = gov().allocate_once([a], 0, P())
-    assert writes == [] and a.desired_mbps is None
+    g = gov()
+    for _ in range(3):
+        assert g.allocate_once([a], 0, P()) == []
+    assert a.desired_mbps is None and not a.release_pending
+
+
+def test_cancel_releases_every_node_immediately():
+    """total 从 >0 改成 0：在线有令牌的节点逐台解除（None = DELETE）。"""
+    a = node("a", quota=100, egress=50)
+    b = node("b", quota=80, egress=10)
+    free = node("free", quota=0)              # 自报已是不限：无需再写
+    off = node("off", quota=60, online=False)
+    ro = node("ro", quota=40, token="")      # 无令牌：从没被总控控制过
+    states = [a, b, free, off, ro]
+    g = gov()
+    g.allocate_once(states, 300, P())
+    writes = g.allocate_once(states, 0, P())
+    assert sorted((s.name, v) for s, v in writes) == \
+        [("a", None), ("b", None)]
+    assert all(s.desired_mbps is None for s in states)
+    assert not free.release_pending          # 已不限，直接了结
+    assert off.release_pending               # 离线：等恢复
+    assert not ro.release_pending
+
+
+def test_pending_release_retried_until_done():
+    a = node("a", quota=100)
+    off = node("off", quota=60, online=False)
+    g = gov()
+    g.allocate_once([a, off], 300, P())
+    assert [s.name for s, _ in g.allocate_once([a, off], 0, P())] == ["a"]
+    # 下发失败（release_pending 没被清）：下一轮再来。
+    assert [s.name for s, _ in g.allocate_once([a, off], 0, P())] == ["a"]
+    # a 解除成功（fleetpoll 清标记），off 恢复在线：轮到 off。
+    a.release_pending = False
+    off.online = True
+    assert [(s.name, v) for s, v in g.allocate_once([a, off], 0, P())] == \
+        [("off", None)]
+    # 都解除完：之后只汇总，绝不再碰节点（哪怕有人又手工设了限速）。
+    off.release_pending = False
+    a.quota_mbps = 50
+    assert g.allocate_once([a, off], 0, P()) == []
+
+
+def test_new_total_cancels_pending_release():
+    off = node("off", quota=60, online=False)
+    g = gov()
+    g.allocate_once([off], 300, P())
+    g.allocate_once([off], 0, P())
+    assert off.release_pending
+    g.allocate_once([off], 200, P())
+    assert not off.release_pending           # 重新做总量控制：作废
 
 
 def test_never_polled_node_counts_zero():
