@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rl-limiter"
-version = "0.6.1"
+version = "0.6.2"
 description = "服务器出口带宽限速与监控（通用形态）：双网卡 + 内核计数器监控，客户端侧网卡入向 tc 闭环限速，rl-fleet 多机总量控制"
 requires-python = ">=3.9"
 dependencies = [
