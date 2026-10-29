@@ -19,7 +19,7 @@ from rl_limiter import fleetconfig, fleetmain, fleetmetrics
 from .test_fleetpoll import FakeNode
 
 log = logging.getLogger("test")
-TOKEN = "fleet-token"
+TOKEN = "4d0f049407ac1f0523f1ef306948f85c64b6e5e95b701a7e"
 
 
 def _free_port() -> int:
@@ -44,7 +44,7 @@ async def test_cancel_total_releases_nodes_immediately(tmp_path):
         "total_egress_mbps: 0\n"
         "alloc_interval_s: 10\n"
         "nodes:\n"
-        f"  - name: n1\n    url: {node.url}\n    token: node-tok\n",
+        f"  - name: n1\n    url: {node.url}\n    token: 5e87f5b9c50fca3df7adef8427563b8ddfe798c5397cea8f\n",
         encoding="utf-8")
     cfg = fleetconfig.load(str(yml))
     port = _free_port()
@@ -75,18 +75,18 @@ async def test_cancel_total_releases_nodes_immediately(tmp_path):
             # 设总带宽：立即分配下发（alloc_interval_s=10，远不用等）。
             await call("PUT", {"quota_mbps": 100})
             await _until(lambda: node.puts, timeout=3)
-            assert node.puts[-1] == {"token": "node-tok",
+            assert node.puts[-1] == {"token": "5e87f5b9c50fca3df7adef8427563b8ddfe798c5397cea8f",
                                      "body": {"quota_mbps": 100.0}}
 
             # 取消总量控制：立即解除节点的实例总限速。
             await call("DELETE")
             await _until(lambda: node.deletes, timeout=3)
-            assert node.deletes == ["node-tok"]
+            assert node.deletes == ["5e87f5b9c50fca3df7adef8427563b8ddfe798c5397cea8f"]
 
             # 之后只汇总：不会反复解除，也不再下发。
             n_puts = len(node.puts)
             await asyncio.sleep(1.0)
-            assert node.deletes == ["node-tok"] and len(node.puts) == n_puts
+            assert node.deletes == ["5e87f5b9c50fca3df7adef8427563b8ddfe798c5397cea8f"] and len(node.puts) == n_puts
 
             # 反查：整条变更时间线都在落盘里，按时间查得回来。
             async with http.get(base + "/api/metrics-log",
@@ -102,7 +102,7 @@ async def test_cancel_total_releases_nodes_immediately(tmp_path):
                 ("total", None, 100.0, 0.0),
                 ("release", "n1", 120.0, 0.0),
             ]
-            assert "node-tok" not in json.dumps(ev)   # 令牌绝不落盘
+            assert "5e87f5b9c50fca3df7adef8427563b8ddfe798c5397cea8f" not in json.dumps(ev)   # 令牌绝不落盘
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

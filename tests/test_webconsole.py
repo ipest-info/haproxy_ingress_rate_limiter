@@ -279,7 +279,8 @@ import asyncio
 
 from rl_limiter import config as configmod
 
-TOKEN = "test-token-123"
+# 写 API 令牌必须过强度规则（tokenpolicy），测试用一个真随机生成的。
+TOKEN = "d9253b4e26b5a7f47d1c1dfd422437a8365824e8c0625dd0"
 
 BASE_YAML = """\
 name: edge-01
@@ -341,6 +342,30 @@ async def test_write_disabled_without_configured_token(tmp_path):
                         headers=auth())
         assert r.status == 403
         assert "RL_API_TOKEN" in (await r.json())["error"]
+
+
+@pytest.mark.parametrize("weak", [
+    "test-token-123",                                   # 太短
+    "a" * 48,                                           # 低熵
+    "my-company-node-api-token-2026-production-01",     # 人编（弱词）
+])
+async def test_weak_configured_token_counts_as_no_token(tmp_path, weak):
+    """配了令牌但强度不达标 = 没有令牌：带着**这个令牌本身**也改不了，
+    403 写明原因与生成方式——弱令牌绝不能成为后门。"""
+    yml = tmp_path / "config.yaml"
+    yml.write_text(BASE_YAML, encoding="utf-8")
+    before = yml.read_text(encoding="utf-8")
+    app = webconsole.build_app(
+        hub(), webconsole.LogBuffer(), __import__("logging").getLogger("t"),
+        yaml_path=str(yml), api_token=weak)
+    async with TestClient(TestServer(app)) as c:
+        r = await c.put("/api/request-limits/fe_a", json={"mbps": 20},
+                        headers=auth(weak))
+        assert r.status == 403
+        err = (await r.json())["error"]
+        assert "强度不足" in err and "openssl rand" in err
+        assert weak not in err                          # 不回显令牌
+    assert yml.read_text(encoding="utf-8") == before
 
 
 async def test_quota_endpoints_are_gone(wclient):

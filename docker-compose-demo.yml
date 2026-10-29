@@ -1,7 +1,7 @@
 # docker compose 演示拓扑（通用形态）：两台"服务器节点" + 压测 + 总控。
 #
 #   起停：make demo-up / make demo-logs / make demo-down
-#   控制台：http://localhost:8090 / :8092（每台节点各一个，令牌 demo-token）
+#   控制台：http://localhost:8090 / :8092（每台节点各一个，令牌 742ccc60283bf452954071b32d99867729047595bb9cbf29）
 #   总控：http://localhost:8095（多机总量控制）
 #   调并发：curl -X PUT http://localhost:8084/concurrency -d '{"concurrency": 1000}'
 #   长连接大文件下载：curl -X PUT http://localhost:8084/big -d '{"per_target": 2}'
@@ -50,7 +50,9 @@ x-node-env: &node-env
   RL_TC_IFACE: "-"
   RL_METRICS_LOG: /var/log/rl-limiter/metrics.jsonl
   RL_CONSOLE_BIND: 0.0.0.0
-  RL_API_TOKEN: demo-token
+  # 演示专用令牌（写在公开仓库里，**绝不可用于生产**）。令牌必须过强度
+  # 规则（≥32 位高强度随机串），弱令牌会被当作没有令牌、写接口禁用。
+  RL_API_TOKEN: 742ccc60283bf452954071b32d99867729047595bb9cbf29
 
 services:
   node1:
@@ -103,7 +105,7 @@ services:
 
   # ---- 总控制台（rl-fleet）：汇总两台节点，把总流出带宽按需分配为
   # 各节点的实例出向目标（节点闭环再转成入向限速）。玩法：打开
-  # http://localhost:8095（令牌 demo-token），设总带宽后加压观察两
+  # http://localhost:8095（令牌 742ccc60283bf452954071b32d99867729047595bb9cbf29），设总带宽后加压观察两
   # 节点配额此消彼长、总出向被压在参考线下。 ----
   fleet:
     build: .
@@ -117,7 +119,7 @@ services:
     environment:
       RL_CONSOLE_PORT: "8095"
       RL_CONSOLE_BIND: 0.0.0.0
-      RL_API_TOKEN: demo-token
+      RL_API_TOKEN: 742ccc60283bf452954071b32d99867729047595bb9cbf29
       # 监控落盘：页面「历史回查」读它。
       RL_METRICS_LOG: /var/log/rl-limiter/fleet-metrics.jsonl
     ports:

@@ -21,6 +21,7 @@ import pathlib
 import platform
 import shutil
 import subprocess
+import sys
 import tarfile
 import hashlib
 
@@ -79,13 +80,27 @@ cp "$f" "$out"
 }
 
 
+# 真随机生成的强令牌（过 tokenpolicy）；弱令牌安装脚本会拒收。
+NODE_TOK = "d9253b4e26b5a7f47d1c1dfd422437a8365824e8c0625dd0"
+NODE_TOK2 = "fe8890a02029cbe0d9a67dd1cb2cbd8f1daa11101d13ef31"
+FLEET_TOK = "4b4ee4871702687022f6fe251e37f4939373663d60927da2"
+FLEET_TOK2 = "272a3e101a6d5e039a5c7739f8c097f879fcd70a04213a1f"
+
+
 def _make_pkg(dst: pathlib.Path) -> pathlib.Path:
-    """造一个发布包目录（假二进制 + 真模板 + 真 install.sh）。"""
+    """造一个发布包目录（假二进制 + 真模板 + 真 install.sh）。
+
+    假 rl-limiter 的 --check-token 转给真实现（python -m rl_limiter）——
+    令牌强度规则只有 Python 一份，安装脚本靠它校验。"""
     (dst / "bin").mkdir(parents=True)
     (dst / "config").mkdir()
     for b in ("rl-limiter", "rl-fleet"):
         p = dst / "bin" / b
-        p.write_text(f"#!/bin/sh\necho {b} 9.9.9\n")
+        p.write_text(
+            "#!/bin/sh\n"
+            f'[ "$1" = --check-token ] && PYTHONPATH="{ROOT}" exec '
+            f'"{sys.executable}" -m rl_limiter --check-token\n'
+            f"echo {b} 9.9.9\n")
         p.chmod(0o755)
     for src in ("deploy/config/limiter.example.yaml",
                 "deploy/config/fleet.example.yaml",
@@ -189,13 +204,13 @@ def test_virtual_nics_do_not_count_as_dual_nic(box):
 
 def test_node_install_writes_token_and_nics(box):
     run, paths = box
-    r = run("--token", "tok-0123456789", "--client-nic", "ens33",
+    r = run("--token", NODE_TOK, "--client-nic", "ens33",
             "--backend-nic", "ens34", nics=["ens33", "ens34"])
     assert r.returncode == 0, r.stderr
     env = _env(paths)
     assert env["RL_TC_IN_IFACE"] == "ens33"
     assert env["RL_BACKEND_IFACE"] == "ens34"
-    assert env["RL_API_TOKEN"] == "tok-0123456789"
+    assert env["RL_API_TOKEN"] == NODE_TOK
     # 每个键只有一行生效（systemd 后写覆盖先写，重复行等于埋雷）。
     text = (paths["conf"] / "rl-limiter.env").read_text()
     for k in ("RL_TC_IN_IFACE", "RL_BACKEND_IFACE", "RL_API_TOKEN"):
@@ -247,6 +262,8 @@ def test_default_nics_missing_asks_for_explicit_flags(box):
 
 @pytest.mark.parametrize("args", [
     ("--token", "short"),                 # 太短
+    ("--token", "a" * 48),                # 够长但低熵（二进制规则拦）
+    ("--token", "my-company-node-api-token-2026-prod"),   # 人编（弱词）
     ("--token", "has space here"),        # 空格进不了 EnvironmentFile
     ("--token", "a'b\"c$d1234"),          # 引号/展开符
     ("--token",),                         # 缺值
@@ -264,28 +281,28 @@ def test_bad_arguments_are_refused(box, args):
 
 def test_equals_form_is_accepted(box):
     run, paths = box
-    r = run("--token=-starts-with-dash", "--client-nic=eth1",
+    r = run("--token=-" + NODE_TOK, "--client-nic=eth1",
             "--backend-nic=eth0")
     assert r.returncode == 0, r.stderr
     env = _env(paths)
-    assert env["RL_API_TOKEN"] == "-starts-with-dash"
+    assert env["RL_API_TOKEN"] == "-" + NODE_TOK
     assert env["RL_TC_IN_IFACE"] == "eth1"
     assert env["RL_BACKEND_IFACE"] == "eth0"
 
 
 def test_rerun_keeps_config_and_only_applies_given_flags(box):
     run, paths = box
-    assert run("--token", "first-token-1").returncode == 0
+    assert run("--token", NODE_TOK).returncode == 0
     envf = paths["conf"] / "rl-limiter.env"
     # 运维手工调过的项：重跑不许动。
     envf.write_text(envf.read_text().replace(
         "RL_CONSOLE_PORT=8090", "RL_CONSOLE_PORT=9999"))
     (paths["conf"] / "config.yaml").write_text("instance_quota_mbps: 42\n")
 
-    r = run("--token", "second-token-2")
+    r = run("--token", NODE_TOK2)
     assert r.returncode == 0, r.stderr
     env = _env(paths)
-    assert env["RL_API_TOKEN"] == "second-token-2"
+    assert env["RL_API_TOKEN"] == NODE_TOK2
     assert env["RL_CONSOLE_PORT"] == "9999"
     assert env["RL_TC_IN_IFACE"] == "eth0"
     assert (paths["conf"] / "config.yaml").read_text() == \
@@ -318,10 +335,10 @@ def test_old_env_without_backend_nic_gets_a_hint(box):
 
 def test_fleet_install_writes_token_and_skips_nic_check(box):
     run, paths = box
-    r = run("--fleet", "--token", "fleet-token-1", nics=[])
+    r = run("--fleet", "--token", FLEET_TOK, nics=[])
     assert r.returncode == 0, r.stderr
     env = _env(paths, "rl-fleet.env")
-    assert env["RL_API_TOKEN"] == "fleet-token-1"
+    assert env["RL_API_TOKEN"] == FLEET_TOK
     assert env["RL_CONSOLE_PORT"] == "8095"
     assert (paths["conf"] / "fleet.yaml").exists()
     assert (paths["units"] / "rl-fleet.service").exists()
@@ -370,13 +387,13 @@ def _publish(paths, tag: str) -> None:
 def test_download_latest_passes_options_through_and_cleans_up(box):
     run, paths = box
     _publish(paths, "v9.9.9")
-    r = run("--download", "--token", "dl-token-123", "--client-nic", "eth1",
+    r = run("--download", "--token", NODE_TOK, "--client-nic", "eth1",
             "--backend-nic", "eth0", script=SCRIPT,
             latest="https://github.com/x/y/releases/tag/v9.9.9")
     assert r.returncode == 0, r.stderr
     assert "最新版本：v9.9.9" in r.stdout
     env = _env(paths)
-    assert env["RL_API_TOKEN"] == "dl-token-123"
+    assert env["RL_API_TOKEN"] == NODE_TOK
     assert env["RL_TC_IN_IFACE"] == "eth1"
     assert env["RL_BACKEND_IFACE"] == "eth0"
     # 临时目录（下载包 + 解包的二进制）必须清掉。
@@ -388,10 +405,10 @@ def test_download_latest_passes_options_through_and_cleans_up(box):
 def test_download_tag_without_v_and_fleet(box):
     run, paths = box
     _publish(paths, "v9.9.9")
-    r = run("--download", "9.9.9", "--fleet", "--token", "fleet-token-2",
+    r = run("--download", "9.9.9", "--fleet", "--token", FLEET_TOK2,
             script=SCRIPT, nics=[])
     assert r.returncode == 0, r.stderr
-    assert _env(paths, "rl-fleet.env")["RL_API_TOKEN"] == "fleet-token-2"
+    assert _env(paths, "rl-fleet.env")["RL_API_TOKEN"] == FLEET_TOK2
 
 
 @pytest.mark.parametrize("args, latest, msg", [
@@ -426,7 +443,7 @@ def _calls(paths) -> list:
 
 def test_uninstall_node_clears_tc_and_keeps_config(box):
     run, paths = box
-    assert run("--token", "node-token-1").returncode == 0
+    assert run("--token", NODE_TOK).returncode == 0
     paths["tc_log"].unlink(missing_ok=True)
     # 卸载不查双网卡：网卡拆了也能卸。
     r = run("--uninstall", nics=[],
@@ -443,7 +460,7 @@ def test_uninstall_node_clears_tc_and_keeps_config(box):
     assert not (paths["prefix"] / "bin/rl-limiter").exists()
     assert not (paths["prefix"] / "bin/rl-fleet").exists()
     # 不加 --purge：配置保留，重装沿用。
-    assert _env(paths)["RL_API_TOKEN"] == "node-token-1"
+    assert _env(paths)["RL_API_TOKEN"] == NODE_TOK
     assert (paths["conf"] / "config.yaml").exists()
 
 
@@ -482,7 +499,7 @@ def test_uninstall_purge_removes_config(box):
 def test_uninstall_keeps_binaries_while_other_role_remains(box):
     run, paths = box
     assert run().returncode == 0
-    assert run("--fleet", "--token", "fleet-token-1").returncode == 0
+    assert run("--fleet", "--token", FLEET_TOK).returncode == 0
 
     r = run("--uninstall")
     assert r.returncode == 0, r.stderr
@@ -524,13 +541,13 @@ def test_fleet_install_enables_metrics_log(box):
 def test_fleet_upgrade_adds_metrics_log_to_old_env(box):
     run, paths = box
     paths["conf"].mkdir()
-    old = "RL_CONSOLE_PORT=8095\nRL_API_TOKEN=fleet-token-1\n"
+    old = f"RL_CONSOLE_PORT=8095\nRL_API_TOKEN={FLEET_TOK}\n"
     (paths["conf"] / "rl-fleet.env").write_text(old)
     r = run("--fleet", nics=[])
     assert r.returncode == 0, r.stderr
     env = _env(paths, "rl-fleet.env")
     assert env["RL_METRICS_LOG"] == "/var/log/rl-limiter/fleet-metrics.jsonl"
-    assert env["RL_API_TOKEN"] == "fleet-token-1"       # 其余不动
+    assert env["RL_API_TOKEN"] == FLEET_TOK             # 其余不动
     # 重跑不重复追加。
     assert run("--fleet", nics=[]).returncode == 0
     text = (paths["conf"] / "rl-fleet.env").read_text()
@@ -545,3 +562,48 @@ def test_fleet_upgrade_respects_disabled_metrics_log(box):
         "RL_CONSOLE_PORT=8095\n# RL_METRICS_LOG=/var/log/x.jsonl\n")
     assert run("--fleet", nics=[]).returncode == 0
     assert "RL_METRICS_LOG" not in _env(paths, "rl-fleet.env")
+
+
+# ---- 令牌强度：弱令牌拒装、auto 生成、已有弱令牌告警 ----------------------
+
+def test_weak_token_refused_before_anything_is_installed(box):
+    run, paths = box
+    r = run("--token", "x" * 40)
+    assert r.returncode != 0 and "强度不足" in r.stderr
+    assert "--token auto" in r.stderr
+    assert not paths["conf"].exists()
+    # 校验用的临时副本不能留在 PREFIX/bin 里。
+    assert not any(p.name.startswith(".rl-limiter-tokencheck")
+                   for p in (paths["prefix"] / "bin").glob(".*"))
+
+
+def test_token_auto_generates_strong_token_and_prints_it(box):
+    from rl_limiter import tokenpolicy
+    run, paths = box
+    r = run("--token", "auto")
+    assert r.returncode == 0, r.stderr
+    tok = _env(paths)["RL_API_TOKEN"]
+    assert len(tok) == 64 and tokenpolicy.is_strong(tok)
+    assert tok in r.stdout                    # 装完打印，便于登记到总控
+    r = run("--fleet", "--token", "auto", nics=[])
+    assert r.returncode == 0, r.stderr
+    ftok = _env(paths, "rl-fleet.env")["RL_API_TOKEN"]
+    assert tokenpolicy.is_strong(ftok) and ftok != tok
+
+
+def test_download_short_token_refused_before_download(box):
+    run, paths = box
+    r = run("--download", "--token", "short-token", script=SCRIPT)
+    assert r.returncode != 0 and "太短" in r.stderr
+    assert not paths["curl_log"].exists()
+
+
+def test_existing_weak_token_warns_on_upgrade(box):
+    run, paths = box
+    paths["conf"].mkdir()
+    (paths["conf"] / "rl-limiter.env").write_text(
+        "RL_TC_IN_IFACE=eth0\nRL_BACKEND_IFACE=eth1\nRL_API_TOKEN=demo-token\n")
+    r = run()
+    assert r.returncode == 0, r.stderr
+    assert "强度不足" in r.stderr and "--token auto" in r.stderr
+    assert "demo-token" not in r.stderr + r.stdout      # 不回显令牌

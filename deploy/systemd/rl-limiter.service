@@ -26,7 +26,8 @@ Type=simple
 # Environment=RL_CONSOLE_PORT=8090
 # Environment=RL_CONSOLE_BIND=10.0.0.11
 # 写 API（页面/API 修改限额）的令牌：不设则写接口整体 403（页面只读）。
-# 生成随机值：openssl rand -hex 24
+# 必须是高强度随机串（≥32 位，规则见 rl_limiter/tokenpolicy.py），弱令牌
+# 当作没设。生成：openssl rand -hex 32
 # Environment=RL_API_TOKEN=
 # 监控数据落盘（分钟粒度 JSONL，按天轮转；/metrics 是实时值，这里是历史）。
 # 目录由下面的 LogsDirectory 自动创建并授权。

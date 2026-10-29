@@ -2,22 +2,28 @@
 # rl-limiter 二进制发布包安装脚本（随 tar.gz 分发，也作为 Release 附件单独下载）。
 #
 # 装节点（默认）——本机必须至少有两张物理网卡（客户侧 + 后端侧），否则拒绝安装：
-#   sudo ./install.sh [--token <令牌>] [--client-nic <网卡>] [--backend-nic <网卡>]
-#     --token        节点写 API 令牌（RL_API_TOKEN；总控登记该节点时填同一个值）
+#   sudo ./install.sh [--token <令牌>|auto] [--client-nic <网卡>] [--backend-nic <网卡>]
+#     --token        节点写 API 令牌（RL_API_TOKEN；总控登记该节点时填同一个值）。
+#                    auto = 自动生成 64 位十六进制随机令牌（256 bit），装完打印出来
 #     --client-nic   客户端侧网卡 = 入向限速执行网卡（RL_TC_IN_IFACE，默认 eth0）
 #     --backend-nic  后端服务侧网卡（RL_BACKEND_IFACE，默认 eth1）
 #   两张网卡必须是不同的网卡（相斥），且都在本机存在。
 #
 # 装总控（rl-fleet，不碰 tc，不要求双网卡）：
-#   sudo ./install.sh --fleet [--token <令牌>]
-#     --token        总控写 API 令牌（页面改总带宽、添加/删除节点用）
+#   sudo ./install.sh --fleet [--token <令牌>|auto]
+#     --token        总控写 API 令牌（页面改总带宽、添加/删除节点用）；auto 同上
+#
+# 令牌必须是**高强度随机串**：≥32 位、估算 ≥128 bit、没有重复/顺序/常见词
+# 等人为痕迹（规则见 rl_limiter/tokenpolicy.py）。不达标拒绝安装；运行中的
+# rl-limiter / rl-fleet 也会把不达标的令牌当作没有（写接口禁用）。推荐
+# --token auto，或 openssl rand -hex 32。
 #
 # 包从哪来：
 #   1. 已有发布包：tar xzf rl-limiter-<tag>-linux-x86_64.tar.gz，进包目录执行；
 #   2. --download [tag]：从 GitHub Release 下载（不带 tag = 最新版），校验
 #      .sha256 后安装，其余参数原样交给包内的 install.sh。例：
-#        sudo ./install.sh --download --token <令牌> --client-nic ens33 --backend-nic ens34
-#        sudo ./install.sh --download v0.6.0 --fleet --token <令牌>
+#        sudo ./install.sh --download --token auto --client-nic ens33 --backend-nic ens34
+#        sudo ./install.sh --download v0.6.4 --fleet --token auto
 #      需要能访问 github.com（含跳转到的 objects.githubusercontent.com）。
 #
 # 装什么：
@@ -112,10 +118,15 @@ done
 # ---- 校验（下载之前就做：参数错了不该先下几十 MB 再报错） ----------------
 [ "$(id -u)" = 0 ] || die "需要 root（写 $PREFIX/bin、$CONF_DIR 与 systemd 单元）"
 
-# 令牌写进 systemd EnvironmentFile：只收不需要转义的字符，并且不能太短。
-if [ -n "$TOKEN" ]; then
-    [[ "$TOKEN" =~ ^[A-Za-z0-9._~+/=-]{8,}$ ]] \
-        || die "令牌至少 8 位，且只能含字母、数字与 ._~+/=-（生成一个：openssl rand -hex 24）"
+# 令牌：这里先做不需要二进制的粗检（字符集、长度），明显不行的在下载
+# 之前就拒绝；完整的强度规则在装之前用包里的 rl-limiter --check-token
+# 校验（规则只在 Python 里写一份，见 token_weakness）。
+TOKEN_HINT="生成一个：--token auto，或 openssl rand -hex 32"
+if [ -n "$TOKEN" ] && [ "$TOKEN" != auto ]; then
+    [[ "$TOKEN" =~ ^[A-Za-z0-9._~+/=-]+$ ]] \
+        || die "令牌含不允许的字符（只收字母、数字与 ._~+/=-）——$TOKEN_HINT"
+    [ "${#TOKEN}" -ge 32 ] \
+        || die "令牌太短（${#TOKEN} 位，至少 32 位高强度随机串）——$TOKEN_HINT"
 fi
 
 if [ "$WITH_FLEET" = 1 ] && { [ -n "$CLIENT_NIC" ] || [ -n "$BACKEND_NIC" ]; }; then
@@ -300,6 +311,50 @@ HERE=$(cd "$(dirname "$0")" && pwd)
     || die "没在发布包目录里（找不到 bin/rl-limiter）。先 tar xzf 解包，" \
            "进包目录再执行；或用 --download [tag] 直接下载安装"
 
+# 令牌强度：调包里的 rl-limiter --check-token（与运行时同一套规则）。
+# 先拷到 $PREFIX/bin 下的临时名再跑——包目录可能在挂了 noexec 的 /tmp
+# 下（--download 就是）。达标输出空，否则输出原因。
+token_weakness() {
+    local chk="$PREFIX/bin/.rl-limiter-tokencheck.$$" out
+    install -d -m 755 "$PREFIX/bin"
+    install -m 700 "$HERE/bin/rl-limiter" "$chk"
+    out=$(printf '%s' "$1" | "$chk" --check-token 2>&1) || true
+    rm -f "$chk"
+    [ "$out" = OK ] || printf '%s' "${out:-无法校验（rl-limiter --check-token 无输出）}"
+}
+
+# --token auto：64 位十六进制（256 bit）。生成后照样过一遍规则（真随机
+# 几乎不可能不过，过不了就换一个）。
+gen_token() {
+    local t i
+    for i in 1 2 3 4 5; do
+        t=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+        [ -z "$(token_weakness "$t")" ] && { printf '%s' "$t"; return 0; }
+    done
+    die "生成令牌 5 次都没过强度校验（/dev/urandom 异常？）"
+}
+
+GENERATED_TOKEN=""
+if [ "$TOKEN" = auto ]; then
+    TOKEN=$(gen_token)
+    GENERATED_TOKEN=$TOKEN
+elif [ -n "$TOKEN" ]; then
+    why=$(token_weakness "$TOKEN")
+    [ -z "$why" ] || die "令牌强度不足：$why。$TOKEN_HINT"
+fi
+
+# 已有 env 里的令牌（升级、没给 --token 时沿用）不达标：新版本会当作
+# 没有令牌，提前说清楚。
+warn_weak_existing() {
+    local file=$1 cur why
+    [ -n "$TOKEN" ] && return 0
+    cur=$(env_get "$file" RL_API_TOKEN)
+    [ -n "$cur" ] || return 0
+    why=$(token_weakness "$cur")
+    [ -z "$why" ] || warn "$file 里现有的 RL_API_TOKEN 强度不足（$why），本版本起会被当作" \
+        "没有令牌（写接口禁用）——加 --token auto 重跑生成新令牌"
+}
+
 # env_set <文件> <键> <值>：有这个键的生效行就全部改掉（systemd 后写的
 # 覆盖先写的，留一行旧值等于没改）；没有生效行就改第一条注释掉的示例
 # 行；都没有就追加。awk 只用 index/sub（老版 mawk 不认 [[:space:]]）；
@@ -364,6 +419,7 @@ if [ "$WITH_FLEET" = 1 ]; then
         env_set "$CONF_DIR/rl-fleet.env" RL_API_TOKEN "$TOKEN"
         log "总控写 API 令牌已写入 rl-fleet.env"
     fi
+    warn_weak_existing "$CONF_DIR/rl-fleet.env"
     # 老版本生成的 rl-fleet.env 没有监控落盘这一项（连注释都没有）：补上
     # 默认值——升级后「历史回查」才有数据。注释掉过的说明是有意关的，不动。
     if ! grep -q "RL_METRICS_LOG=" "$CONF_DIR/rl-fleet.env"; then
@@ -426,6 +482,7 @@ else
         env_set "$ENVF" RL_API_TOKEN "$TOKEN"
         log "节点写 API 令牌已写入 rl-limiter.env"
     fi
+    warn_weak_existing "$ENVF"
     NODE_TOKEN=$(env_get "$ENVF" RL_API_TOKEN)
     NODE_PORT=$(env_get "$ENVF" RL_CONSOLE_PORT)
 
@@ -476,10 +533,12 @@ if [ "$WITH_FLEET" = 1 ]; then
     log "  2. systemctl enable --now rl-fleet"
     log "  3. 打开 http://<本机>:${FLEET_PORT:-<端口>} → 页头填令牌 →「节点管理」添加节点"
     [ -n "$FLEET_TOKEN" ] || warn "未设总控令牌（--token）：页面只读，改总带宽/添加节点都会被拒"
+    [ -z "$GENERATED_TOKEN" ] || log "总控令牌（已写入 rl-fleet.env，页头填它；请妥善保存）：$GENERATED_TOKEN"
 else
     log "  1. 核对 $CONF_DIR/config.yaml（instance_quota_mbps 出向目标 / ports / request_limits）"
     log "  2. systemctl enable --now rl-limiter"
     log "  3. 在总控「节点管理」登记本节点：地址 http://<本机内网地址>:${NODE_PORT:-8090}，令牌同 RL_API_TOKEN"
     [ -n "$NODE_TOKEN" ] || warn "未设节点令牌（--token）：写 API 禁用，总控无法向本节点下发配额"
+    [ -z "$GENERATED_TOKEN" ] || log "节点令牌（已写入 rl-limiter.env，总控登记本节点时填它；请妥善保存）：$GENERATED_TOKEN"
 fi
 exit 0

@@ -40,7 +40,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from . import configstore, model
+from . import configstore, model, tokenpolicy
 
 # 快照留存拍数：1s 一拍即约 10 分钟窗口，页面刷新后能立即回填完整曲线。
 HISTORY_TICKS = 600
@@ -452,7 +452,8 @@ def build_app(
 
     写 API 只在 yaml_path 非空时挂载（测试/极简形态可以只要只读部分），
     且每个请求都要过令牌校验：api_token 为空 = 未配置 RL_API_TOKEN，
-    所有写请求 403——绝不允许"没配令牌就人人可改限速"。
+    所有写请求 403——绝不允许"没配令牌就人人可改限速"。**强度不达标的
+    令牌同样视为未配置**（规则见 tokenpolicy），403 里写明原因。
 
     known_frontends_fn 返回当前 haproxy.cfg 里解析到的段名集合，用来
     拒绝给不存在的 frontend 登记限额（多半是拼错了名字；写进去也只会
@@ -620,13 +621,19 @@ def build_app(
     # 服务内写操作串行化：整份读-改-写不可交叠，否则并发 PUT 会互相
     # 覆盖对方刚写进去的键。
     write_lock = asyncio.Lock()
+    # 弱令牌 = 没有令牌：在鉴权层本身兜底，不依赖调用方先查过。
+    api_token, token_weak = tokenpolicy.effective(api_token)
 
     def _authorized(request: web.Request) -> "web.Response | None":
         """令牌校验。通过返回 None，否则返回该直接回给客户端的响应。"""
         if not api_token:
             return web.json_response(
-                {"error": "未配置 RL_API_TOKEN，写接口已禁用——在服务的"
-                          "环境变量里设置令牌后重启即可启用"},
+                {"error": (f"RL_API_TOKEN 强度不足（{token_weak}），已视为"
+                           f"未配置，写接口禁用——用 "
+                           f"{tokenpolicy.GENERATE_HINT} 生成新令牌，写进"
+                           f"服务的环境变量后重启" if token_weak else
+                           "未配置 RL_API_TOKEN，写接口已禁用——在服务的"
+                           "环境变量里设置令牌后重启即可启用")},
                 status=403)
         got = ""
         auth = request.headers.get("Authorization", "")
@@ -835,8 +842,11 @@ async def run_console(
     await runner.setup()
     site = web.TCPSite(runner, bind, port)
     await site.start()
+    eff_token, token_weak = tokenpolicy.effective(api_token)
     log.info("Web 控制台已启动 bind=%s port=%d 写API=%s", bind, port,
-             ("已启用（令牌鉴权）" if yaml_path and api_token
+             ("已启用（令牌鉴权）" if yaml_path and eff_token
+              else "已禁用（RL_API_TOKEN 强度不足，视为未配置）"
+              if yaml_path and token_weak
               else "已禁用（未配置 RL_API_TOKEN）" if yaml_path
               else "未挂载"))
     if bind not in ("127.0.0.1", "::1", "localhost"):

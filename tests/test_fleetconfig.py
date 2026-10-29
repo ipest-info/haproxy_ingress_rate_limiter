@@ -17,10 +17,10 @@ total_egress_mbps: 300
 nodes:
   - name: node1
     url: http://10.0.0.1:8090
-    token: tok1
+    token: fe8890a02029cbe0d9a67dd1cb2cbd8f1daa11101d13ef31
   - name: node2
     url: http://10.0.0.2:8090
-    token: tok2
+    token: 4b4ee4871702687022f6fe251e37f4939373663d60927da2
     console_url: http://pub.example:8092
 """
 
@@ -114,15 +114,15 @@ def test_set_total_quota_refuses_broken_yaml(yml):
 
 def test_add_node_appends_and_keeps_other_sections(yml):
     fleetconfig.add_node(str(yml), "node3",
-                         {"url": "http://10.0.0.3:8090/", "token": " tok3 "})
+                         {"url": "http://10.0.0.3:8090/", "token": " 272a3e101a6d5e039a5c7739f8c097f879fcd70a04213a1f "})
     cfg = fleetconfig.load(str(yml))
     assert [n.name for n in cfg.nodes] == ["node1", "node2", "node3"]
     n3 = cfg.nodes[2]
     assert (n3.url, n3.token, n3.console_url) == \
-        ("http://10.0.0.3:8090", "tok3", "")
+        ("http://10.0.0.3:8090", "272a3e101a6d5e039a5c7739f8c097f879fcd70a04213a1f", "")
     assert cfg.total_egress_mbps == 300.0
     # 已有节点的令牌原样保留。
-    assert cfg.nodes[0].token == "tok1"
+    assert cfg.nodes[0].token == "fe8890a02029cbe0d9a67dd1cb2cbd8f1daa11101d13ef31"
 
 
 def test_add_node_without_token_is_read_only(yml):
@@ -157,7 +157,7 @@ def test_update_node_changes_only_given_fields(yml):
     fleetconfig.update_node(str(yml), "node2", {"url": "http://10.0.0.22:8090"})
     n2 = fleetconfig.load(str(yml)).nodes[1]
     assert n2.url == "http://10.0.0.22:8090"
-    assert n2.token == "tok2"                         # 没给 = 不动
+    assert n2.token == "4b4ee4871702687022f6fe251e37f4939373663d60927da2"                         # 没给 = 不动
     assert n2.console_url == "http://pub.example:8092"
     # token 给空串 = 清除（转只读观测）。
     fleetconfig.update_node(str(yml), "node2", {"token": ""})
@@ -186,6 +186,30 @@ def test_node_writes_refuse_broken_nodes_section(tmp_path):
     with pytest.raises(fleetconfig.FleetConfigError):
         fleetconfig.add_node(str(p), "n1", {"url": "http://x:1"})
     assert p.read_text(encoding="utf-8") == "nodes: oops\n"
+
+
+def test_weak_node_token_in_yaml_counts_as_none():
+    """配置文件里的弱节点令牌：配置照常加载，但该节点当作没有令牌（只读
+    观测、绝不下发），原因记在 token_rejected。"""
+    cfg = fleetconfig.from_raw({"nodes": [
+        {"name": "weak", "url": "http://x:1", "token": "tok-123"},
+        {"name": "strong", "url": "http://y:1",
+         "token": "5e87f5b9c50fca3df7adef8427563b8ddfe798c5397cea8f"},
+    ]}, source="测试")
+    weak, strong = cfg.nodes
+    assert weak.token == "" and "太短" in weak.token_rejected
+    assert strong.token and strong.token_rejected == ""
+
+
+@pytest.mark.parametrize("tok", ["tok3", "x" * 40, "node-01-secret-key-for-fleet-xx"])
+def test_node_writes_refuse_weak_tokens(yml, tok):
+    before = yml.read_text(encoding="utf-8")
+    with pytest.raises(fleetconfig.FleetConfigError, match="强度不足"):
+        fleetconfig.add_node(str(yml), "n9", {"url": "http://x:1",
+                                                "token": tok})
+    with pytest.raises(fleetconfig.FleetConfigError, match="强度不足"):
+        fleetconfig.update_node(str(yml), "node1", {"token": tok})
+    assert yml.read_text(encoding="utf-8") == before
 
 
 # ---------------------------------------------------------------------------

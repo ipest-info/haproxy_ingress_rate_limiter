@@ -297,8 +297,8 @@ a.btn-link:hover { text-decoration: underline; }
             <input id="nf-name" maxlength="64" placeholder="node-sh-01" autocomplete="off"></label>
           <label>节点控制台地址
             <input id="nf-url" placeholder="http://10.0.1.11:8090" autocomplete="off"></label>
-          <label>节点令牌（该节点的 RL_API_TOKEN）
-            <input id="nf-token" type="password" placeholder="装节点时 --token 指定的值" autocomplete="new-password"></label>
+          <label>节点令牌（该节点的 RL_API_TOKEN，须高强度）
+            <input id="nf-token" type="password" placeholder="≥32 位随机串，如 openssl rand -hex 32" autocomplete="new-password"></label>
           <label>页面跳转地址（可选）
             <input id="nf-console" placeholder="内外网地址不同时填；缺省 = 控制台地址" autocomplete="off"></label>
         </div>
@@ -311,7 +311,9 @@ a.btn-link:hover { text-decoration: underline; }
         </div>
         <div class="hint" style="margin-top:10px">节点侧前提：控制台（RL_CONSOLE_PORT）绑在总控可达的内网地址，
           并用防火墙/安全组限制只有总控能访问；令牌留空 = 只读观测（汇总里看得到，但不参与分配、不被下发）。
-          节点令牌只保存在总控的 fleet.yaml 里，页面与读接口永远只显示"已配置/未配置"。</div>
+          节点令牌只保存在总控的 fleet.yaml 里，页面与读接口永远只显示"已配置/未配置"。
+          令牌必须是高强度随机串（≥32 位、估算 ≥128 bit、不能有重复/顺序/常见词等人为痕迹），
+          弱令牌会被拒收；推荐在节点上用 <code>install.sh --token auto</code> 或 <code>openssl rand -hex 32</code> 生成。</div>
       </div>
     </div>
 
@@ -634,7 +636,9 @@ function renderNodeList() {
         <td><b>${esc(n.name)}</b></td>
         <td class="url">${esc(n.url)}</td>
         <td class="url">${n.console_url ? esc(n.console_url) : '<span class="hint">= 控制台地址</span>'}</td>
-        <td>${n.has_token ? '<span class="tag ok">已配置</span>' : '<span class="tag">未配置 · 只读观测</span>'}</td>
+        <td>${n.has_token ? '<span class="tag ok">已配置</span>'
+             : n.token_weak ? '<span class="tag alert" title="fleet.yaml 里的令牌没过强度规则，已当作没有令牌：只读观测，不下发、不解除。在该节点上重新生成强令牌后点「编辑」更新">强度不足 · 已作废</span>'
+             : '<span class="tag">未配置 · 只读观测</span>'}</td>
         <td>${live[n.name] ? nodeBadge(live[n.name]) : '<span class="tag">等待轮询</span>'}</td>
         <td class="ops"><button data-edit="${esc(n.name)}">编辑</button>
           <button class="danger" data-del="${esc(n.name)}">删除</button></td>
@@ -645,7 +649,7 @@ function resetNodeForm() {
   state.editing = null;
   for (const id of ["#nf-name", "#nf-url", "#nf-token", "#nf-console"]) $(id).value = "";
   $("#nf-name").disabled = false;
-  $("#nf-token").placeholder = "装节点时 --token 指定的值";
+  $("#nf-token").placeholder = "≥32 位随机串，如 openssl rand -hex 32";
   $("#nf-clear-token").checked = false;
   $("#nf-clear-wrap").hidden = true;
   $("#nf-cancel").hidden = true;
@@ -679,7 +683,7 @@ async function saveNode() {
   if (!/^https?:\/\/[^\/\s]+/.test(url)) {
     toast("控制台地址应为 http(s)://<节点地址>:<端口>，如 http://10.0.1.11:8090", true); return;
   }
-  if (/\s/.test(token)) { toast("令牌不能含空白字符", true); return; }
+  if (token && token.length < 32) { toast("令牌太短：至少 32 位高强度随机串（如 openssl rand -hex 32）", true); return; }
   let r;
   if (state.editing) {
     const body = {url, console_url: cu};

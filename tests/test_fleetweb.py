@@ -12,14 +12,14 @@ from aiohttp.test_utils import TestClient, TestServer
 from rl_limiter import fleetconfig, fleetgov, fleetweb
 
 log = logging.getLogger("test")
-TOKEN = "fleet-token"
+TOKEN = "4d0f049407ac1f0523f1ef306948f85c64b6e5e95b701a7e"  # 写 API 令牌须过强度规则
 
 FLEET_YAML = """\
 total_egress_mbps: 300
 nodes:
   - name: node1
     url: http://10.0.0.1:8090
-    token: t1
+    token: fe8890a02029cbe0d9a67dd1cb2cbd8f1daa11101d13ef31
 """
 
 
@@ -154,8 +154,9 @@ async def test_sse_stream_delivers_latest_frame(client):
 async def test_nodes_read_view_never_leaks_tokens(client):
     j = await (await client.get("/api/nodes")).json()
     assert j["nodes"] == [{"name": "node1", "url": "http://10.0.0.1:8090",
-                           "console_url": "", "has_token": True}]
-    assert "t1" not in json.dumps(j)
+                           "console_url": "", "has_token": True,
+                           "token_weak": False}]
+    assert "fe8890a02029cbe0d9a67dd1cb2cbd8f1daa11101d13ef31" not in json.dumps(j)
 
 
 async def test_node_writes_require_token(client):
@@ -173,12 +174,12 @@ async def test_node_writes_require_token(client):
 async def test_add_edit_delete_node_roundtrip(client):
     yml, poke = client.app["yml"], client.app["poke"]
     r = await client.post("/api/nodes", headers=auth(), json={
-        "name": "node2", "url": "http://10.0.0.2:8090", "token": "t2"})
+        "name": "node2", "url": "http://10.0.0.2:8090", "token": "4b4ee4871702687022f6fe251e37f4939373663d60927da2"})
     assert r.status == 200, await r.text()
     assert poke.is_set()
     cfg = fleetconfig.load(str(yml))
     assert [(n.name, n.token) for n in cfg.nodes] == \
-        [("node1", "t1"), ("node2", "t2")]
+        [("node1", "fe8890a02029cbe0d9a67dd1cb2cbd8f1daa11101d13ef31"), ("node2", "4b4ee4871702687022f6fe251e37f4939373663d60927da2")]
     j = await (await client.get("/api/nodes")).json()
     assert [n["name"] for n in j["nodes"]] == ["node1", "node2"]
 
@@ -193,7 +194,7 @@ async def test_add_edit_delete_node_roundtrip(client):
                          json={"console_url": "http://pub:8092"})
     assert r.status == 200
     n2 = fleetconfig.load(str(yml)).nodes[1]
-    assert (n2.console_url, n2.token) == ("http://pub:8092", "t2")
+    assert (n2.console_url, n2.token) == ("http://pub:8092", "4b4ee4871702687022f6fe251e37f4939373663d60927da2")
 
     r = await client.delete("/api/nodes/node2", headers=auth())
     assert r.status == 200
@@ -288,3 +289,49 @@ async def test_metrics_log_bad_params(tmp_path, params):
     async with TestClient(TestServer(app)) as c:
         r = await c.get("/api/metrics-log", params=params)
         assert r.status == 400 and (await r.json())["error"]
+
+
+# ---------------------------------------------------------------------------
+# 令牌强度：弱令牌 = 没有令牌
+# ---------------------------------------------------------------------------
+
+async def test_weak_fleet_token_disables_writes(tmp_path):
+    """总控自己的 RL_API_TOKEN 不达标：带着它本身也改不了，403 说原因。"""
+    yml = tmp_path / "fleet.yaml"
+    yml.write_text(FLEET_YAML, encoding="utf-8")
+    weak = "fleet-token"
+    app = fleetweb.build_fleet_app(
+        hub(), fleetweb.LogBuffer(), log, yaml_path=str(yml), api_token=weak)
+    async with TestClient(TestServer(app)) as c:
+        for method, url, body in (
+                ("PUT", "/api/total-quota", {"quota_mbps": 1}),
+                ("POST", "/api/nodes", {"name": "n2", "url": "http://x:1"})):
+            r = await c.request(method, url, json=body, headers=auth(weak))
+            assert r.status == 403
+            err = (await r.json())["error"]
+            assert "强度不足" in err and weak not in err
+    assert yml.read_text(encoding="utf-8") == FLEET_YAML
+
+
+async def test_weak_node_token_rejected_on_add_and_edit(client):
+    before = client.app["yml"].read_text(encoding="utf-8")
+    r = await client.post("/api/nodes", headers=auth(), json={
+        "name": "node2", "url": "http://10.0.0.2:8090", "token": "node2-pass"})
+    assert r.status == 400 and "强度不足" in (await r.json())["error"]
+    r = await client.put("/api/nodes/node1", headers=auth(),
+                         json={"token": "a" * 48})
+    assert r.status == 400
+    assert client.app["yml"].read_text(encoding="utf-8") == before
+
+
+async def test_weak_node_token_in_yaml_shows_as_weak(tmp_path):
+    """手写进 YAML 的弱节点令牌：加载时作废（只读观测），读接口标出来。"""
+    yml = tmp_path / "fleet.yaml"
+    yml.write_text("nodes:\n  - name: n1\n    url: http://x:1\n"
+                   "    token: weakweak\n", encoding="utf-8")
+    h = hub(nodes_fn=lambda: fleetconfig.load(str(yml)).nodes)
+    app = fleetweb.build_fleet_app(h, fleetweb.LogBuffer(), log)
+    async with TestClient(TestServer(app)) as c:
+        j = await (await c.get("/api/nodes")).json()
+    assert j["nodes"][0]["has_token"] is False
+    assert j["nodes"][0]["token_weak"] is True

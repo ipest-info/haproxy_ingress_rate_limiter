@@ -25,7 +25,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from . import fleetconfig, fleetmetrics
+from . import fleetconfig, fleetmetrics, tokenpolicy
 from .webconsole import HISTORY_TICKS, LOGS_PAGE_LIMIT, LogBuffer  # noqa: F401
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -147,7 +147,9 @@ class FleetHub:
         绝不给值——与快照同一条安全边界。"""
         return [{"name": n.name, "url": n.url,
                  "console_url": n.console_url,
-                 "has_token": bool(n.token)}
+                 "has_token": bool(n.token),
+                 # 配了但强度不足、已当作没有令牌（只读观测）。
+                 "token_weak": bool(getattr(n, "token_rejected", ""))}
                 for n in self._nodes_fn()]
 
 
@@ -266,13 +268,19 @@ def build_fleet_app(
         return resp
 
     write_lock = asyncio.Lock()
+    # 弱令牌 = 没有令牌：在鉴权层本身兜底，不依赖调用方先查过。
+    api_token, token_weak = tokenpolicy.effective(api_token)
 
     def _authorized(request: web.Request) -> "web.Response | None":
         if not api_token:
             return web.json_response(
-                {"error": "未配置 RL_API_TOKEN，写接口已禁用——在 rl-fleet"
-                          " 的环境变量（rl-fleet.env）里设置令牌后重启即可"
-                          "启用"},
+                {"error": (f"RL_API_TOKEN 强度不足（{token_weak}），已视为"
+                           f"未配置，写接口禁用——用 "
+                           f"{tokenpolicy.GENERATE_HINT} 生成新令牌，写进 "
+                           f"rl-fleet.env 后重启" if token_weak else
+                           "未配置 RL_API_TOKEN，写接口已禁用——在 rl-fleet"
+                           " 的环境变量（rl-fleet.env）里设置令牌后重启即可"
+                           "启用")},
                 status=403)
         got = ""
         auth = request.headers.get("Authorization", "")
@@ -446,8 +454,11 @@ async def run_fleet_console(
     await runner.setup()
     site = web.TCPSite(runner, bind, port)
     await site.start()
+    eff_token, token_weak = tokenpolicy.effective(api_token)
     log.info("总控制台已启动 bind=%s port=%d 写API=%s", bind, port,
-             ("已启用（令牌鉴权）" if yaml_path and api_token
+             ("已启用（令牌鉴权）" if yaml_path and eff_token
+              else "已禁用（RL_API_TOKEN 强度不足，视为未配置）"
+              if yaml_path and token_weak
               else "已禁用（未配置 RL_API_TOKEN）" if yaml_path
               else "未挂载"))
     if bind not in ("127.0.0.1", "::1", "localhost"):

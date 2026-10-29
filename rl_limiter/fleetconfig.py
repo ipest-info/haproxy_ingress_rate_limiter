@@ -29,6 +29,8 @@ from typing import Any
 
 import yaml
 
+from . import tokenpolicy
+
 DEFAULT_LOG_LEVEL = "info"
 # 轮询周期（秒）：页面实时性与几十台节点的请求开销的平衡点。
 DEFAULT_POLL_INTERVAL_S = 2.0
@@ -86,8 +88,10 @@ class FleetNode:
     # 节点控制台地址（轮询与下发都走它），http(s)://host:port。
     url: str = ""
     # 节点写 API 的令牌（= 该节点的 RL_API_TOKEN）。空 = 只读观测，
-    # 该节点不可控（加载时 WARN 提示）。
+    # 该节点不可控（加载时 WARN 提示）。强度不达标的令牌加载时**置空**
+    # （当作没有令牌），原因记在 token_rejected。
     token: str = ""
+    token_rejected: str = ""
     # 页面跳转地址（内外网地址不同时填；缺省 = url）。
     console_url: str = ""
 
@@ -198,10 +202,13 @@ def _parse(raw: dict[str, Any]) -> FleetConfig:
             raise ValueError(
                 f"nodes[{i}] 有不认识的键 {sorted(n_unknown)}，"
                 f"可用：{sorted(n_known)}")
+        token, rejected = tokenpolicy.effective(
+            str(n_raw.get("token", "") or ""))
         n = FleetNode(
             name=str(n_raw.get("name", "") or "").strip(),
             url=str(n_raw.get("url", "") or "").strip().rstrip("/"),
-            token=str(n_raw.get("token", "") or "").strip(),
+            token=token,
+            token_rejected=rejected,
             console_url=str(n_raw.get("console_url", "") or "").strip(),
         )
         cfg.nodes.append(n)
@@ -360,9 +367,15 @@ def _node_value(key: str, v: Any) -> str:
     if not isinstance(v, str):
         raise FleetConfigError(f"{key} 必须是字符串，当前值 {v!r}")
     v = v.strip()
-    # 令牌随请求头发给节点：空白/控制字符要么被拒、要么拼出畸形请求头。
-    if key == "token" and any(c.isspace() or ord(c) < 32 for c in v):
-        raise FleetConfigError("token 不能含空白或控制字符")
+    # 写 API 只收强令牌（空 = 只读观测，合法）：弱令牌写进去也会在
+    # 加载时被当作没有，不如在门口就拒绝并说清楚。
+    if key == "token" and v:
+        why = tokenpolicy.weakness(v)
+        if why:
+            raise FleetConfigError(
+                f"token 强度不足：{why}。节点令牌须是高强度随机串——在该"
+                f"节点上用 {tokenpolicy.GENERATE_HINT} 生成，写进它的 "
+                f"RL_API_TOKEN 后重启，再在这里登记同一个值")
     return v
 
 

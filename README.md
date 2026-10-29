@@ -36,7 +36,7 @@ rl-limiter，**不依赖机器上跑的任何服务**——nginx、HAProxy、自
 
 ```bash
 make demo-up          # 两台"任意服务"节点 + 压测 + 总控，双网卡拓扑
-open http://127.0.0.1:8090        # node1 控制台（令牌 demo-token）
+open http://127.0.0.1:8090        # node1 控制台（演示令牌见 docs/05）
 # 配置页设"实例总限速"=40 → curl -X PUT localhost:8084/concurrency \
 #   -d '{"concurrency": 1000}' 加压 → 看"调节视图"收敛
 make demo-down
@@ -47,8 +47,8 @@ make demo-down
 
 ```bash
 curl -fL -o install.sh https://github.com/ipest-info/haproxy_ingress_rate_limiter/releases/latest/download/install.sh
-sudo bash install.sh --download --token <节点令牌> --client-nic eth0 --backend-nic eth1   # 节点
-sudo bash install.sh --download --fleet --token <总控令牌>                               # 总控（页面里添加节点）
+sudo bash install.sh --download --token auto --client-nic eth0 --backend-nic eth1   # 节点（装完打印令牌）
+sudo bash install.sh --download --fleet --token auto                               # 总控（页面里添加节点）
 ```
 
 或裸机 `deploy/bare/rl-limiter.sh install`，或容器 host 网络

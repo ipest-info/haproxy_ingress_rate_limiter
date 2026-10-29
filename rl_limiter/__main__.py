@@ -25,7 +25,7 @@ import sys
 from . import cfgparse
 from . import config as configmod
 from . import ingressgov, metricslog, model, netsrc
-from . import netdev
+from . import netdev, tokenpolicy
 from . import tcifb as tcifbmod
 from . import tcingress as tcinmod
 from . import tcshaper as tcmod
@@ -103,7 +103,8 @@ ENV_METRICS_LOG_DAYS = "RL_METRICS_LOG_DAYS"
 
 # 写 API 的鉴权令牌（控制台/API 修改限额用，见 webconsole 模块）。
 # 不设 = 写接口整体 403（只读部分照常）。改限速影响生产流量，绝不允许
-# "没配令牌就人人可改"。
+# "没配令牌就人人可改"。**强度不达标（规则见 tokenpolicy）一律视为没
+# 设**——启动时 ERROR 说明原因，写接口照样 403。
 ENV_API_TOKEN = "RL_API_TOKEN"
 
 
@@ -148,7 +149,8 @@ async def _amain(cfg, log: logging.Logger,
                  nic: str = "",
                  backend_iface: str = "",
                  mlog: "metricslog.MetricsLog | None" = None,
-                 api_token: str = "") -> None:
+                 api_token: str = "",
+                 token_weak: str = "") -> None:
     """事件循环内的主体：组装组件、引导配置、并发运行监控循环与配置源。
 
     boot_frontends 是启动时从 haproxy.cfg 解析并合并限额后的受管清单；
@@ -455,7 +457,9 @@ async def _amain(cfg, log: logging.Logger,
              "value": ((os.environ.get(ENV_METRICS_LOG) or "").strip()
                        or "未启用")},
             {"label": "写 API 令牌 RL_API_TOKEN",
-             "value": ("已配置（页头填令牌后可改限额）" if api_token
+             "value": (f"强度不足，已视为未配置（{token_weak}；写接口"
+                       f"整体禁用，页面只读）" if token_weak
+                       else "已配置（页头填令牌后可改限额）" if api_token
                        else "未配置（写接口整体禁用，页面只读）")},
         ]
         # 本分支的入向接线也属于"启动时定型"的事实，一并摆出来。
@@ -680,11 +684,19 @@ def main() -> None:
         help="YAML 配置文件路径（默认 %(default)s）")
     parser.add_argument(
         "--version", action="store_true", help="打印版本号后退出")
+    parser.add_argument(
+        "--check-token", action="store_true",
+        help="从标准输入读一个令牌，按强度规则检查后退出（达标退出码 0，"
+             "否则打印原因、退出码 1）；安装脚本用它校验 --token")
     args = parser.parse_args()
 
     if args.version:
         print("rl-limiter", SERVICE_VERSION)
         return
+    if args.check_token:
+        why = tokenpolicy.weakness(sys.stdin.read().strip())
+        print(why or "OK")
+        raise SystemExit(1 if why else 0)
 
     # 日志先以 INFO 起步，配置加载成功后再把根 logger 调到配置指定的级别。
     # 格式固定为"时间 级别 消息"三段；消息本体统一为中文描述 + 英文
@@ -718,8 +730,16 @@ def main() -> None:
         logging.getLogger().addHandler(logbuf)
     console_bind = (os.environ.get(ENV_CONSOLE_BIND) or "").strip() \
         or DEFAULT_CONSOLE_BIND
+    # 原值交给控制台（它自己按规则判，弱令牌的 403 才说得出"强度不足"）；
+    # 这里只用判定结果打启动日志。
     api_token = (os.environ.get(ENV_API_TOKEN) or "").strip()
-    if console_port and not api_token:
+    _, token_weak = tokenpolicy.effective(api_token)
+    if token_weak:
+        log.error("%s 强度不足，按未配置处理（写接口整体禁用，总控也无法"
+                  "向本节点下发）：%s——用 %s 生成新令牌，写进 "
+                  "rl-limiter.env 后重启", ENV_API_TOKEN, token_weak,
+                  tokenpolicy.GENERATE_HINT)
+    elif console_port and not api_token:
         log.warning("未配置 %s：控制台/API 的写接口（修改限额）整体 403 "
                     "禁用，只读观测不受影响；要启用请在环境变量里设置令牌"
                     "后重启", ENV_API_TOKEN)
@@ -956,7 +976,8 @@ def main() -> None:
                            console_bind=console_bind,
                            shaper=shaper, ingress=ingress, nic=nic,
                            backend_iface=backend_iface,
-                           mlog=mlog, api_token=api_token))
+                           mlog=mlog, api_token=api_token,
+                           token_weak=token_weak))
     except KeyboardInterrupt:  # 信号处理兜底：极端时序下直接吞掉干净退出
         pass
     log.info("rl-limiter 服务已停止")

@@ -17,7 +17,8 @@ import os
 import sys
 import time
 
-from . import fleetconfig, fleetgov, fleetmetrics, fleetpoll, fleetweb
+from . import (fleetconfig, fleetgov, fleetmetrics, fleetpoll, fleetweb,
+               tokenpolicy)
 
 try:
     from importlib import metadata as _metadata
@@ -240,9 +241,17 @@ def main() -> None:
         logging.getLogger().addHandler(logbuf)
     console_bind = (os.environ.get("RL_CONSOLE_BIND") or "").strip() \
         or DEFAULT_CONSOLE_BIND
+    # 原值交给控制台（它自己按规则判，弱令牌的 403 才说得出"强度不足"）；
+    # 这里只用判定结果打启动日志。
     api_token = (os.environ.get("RL_API_TOKEN") or "").strip()
+    _, token_weak = tokenpolicy.effective(api_token)
     mlog = _open_metrics_log(log)
-    if console_port and not api_token:
+    if token_weak:
+        log.error("RL_API_TOKEN 强度不足，按未配置处理（总控页面只读：改不"
+                  "了总带宽、加不了节点）：%s——用 %s 生成新令牌，写进 "
+                  "rl-fleet.env 后重启", token_weak,
+                  tokenpolicy.GENERATE_HINT)
+    elif console_port and not api_token:
         log.warning("未配置 RL_API_TOKEN：总控页面只读（看得到汇总，"
                     "改不了总带宽、加不了节点）。需要写能力请设置令牌后"
                     "重启")
@@ -263,7 +272,12 @@ def main() -> None:
         cfg.poll_interval_s, cfg.alloc_interval_s, cfg.offline_after,
         cfg.log_level)
     for n in cfg.nodes:
-        if not n.token:
+        if n.token_rejected:
+            log.error("节点令牌强度不足，按未配置处理（只读观测、不可控，"
+                      "不会向它下发或解除配额）：%s——在该节点上用 %s "
+                      "生成新令牌，并在总控「节点管理」更新 node=%s",
+                      n.token_rejected, tokenpolicy.GENERATE_HINT, n.name)
+        elif not n.token:
             log.warning("节点未配置令牌，只读观测、不可控（不会向它下发"
                         "配额） node=%s url=%s", n.name, n.url)
 
