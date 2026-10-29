@@ -7,7 +7,13 @@
 #                    auto = 自动生成 64 位十六进制随机令牌（256 bit），装完打印出来
 #     --client-nic   客户端侧网卡 = 入向限速执行网卡（RL_TC_IN_IFACE，默认 eth0）
 #     --backend-nic  后端服务侧网卡（RL_BACKEND_IFACE，默认 eth1）
+#     --node-name    总控里显示的节点名（默认短主机名）
+#     --advertise    总控访问本节点控制台的地址（默认后端侧网卡 IPv4 + 控制台端口；
+#                    可给 主机、主机:端口 或完整 http(s)://…）
 #   两张网卡必须是不同的网卡（相斥），且都在本机存在。
+#   装完单独打印一行**接入串**（rl-node name=… url=… token=…），复制到总控
+#   「节点管理」→「粘贴接入串」即完成登记（多台可一起粘）。事后补打：
+#   sudo ./install.sh --show-join [--node-name …] [--advertise …]
 #
 # 装总控（rl-fleet，不碰 tc，不要求双网卡）：
 #   sudo ./install.sh --fleet [--token <令牌>|auto]
@@ -57,6 +63,9 @@ WITH_FLEET=0
 DOWNLOAD=0
 UNINSTALL=0
 PURGE=0
+SHOW_JOIN=0
+NODE_NAME=""
+ADVERTISE=""
 DOWNLOAD_TAG=""
 TOKEN=""
 CLIENT_NIC=""
@@ -98,6 +107,11 @@ while [ $# -gt 0 ]; do
             take_value "$@"; CLIENT_NIC=$OPTVAL; shift "$OPTSHIFT" ;;
         --backend-nic|--backend-nic=*)
             take_value "$@"; BACKEND_NIC=$OPTVAL; shift "$OPTSHIFT" ;;
+        --node-name|--node-name=*)
+            take_value "$@"; NODE_NAME=$OPTVAL; shift "$OPTSHIFT" ;;
+        --advertise|--advertise=*)
+            take_value "$@"; ADVERTISE=$OPTVAL; shift "$OPTSHIFT" ;;
+        --show-join) SHOW_JOIN=1 ;;
         --download)
             # 带 tag = 装指定版本；不带（下一个是选项或没有了）= 最新版。
             DOWNLOAD=1
@@ -110,7 +124,8 @@ while [ $# -gt 0 ]; do
             fi ;;
         -h|--help) usage ;;
         *) die "不认识的参数 '$1'（--token / --client-nic / --backend-nic /" \
-               "--fleet / --download [tag] / --uninstall [--purge] / --help）" ;;
+               "--node-name / --advertise / --show-join / --fleet /" \
+               "--download [tag] / --uninstall [--purge] / --help）" ;;
     esac
     shift
 done
@@ -132,6 +147,78 @@ fi
 if [ "$WITH_FLEET" = 1 ] && { [ -n "$CLIENT_NIC" ] || [ -n "$BACKEND_NIC" ]; }; then
     die "--client-nic / --backend-nic 只用于节点安装；总控（--fleet）不碰网卡"
 fi
+if [ "$WITH_FLEET" = 1 ] && [ -n "$NODE_NAME$ADVERTISE" ]; then
+    die "--node-name / --advertise 只用于节点（生成接入串）"
+fi
+[ -z "$NODE_NAME" ] || [[ "$NODE_NAME" =~ ^[A-Za-z0-9._-]{1,64}$ ]] \
+    || die "--node-name '$NODE_NAME' 不合法（1~64 位字母/数字/._-）"
+# 方括号表达式里 ] 放最前、- 放最后才是字面量（IPv6 字面量 [::1]:8090 也收）。
+ADV_RE='^[]A-Za-z0-9._:/[-]+$'
+[ -z "$ADVERTISE" ] || [[ "$ADVERTISE" =~ $ADV_RE ]] \
+    || die "--advertise '$ADVERTISE' 不合法（主机、主机:端口 或 http(s)://主机:端口）"
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+# 令牌强度：调 rl-limiter --check-token（与运行时同一套规则，规则只在
+# Python 里写一份）。有包目录就用包里的二进制——先拷到 $PREFIX/bin 下的
+# 临时名再跑，包目录可能在挂了 noexec 的 /tmp 下（--download 就是）；
+# 没有包目录（--show-join 单独跑）用已装的。达标输出空，否则输出原因。
+token_weakness() {
+    local chk out
+    if [ -f "$HERE/bin/rl-limiter" ]; then
+        chk="$PREFIX/bin/.rl-limiter-tokencheck.$$"
+        install -d -m 755 "$PREFIX/bin"
+        install -m 700 "$HERE/bin/rl-limiter" "$chk"
+        out=$(printf '%s' "$1" | "$chk" --check-token 2>&1) || true
+        rm -f "$chk"
+    elif [ -x "$PREFIX/bin/rl-limiter" ]; then
+        out=$(printf '%s' "$1" | "$PREFIX/bin/rl-limiter" --check-token 2>&1) || true
+    fi
+    [ "$out" = OK ] || printf '%s' "${out:-无法校验（找不到 rl-limiter）}"
+}
+
+# 接入串：rl-node name=<名称> url=<节点控制台地址> [token=<令牌>]，总控
+# 「节点管理」→「粘贴接入串」解析它（格式见 rl_limiter/fleetconfig.py）。
+# 地址默认取**后端侧网卡**的 IPv4——总控 ↔ 节点控制台走后端/管理侧，不混
+# 进客户端侧被整形的流量（docs/10）。令牌不达标就不带（总控里只读观测）。
+join_line() {
+    local envf="$CONF_DIR/rl-limiter.env" name port bind backend addr url tok
+    name=${NODE_NAME:-$(hostname -s 2>/dev/null || hostname)}
+    name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-64)
+    [ -n "$name" ] || name=node
+    port=$(env_get "$envf" RL_CONSOLE_PORT)
+    bind=$(env_get "$envf" RL_CONSOLE_BIND)
+    tok=$(env_get "$envf" RL_API_TOKEN)
+    if [ -z "$port" ]; then
+        warn "rl-limiter.env 没开控制台（RL_CONSOLE_PORT），总控连不上本节点——设好后重启"
+        port=8090
+    fi
+    case "$bind" in 127.*|localhost|::1)
+        warn "控制台只绑了 $bind（RL_CONSOLE_BIND），总控连不上——改成 0.0.0.0 或后端侧地址后重启" ;;
+    esac
+    case "$ADVERTISE" in
+        http://*|https://*) url=${ADVERTISE%/} ;;
+        *:*) url="http://$ADVERTISE" ;;
+        ?*)  url="http://$ADVERTISE:$port" ;;
+        *)
+            backend=$(env_get "$envf" RL_BACKEND_IFACE)
+            addr=""
+            [ -z "$backend" ] || addr=$(ip -4 -o addr show dev "$backend" scope global \
+                2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+            if [ -z "$addr" ]; then
+                addr=$(hostname -I 2>/dev/null | awk '{print $1}')
+                warn "后端侧网卡 ${backend:-（未登记）} 上没有 IPv4，接入串先用 ${addr:-<本机内网地址>}" \
+                    "——请核对总控走哪个地址访问本节点，可用 --advertise <地址> 指定"
+            fi
+            url="http://${addr:-<本机内网地址>}:$port" ;;
+    esac
+    if [ -n "$tok" ] && [ -z "$(token_weakness "$tok")" ]; then
+        printf 'rl-node name=%s url=%s token=%s\n' "$name" "$url" "$tok"
+    else
+        warn "本节点没有有效令牌，接入串不带 token（总控里只读观测）——加 --token auto 重跑"
+        printf 'rl-node name=%s url=%s\n' "$name" "$url"
+    fi
+}
 
 phys_nics() {   # 本机物理网卡（有 device 链接的才是物理设备），空格分隔
     local d out=""
@@ -250,8 +337,16 @@ uninstall() {
     log "卸载完成"
 }
 
+if [ "$SHOW_JOIN" = 1 ]; then
+    [ "$WITH_FLEET$DOWNLOAD$UNINSTALL" = 000 ] && [ -z "$TOKEN$CLIENT_NIC$BACKEND_NIC" ] \
+        || die "--show-join 只能和 --node-name / --advertise 一起用"
+    [ -f "$CONF_DIR/rl-limiter.env" ] || die "本机还没装节点（没有 $CONF_DIR/rl-limiter.env）"
+    join_line
+    exit 0
+fi
+
 if [ "$UNINSTALL" = 1 ]; then
-    [ "$DOWNLOAD" = 0 ] && [ -z "$TOKEN$CLIENT_NIC$BACKEND_NIC" ] \
+    [ "$DOWNLOAD" = 0 ] && [ -z "$TOKEN$CLIENT_NIC$BACKEND_NIC$NODE_NAME$ADVERTISE" ] \
         || die "--uninstall 不能与 --download / --token / --client-nic / --backend-nic 同用"
     uninstall
     exit 0
@@ -298,6 +393,8 @@ if [ "$DOWNLOAD" = 1 ]; then
     [ -n "$TOKEN" ]       && args+=("--token=$TOKEN")
     [ -n "$CLIENT_NIC" ]  && args+=("--client-nic=$CLIENT_NIC")
     [ -n "$BACKEND_NIC" ] && args+=("--backend-nic=$BACKEND_NIC")
+    [ -n "$NODE_NAME" ]   && args+=("--node-name=$NODE_NAME")
+    [ -n "$ADVERTISE" ]   && args+=("--advertise=$ADVERTISE")
     # 不 exec：要等它结束让 EXIT trap 清掉临时目录；用 bash 跑而不是
     # 直接执行，/tmp 挂了 noexec 的加固机器上也能装。
     rc=0
@@ -306,22 +403,9 @@ if [ "$DOWNLOAD" = 1 ]; then
 fi
 
 # ---- 模式 1：从包目录安装 ------------------------------------------------
-HERE=$(cd "$(dirname "$0")" && pwd)
 [ -f "$HERE/bin/rl-limiter" ] \
     || die "没在发布包目录里（找不到 bin/rl-limiter）。先 tar xzf 解包，" \
            "进包目录再执行；或用 --download [tag] 直接下载安装"
-
-# 令牌强度：调包里的 rl-limiter --check-token（与运行时同一套规则）。
-# 先拷到 $PREFIX/bin 下的临时名再跑——包目录可能在挂了 noexec 的 /tmp
-# 下（--download 就是）。达标输出空，否则输出原因。
-token_weakness() {
-    local chk="$PREFIX/bin/.rl-limiter-tokencheck.$$" out
-    install -d -m 755 "$PREFIX/bin"
-    install -m 700 "$HERE/bin/rl-limiter" "$chk"
-    out=$(printf '%s' "$1" | "$chk" --check-token 2>&1) || true
-    rm -f "$chk"
-    [ "$out" = OK ] || printf '%s' "${out:-无法校验（rl-limiter --check-token 无输出）}"
-}
 
 # --token auto：64 位十六进制（256 bit）。生成后照样过一遍规则（真随机
 # 几乎不可能不过，过不了就换一个）。
@@ -484,7 +568,6 @@ else
     fi
     warn_weak_existing "$ENVF"
     NODE_TOKEN=$(env_get "$ENVF" RL_API_TOKEN)
-    NODE_PORT=$(env_get "$ENVF" RL_CONSOLE_PORT)
 
     log "systemd 单元 → $UNIT_DIR/rl-limiter.service"
     install -d -m 755 "$UNIT_DIR"
@@ -537,8 +620,11 @@ if [ "$WITH_FLEET" = 1 ]; then
 else
     log "  1. 核对 $CONF_DIR/config.yaml（instance_quota_mbps 出向目标 / ports / request_limits）"
     log "  2. systemctl enable --now rl-limiter"
-    log "  3. 在总控「节点管理」登记本节点：地址 http://<本机内网地址>:${NODE_PORT:-8090}，令牌同 RL_API_TOKEN"
+    log "  3. 把下面这行接入串复制到总控「节点管理」→「粘贴接入串」（多台可以攒起来一起粘）"
     [ -n "$NODE_TOKEN" ] || warn "未设节点令牌（--token）：写 API 禁用，总控无法向本节点下发配额"
-    [ -z "$GENERATED_TOKEN" ] || log "节点令牌（已写入 rl-limiter.env，总控登记本节点时填它；请妥善保存）：$GENERATED_TOKEN"
+    [ -z "$GENERATED_TOKEN" ] || log "令牌已自动生成并写入 rl-limiter.env（就在接入串里，请妥善保存）"
+    echo
+    join_line
+    echo
 fi
 exit 0

@@ -179,6 +179,15 @@ button.danger { color: var(--critical); }
 .node-table td.ops { text-align: right; }
 .node-table td.ops button { padding: 3px 10px; font-size: 12px; }
 .node-table td.url { font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+#imp-text {
+  width: 100%; min-height: 128px; resize: vertical; padding: 8px 10px;
+  font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace;
+  border: 1px solid var(--border-strong); border-radius: 7px;
+  background: var(--surface-1); color: var(--text-primary);
+}
+#imp-text:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+#imp-table { margin-top: 12px; }
+.node-table td.imp-msg { white-space: normal; min-width: 220px; }
 
 /* 历史回查 */
 .hq-bar { display: flex; align-items: flex-end; gap: 10px 14px; flex-wrap: wrap; }
@@ -288,7 +297,27 @@ a.btn-link:hover { text-decoration: underline; }
   <section class="tabpage" id="page-nodes">
     <div class="card">
       <div class="card-head">
-        <span class="card-title" id="nf-title">添加节点</span>
+        <span class="card-title">粘贴接入串</span>
+        <span class="tag ok">推荐 · 可批量</span>
+        <span class="hint">节点装完 install.sh 会单独打印一行 <code>rl-node …</code>；多台一起粘，一行一台（整段安装输出直接粘也行，别的行会忽略）</span>
+      </div>
+      <div class="card-body">
+        <textarea id="imp-text" spellcheck="false" autocomplete="off"
+          placeholder="rl-node name=node-sh-01 url=http://10.0.1.11:8090 token=…&#10;rl-node name=node-sh-02 url=http://10.0.1.12:8090 token=…"></textarea>
+        <div class="form-actions">
+          <span class="hint" id="imp-summary">粘贴后自动预览：每行会新增、更新、无变化还是有错，确认后再导入</span>
+          <span class="grow"></span>
+          <button id="imp-clear">清空</button>
+          <button id="imp-preview">预览</button>
+          <button id="imp-go" class="primary" disabled>导入</button>
+        </div>
+        <table class="node-table left" id="imp-table" hidden><tbody></tbody></table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title" id="nf-title">手工添加节点</span>
         <span class="hint">写回 fleet.yaml、即时加入轮询；需页头令牌（rl-fleet 的 RL_API_TOKEN）</span>
       </div>
       <div class="card-body">
@@ -645,6 +674,60 @@ function renderNodeList() {
       </tr>`).join("");
 }
 
+// ---- 粘贴接入串（POST /api/nodes/import，先 dry_run 预览再导入） ----
+const IMP_ACT = {add: ["新增", "ok"], update: ["更新", "warn"],
+                 same: ["无变化", ""], error: ["有错，跳过", "alert"]};
+const IMP_FIELD = {url: "地址", token: "令牌", console_url: "跳转地址"};
+
+async function importNodes(dryRun) {
+  const text = $("#imp-text").value;
+  const sum = $("#imp-summary");
+  if (!text.trim()) {
+    $("#imp-table").hidden = true; $("#imp-go").disabled = true;
+    sum.textContent = "粘贴后自动预览：每行会新增、更新、无变化还是有错，确认后再导入";
+    return;
+  }
+  if (!tokenInput.value.trim()) {
+    sum.innerHTML = '<span style="color:var(--warn)">先在页头填总控令牌，才能预览/导入</span>';
+    $("#imp-go").disabled = true;
+    return;
+  }
+  const r = await apiWrite("POST", "/api/nodes/import", {text, dry_run: dryRun});
+  if (!r) { $("#imp-go").disabled = true; return; }
+  renderImport(r);
+  if (!dryRun) {
+    toast(`已导入：新增 ${r.add} 台、更新 ${r.update} 台` + (r.error ? `；${r.error} 行有错，留在框里待改` : ""), !!r.error);
+    // 成功的行拿掉，只留有错的行，改好再导。
+    const bad = new Set(r.items.filter(i => i.action === "error").map(i => i.line));
+    $("#imp-text").value = text.split("\n").filter((_, i) => bad.has(i + 1)).join("\n");
+    $("#imp-go").disabled = true;
+    setTimeout(loadNodes, 800);
+  }
+}
+
+function renderImport(r) {
+  const tb = $("#imp-table tbody");
+  $("#imp-table").hidden = !r.items.length;
+  tb.innerHTML = '<tr><th>行</th><th>节点</th><th>控制台地址</th><th>令牌</th><th>结果</th></tr>' +
+    r.items.map(i => {
+      const [lbl, cls] = IMP_ACT[i.action] || [i.action, ""];
+      const msg = i.action === "error" ? esc(i.error)
+        : i.action === "update" ? "改 " + i.changes.map(c => IMP_FIELD[c] || c).join("、") : "";
+      return `<tr><td>${i.line}</td><td><b>${esc(i.name || "–")}</b></td>
+        <td class="url">${esc(i.url || "–")}</td>
+        <td>${i.action === "error" ? "–" : i.has_token ? '<span class="tag ok">有</span>' : '<span class="tag">无 · 只读观测</span>'}</td>
+        <td class="imp-msg"><span class="tag ${cls}">${lbl}</span> ${msg}</td></tr>`;
+    }).join("");
+  const n = r.add + r.update;
+  $("#imp-summary").innerHTML = (r.dry_run ? "预览：" : "已导入：") +
+    `新增 <b>${r.add}</b>、更新 <b>${r.update}</b>、无变化 ${r.same}` +
+    (r.error ? `、<span style="color:var(--critical)">有错 ${r.error}</span>` : "") +
+    (r.ignored_lines ? `；忽略 ${r.ignored_lines} 行非接入串` : "") +
+    (r.dry_run && n ? `——点「导入」生效` : "");
+  $("#imp-go").disabled = !(r.dry_run && n > 0);
+  $("#imp-go").textContent = r.dry_run && n ? `导入 ${n} 台` : "导入";
+}
+
 function resetNodeForm() {
   state.editing = null;
   for (const id of ["#nf-name", "#nf-url", "#nf-token", "#nf-console"]) $(id).value = "";
@@ -653,7 +736,7 @@ function resetNodeForm() {
   $("#nf-clear-token").checked = false;
   $("#nf-clear-wrap").hidden = true;
   $("#nf-cancel").hidden = true;
-  $("#nf-title").textContent = "添加节点";
+  $("#nf-title").textContent = "手工添加节点";
   $("#nf-save").textContent = "添加节点";
 }
 
@@ -989,6 +1072,15 @@ $("#hq-node").onchange = hqQuery;
 $("#hq-chart").addEventListener("mousemove", (e) => { state.hq.tipX = e.offsetX; drawHist(); });
 $("#hq-chart").addEventListener("mouseleave", () => { state.hq.tipX = null; drawHist(); });
 new ResizeObserver(() => { if (state.tab === "history") drawHist(); }).observe($("#hq-chart"));
+let impTimer = null;
+$("#imp-text").addEventListener("input", () => {
+  $("#imp-go").disabled = true;                 // 改了内容必须重新预览
+  clearTimeout(impTimer);
+  impTimer = setTimeout(() => importNodes(true), 400);
+});
+$("#imp-preview").onclick = () => importNodes(true);
+$("#imp-go").onclick = () => importNodes(false);
+$("#imp-clear").onclick = () => { $("#imp-text").value = ""; importNodes(true); };
 $("#nf-save").onclick = saveNode;
 $("#nf-cancel").onclick = resetNodeForm;
 $("#nl-table").addEventListener("click", (e) => {

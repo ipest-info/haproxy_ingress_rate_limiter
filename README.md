@@ -47,8 +47,8 @@ make demo-down
 
 ```bash
 curl -fL -o install.sh https://github.com/ipest-info/haproxy_ingress_rate_limiter/releases/latest/download/install.sh
-sudo bash install.sh --download --token auto --client-nic eth0 --backend-nic eth1   # 节点（装完打印令牌）
-sudo bash install.sh --download --fleet --token auto                               # 总控（页面里添加节点）
+sudo bash install.sh --download --token auto --client-nic eth0 --backend-nic eth1   # 节点：装完打印一行接入串
+sudo bash install.sh --download --fleet --token auto                               # 总控：「节点管理」粘贴接入串（可批量）
 ```
 
 或裸机 `deploy/bare/rl-limiter.sh install`，或容器 host 网络

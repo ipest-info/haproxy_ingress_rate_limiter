@@ -213,6 +213,101 @@ def test_node_writes_refuse_weak_tokens(yml, tok):
 
 
 # ---------------------------------------------------------------------------
+# 接入串（粘贴批量导入）
+# ---------------------------------------------------------------------------
+
+TOK_A = "d9253b4e26b5a7f47d1c1dfd422437a8365824e8c0625dd0"
+TOK_B = "272a3e101a6d5e039a5c7739f8c097f879fcd70a04213a1f"
+
+
+def test_join_line_roundtrip():
+    line = fleetconfig.join_line("n1", "http://10.0.0.9:8090", TOK_A,
+                                 "http://pub:8092")
+    assert line.startswith("rl-node ")
+    (e,), ignored = fleetconfig.parse_join_text(line)
+    assert ignored == 0 and e["error"] == ""
+    assert (e["name"], e["url"], e["token"], e["console_url"]) == \
+        ("n1", "http://10.0.0.9:8090", TOK_A, "http://pub:8092")
+
+
+def test_parse_tolerates_pasted_install_output():
+    """整段安装输出直接粘：非接入串的行忽略，行首前缀也忽略。"""
+    text = f"""install.sh: 完成。下一步：
+install.sh:   2. systemctl enable --now rl-limiter
+  rl-node name=a url=http://10.0.0.1:8090/ token={TOK_A}
+
+rl-node name=b url=http://10.0.0.2:8090
+"""
+    entries, ignored = fleetconfig.parse_join_text(text)
+    assert ignored == 2
+    assert [(e["name"], e["url"], bool(e["token"]), e["error"])
+            for e in entries] == [
+        ("a", "http://10.0.0.1:8090", True, ""),
+        ("b", "http://10.0.0.2:8090", False, ""),       # 没令牌 = 只读观测
+    ]
+
+
+@pytest.mark.parametrize("line, kw", [
+    ("rl-node url=http://x:1", "缺 name"),
+    ("rl-node name=a", "缺 url"),
+    ("rl-node name=a b url=http://x:1", "key=value"),
+    ("rl-node name=a url=http://x:1 foo=1", "不认识的字段"),
+    ("rl-node name=a! url=http://x:1", "name"),
+    ("rl-node name=a url=ftp://x", "url"),
+    ("rl-node name=a url=http://x:1 token=short", "强度不足"),
+    ("rl-node name=a url=http://x:1 console=x", "console"),
+])
+def test_parse_reports_bad_lines(line, kw):
+    (e,), _ = fleetconfig.parse_join_text(line)
+    assert kw in e["error"]
+
+
+def test_parse_flags_duplicate_names_in_one_paste():
+    entries, _ = fleetconfig.parse_join_text(
+        "rl-node name=a url=http://x:1\nrl-node name=a url=http://y:1\n")
+    assert entries[0]["error"] == ""
+    assert "与第 1 行重名" in entries[1]["error"]
+
+
+def test_import_adds_updates_and_skips(yml):
+    text = "\n".join([
+        f"rl-node name=node3 url=http://10.0.0.3:8090 token={TOK_A}",  # 新增
+        f"rl-node name=node1 url=http://10.0.0.1:8090 token={TOK_B}",  # 换令牌
+        "rl-node name=bad url=ftp://x",                                 # 错误
+    ])
+    entries, _ = fleetconfig.parse_join_text(text)
+    before = yml.read_text(encoding="utf-8")
+    preview = fleetconfig.import_nodes(str(yml), entries, dry_run=True)
+    assert [(r["name"], r["action"]) for r in preview] == \
+        [("node3", "add"), ("node1", "update"), ("bad", "error")]
+    assert preview[1]["changes"] == ["token"]
+    assert yml.read_text(encoding="utf-8") == before      # 预览不写盘
+
+    fleetconfig.import_nodes(str(yml), entries)
+    cfg = fleetconfig.load(str(yml))
+    by = {n.name: n for n in cfg.nodes}
+    assert by["node3"].token == TOK_A
+    assert by["node1"].token == TOK_B
+    assert by["node2"].console_url == "http://pub.example:8092"   # 不相关的不动
+    assert "bad" not in by
+
+    # 再粘一遍：全部无变化，不重写文件。
+    again = fleetconfig.import_nodes(str(yml), entries[:2])
+    assert [r["action"] for r in again] == ["same", "same"]
+
+
+def test_import_update_without_token_clears_it(yml):
+    """接入串没带令牌 = 节点当前没令牌：总控清掉旧令牌（转只读观测），
+    留着只会一直 401。console_url 没带则保留原值。"""
+    entries, _ = fleetconfig.parse_join_text(
+        "rl-node name=node2 url=http://10.0.0.2:8090")
+    (r,) = fleetconfig.import_nodes(str(yml), entries)
+    assert r["action"] == "update" and r["changes"] == ["token"]
+    n2 = fleetconfig.load(str(yml)).nodes[1]
+    assert n2.token == "" and n2.console_url == "http://pub.example:8092"
+
+
+# ---------------------------------------------------------------------------
 # 热更轮询
 # ---------------------------------------------------------------------------
 

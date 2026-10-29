@@ -405,6 +405,53 @@ def build_fleet_app(
                     "yaml=%s", name, ",".join(sorted(fields)), yaml_path)
         return web.json_response({"ok": True, "name": name})
 
+    async def handle_import_nodes(request: web.Request) -> web.Response:
+        """粘贴接入串批量导入：{"text": "...", "dry_run": true|false}。
+
+        dry_run = 只预览每行会怎样（新增/更新/无变化/错误），不写盘；
+        正式导入跳过有错的行，其余一次原子回写。响应里绝不带令牌。
+        """
+        denied = _authorized(request)
+        if denied is not None:
+            return denied
+        body = await _json_body(request)
+        if body is None or not isinstance(body.get("text"), str):
+            return web.json_response(
+                {"error": "请求体必须是 JSON：{\"text\": \"<接入串，一行一台>"
+                          "\", \"dry_run\": true|false}"}, status=400)
+        dry_run = bool(body.get("dry_run"))
+        entries, ignored = fleetconfig.parse_join_text(body["text"])
+        if not entries:
+            return web.json_response(
+                {"error": "没找到接入串（形如 rl-node name=... url=... "
+                          "token=...，节点装完 install.sh 会打印）"},
+                status=400)
+        async with write_lock:
+            try:
+                results = await asyncio.to_thread(
+                    fleetconfig.import_nodes, yaml_path, entries, dry_run)
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
+        by_line = {e["line"]: e for e in entries}
+        for r in results:
+            e = by_line[r["line"]]
+            r.update(url=e["url"], console_url=e["console_url"],
+                     has_token=bool(e["token"]))
+        counts = {a: sum(r["action"] == a for r in results)
+                  for a in ("add", "update", "same", "error")}
+        if not dry_run and (counts["add"] or counts["update"]):
+            if poke is not None:
+                poke.set()
+            log.warning("写 API 已粘贴导入节点并回写 YAML 新增=%d 更新=%d "
+                        "无变化=%d 跳过（有错）=%d 节点=%s yaml=%s",
+                        counts["add"], counts["update"], counts["same"],
+                        counts["error"],
+                        ",".join(r["name"] for r in results
+                                 if r["action"] in ("add", "update")),
+                        yaml_path)
+        return web.json_response({"dry_run": dry_run, "items": results,
+                                  "ignored_lines": ignored, **counts})
+
     async def handle_delete_node(request: web.Request) -> web.Response:
         denied = _authorized(request)
         if denied is not None:
@@ -429,6 +476,7 @@ def build_fleet_app(
         app.router.add_put("/api/total-quota", handle_put_total)
         app.router.add_delete("/api/total-quota", handle_delete_total)
         app.router.add_post("/api/nodes", handle_add_node)
+        app.router.add_post("/api/nodes/import", handle_import_nodes)
         app.router.add_put("/api/nodes/{name}", handle_update_node)
         app.router.add_delete("/api/nodes/{name}", handle_delete_node)
     return app

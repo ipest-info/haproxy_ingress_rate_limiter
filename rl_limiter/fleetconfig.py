@@ -443,6 +443,140 @@ def remove_node(path: str, name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 接入串：节点装完 install.sh 打印的一行，总控「节点管理」粘贴（可批量）
+# ---------------------------------------------------------------------------
+#
+#   rl-node name=<名称> url=<节点控制台地址> [token=<令牌>] [console=<页面跳转地址>]
+#
+# 一行一台，空格分隔 key=value——名称/地址/令牌的字符集都不含空格，值里
+# 不会有空格；令牌里的 "=" 只按第一个切。行里 "rl-node " 之前的内容忽略
+# （整段安装输出直接粘也行），不含它的行整行忽略。没有 token = 只读观测。
+
+JOIN_PREFIX = "rl-node"
+_JOIN_KEYS = {"name": "name", "url": "url", "token": "token",
+              "console": "console_url"}
+
+
+def join_line(name: str, url: str, token: str = "",
+              console_url: str = "") -> str:
+    """拼一行接入串（与 install.sh 打印的同一格式）。"""
+    parts = [JOIN_PREFIX, f"name={name}", f"url={url}"]
+    if token:
+        parts.append(f"token={token}")
+    if console_url:
+        parts.append(f"console={console_url}")
+    return " ".join(parts)
+
+
+def _http_url(v: str) -> bool:
+    return ((v.startswith("http://") or v.startswith("https://"))
+            and bool(urllib.parse.urlsplit(v).netloc))
+
+
+def parse_join_text(text: str) -> "tuple[list, int]":
+    """解析粘贴进来的接入串文本，返回 (条目列表, 忽略的行数)。
+
+    条目 = {"line", "name", "url", "token", "console_url", "error"}；
+    error 非空 = 这一行不能导入（字段缺失/非法、令牌强度不足、同批重名）。
+    """
+    entries: list = []
+    ignored = 0
+    seen: dict = {}
+    for no, raw_line in enumerate((text or "").splitlines(), start=1):
+        idx = raw_line.find(JOIN_PREFIX + " ")
+        if idx < 0:
+            if raw_line.strip():
+                ignored += 1
+            continue
+        e = {"line": no, "name": "", "url": "", "token": "",
+             "console_url": "", "error": ""}
+        errs = []
+        for part in raw_line[idx + len(JOIN_PREFIX):].split():
+            k, sep, v = part.partition("=")
+            if not sep:
+                errs.append(f"{part!r} 不是 key=value")
+            elif k not in _JOIN_KEYS:
+                errs.append(f"不认识的字段 {k!r}（可用 name/url/token/"
+                            f"console）")
+            else:
+                e[_JOIN_KEYS[k]] = v.strip()
+        e["url"] = e["url"].rstrip("/")
+        if not e["name"]:
+            errs.append("缺 name")
+        elif not _NAME_RE.match(e["name"]):
+            errs.append(f"name {e['name']!r} 非法（1~64 位字母/数字/._-）")
+        if not e["url"]:
+            errs.append("缺 url")
+        elif not _http_url(e["url"]):
+            errs.append(f"url {e['url']!r} 不是 http(s)://<主机>:<端口>")
+        if e["console_url"] and not _http_url(e["console_url"]):
+            errs.append("console 不是 http(s):// 地址")
+        if e["token"]:
+            why = tokenpolicy.weakness(e["token"])
+            if why:
+                errs.append(f"令牌强度不足：{why}")
+        if e["name"] and not errs:
+            if e["name"] in seen:
+                errs.append(f"与第 {seen[e['name']]} 行重名")
+            else:
+                seen[e["name"]] = no
+        e["error"] = "；".join(errs)
+        entries.append(e)
+    return entries, ignored
+
+
+def import_nodes(path: str, entries: list, dry_run: bool = False) -> list:
+    """把解析好的接入串条目导入节点清单（一次整份校验 + 原子回写）。
+
+    每条的结果 action：add（新节点）/ update（同名节点改 url/token/
+    console_url）/ same（与清单里完全一致，不动）/ error（行本身有错，
+    跳过）。update 时接入串没带 token = 清除令牌（以节点当前状态为准：
+    节点没令牌，总控留着旧令牌只会一直 401）。dry_run 只算结果不写盘。
+    返回 [{"line", "name", "action", "changes", "error"}]（不含令牌）。
+    """
+    raw = _read_raw(path)
+    nodes = _raw_nodes(raw)
+    results = []
+    changed = False
+    for e in entries:
+        r = {"line": e["line"], "name": e["name"], "action": "error",
+             "changes": [], "error": e.get("error", "")}
+        results.append(r)
+        if r["error"]:
+            continue
+        want = {"url": e["url"], "token": e["token"]}
+        if e["console_url"]:
+            want["console_url"] = e["console_url"]
+        i = _find(nodes, e["name"])
+        if i < 0:
+            item = {"name": e["name"], **want}
+            nodes.append(item)
+            r["action"] = "add"
+            changed = True
+            continue
+        cur = dict(nodes[i])
+
+        def _norm(k):
+            v = str(cur.get(k, "") or "").strip()
+            return v if k == "token" else v.rstrip("/")
+        diff = [k for k, v in want.items() if _norm(k) != v]
+        if not diff:
+            r["action"] = "same"
+            continue
+        cur.update(want)
+        nodes[i] = cur
+        r["action"] = "update"
+        r["changes"] = diff
+        changed = True
+    if changed and not dry_run:
+        _write_raw(path, raw)
+    elif changed:
+        # 预览也要过同一条校验链：能预览成功的就一定能写成功。
+        from_raw(raw, source="导入后的配置")
+    return results
+
+
+# ---------------------------------------------------------------------------
 # 热更轮询
 # ---------------------------------------------------------------------------
 

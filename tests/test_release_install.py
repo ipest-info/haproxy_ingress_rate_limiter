@@ -53,7 +53,14 @@ exit 0
     "ip": r'''
 echo "ip $*" >>"$FAKE_TC_LOG"
 case "$1 $2" in "link show") [ -n "$FAKE_IFB" ] || exit 1 ;; esac
+case "$*" in "-4 -o addr show dev "*)
+  [ -n "$FAKE_IP" ] && echo "3: $6    inet $FAKE_IP/24 brd 10.0.1.255 scope global $6" ;;
+esac
 exit 0
+''',
+    # 假 hostname：-s 给短主机名，-I 给"本机全部地址"（后端侧网卡没 IP 时的回退）。
+    "hostname": r'''
+case "$1" in -I) echo "${FAKE_HOST_IP:-}" ;; *) echo "${FAKE_HOST:-node-test.example.com}" | cut -d. -f1 ;; esac
 ''',
     # 假 curl：-w（查最新版）打印 $FAKE_LATEST；-o 下载从 $FAKE_ASSETS 拷。
     "curl": r'''
@@ -607,3 +614,69 @@ def test_existing_weak_token_warns_on_upgrade(box):
     assert r.returncode == 0, r.stderr
     assert "强度不足" in r.stderr and "--token auto" in r.stderr
     assert "demo-token" not in r.stderr + r.stdout      # 不回显令牌
+
+
+# ---- 接入串：装完打印一行，总控粘贴即登记 --------------------------------
+
+def _join(stdout: str) -> str:
+    lines = [ln for ln in stdout.splitlines() if ln.startswith("rl-node ")]
+    assert len(lines) == 1, stdout
+    return lines[0]
+
+
+def test_node_install_prints_join_line_parsable_by_fleet(box):
+    """接入串单独一行（没有 install.sh: 前缀，三击即选中），地址取后端侧
+    网卡 IPv4 + 控制台端口，总控的解析器原样认。"""
+    from rl_limiter import fleetconfig
+    run, paths = box
+    r = run("--token", NODE_TOK, env={"FAKE_IP": "10.0.1.21",
+                                      "FAKE_HOST": "edge-sh-07.idc"})
+    assert r.returncode == 0, r.stderr
+    line = _join(r.stdout)
+    assert line == (f"rl-node name=edge-sh-07 url=http://10.0.1.21:8090 "
+                    f"token={NODE_TOK}")
+    (e,), _ = fleetconfig.parse_join_text(line)
+    assert e["error"] == "" and e["token"] == NODE_TOK
+    # 地址取的是**后端侧**网卡（eth1）。
+    assert "ip -4 -o addr show dev eth1 scope global" in _calls(paths)
+
+
+def test_join_line_overrides_and_show_join(box):
+    run, paths = box
+    assert run("--token", "auto").returncode == 0
+    tok = _env(paths)["RL_API_TOKEN"]
+    r = run("--show-join", "--node-name", "sh-01", "--advertise",
+            "192.168.9.9", nics=[])                  # 只打印：不查网卡、不装
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == \
+        f"rl-node name=sh-01 url=http://192.168.9.9:8090 token={tok}"
+    r = run("--show-join", "--advertise", "https://n1.example:9443/")
+    assert _join(r.stdout).split()[2] == "url=https://n1.example:9443"
+
+
+def test_join_line_without_backend_ip_falls_back_and_warns(box):
+    run, _ = box
+    r = run("--token", NODE_TOK, env={"FAKE_HOST_IP": "172.16.0.5 10.9.9.9"})
+    assert r.returncode == 0, r.stderr
+    assert "url=http://172.16.0.5:8090" in _join(r.stdout)
+    assert "--advertise" in r.stderr
+
+
+def test_join_line_without_token_is_read_only(box):
+    run, _ = box
+    r = run(env={"FAKE_IP": "10.0.1.21"})
+    line = _join(r.stdout)
+    assert "token=" not in line and "只读观测" in r.stderr
+
+
+@pytest.mark.parametrize("args, kw", [
+    (("--show-join",), "还没装节点"),
+    (("--show-join", "--token", "auto"), "只能和"),
+    (("--node-name", "bad name!"), "不合法"),
+    (("--fleet", "--node-name", "x"), "只用于节点"),
+    (("--advertise", "a b"), "不合法"),
+])
+def test_join_options_validated(box, args, kw):
+    run, paths = box
+    r = run(*args)
+    assert r.returncode != 0 and kw in r.stderr

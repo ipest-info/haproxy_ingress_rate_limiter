@@ -335,3 +335,51 @@ async def test_weak_node_token_in_yaml_shows_as_weak(tmp_path):
         j = await (await c.get("/api/nodes")).json()
     assert j["nodes"][0]["has_token"] is False
     assert j["nodes"][0]["token_weak"] is True
+
+
+# ---------------------------------------------------------------------------
+# 粘贴接入串批量导入 /api/nodes/import
+# ---------------------------------------------------------------------------
+
+IMP_TOK = "fe8890a02029cbe0d9a67dd1cb2cbd8f1daa11101d13ef31"
+
+
+async def test_import_preview_then_commit(client):
+    yml, poke = client.app["yml"], client.app["poke"]
+    text = (f"install.sh: 完成\n"
+            f"rl-node name=node2 url=http://10.0.0.2:8090 token={IMP_TOK}\n"
+            f"rl-node name=node3 url=http://10.0.0.3:8090\n"
+            f"rl-node name=node4 url=http://10.0.0.4:8090 token=weak\n")
+    before = yml.read_text(encoding="utf-8")
+    r = await client.post("/api/nodes/import", headers=auth(),
+                          json={"text": text, "dry_run": True})
+    assert r.status == 200
+    j = await r.json()
+    assert (j["add"], j["update"], j["error"], j["ignored_lines"]) == \
+        (2, 0, 1, 1)
+    assert [i["action"] for i in j["items"]] == ["add", "add", "error"]
+    assert j["items"][0]["has_token"] is True
+    assert IMP_TOK not in json.dumps(j)                  # 不回显令牌
+    assert yml.read_text(encoding="utf-8") == before and not poke.is_set()
+
+    r = await client.post("/api/nodes/import", headers=auth(),
+                          json={"text": text})
+    j = await r.json()
+    assert (j["dry_run"], j["add"]) == (False, 2) and poke.is_set()
+    names = [n.name for n in fleetconfig.load(str(yml)).nodes]
+    assert names == ["node1", "node2", "node3"]
+
+
+@pytest.mark.parametrize("body, status", [
+    ({"text": "没有接入串"}, 400),
+    ({"lines": []}, 400),
+])
+async def test_import_bad_requests(client, body, status):
+    r = await client.post("/api/nodes/import", headers=auth(), json=body)
+    assert r.status == status
+
+
+async def test_import_requires_fleet_token(client):
+    r = await client.post("/api/nodes/import", json={
+        "text": "rl-node name=n9 url=http://x:1", "dry_run": True})
+    assert r.status == 401
