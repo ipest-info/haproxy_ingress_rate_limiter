@@ -1,6 +1,9 @@
 # 07 API 参考
 
-控制台同端口（`RL_CONSOLE_PORT`）提供全部 HTTP API。约定：
+控制台同端口（`RL_CONSOLE_PORT`）提供全部 HTTP API。本文讲字段口径与
+集成思路；**规范性的接口文档**（逐个接口的参数、响应、错误码，含安装
+脚本与总控）见 [13 接口文档](13-接口文档.md)，机器可读描述
+`GET /api/openapi.json`。约定：
 
 - **速率字段一律 bytes/s（应用层口径）**，与配置/页面的 Mbps 换算
   （×8÷1e6）只在显示层做；闭环调节视图（regulation）例外，整段 Mbps；
@@ -112,21 +115,7 @@ Prometheus 文本格式，与快照同源同口径。指标名前缀 `rl_limiter
 统一行为：修改经整份校验后原子回写 YAML（校验不过 400、文件不动），
 并立即 poke 配置轮询——数秒内热生效。未配置 `RL_API_TOKEN`（或配了
 但强度不达标，见 [11](11-发布与安装.md) §3.4）时整体 403；令牌缺失/
-错误 401；段名不存在 400（会列出当前解析到的段名）。
-
-### PUT /api/quotas/{name}
-
-```bash
-curl -X PUT -H "X-API-Token: $TOKEN" -H "Content-Type: application/json" \
-  -d '{"quota_mbps": 40}' http://127.0.0.1:8090/api/quotas/fe_main
-```
-
-登记/修改该端口的**出向带宽目标**（本分支：闭环判断基准）。0 = 显式
-不限速。
-
-### DELETE /api/quotas/{name}
-
-删除登记（回到只监控不限速）。响应 `{"removed": true|false}`。
+错误 401；端口名不在 YAML `ports` 段 400（会列出当前登记的端口）。
 
 ### PUT /api/instance-quota · DELETE /api/instance-quota
 
@@ -149,7 +138,8 @@ curl -X PUT -H "X-API-Token: $TOKEN" -H "Content-Type: application/json" \
 
 ### DELETE /api/request-limits/{name}
 
-删除入向限速登记（回到不限请求方向）。
+删除入向限速登记（回到不限请求方向）。响应
+`{"ok": true, "frontend": "<名>", "removed": true|false}`。
 
 ## 3. 集成提示
 
@@ -161,7 +151,7 @@ curl -X PUT -H "X-API-Token: $TOKEN" -H "Content-Type: application/json" \
 
 ## 4. 总控（rl-fleet）的 API
 
-总控自身的 HTTP 面（overview/history/stream/logs + PUT/DELETE
-/api/total-quota）字段口径与本文一致，见
-[10 总控制台](10-总控制台.md) §4；总控消费的就是本文的节点读写
+总控自身的 HTTP 面字段口径与本文一致，见 [10 总控制台](10-总控制台.md)
+§4、开放 API [12](12-总控开放API.md)，逐个接口的规范见
+[13 接口文档](13-接口文档.md) §4；总控消费的就是本文的节点读写
 接口（轮询 `/api/overview`、下发 `PUT /api/instance-quota`）。

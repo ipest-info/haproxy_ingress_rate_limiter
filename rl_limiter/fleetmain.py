@@ -41,7 +41,6 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
                  console_bind: str = DEFAULT_CONSOLE_BIND,
                  api_token: str = "",
                  mlog: "fleetmetrics.FleetMetricsLog | None" = None,
-                 frame_ancestors: "list | tuple" = (),
                  cors_origins: "list | tuple" = (),
                  ssl_context=None) -> None:
     poller = fleetpoll.NodePoller(log, timeout_s=cfg.node_timeout_s,
@@ -155,7 +154,7 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
                 api_token=api_token, poke=cfg_poke,
                 metrics_path=mlog.path if mlog is not None else "",
                 keys_fn=lambda: cur["cfg"].api_keys, audit_fn=_on_api,
-                frame_ancestors=frame_ancestors, cors_origins=cors_origins,
+                cors_origins=cors_origins,
                 ssl_context=ssl_context),
             name="fleet-console"))
 
@@ -303,16 +302,13 @@ def main() -> None:
             log.warning("节点未配置令牌，只读观测、不可控（不会向它下发"
                         "配额） node=%s url=%s", n.name, n.url)
 
-    frame_ancestors = _origin_env("RL_FRAME_ANCESTORS", _ANCESTOR_RE,
-                                  True, log)
-    cors_origins = _origin_env("RL_CORS_ORIGINS", _ORIGIN_RE, False, log)
+    cors_origins = _origin_env("RL_CORS_ORIGINS", _ORIGIN_RE, log)
     ssl_context = _ssl_from_env()
     if console_port:
-        log.info("开放 API：API 密钥 %d 个（%s）；iframe 嵌入允许 %s；"
+        log.info("开放 API：API 密钥 %d 个（%s）；iframe 嵌入不限制；"
                  "跨域允许 %s；%s",
                  len(cfg.api_keys),
                  "、".join(k.name for k in cfg.api_keys) or "无",
-                 "、".join(frame_ancestors) or "仅同源",
                  "、".join(cors_origins) or "无",
                  "HTTPS" if ssl_context is not None else "HTTP（被 HTTPS 页面"
                  "嵌入需要配 RL_TLS_CERT/RL_TLS_KEY）")
@@ -321,32 +317,23 @@ def main() -> None:
         asyncio.run(_amain(cfg, log, args.config,
                            console_port=console_port, logbuf=logbuf,
                            console_bind=console_bind, api_token=api_token,
-                           mlog=mlog, frame_ancestors=frame_ancestors,
-                           cors_origins=cors_origins,
+                           mlog=mlog, cors_origins=cors_origins,
                            ssl_context=ssl_context))
     except KeyboardInterrupt:
         log.info("收到中断信号，rl-fleet 退出")
 
 
-# 允许 iframe 嵌入总控页面的来源（CSP frame-ancestors 源表达式）：
-# https://portal.example.com、https://*.example.com、可带端口；单独一个 *
-# = 任何网站（等于不设防，启动时告警）。
-_ANCESTOR_RE = re.compile(r"^https?://(\*\.)?[A-Za-z0-9.-]+(:\d{1,5})?$")
 # 允许浏览器跨域调 /api/ 的来源：必须是精确来源（不收通配）。
 _ORIGIN_RE = re.compile(r"^https?://[A-Za-z0-9.-]+(:\d{1,5})?$")
 
 
-def _origin_env(name: str, pattern: "re.Pattern", allow_star: bool,
+def _origin_env(name: str, pattern: "re.Pattern",
                 log: logging.Logger) -> list:
     """读逗号/空格分隔的来源清单；有一个不合法就启动失败（配错了宁可
     起不来，也不要以为放行了、实际被浏览器拦）。"""
     items = [x.rstrip("/") for x in
              re.split(r"[\s,]+", os.environ.get(name) or "") if x]
     for x in items:
-        if x == "*" and allow_star:
-            log.warning("%s=*：任何网站都能用 iframe 嵌入总控页面（有"
-                        "点击劫持风险），建议改成具体来源", name)
-            continue
         if not pattern.match(x):
             print(f"rl-fleet: {name} 里的 {x!r} 不是合法来源（写成 "
                   f"https://portal.example.com 这样，多个用逗号隔开）",

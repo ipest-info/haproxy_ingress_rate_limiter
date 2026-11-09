@@ -623,3 +623,18 @@ async def test_delete_request_limit(wclient):
     assert (await r.json())["removed"] is True
     r = await wclient.delete("/api/request-limits/fe_a", headers=auth())
     assert (await r.json())["removed"] is False
+
+
+
+async def test_node_openapi_matches_routes(wclient):
+    """节点的机器可读接口描述必须与实际路由一一对应（docs/13 §3）。"""
+    spec = await (await wclient.get("/api/openapi.json")).json()
+    assert spec["openapi"].startswith("3.")
+    routes = {(r.method, r.resource.canonical)
+              for r in wclient.app.router.routes()
+              if r.resource is not None and r.method != "HEAD"
+              and (r.resource.canonical.startswith("/api/")
+                   or r.resource.canonical == "/metrics")}
+    documented = {(m.upper(), path) for path, ops in spec["paths"].items()
+                  for m in ops if m != "parameters"}
+    assert routes == documented

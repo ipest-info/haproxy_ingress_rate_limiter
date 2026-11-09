@@ -400,7 +400,6 @@ async def oclient(tmp_path):
         fleetweb.LogBuffer(), log, yaml_path=str(yml), api_token=TOKEN,
         keys_fn=lambda: fleetconfig.load(str(yml)).api_keys,
         audit_fn=lambda actor, op, d: audits.append((actor, op, d)),
-        frame_ancestors=["https://portal.example.com"],
         cors_origins=["https://ops.example.com"])
     app["yml"], app["audits"] = yml, audits
     async with TestClient(TestServer(app)) as c:
@@ -517,18 +516,14 @@ async def test_cors_preflight_and_headers(oclient):
     assert "Access-Control-Allow-Origin" not in r.headers
 
 
-async def test_frame_ancestors_allowlist(oclient):
-    r = await oclient.get("/")
-    assert r.headers["Content-Security-Policy"] == \
-        "frame-ancestors 'self' https://portal.example.com"
-    assert "X-Frame-Options" not in r.headers      # 有白名单就不能再 SAMEORIGIN
-
-
-async def test_default_only_same_origin_can_embed(client):
-    """没配白名单 = 只许同源嵌入（防点击劫持），老浏览器靠 X-Frame-Options。"""
-    r = await client.get("/")
-    assert r.headers["Content-Security-Policy"] == "frame-ancestors 'self'"
-    assert r.headers["X-Frame-Options"] == "SAMEORIGIN"
+async def test_iframe_embedding_is_unrestricted(client):
+    """iframe 嵌入不设任何限制：页面与接口都不发 X-Frame-Options /
+    frame-ancestors，任何网站都能引用（只读精简页用 ?embed=1）。"""
+    for path in ("/", "/?embed=1&tab=overview", "/api/overview"):
+        r = await client.get(path)
+        assert "X-Frame-Options" not in r.headers
+        assert "frame-ancestors" not in r.headers.get(
+            "Content-Security-Policy", "")
     r = await client.options("/api/total-quota", headers={
         "Origin": "https://ops.example.com",
         "Access-Control-Request-Method": "PUT"})

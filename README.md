@@ -71,6 +71,7 @@ sudo bash install.sh --download --fleet --token auto                            
 | [10 总控制台](docs/10-总控制台.md) | **多机总量控制**：rl-fleet 汇总数十台节点并把总流出带宽按需分配为各节点的出向目标；页面「节点管理」增删节点、「历史回查」查总带宽/限速变更 |
 | [11 发布与安装](docs/11-发布与安装.md) | 二进制发布包：tag/Release 命名规则、CI 构建、install.sh 一键安装（令牌/网卡选项、双网卡检查） |
 | [12 总控开放 API](docs/12-总控开放API.md) | 第三方集成：按范围授权的 API 密钥、改总带宽/节点固定限速、审计、iframe 嵌入、CORS、HTTPS |
+| [13 接口文档](docs/13-接口文档.md) | 标准接口文档：install.sh 命令行、节点与总控全部 HTTP 接口（参数/响应/错误码）、接入串与落盘数据格式、Prometheus 指标、配置项 |
 
 ## 系统组成
 

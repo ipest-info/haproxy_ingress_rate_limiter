@@ -40,7 +40,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from . import configstore, model, tokenpolicy
+from . import configstore, model, nodeopenapi, tokenpolicy
 
 # 快照留存拍数：1s 一拍即约 10 分钟窗口，页面刷新后能立即回填完整曲线。
 HISTORY_TICKS = 600
@@ -748,9 +748,9 @@ def build_app(
         known = known_frontends_fn() if known_frontends_fn is not None else None
         if known is not None and name not in known:
             return web.json_response(
-                {"error": f"haproxy.cfg 里没有名为 {name!r} 的 frontend/"
-                          f"listen 段（是不是拼错了？）。当前解析到的段："
-                          f"{sorted(known)}"},
+                {"error": f"配置的 ports 段里没有名为 {name!r} 的端口登记"
+                          f"（是不是拼错了？先在 YAML ports 段登记端口）。"
+                          f"当前登记的端口：{sorted(known)}"},
                 status=400)
         async with write_lock:
             try:
@@ -794,6 +794,10 @@ def build_app(
     app.router.add_get("/api/config-view", handle_config_view)
     app.router.add_get("/api/logs", handle_logs)
     app.router.add_get("/api/stream", handle_stream)
+
+    async def handle_openapi(_request: web.Request) -> web.Response:
+        return web.json_response(nodeopenapi.spec())
+    app.router.add_get("/api/openapi.json", handle_openapi)
     # Prometheus 抓取端点：与只读 API 同一个监听面（同样的安全边界——
     # 默认回环，放内网靠防火墙）。
     app.router.add_get("/metrics", handle_metrics)

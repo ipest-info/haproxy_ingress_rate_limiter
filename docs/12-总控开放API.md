@@ -3,11 +3,12 @@
 rl-fleet 总控对第三方系统（计费、运维门户、CMDB、工单……）开放两类能力：
 
 - **API**：改总带宽、给单个节点设固定限速、维护节点清单，读概览与历史；
-- **页面嵌入**：第三方页面用 iframe 引用总控页面（只读精简版）。
+- **页面嵌入**：第三方页面用 iframe 直接引用总控页面（不设限制；有只读精简版）。
 
 机器可读的接口描述：`GET /api/openapi.json`（OpenAPI 3，可直接导入
 Postman / Apifox 或生成客户端）。总控页面「开放 API」页签有接口速查与
-curl 示例。
+curl 示例。逐个接口的参数、响应字段、错误码与数据格式见规范性的
+[13 接口文档](13-接口文档.md)。
 
 ## 1. 凭据与权限范围
 
@@ -131,32 +132,27 @@ curl -s "$F/api/metrics-log?kind=event&from=2026-11-01T00:00:00%2B08:00" | jq '.
 
 ## 5. 页面嵌入（iframe）
 
-**默认只许同源嵌入**（`Content-Security-Policy: frame-ancestors 'self'`
-+ `X-Frame-Options: SAMEORIGIN`）：总控页面上有带令牌的写操作，放开给
-任意网站嵌入就有点击劫持风险。允许第三方嵌入，在 `rl-fleet.env` 里配：
-
-```
-RL_FRAME_ANCESTORS=https://portal.example.com,https://*.corp.example.com
-```
-
-重启 rl-fleet 生效。第三方页面这样引用（**只读精简版**：没有页头、页签、
-令牌输入框和任何写操作，也不读浏览器里存的令牌）：
+总控页面**不设任何嵌入限制**（不发 `X-Frame-Options`、
+`Content-Security-Policy: frame-ancestors`），任何第三方页面都能直接
+iframe 引用。完整页面原样可用（页头填令牌即可做写操作）；只想展示、
+不想带出写操作时用**只读精简版**：
 
 ```html
 <iframe src="https://fleet.example.com:8095/?embed=1&tab=overview"
         style="width:100%;height:640px;border:0"></iframe>
 ```
 
-`tab` 可选 `overview`（总览）/ `nodes`（节点清单）/ `history`（历史回查）/
-`logs`（日志）。
+`embed=1`：去掉页头、页签、令牌输入框和一切写操作，也不读浏览器里存的
+令牌。`tab` 可选 `overview`（总览）/ `nodes`（节点清单）/ `history`
+（历史回查）/ `logs`（日志），缺省 overview。
 
-**HTTPS**：第三方页面是 HTTPS 时，被嵌入的总控也必须是 HTTPS，否则浏览器
-按"混合内容"直接拦掉。两种做法：
+**HTTPS**（浏览器规则，不是总控的限制）：第三方页面是 HTTPS 时，被嵌入
+的总控也必须是 HTTPS，否则浏览器按"混合内容"直接拦掉。两种做法：
 
 - 总控自己开 HTTPS：`rl-fleet.env` 里设 `RL_TLS_CERT` / `RL_TLS_KEY`
   （PEM，服务用户 rl-limiter 可读），重启生效；
-- 前面放反向代理（nginx 等）做 TLS——此时代理不要覆盖总控返回的
-  `Content-Security-Policy` 头。
+- 前面放反向代理（nginx 等）做 TLS——代理也不要加 `X-Frame-Options`
+  之类的嵌入限制头。
 
 ## 6. 浏览器跨域调用（CORS）
 
@@ -176,9 +172,8 @@ RL_CORS_ORIGINS=https://ops.example.com
 | 变量 | 默认 | 说明 |
 | ---- | ---- | ---- |
 | `RL_API_TOKEN` | 未设 | 管理员令牌（高强度，见 [11](11-发布与安装.md) §3.4） |
-| `RL_FRAME_ANCESTORS` | 未设 = 只许同源 | 允许 iframe 嵌入的来源，逗号分隔，可 `https://*.example.com`；`*` = 任何网站（启动告警） |
 | `RL_CORS_ORIGINS` | 未设 = 不放行 | 允许浏览器跨域调 `/api/` 的精确来源 |
 | `RL_TLS_CERT` / `RL_TLS_KEY` | 未设 = HTTP | HTTPS 证书链与私钥（两个一起设） |
 
-配错（来源格式不对、只给了证书没给私钥、证书加载失败）rl-fleet 直接
-启动失败并写明原因——不会让人以为放行了、实际被浏览器拦。
+配错（跨域来源格式不对、只给了证书没给私钥、证书加载失败）rl-fleet
+直接启动失败并写明原因——不会让人以为放行了、实际被浏览器拦。

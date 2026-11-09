@@ -183,7 +183,6 @@ def build_fleet_app(
     metrics_path: str = "",
     keys_fn: "Callable[[], list] | None" = None,
     audit_fn: "Callable[[str, str, dict], None] | None" = None,
-    frame_ancestors: "list | tuple" = (),
     cors_origins: "list | tuple" = (),
 ) -> web.Application:
     """组装总控的 aiohttp 应用（开放 API，接口说明见 docs/12 与
@@ -193,8 +192,9 @@ def build_fleet_app(
     节点固定限速）、nodes（节点清单增删改与导入）——管理员令牌
     （RL_API_TOKEN）拥有全部范围并且能管理 API 密钥；第三方用按范围
     授权的 API 密钥（keys_fn 给出当前密钥）。每次成功写都经 audit_fn
-    留痕（调用者 + 操作）。frame_ancestors 是允许 iframe 嵌入本页面的
-    来源（缺省只许同源），cors_origins 是允许浏览器跨域调 /api/ 的来源。
+    留痕（调用者 + 操作）。cors_origins 是允许浏览器跨域调 /api/ 的
+    来源。页面不设任何 iframe 嵌入限制（第三方可直接引用，只读精简页
+    用 ?embed=1）。
     """
 
     index_html = (_STATIC_DIR / "fleet.html").read_bytes()
@@ -586,10 +586,10 @@ def build_fleet_app(
     async def handle_openapi(_request: web.Request) -> web.Response:
         return web.json_response(fleetopenapi.spec())
 
-    # ---- 响应头：嵌入白名单（frame-ancestors）+ 跨域（CORS） ----
+    # ---- 响应头：跨域（CORS）。iframe 嵌入不设限制（不发
+    # X-Frame-Options / frame-ancestors），任何网站都能引用总控页面。 ----
 
     cors_set = set(cors_origins or ())
-    ancestors = ["'self'"] + list(frame_ancestors or ())
 
     @web.middleware
     async def preflight_mw(request: web.Request, handler):
@@ -608,9 +608,6 @@ def build_fleet_app(
     async def on_prepare(request: web.Request,
                          response: web.StreamResponse) -> None:
         h = response.headers
-        h["Content-Security-Policy"] = "frame-ancestors " + " ".join(ancestors)
-        if not frame_ancestors:
-            h["X-Frame-Options"] = "SAMEORIGIN"     # 老浏览器不认 CSP
         h["X-Content-Type-Options"] = "nosniff"
         origin = request.headers.get("Origin", "")
         if origin and origin in cors_set and request.path.startswith("/api/"):
@@ -655,7 +652,6 @@ async def run_fleet_console(
     metrics_path: str = "",
     keys_fn: "Callable[[], list] | None" = None,
     audit_fn: "Callable[[str, str, dict], None] | None" = None,
-    frame_ancestors: "list | tuple" = (),
     cors_origins: "list | tuple" = (),
     ssl_context=None,
 ) -> None:
@@ -666,8 +662,7 @@ async def run_fleet_console(
         build_fleet_app(hub, logbuf, log, yaml_path=yaml_path,
                         api_token=api_token, poke=poke,
                         metrics_path=metrics_path, keys_fn=keys_fn,
-                        audit_fn=audit_fn, frame_ancestors=frame_ancestors,
-                        cors_origins=cors_origins),
+                        audit_fn=audit_fn, cors_origins=cors_origins),
         access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, bind, port, ssl_context=ssl_context)
