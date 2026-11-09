@@ -2,9 +2,13 @@
 # rl-limiter 二进制发布包安装脚本（随 tar.gz 分发，也作为 Release 附件单独下载）。
 #
 # 装节点（默认）——本机必须至少有两张物理网卡（客户侧 + 后端侧），否则拒绝安装：
-#   sudo ./install.sh [--token <令牌>|auto] [--client-nic <网卡>] [--backend-nic <网卡>]
-#     --token        节点写 API 令牌（RL_API_TOKEN；总控登记该节点时填同一个值）。
-#                    auto = 自动生成 64 位十六进制随机令牌（256 bit），装完打印出来
+#   sudo ./install.sh [--token <令牌>|auto|ask|-] [--client-nic <网卡>] [--backend-nic <网卡>]
+#     --token        节点写 API 令牌（RL_API_TOKEN；总控登记该节点时填同一个值），四种给法：
+#                      <令牌>  直接写在命令行（会留在 shell 历史、短暂出现在 ps 里）
+#                      ask     交互输入：不回显、输两次确认、强度不够当场重输；
+#                              直接回车 = 自动生成（同 auto）
+#                      -       从标准输入读一行（脚本/密钥管理工具用，不进命令行）
+#                      auto    自动生成 64 位十六进制随机令牌（256 bit），装完打印出来
 #     --client-nic   客户端侧网卡 = 入向限速执行网卡（RL_TC_IN_IFACE，默认 eth0）
 #     --backend-nic  后端服务侧网卡（RL_BACKEND_IFACE，默认 eth1）
 #     --node-name    总控里显示的节点名（默认短主机名）
@@ -16,13 +20,16 @@
 #   sudo ./install.sh --show-join [--node-name …] [--advertise …]
 #
 # 装总控（rl-fleet，不碰 tc，不要求双网卡）：
-#   sudo ./install.sh --fleet [--token <令牌>|auto]
-#     --token        总控写 API 令牌（页面改总带宽、添加/删除节点用）；auto 同上
+#   sudo ./install.sh --fleet [--token <令牌>|auto|ask|-]
+#     --token        总控写 API 令牌（页面改总带宽、添加/删除节点用）；给法同上
 #
 # 令牌必须是**高强度随机串**：≥32 位、估算 ≥128 bit、没有重复/顺序/常见词
 # 等人为痕迹（规则见 rl_limiter/tokenpolicy.py）。不达标拒绝安装；运行中的
-# rl-limiter / rl-fleet 也会把不达标的令牌当作没有（写接口禁用）。推荐
-# --token auto，或 openssl rand -hex 32。
+# rl-limiter / rl-fleet 也会把不达标的令牌当作没有（写接口禁用）。自己定
+# 令牌就用 openssl rand -hex 32 之类生成，再 --token ask 输入；省事用
+# --token auto。例：
+#   sudo ./install.sh --token ask                                  # 交互输入
+#   openssl rand -hex 32 | tee node.token | sudo ./install.sh --token -
 #
 # 包从哪来：
 #   1. 已有发布包：tar xzf rl-limiter-<tag>-linux-x86_64.tar.gz，进包目录执行；
@@ -30,6 +37,7 @@
 #      .sha256 后安装，其余参数原样交给包内的 install.sh。例：
 #        sudo ./install.sh --download --token auto --client-nic ens33 --backend-nic ens34
 #        sudo ./install.sh --download v0.6.4 --fleet --token auto
+#      令牌（<令牌>/ask/-）经标准输入交给包内的 install.sh，不出现在它的命令行里。
 #      需要能访问 github.com（含跳转到的 objects.githubusercontent.com）。
 #
 # 装什么：
@@ -51,6 +59,9 @@
 set -euo pipefail
 
 REPO="ipest-info/haproxy_ingress_rate_limiter"
+# 本脚本支持的特性。--download 装别的版本时，外层脚本 grep 包内脚本的这
+# 一行决定怎么交接令牌（老版本没有 token-stdin 就只能走命令行）。
+INSTALL_FEATURES="token-stdin token-ask"
 PREFIX=${PREFIX:-/usr/local}
 CONF_DIR=${CONF_DIR:-/etc/rl-limiter}
 UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
@@ -102,7 +113,12 @@ while [ $# -gt 0 ]; do
         --uninstall) UNINSTALL=1 ;;
         --purge) PURGE=1 ;;
         --token|--token=*)
-            take_value "$@"; TOKEN=$OPTVAL; shift "$OPTSHIFT" ;;
+            # "--token -" = 从标准输入读（单独一个 - 不是"下一个选项"）。
+            if [ "$1" = --token ] && [ "${2-}" = - ]; then
+                TOKEN=-; shift
+            else
+                take_value "$@"; TOKEN=$OPTVAL; shift "$OPTSHIFT"
+            fi ;;
         --client-nic|--client-nic=*)
             take_value "$@"; CLIENT_NIC=$OPTVAL; shift "$OPTSHIFT" ;;
         --backend-nic|--backend-nic=*)
@@ -136,12 +152,32 @@ done
 # 令牌：这里先做不需要二进制的粗检（字符集、长度），明显不行的在下载
 # 之前就拒绝；完整的强度规则在装之前用包里的 rl-limiter --check-token
 # 校验（规则只在 Python 里写一份，见 token_weakness）。
-TOKEN_HINT="生成一个：--token auto，或 openssl rand -hex 32"
-if [ -n "$TOKEN" ] && [ "$TOKEN" != auto ]; then
-    [[ "$TOKEN" =~ ^[A-Za-z0-9._~+/=-]+$ ]] \
-        || die "令牌含不允许的字符（只收字母、数字与 ._~+/=-）——$TOKEN_HINT"
-    [ "${#TOKEN}" -ge 32 ] \
-        || die "令牌太短（${#TOKEN} 位，至少 32 位高强度随机串）——$TOKEN_HINT"
+TOKEN_HINT="生成一个：--token auto，或 openssl rand -hex 32 后用 --token ask 输入"
+token_precheck() {   # 达标输出空，否则输出原因
+    if ! [[ "$1" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+        printf '%s' "令牌含不允许的字符（只收字母、数字与 ._~+/=-）"
+    elif [ "${#1}" -lt 32 ]; then
+        printf '%s' "令牌太短（${#1} 位，至少 32 位高强度随机串）"
+    fi
+}
+
+# --token -：从标准输入读一行（去掉行尾回车与首尾空白）。标准输入是终端
+# 时等同 ask（免得回显出来）。--download 时在这里就读掉：包内脚本经
+# 管道再收一次。
+if [ "$TOKEN" = - ]; then
+    if [ -t 0 ]; then
+        TOKEN=ask
+    else
+        IFS= read -r TOKEN || true
+        TOKEN=${TOKEN%$'\r'}
+        TOKEN=${TOKEN#"${TOKEN%%[![:space:]]*}"}
+        TOKEN=${TOKEN%"${TOKEN##*[![:space:]]}"}
+        [ -n "$TOKEN" ] || die "--token -：标准输入里没读到令牌（例：openssl rand -hex 32 | sudo ./install.sh --token -）"
+    fi
+fi
+if [ -n "$TOKEN" ] && [ "$TOKEN" != auto ] && [ "$TOKEN" != ask ]; then
+    why=$(token_precheck "$TOKEN")
+    [ -z "$why" ] || die "$why——$TOKEN_HINT"
 fi
 
 if [ "$WITH_FLEET" = 1 ] && { [ -n "$CLIENT_NIC" ] || [ -n "$BACKEND_NIC" ]; }; then
@@ -163,18 +199,55 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # Python 里写一份）。有包目录就用包里的二进制——先拷到 $PREFIX/bin 下的
 # 临时名再跑，包目录可能在挂了 noexec 的 /tmp 下（--download 就是）；
 # 没有包目录（--show-join 单独跑）用已装的。达标输出空，否则输出原因。
+PKG_DIR=$HERE
 token_weakness() {
     local chk out
-    if [ -f "$HERE/bin/rl-limiter" ]; then
+    if [ -f "$PKG_DIR/bin/rl-limiter" ]; then
         chk="$PREFIX/bin/.rl-limiter-tokencheck.$$"
         install -d -m 755 "$PREFIX/bin"
-        install -m 700 "$HERE/bin/rl-limiter" "$chk"
+        install -m 700 "$PKG_DIR/bin/rl-limiter" "$chk"
         out=$(printf '%s' "$1" | "$chk" --check-token 2>&1) || true
         rm -f "$chk"
     elif [ -x "$PREFIX/bin/rl-limiter" ]; then
         out=$(printf '%s' "$1" | "$PREFIX/bin/rl-limiter" --check-token 2>&1) || true
     fi
     [ "$out" = OK ] || printf '%s' "${out:-无法校验（找不到 rl-limiter）}"
+}
+
+# --token ask：从终端交互输入（不回显、输两次）。强度不够当场说原因、重输，
+# 最多 3 次；直接回车 = 自动生成（TOKEN=auto）。读写都走 /dev/tty——标准
+# 输入/输出被重定向（管道、--download 的交接）也照样能问。结果放在全局
+# TOKEN 里（不经 $(...)，令牌不过子进程的输出管道）。
+prompt_token() {
+    local a b why i
+    { : </dev/tty; } 2>/dev/null \
+        || die "--token ask 需要在终端里交互运行（当前没有终端）——脚本化安装请用" \
+               "--token -（从标准输入读）、--token <令牌> 或 --token auto"
+    for i in 1 2 3; do
+        printf 'install.sh: 输入令牌（不回显；直接回车 = 自动生成）：' >/dev/tty
+        IFS= read -r -s a </dev/tty || a=""
+        printf '\n' >/dev/tty
+        if [ -z "$a" ]; then
+            TOKEN=auto; log "未输入，改为自动生成令牌"; return 0
+        fi
+        why=$(token_precheck "$a")
+        if [ -z "$why" ]; then
+            why=$(token_weakness "$a")
+            [ -z "$why" ] || why="令牌强度不足：$why"
+        fi
+        if [ -n "$why" ]; then
+            warn "$why——请重输（直接回车 = 自动生成；或 openssl rand -hex 32 生成后粘贴）"
+            continue
+        fi
+        printf 'install.sh: 再输入一次确认：' >/dev/tty
+        IFS= read -r -s b </dev/tty || b=""
+        printf '\n' >/dev/tty
+        if [ "$a" != "$b" ]; then
+            warn "两次输入不一致，请重输"; continue
+        fi
+        TOKEN=$a; log "令牌已输入（强度校验通过）"; return 0
+    done
+    die "3 次都没输入有效令牌，终止安装（什么都没装）"
 }
 
 # 接入串：rl-node name=<名称> url=<节点控制台地址> [token=<令牌>]，总控
@@ -388,9 +461,26 @@ if [ "$DOWNLOAD" = 1 ]; then
         || die "sha256 校验失败——下载不完整或被篡改，终止安装"
     tar -C "$TMP" -xzf "$TMP/$NAME.tar.gz"
     [ -f "$TMP/$NAME/install.sh" ] || die "发布包里没有 install.sh（包损坏？）"
+    # 交互输入放在下载之后：用包里的 rl-limiter 做完整强度校验，不行当场重输。
+    if [ "$TOKEN" = ask ]; then
+        PKG_DIR="$TMP/$NAME"
+        prompt_token
+    fi
+    # 令牌交接：包内脚本支持 token-stdin 就经管道给（不进它的命令行）；
+    # 老版本只能走命令行。auto 原样交给包内脚本生成并打印。
+    feed=0
     args=()
     [ "$WITH_FLEET" = 1 ] && args+=(--fleet)
-    [ -n "$TOKEN" ]       && args+=("--token=$TOKEN")
+    if [ "$TOKEN" = auto ]; then
+        args+=("--token=auto")
+    elif [ -n "$TOKEN" ]; then
+        if grep -q '^INSTALL_FEATURES=.*token-stdin' "$TMP/$NAME/install.sh"; then
+            args+=("--token=-"); feed=1
+        else
+            warn "$DOWNLOAD_TAG 的 install.sh 不支持从标准输入收令牌，令牌经命令行交给它"
+            args+=("--token=$TOKEN")
+        fi
+    fi
     [ -n "$CLIENT_NIC" ]  && args+=("--client-nic=$CLIENT_NIC")
     [ -n "$BACKEND_NIC" ] && args+=("--backend-nic=$BACKEND_NIC")
     [ -n "$NODE_NAME" ]   && args+=("--node-name=$NODE_NAME")
@@ -398,7 +488,11 @@ if [ "$DOWNLOAD" = 1 ]; then
     # 不 exec：要等它结束让 EXIT trap 清掉临时目录；用 bash 跑而不是
     # 直接执行，/tmp 挂了 noexec 的加固机器上也能装。
     rc=0
-    bash "$TMP/$NAME/install.sh" "${args[@]+"${args[@]}"}" || rc=$?
+    if [ "$feed" = 1 ]; then
+        printf '%s\n' "$TOKEN" | bash "$TMP/$NAME/install.sh" "${args[@]+"${args[@]}"}" || rc=$?
+    else
+        bash "$TMP/$NAME/install.sh" "${args[@]+"${args[@]}"}" || rc=$?
+    fi
     exit "$rc"
 fi
 
@@ -419,6 +513,7 @@ gen_token() {
 }
 
 GENERATED_TOKEN=""
+[ "$TOKEN" != ask ] || prompt_token        # 交互输入（空 = auto）
 if [ "$TOKEN" = auto ]; then
     TOKEN=$(gen_token)
     GENERATED_TOKEN=$TOKEN
@@ -453,7 +548,9 @@ env_set() {
         printf '%s=%s\n' "$key" "$val" >>"$file"; return 0
     fi
     tmp=$(mktemp)
-    awk -v k="$key=" -v kv="$key=$val" -v mode="$mode" '
+    # 值经环境变量交给 awk，不进 awk 的命令行（令牌不该出现在 ps 里）。
+    RL_ENV_KV="$key=$val" awk -v k="$key=" -v mode="$mode" '
+        BEGIN { kv = ENVIRON["RL_ENV_KV"] }
         { s = $0; sub(/^[ \t]*/, "", s) }
         mode == "live" && index(s, k) == 1 { print kv; next }
         mode == "example" && !done && substr(s, 1, 1) == "#" {

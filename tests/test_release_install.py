@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import pathlib
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -143,7 +144,9 @@ def box(tmp_path):
     paths["assets"].mkdir()
 
     def run(*args, nics=("eth0", "eth1"), virtual=("lo",), latest="",
-            script=None, env=None):
+            script=None, env=None, input=None, tty=None):
+        """tty = 依次要在终端里回答的输入（--token ask 用）：给了就在伪
+        终端里跑，返回 (退出码, 终端上看到的全部输出)。"""
         sysd = paths["sys"]
         if sysd.exists():
             shutil.rmtree(sysd)
@@ -165,11 +168,69 @@ def box(tmp_path):
                    FAKE_CURL_LOG=str(paths["curl_log"]),
                    FAKE_TC_LOG=str(paths["tc_log"]),
                    FAKE_LATEST=latest, **extra)
-        return subprocess.run(
-            ["bash", str(script or paths["pkg"] / "install.sh"), *args],
-            capture_output=True, text=True, env=env)
+        argv = ["bash", str(script or paths["pkg"] / "install.sh"), *args]
+        if tty is not None:
+            return _run_in_pty(argv, env, list(tty))
+        return subprocess.run(argv, capture_output=True, text=True, env=env,
+                              input=input)
 
     return run, paths
+
+
+_PROMPT = re.compile(r"(输入令牌|再输入一次确认)[^\n]*：$")
+
+
+def _run_in_pty(argv, env, answers, timeout=30.0):
+    """在伪终端里跑（有控制终端，/dev/tty 可用）：每出现一个令牌提示、
+    且终端已关回显（read -s 生效）时，敲下一个答案。返回 (退出码, 输出)。
+
+    等回显关掉再敲，是为了钉住"令牌不回显"——提前敲进去的字符会被终端
+    回显，测试就会误报泄漏。"""
+    import pty
+    import select
+    import termios
+    import time
+
+    pid, fd = pty.fork()
+    if pid == 0:                                   # 子进程：exec 脚本
+        try:
+            os.execvpe(argv[0], argv, env)
+        finally:
+            os._exit(127)
+    out, answered = "", 0
+    deadline = time.monotonic() + timeout
+    while True:
+        if time.monotonic() > deadline:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+            raise AssertionError(f"超时，终端输出：{out!r}")
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:                        # 子进程关了终端（EIO）
+                break
+            if not chunk:
+                break
+            out += chunk.decode("utf-8", "replace")
+        lines = [ln.rstrip("\r") for ln in out.split("\n")]
+        prompts = sum(1 for ln in lines if _PROMPT.search(ln))
+        # 还停在提示行上（没换行 = 正在等输入）且这个提示还没答过。
+        if prompts > answered and _PROMPT.search(lines[-1]):
+            try:
+                echo_on = termios.tcgetattr(fd)[3] & termios.ECHO
+            except termios.error:
+                echo_on = True
+            if not echo_on:
+                if answered >= len(answers):
+                    os.kill(pid, 9)
+                    os.waitpid(pid, 0)
+                    raise AssertionError(f"答案不够，终端输出：{out!r}")
+                os.write(fd, (answers[answered] + "\r").encode())
+                answered += 1
+    _, status = os.waitpid(pid, 0)
+    os.close(fd)
+    return os.waitstatus_to_exitcode(status), out
 
 
 def _env(paths, name="rl-limiter.env") -> dict:
@@ -680,3 +741,126 @@ def test_join_options_validated(box, args, kw):
     run, paths = box
     r = run(*args)
     assert r.returncode != 0 and kw in r.stderr
+
+
+# ---- 手动令牌：--token ask（交互）/ --token -（标准输入） ------------------
+#
+# 手动给令牌除了 --token <令牌>（会进 shell 历史和 ps），还有两种不进命令行
+# 的给法：ask 在终端里输（不回显、两次确认、不达标当场重输、空 = auto），
+# - 从标准输入读一行。两种都照样过强度规则。
+
+def test_token_from_stdin_is_written_and_never_echoed(box):
+    run, paths = box
+    r = run("--fleet", "--token", "-", nics=[], input=FLEET_TOK + "\n")
+    assert r.returncode == 0, r.stderr
+    assert _env(paths, "rl-fleet.env")["RL_API_TOKEN"] == FLEET_TOK
+    assert FLEET_TOK not in r.stdout + r.stderr
+    # --token=- 同义；行尾回车/首尾空白去掉（Windows 下生成的文件）。
+    r = run("--token=-", input=f"  {NODE_TOK}\r\n")
+    assert r.returncode == 0, r.stderr
+    assert _env(paths)["RL_API_TOKEN"] == NODE_TOK
+
+
+@pytest.mark.parametrize("stdin, msg", [
+    ("", "没读到令牌"),
+    ("\n", "没读到令牌"),
+    ("short\n", "太短"),
+    ("x" * 40 + "\n", "强度不足"),
+    ("my-company-node-api-token-2026-prod\n", "强度不足"),
+])
+def test_bad_token_from_stdin_refused_before_install(box, stdin, msg):
+    run, paths = box
+    r = run("--token", "-", input=stdin)
+    assert r.returncode != 0 and msg in r.stderr, r.stderr
+    assert not paths["conf"].exists()
+
+
+def test_token_ask_interactive_hidden_and_confirmed(box):
+    run, paths = box
+    rc, out = run("--fleet", "--token", "ask", nics=[],
+                  tty=[FLEET_TOK, FLEET_TOK])
+    assert rc == 0, out
+    assert _env(paths, "rl-fleet.env")["RL_API_TOKEN"] == FLEET_TOK
+    assert "再输入一次确认" in out
+    assert FLEET_TOK not in out                  # 不回显、装完也不打印
+
+
+def test_token_ask_retries_on_weak_or_mismatch(box):
+    run, paths = box
+    rc, out = run("--fleet", "--token", "ask", nics=[], tty=[
+        "short",                                 # 太短：当场重输
+        "x" * 40,                                # 低熵：二进制规则拦
+        FLEET_TOK, FLEET_TOK2,                   # 两次不一致
+    ])
+    assert rc != 0 and "3 次都没输入有效令牌" in out, out
+    assert "太短" in out and "强度不足" in out and "不一致" in out
+    assert not paths["conf"].exists()            # 什么都没装
+    rc, out = run("--fleet", "--token", "ask", nics=[],
+                  tty=["short", FLEET_TOK, FLEET_TOK])
+    assert rc == 0, out
+    assert _env(paths, "rl-fleet.env")["RL_API_TOKEN"] == FLEET_TOK
+
+
+def test_token_ask_empty_means_auto(box):
+    from rl_limiter import tokenpolicy
+    run, paths = box
+    rc, out = run("--token", "ask", tty=[""])
+    assert rc == 0, out
+    tok = _env(paths)["RL_API_TOKEN"]
+    assert len(tok) == 64 and tokenpolicy.is_strong(tok)
+    assert "改为自动生成" in out and tok in out  # 自动生成的照常打印（接入串里）
+
+
+def test_token_ask_without_terminal_says_what_to_use(box):
+    run, paths = box
+    r = run("--token", "ask")                    # subprocess：没有控制终端
+    assert r.returncode != 0 and "需要在终端里交互运行" in r.stderr
+    assert "--token -" in r.stderr
+    assert not paths["conf"].exists()
+
+
+def test_download_hands_token_over_via_stdin(box):
+    """--download：令牌经管道交给包内脚本（--token=-），不进它的命令行。"""
+    run, paths = box
+    _publish(paths, "v9.9.9")
+    log = paths["tmp"].parent / "argv.log"
+    # 包装 bash：记下包内 install.sh 收到的命令行。
+    wrap = paths["tmp"].parent / "stubs" / "bash"
+    wrap.write_text('#!/bin/sh\necho "$*" >>"$ARGV_LOG"\n'
+                    f'exec {shutil.which("bash")} "$@"\n')
+    wrap.chmod(0o755)
+    r = run("--download", "v9.9.9", "--fleet", "--token", "-",
+            script=SCRIPT, nics=[], input=FLEET_TOK + "\n",
+            env={"ARGV_LOG": str(log)})
+    assert r.returncode == 0, r.stderr
+    assert _env(paths, "rl-fleet.env")["RL_API_TOKEN"] == FLEET_TOK
+    argv = log.read_text()
+    assert "--token=-" in argv and FLEET_TOK not in argv
+    assert list(paths["tmp"].iterdir()) == []
+
+
+def test_download_ask_prompts_after_download_with_full_check(box):
+    run, paths = box
+    _publish(paths, "v9.9.9")
+    rc, out = run("--download", "v9.9.9", "--fleet", "--token", "ask",
+                  script=SCRIPT, nics=[],
+                  tty=["x" * 40, FLEET_TOK2, FLEET_TOK2])
+    assert rc == 0, out
+    assert "强度不足" in out                      # 包里的二进制做了完整校验
+    assert _env(paths, "rl-fleet.env")["RL_API_TOKEN"] == FLEET_TOK2
+    assert FLEET_TOK2 not in out
+
+
+def test_download_old_package_falls_back_to_argv(box):
+    """包内是不认 token-stdin 的老版本 install.sh：退回命令行交接并提示。"""
+    run, paths = box
+    inner = paths["pkg"] / "install.sh"
+    inner.write_text("\n".join(
+        ln for ln in inner.read_text().splitlines()
+        if not ln.startswith("INSTALL_FEATURES=")) + "\n")
+    _publish(paths, "v9.9.9")
+    r = run("--download", "v9.9.9", "--fleet", "--token", FLEET_TOK,
+            script=SCRIPT, nics=[])
+    assert r.returncode == 0, r.stderr
+    assert "不支持从标准输入收令牌" in r.stderr
+    assert _env(paths, "rl-fleet.env")["RL_API_TOKEN"] == FLEET_TOK

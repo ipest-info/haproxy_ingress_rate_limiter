@@ -104,8 +104,18 @@ sudo systemctl enable --now rl-fleet
 ```
 
 - 节点：`http://<节点>:8090`；总控：`http://<总控>:8095`；
-- `--token auto` 生成 256 bit 随机令牌。令牌必须是高强度随机串，弱令牌
-  一律当作没有令牌（写接口禁用），安装脚本直接拒装；
+- **令牌可以自动生成，也可以自己定**（节点与总控相同）：
+
+  | 给法 | 示例 |
+  | ---- | ---- |
+  | 自动生成（256 bit，装完打印） | `--token auto` |
+  | 交互输入（不回显、输两次、不达标当场重输） | `--token ask` |
+  | 从标准输入读（脚本/密钥管理工具） | `openssl rand -hex 32 > node.token; sudo bash install.sh --download --token - < node.token` |
+  | 直接写值（会留在 shell 历史里） | `--token <令牌>` |
+
+  令牌必须是高强度随机串（≥ 32 位、估算 ≥ 128 bit、没有人为痕迹），弱令牌
+  一律当作没有令牌（写接口禁用），安装脚本直接拒装——规则见
+  [11 发布与安装](docs/11-发布与安装.md) §3.3.1、§3.4；
 - 升级 = 重跑 install.sh（二进制覆盖、配置不动）+ `systemctl restart`；
   卸载 `install.sh --uninstall [--fleet] [--purge]`（会清掉网卡上的 tc 规则）；
 - 其它装法：venv 裸机脚本 `deploy/bare/rl-limiter.sh install`，或容器 host
