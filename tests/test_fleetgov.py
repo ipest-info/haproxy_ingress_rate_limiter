@@ -228,3 +228,71 @@ def test_ewma_smooths_alternating_traffic():
     # 相邻两轮 a 的分配变化远小于流量摆幅（80Mbps）。
     deltas = [abs(seen[i][0] - seen[i - 1][0]) for i in range(1, len(seen))]
     assert max(deltas) < 40
+
+
+# ---- 固定限速 ---------------------------------------------------------------
+
+def pin(s, mbps):
+    s.fixed_mbps = mbps
+    return s
+
+
+def test_pinned_node_gets_exact_value_and_is_reserved():
+    """固定节点照值下发，不参与按需；按需节点分 total − Σ固定。"""
+    a = pin(node("a", quota=100, egress=90), 40.0)
+    b = node("b", quota=100, egress=50)
+    c = node("c", quota=100, egress=50)
+    writes = gov().allocate_once([a, b, c], 300, P(smooth_alpha=1.0))
+    got = dict((s.name, v) for s, v in writes)
+    assert got["a"] == 40.0 and a.desired_mbps == 40.0
+    assert b.desired_mbps + c.desired_mbps == pytest.approx(260, abs=0.5)
+
+
+def test_pinned_written_once_then_quiet():
+    a = pin(node("a", quota=40.02), 40.0)       # 已经是这个值（差 < 0.05）
+    assert gov().allocate_once([a], 300, P()) == []
+
+
+def test_pinned_applies_without_total_control():
+    """固定限速与总量控制无关：total = 0 也照值下发。"""
+    a = pin(node("a", quota=0), 25.0)
+    b = node("b", quota=0)
+    writes = gov().allocate_once([a, b], 0, P())
+    assert [(s.name, v) for s, v in writes] == [("a", 25.0)]
+
+
+def test_cancel_total_releases_only_auto_nodes():
+    a = pin(node("a", quota=40), 40.0)
+    b = node("b", quota=120)
+    g = gov()
+    g.allocate_once([a, b], 300, P())
+    writes = g.allocate_once([a, b], 0, P())
+    assert [(s.name, v) for s, v in writes] == [("b", None)]
+    assert not a.release_pending
+
+
+def test_unpin_without_total_releases_node():
+    a = pin(node("a", quota=40), 40.0)
+    g = gov()
+    g.allocate_once([a], 0, P())
+    a.fixed_mbps = 0.0
+    writes = g.allocate_once([a], 0, P())
+    assert [(s.name, v) for s, v in writes] == [("a", None)]
+
+
+def test_unpin_with_total_rejoins_allocation():
+    a = pin(node("a", quota=40, egress=10), 40.0)
+    b = node("b", quota=100, egress=10)
+    g = gov()
+    g.allocate_once([a, b], 200, P())
+    a.fixed_mbps = 0.0
+    g.allocate_once([a, b], 200, P(smooth_alpha=1.0))
+    assert a.desired_mbps is not None and a.desired_mbps != 40.0
+    assert a.desired_mbps + b.desired_mbps == pytest.approx(200, abs=0.5)
+    assert not a.release_pending
+
+
+def test_pinned_offline_waits():
+    a = pin(node("a", quota=100, online=False), 40.0)
+    assert gov().allocate_once([a], 300, P()) == []
+    assert a.desired_mbps == 40.0

@@ -70,4 +70,12 @@ allocation:
 #     token: <该节点的 RL_API_TOKEN>
 #     # 页面"跳到该节点控制台"的链接；内外网地址不同时填，缺省 = url。
 #     console_url: ""
+#     # 固定限速（Mbps，可选）：该节点出向目标固定为这个值，不参与按需
+#     # 分配但计入总量；页面「节点管理」或开放 API 设置。不写 = 按需分配。
+#     fixed_mbps: 50
 nodes: []
+
+# 第三方 API 密钥（页面「开放 API」页签创建/吊销，这里只存 sha256，不存
+# 明文令牌）。范围：limits = 总带宽与节点固定限速；nodes = 节点清单。
+# 接口说明见 docs/12-总控开放API.md 与 /api/openapi.json。
+api_keys: []

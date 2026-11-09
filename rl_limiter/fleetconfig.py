@@ -19,9 +19,12 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
+import hashlib
 import logging
 import os
 import re
+import secrets
 import tempfile
 import urllib.parse
 from dataclasses import dataclass, field
@@ -94,6 +97,32 @@ class FleetNode:
     token_rejected: str = ""
     # 页面跳转地址（内外网地址不同时填；缺省 = url）。
     console_url: str = ""
+    # 固定限速（Mbps）：> 0 = 该节点的实例出向目标固定为这个值，不参与
+    # 按需分配（但计入总量记账）；0 = 按需分配（默认）。
+    fixed_mbps: float = 0.0
+
+
+# 开放 API 密钥的权限范围：limits = 总带宽与节点固定限速；nodes = 节点
+# 清单增删改与接入串导入。管理员令牌（RL_API_TOKEN）拥有全部范围，并且
+# 是唯一能管理密钥本身的凭据。
+API_SCOPES = ("limits", "nodes")
+
+
+@dataclass
+class ApiKey:
+    """api_keys 段的一项：给第三方系统的 API 密钥。
+
+    只存令牌的 sha256（校验只需要它）：明文在创建时由总控生成、返回
+    一次，之后谁也拿不回来——丢了就吊销重建。"""
+
+    name: str = ""
+    token_sha256: str = ""
+    scopes: tuple = ()
+    created: str = ""
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -110,6 +139,7 @@ class FleetConfig:
     offline_after: int = DEFAULT_OFFLINE_AFTER
     alloc: AllocConfig = field(default_factory=AllocConfig)
     nodes: list = field(default_factory=list)
+    api_keys: list = field(default_factory=list)
 
 
 def load(path: str) -> FleetConfig:
@@ -151,7 +181,7 @@ def _num(raw: dict, key: str, default) -> float:
 def _parse(raw: dict[str, Any]) -> FleetConfig:
     known = {"log_level", "total_egress_mbps", "poll_interval_s",
              "alloc_interval_s", "node_timeout_s", "offline_after",
-             "allocation", "nodes"}
+             "allocation", "nodes", "api_keys"}
     unknown = set(raw) - known
     if unknown:
         raise ValueError(
@@ -188,6 +218,28 @@ def _parse(raw: dict[str, Any]) -> FleetConfig:
             setattr(a, k, _num(a_raw, k, getattr(a, k)))
     cfg.alloc = a
 
+    keys_raw = raw.get("api_keys") or []
+    if not isinstance(keys_raw, list):
+        raise ValueError(
+            f"api_keys 必须是列表，实际是 {type(keys_raw).__name__}")
+    for i, k_raw in enumerate(keys_raw):
+        if not isinstance(k_raw, dict):
+            raise ValueError(f"api_keys[{i}] 必须是映射")
+        k_unknown = set(k_raw) - {"name", "token_sha256", "scopes",
+                                  "created"}
+        if k_unknown:
+            raise ValueError(f"api_keys[{i}] 有不认识的键 {sorted(k_unknown)}"
+                             f"（密钥只存 token_sha256，不存明文令牌）")
+        scopes = k_raw.get("scopes") or []
+        if not isinstance(scopes, list):
+            raise ValueError(f"api_keys[{i}].scopes 必须是列表")
+        cfg.api_keys.append(ApiKey(
+            name=str(k_raw.get("name", "") or "").strip(),
+            token_sha256=str(k_raw.get("token_sha256", "") or "")
+            .strip().lower(),
+            scopes=tuple(str(s) for s in scopes),
+            created=str(k_raw.get("created", "") or "")))
+
     nodes_raw = raw.get("nodes") or []
     if not isinstance(nodes_raw, list):
         raise ValueError(
@@ -196,7 +248,7 @@ def _parse(raw: dict[str, Any]) -> FleetConfig:
         if not isinstance(n_raw, dict):
             raise ValueError(f"nodes[{i}] 必须是映射（name/url/token），"
                              f"实际是 {type(n_raw).__name__}")
-        n_known = {"name", "url", "token", "console_url"}
+        n_known = {"name", "url", "token", "console_url", "fixed_mbps"}
         n_unknown = set(n_raw) - n_known
         if n_unknown:
             raise ValueError(
@@ -210,6 +262,7 @@ def _parse(raw: dict[str, Any]) -> FleetConfig:
             token=token,
             token_rejected=rejected,
             console_url=str(n_raw.get("console_url", "") or "").strip(),
+            fixed_mbps=_num(n_raw, "fixed_mbps", 0.0),
         )
         cfg.nodes.append(n)
     return cfg
@@ -272,11 +325,32 @@ def _validate(cfg: FleetConfig) -> None:
         if n.name in seen:
             raise ValueError(f"nodes 里节点名重复：{n.name!r}")
         seen.add(n.name)
+        if n.fixed_mbps < 0:
+            raise ValueError(
+                f"nodes[{i}]({n.name}).fixed_mbps 必须 ≥ 0（0 = 按需分配），"
+                f"当前值 {n.fixed_mbps:g}")
         if (not (n.url.startswith("http://") or n.url.startswith("https://"))
                 or not urllib.parse.urlsplit(n.url).netloc):
             raise ValueError(
                 f"nodes[{i}]({n.name}).url 必须是 http(s)://<主机>:<端口> "
                 f"地址（节点控制台），当前值 {n.url!r}")
+
+    seen_keys: set = set()
+    for i, k in enumerate(cfg.api_keys):
+        if not _NAME_RE.match(k.name or ""):
+            raise ValueError(f"api_keys[{i}].name 非法——应为 1~64 位字母/"
+                             f"数字/._-，当前值 {k.name!r}")
+        if k.name in seen_keys:
+            raise ValueError(f"api_keys 里密钥名重复：{k.name!r}")
+        seen_keys.add(k.name)
+        if not re.fullmatch(r"[0-9a-f]{64}", k.token_sha256):
+            raise ValueError(f"api_keys[{i}]({k.name}).token_sha256 必须是 "
+                             f"64 位十六进制（令牌的 sha256）")
+        bad = [s for s in k.scopes if s not in API_SCOPES]
+        if not k.scopes or bad:
+            raise ValueError(f"api_keys[{i}]({k.name}).scopes 必须是 "
+                             f"{list(API_SCOPES)} 的非空子集，当前 "
+                             f"{list(k.scopes)}")
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +373,14 @@ class NodeExistsError(FleetConfigError):
 
 class NodeNotFoundError(FleetConfigError):
     """编辑/删除的节点不在清单里。"""
+
+
+class KeyExistsError(FleetConfigError):
+    """创建 API 密钥时重名。"""
+
+
+class KeyNotFoundError(FleetConfigError):
+    """吊销的 API 密钥不存在。"""
 
 
 def _read_raw(path: str) -> dict:
@@ -427,6 +509,78 @@ def update_node(path: str, name: str, fields: dict) -> None:
         if k in fields:
             item[k] = _node_value(k, fields[k])
     nodes[i] = item
+    _write_raw(path, raw)
+
+
+def set_node_limit(path: str, name: str, mbps: float) -> None:
+    """设置节点固定限速（Mbps，> 0）；mbps 为 0 = 取消固定、回到按需分配。"""
+    if isinstance(mbps, bool) or not isinstance(mbps, (int, float)) \
+            or mbps < 0:
+        raise FleetConfigError(
+            f"限速必须是 ≥ 0 的数字（Mbps；0 = 回到按需分配），当前值 {mbps!r}")
+    raw = _read_raw(path)
+    nodes = _raw_nodes(raw)
+    i = _find(nodes, name)
+    if i < 0:
+        raise NodeNotFoundError(f"节点 {name!r} 不在清单里")
+    item = dict(nodes[i])
+    if mbps:
+        item["fixed_mbps"] = float(mbps)
+    else:
+        item.pop("fixed_mbps", None)
+    nodes[i] = item
+    _write_raw(path, raw)
+
+
+def add_api_key(path: str, name: str, scopes: list) -> str:
+    """创建 API 密钥：生成高强度令牌，只把 sha256 写进 YAML，返回明文
+    （唯一一次能拿到它的机会）。"""
+    if not isinstance(name, str) or not _NAME_RE.match(name.strip()):
+        raise FleetConfigError(f"密钥名 {name!r} 非法（1~64 位字母/数字/._-）")
+    name = name.strip()
+    if (not isinstance(scopes, list) or not scopes
+            or any(s not in API_SCOPES for s in scopes)):
+        raise FleetConfigError(
+            f"scopes 必须是 {list(API_SCOPES)} 的非空子集（limits = 总带宽与"
+            f"节点固定限速；nodes = 节点清单增删改与导入），当前 {scopes!r}")
+    raw = _read_raw(path)
+    keys = raw.get("api_keys")
+    if keys is None:
+        keys = []
+    if not isinstance(keys, list):
+        raise FleetConfigError(
+            "配置文件里 api_keys 不是列表，拒绝回写（请先手工修复）")
+    raw["api_keys"] = keys
+    if any(isinstance(k, dict) and str(k.get("name", "")).strip() == name
+           for k in keys):
+        raise KeyExistsError(f"密钥 {name!r} 已存在（换令牌 = 吊销后重建）")
+    while True:
+        token = secrets.token_hex(32)
+        if tokenpolicy.is_strong(token):
+            break
+    keys.append({
+        "name": name, "scopes": sorted(set(scopes)),
+        "token_sha256": hash_token(token),
+        "created": _dt.datetime.now(_dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+    })
+    _write_raw(path, raw)
+    return token
+
+
+def remove_api_key(path: str, name: str) -> None:
+    """吊销 API 密钥（从 YAML 删掉，热更后立即失效）。"""
+    raw = _read_raw(path)
+    keys = raw.get("api_keys") or []
+    if not isinstance(keys, list):
+        raise FleetConfigError(
+            "配置文件里 api_keys 不是列表，拒绝回写（请先手工修复）")
+    left = [k for k in keys
+            if not (isinstance(k, dict)
+                    and str(k.get("name", "")).strip() == name)]
+    if len(left) == len(keys):
+        raise KeyNotFoundError(f"密钥 {name!r} 不存在")
+    raw["api_keys"] = left
     _write_raw(path, raw)
 
 
@@ -586,11 +740,14 @@ def _hot_view(cfg: FleetConfig):
         cfg.total_egress_mbps,
         cfg.offline_after,
         tuple(sorted(
-            (n.name, n.url, n.token, n.console_url) for n in cfg.nodes)),
+            (n.name, n.url, n.token, n.console_url, n.fixed_mbps)
+            for n in cfg.nodes)),
         (cfg.alloc.min_share_ratio, cfg.alloc.smooth_alpha,
          cfg.alloc.press_ratio, cfg.alloc.press_boost, cfg.alloc.idle_mbps,
          cfg.alloc.apply_epsilon, cfg.alloc.min_delta_mbps,
          cfg.alloc.min_quota_mbps),
+        tuple(sorted((k.name, k.token_sha256, k.scopes)
+                     for k in cfg.api_keys)),
     )
 
 

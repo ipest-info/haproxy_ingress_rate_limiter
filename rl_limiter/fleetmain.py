@@ -14,6 +14,8 @@ import argparse
 import asyncio
 import logging
 import os
+import re
+import ssl
 import sys
 import time
 
@@ -38,7 +40,10 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
                  logbuf: "fleetweb.LogBuffer | None" = None,
                  console_bind: str = DEFAULT_CONSOLE_BIND,
                  api_token: str = "",
-                 mlog: "fleetmetrics.FleetMetricsLog | None" = None) -> None:
+                 mlog: "fleetmetrics.FleetMetricsLog | None" = None,
+                 frame_ancestors: "list | tuple" = (),
+                 cors_origins: "list | tuple" = (),
+                 ssl_context=None) -> None:
     poller = fleetpoll.NodePoller(log, timeout_s=cfg.node_timeout_s,
                                   offline_after=cfg.offline_after)
     poller.set_nodes(cfg.nodes)
@@ -79,6 +84,11 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
             alloc_wake.set()
 
     cfg_poke = asyncio.Event()
+
+    def _on_api(actor: str, op: str, detail: dict) -> None:
+        """开放 API 写操作的审计：谁（admin / key:<名>）做了什么。"""
+        if mlog is not None:
+            mlog.event("api", by=actor, op=op, **detail)
 
     hub: "fleetweb.FleetHub | None" = None
     if console_port:
@@ -143,7 +153,10 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
                 console_port, hub, logbuf or fleetweb.LogBuffer(), log,
                 bind=console_bind, yaml_path=yaml_path,
                 api_token=api_token, poke=cfg_poke,
-                metrics_path=mlog.path if mlog is not None else ""),
+                metrics_path=mlog.path if mlog is not None else "",
+                keys_fn=lambda: cur["cfg"].api_keys, audit_fn=_on_api,
+                frame_ancestors=frame_ancestors, cors_origins=cors_origins,
+                ssl_context=ssl_context),
             name="fleet-console"))
 
     log.info("rl-fleet 总控已启动，开始轮询与分配 nodes=%d total=%gMbps "
@@ -169,7 +182,8 @@ async def _amain(cfg: "fleetconfig.FleetConfig",
 def _record_config_events(mlog: "fleetmetrics.FleetMetricsLog",
                           old: "fleetconfig.FleetConfig",
                           new: "fleetconfig.FleetConfig") -> None:
-    """配置热更（页面/API/改 YAML 都走这里）落事件：总带宽、节点清单。
+    """配置热更（页面/API/改 YAML 都走这里）落事件：总带宽、节点清单、
+    节点固定限速（limit）、API 密钥增删（keys）。
 
     节点改了哪些字段只记字段名——令牌的值绝不落盘。
     """
@@ -185,6 +199,14 @@ def _record_config_events(mlog: "fleetmetrics.FleetMetricsLog",
                   if getattr(a, k) != getattr(b, k)]
         if fields:
             changed.append({"name": name, "fields": fields})
+    for name in sorted(set(before) & set(after)):
+        a, b = before[name].fixed_mbps, after[name].fixed_mbps
+        if a != b:
+            mlog.event("limit", node=name, from_mbps=a, to_mbps=b)
+    kb = {k.name for k in old.api_keys}
+    ka = {k.name for k in new.api_keys}
+    if kb != ka:
+        mlog.event("keys", added=sorted(ka - kb), removed=sorted(kb - ka))
     added = sorted(set(after) - set(before))
     removed = sorted(set(before) - set(after))
     if added or removed or changed:
@@ -281,13 +303,77 @@ def main() -> None:
             log.warning("节点未配置令牌，只读观测、不可控（不会向它下发"
                         "配额） node=%s url=%s", n.name, n.url)
 
+    frame_ancestors = _origin_env("RL_FRAME_ANCESTORS", _ANCESTOR_RE,
+                                  True, log)
+    cors_origins = _origin_env("RL_CORS_ORIGINS", _ORIGIN_RE, False, log)
+    ssl_context = _ssl_from_env()
+    if console_port:
+        log.info("开放 API：API 密钥 %d 个（%s）；iframe 嵌入允许 %s；"
+                 "跨域允许 %s；%s",
+                 len(cfg.api_keys),
+                 "、".join(k.name for k in cfg.api_keys) or "无",
+                 "、".join(frame_ancestors) or "仅同源",
+                 "、".join(cors_origins) or "无",
+                 "HTTPS" if ssl_context is not None else "HTTP（被 HTTPS 页面"
+                 "嵌入需要配 RL_TLS_CERT/RL_TLS_KEY）")
+
     try:
         asyncio.run(_amain(cfg, log, args.config,
                            console_port=console_port, logbuf=logbuf,
                            console_bind=console_bind, api_token=api_token,
-                           mlog=mlog))
+                           mlog=mlog, frame_ancestors=frame_ancestors,
+                           cors_origins=cors_origins,
+                           ssl_context=ssl_context))
     except KeyboardInterrupt:
         log.info("收到中断信号，rl-fleet 退出")
+
+
+# 允许 iframe 嵌入总控页面的来源（CSP frame-ancestors 源表达式）：
+# https://portal.example.com、https://*.example.com、可带端口；单独一个 *
+# = 任何网站（等于不设防，启动时告警）。
+_ANCESTOR_RE = re.compile(r"^https?://(\*\.)?[A-Za-z0-9.-]+(:\d{1,5})?$")
+# 允许浏览器跨域调 /api/ 的来源：必须是精确来源（不收通配）。
+_ORIGIN_RE = re.compile(r"^https?://[A-Za-z0-9.-]+(:\d{1,5})?$")
+
+
+def _origin_env(name: str, pattern: "re.Pattern", allow_star: bool,
+                log: logging.Logger) -> list:
+    """读逗号/空格分隔的来源清单；有一个不合法就启动失败（配错了宁可
+    起不来，也不要以为放行了、实际被浏览器拦）。"""
+    items = [x.rstrip("/") for x in
+             re.split(r"[\s,]+", os.environ.get(name) or "") if x]
+    for x in items:
+        if x == "*" and allow_star:
+            log.warning("%s=*：任何网站都能用 iframe 嵌入总控页面（有"
+                        "点击劫持风险），建议改成具体来源", name)
+            continue
+        if not pattern.match(x):
+            print(f"rl-fleet: {name} 里的 {x!r} 不是合法来源（写成 "
+                  f"https://portal.example.com 这样，多个用逗号隔开）",
+                  file=sys.stderr)
+            raise SystemExit(1)
+    return items
+
+
+def _ssl_from_env() -> "ssl.SSLContext | None":
+    """RL_TLS_CERT / RL_TLS_KEY 都给 = 总控页面与 API 走 HTTPS。"""
+    cert = (os.environ.get("RL_TLS_CERT") or "").strip()
+    key = (os.environ.get("RL_TLS_KEY") or "").strip()
+    if not cert and not key:
+        return None
+    if not (cert and key):
+        print("rl-fleet: RL_TLS_CERT 与 RL_TLS_KEY 要一起设（证书链 + 私钥"
+              "的 PEM 文件路径）", file=sys.stderr)
+        raise SystemExit(1)
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    try:
+        ctx.load_cert_chain(cert, key)
+    except (OSError, ssl.SSLError) as e:
+        print(f"rl-fleet: 加载 HTTPS 证书失败（{e}）：RL_TLS_CERT={cert} "
+              f"RL_TLS_KEY={key}——确认文件存在、服务用户可读、证书与私钥"
+              f"配对", file=sys.stderr)
+        raise SystemExit(1)
+    return ctx
 
 
 def _open_metrics_log(log: logging.Logger

@@ -25,7 +25,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from . import fleetconfig, fleetmetrics, tokenpolicy
+from . import fleetconfig, fleetmetrics, fleetopenapi, tokenpolicy
 from .webconsole import HISTORY_TICKS, LOGS_PAGE_LIMIT, LogBuffer  # noqa: F401
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -70,6 +70,8 @@ def fleet_snapshot(now: float, states: list, total_mbps: float) -> dict:
             "write_err": s.write_err,
             # 总量控制已取消、该节点的限速还没解除（离线/下发失败中）。
             "release_pending": s.release_pending,
+            # 固定限速（Mbps；0 = 按需分配）。
+            "fixed_mbps": s.fixed_mbps,
         }
     return {
         "ts": now,
@@ -149,7 +151,9 @@ class FleetHub:
                  "console_url": n.console_url,
                  "has_token": bool(n.token),
                  # 配了但强度不足、已当作没有令牌（只读观测）。
-                 "token_weak": bool(getattr(n, "token_rejected", ""))}
+                 "token_weak": bool(getattr(n, "token_rejected", "")),
+                 # 固定限速（Mbps；0 = 按需分配）。
+                 "fixed_mbps": getattr(n, "fixed_mbps", 0.0)}
                 for n in self._nodes_fn()]
 
 
@@ -177,9 +181,21 @@ def build_fleet_app(
     api_token: str = "",
     poke: "asyncio.Event | None" = None,
     metrics_path: str = "",
+    keys_fn: "Callable[[], list] | None" = None,
+    audit_fn: "Callable[[str, str, dict], None] | None" = None,
+    frame_ancestors: "list | tuple" = (),
+    cors_origins: "list | tuple" = (),
 ) -> web.Application:
-    """组装总控的 aiohttp 应用。写 API 两组：总带宽、节点清单（都回写
-    fleet YAML，配置里只有 total_egress_mbps 与 nodes 开放给写 API）。"""
+    """组装总控的 aiohttp 应用（开放 API，接口说明见 docs/12 与
+    /api/openapi.json）。
+
+    写接口全部回写 fleet YAML 并即时热更，按范围鉴权：limits（总带宽、
+    节点固定限速）、nodes（节点清单增删改与导入）——管理员令牌
+    （RL_API_TOKEN）拥有全部范围并且能管理 API 密钥；第三方用按范围
+    授权的 API 密钥（keys_fn 给出当前密钥）。每次成功写都经 audit_fn
+    留痕（调用者 + 操作）。frame_ancestors 是允许 iframe 嵌入本页面的
+    来源（缺省只许同源），cors_origins 是允许浏览器跨域调 /api/ 的来源。
+    """
 
     index_html = (_STATIC_DIR / "fleet.html").read_bytes()
 
@@ -270,17 +286,24 @@ def build_fleet_app(
     write_lock = asyncio.Lock()
     # 弱令牌 = 没有令牌：在鉴权层本身兜底，不依赖调用方先查过。
     api_token, token_weak = tokenpolicy.effective(api_token)
+    keys_fn = keys_fn or (lambda: [])
 
-    def _authorized(request: web.Request) -> "web.Response | None":
-        if not api_token:
-            return web.json_response(
-                {"error": (f"RL_API_TOKEN 强度不足（{token_weak}），已视为"
-                           f"未配置，写接口禁用——用 "
-                           f"{tokenpolicy.GENERATE_HINT} 生成新令牌，写进 "
-                           f"rl-fleet.env 后重启" if token_weak else
-                           "未配置 RL_API_TOKEN，写接口已禁用——在 rl-fleet"
-                           " 的环境变量（rl-fleet.env）里设置令牌后重启即可"
-                           "启用")},
+    def _no_admin_reason() -> str:
+        return (f"RL_API_TOKEN 强度不足（{token_weak}），已视为未配置——用 "
+                f"{tokenpolicy.GENERATE_HINT} 生成新令牌，写进 rl-fleet.env "
+                f"后重启" if token_weak else
+                "未配置 RL_API_TOKEN——在 rl-fleet 的环境变量（rl-fleet.env）"
+                "里设置令牌后重启")
+
+    def _auth(request: web.Request,
+              scope: "str | None") -> "tuple[str, web.Response | None]":
+        """鉴权。scope = "limits"/"nodes"：管理员令牌或带该范围的 API
+        密钥都行；None：只认管理员令牌（管理密钥本身）；"any"：任一有效
+        凭据。返回 (调用者, 拒绝响应)——调用者 = "admin" 或 "key:<名>"。"""
+        keys = list(keys_fn())
+        if not api_token and not keys:
+            return "", web.json_response(
+                {"error": _no_admin_reason() + "，写接口整体禁用"},
                 status=403)
         got = ""
         auth = request.headers.get("Authorization", "")
@@ -288,73 +311,37 @@ def build_fleet_app(
             got = auth[len("Bearer "):].strip()
         if not got:
             got = request.headers.get("X-API-Token", "").strip()
-        if not got or not hmac.compare_digest(got, api_token):
-            return web.json_response(
-                {"error": "令牌缺失或不正确（请求头 Authorization: "
-                          "Bearer <token> 或 X-API-Token: <token>）"},
-                status=401)
-        return None
+        bad = web.json_response(
+            {"error": "令牌缺失或不正确（请求头 Authorization: Bearer "
+                      "<token> 或 X-API-Token: <token>）"}, status=401)
+        if not got:
+            return "", bad
+        # 常数时间比较：令牌校验不能给旁路计时留缝。
+        if api_token and hmac.compare_digest(got, api_token):
+            return "admin", None
+        h = fleetconfig.hash_token(got)
+        for k in keys:
+            if hmac.compare_digest(h, k.token_sha256):
+                if scope is None:
+                    return "", web.json_response(
+                        {"error": "API 密钥不能管理密钥——需要管理员令牌"
+                                  "（rl-fleet 的 RL_API_TOKEN）"}, status=403)
+                if scope != "any" and scope not in k.scopes:
+                    return "", web.json_response(
+                        {"error": f"密钥 {k.name!r} 没有 {scope} 权限（它的"
+                                  f"范围：{','.join(k.scopes)}）"}, status=403)
+                return f"key:{k.name}", None
+        return "", bad
 
-    async def handle_put_total(request: web.Request) -> web.Response:
-        denied = _authorized(request)
-        if denied is not None:
-            return denied
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(
-                {"error": "请求体必须是 JSON（{\"quota_mbps\": <数字>}）"},
-                status=400)
-        v = body.get("quota_mbps") if isinstance(body, dict) else None
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
-            return web.json_response(
-                {"error": f"quota_mbps 必须是 ≥0 的数字（Mbps；0 = 取消"
-                          f"总量控制，解除各节点实例总限速），当前值 {v!r}"},
-                status=400)
-        async with write_lock:
+    def _audit(actor: str, op: str, **detail) -> None:
+        """每次成功的写操作留痕：谁（admin / key:<名>）做了什么。"""
+        log.warning("开放 API 写操作 by=%s op=%s %s", actor, op,
+                    " ".join(f"{k}={v}" for k, v in detail.items()))
+        if audit_fn is not None:
             try:
-                await asyncio.to_thread(
-                    fleetconfig.set_total_quota, yaml_path, float(v))
-            except ValueError as e:
-                return web.json_response({"error": str(e)}, status=400)
-        if poke is not None:
-            poke.set()
-        log.warning("写 API 已修改总流出带宽并回写 YAML（立即重新分配）"
-                    " total=%gMbps yaml=%s", v, yaml_path)
-        return web.json_response({"ok": True, "total_egress_mbps": float(v)})
-
-    async def handle_delete_total(request: web.Request) -> web.Response:
-        denied = _authorized(request)
-        if denied is not None:
-            return denied
-        async with write_lock:
-            try:
-                await asyncio.to_thread(
-                    fleetconfig.set_total_quota, yaml_path, 0.0)
-            except ValueError as e:
-                return web.json_response({"error": str(e)}, status=400)
-        if poke is not None:
-            poke.set()
-        log.warning("写 API 已取消总量控制（立即解除各节点实例总限速，"
-                    "之后只汇总不下发）yaml=%s", yaml_path)
-        return web.json_response({"ok": True, "total_egress_mbps": 0})
-
-    # ---- 节点清单（后台手动添加/编辑/删除节点） ----
-
-    async def _node_write(fn, *args) -> "web.Response | None":
-        """回写节点清单的公共尾巴：串行化写、错误码映射、触发热更。"""
-        async with write_lock:
-            try:
-                await asyncio.to_thread(fn, yaml_path, *args)
-            except fleetconfig.NodeExistsError as e:
-                return web.json_response({"error": str(e)}, status=409)
-            except fleetconfig.NodeNotFoundError as e:
-                return web.json_response({"error": str(e)}, status=404)
-            except ValueError as e:
-                return web.json_response({"error": str(e)}, status=400)
-        if poke is not None:
-            poke.set()
-        return None
+                audit_fn(actor, op, detail)
+            except Exception as e:                # 记账失败不影响写结果
+                log.warning("审计记录失败 err=%s", e)
 
     async def _json_body(request: web.Request) -> "dict | None":
         try:
@@ -363,8 +350,92 @@ def build_fleet_app(
             return None
         return body if isinstance(body, dict) else None
 
+    async def _write(fn, *args) -> "tuple[object, web.Response | None]":
+        """回写 YAML 的公共尾巴：串行化写、错误码映射、触发热更。"""
+        async with write_lock:
+            try:
+                res = await asyncio.to_thread(fn, yaml_path, *args)
+            except (fleetconfig.NodeExistsError,
+                    fleetconfig.KeyExistsError) as e:
+                return None, web.json_response({"error": str(e)}, status=409)
+            except (fleetconfig.NodeNotFoundError,
+                    fleetconfig.KeyNotFoundError) as e:
+                return None, web.json_response({"error": str(e)}, status=404)
+            except ValueError as e:
+                return None, web.json_response({"error": str(e)}, status=400)
+        if poke is not None:
+            poke.set()
+        return res, None
+
+    # ---- 限速：总带宽 + 节点固定限速（scope = limits） ----
+
+    def _mbps(body: "dict | None", key: str, allow_zero: bool
+              ) -> "float | None":
+        v = body.get(key) if body is not None else None
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        if v < 0 or (v == 0 and not allow_zero) or v > 1e7:
+            return None
+        return float(v)
+
+    async def handle_put_total(request: web.Request) -> web.Response:
+        actor, denied = _auth(request, "limits")
+        if denied is not None:
+            return denied
+        v = _mbps(await _json_body(request), "quota_mbps", allow_zero=True)
+        if v is None:
+            return web.json_response(
+                {"error": "请求体必须是 JSON {\"quota_mbps\": <≥0 的数字>}"
+                          "（Mbps；0 = 取消总量控制，解除各节点实例总限速）"},
+                status=400)
+        _, err = await _write(fleetconfig.set_total_quota, v)
+        if err is not None:
+            return err
+        _audit(actor, "set_total", total_mbps=v)
+        return web.json_response({"ok": True, "total_egress_mbps": v})
+
+    async def handle_delete_total(request: web.Request) -> web.Response:
+        actor, denied = _auth(request, "limits")
+        if denied is not None:
+            return denied
+        _, err = await _write(fleetconfig.set_total_quota, 0.0)
+        if err is not None:
+            return err
+        _audit(actor, "cancel_total")
+        return web.json_response({"ok": True, "total_egress_mbps": 0})
+
+    async def handle_put_limit(request: web.Request) -> web.Response:
+        """节点固定限速：{"mbps": <>0>}。照值下发，不参与按需分配。"""
+        actor, denied = _auth(request, "limits")
+        if denied is not None:
+            return denied
+        name = request.match_info["name"]
+        v = _mbps(await _json_body(request), "mbps", allow_zero=False)
+        if v is None:
+            return web.json_response(
+                {"error": "请求体必须是 JSON {\"mbps\": <大于 0 的数字>}（Mbps；"
+                          "取消固定、回到按需分配用 DELETE）"}, status=400)
+        _, err = await _write(fleetconfig.set_node_limit, name, v)
+        if err is not None:
+            return err
+        _audit(actor, "set_node_limit", node=name, mbps=v)
+        return web.json_response({"ok": True, "name": name, "fixed_mbps": v})
+
+    async def handle_delete_limit(request: web.Request) -> web.Response:
+        actor, denied = _auth(request, "limits")
+        if denied is not None:
+            return denied
+        name = request.match_info["name"]
+        _, err = await _write(fleetconfig.set_node_limit, name, 0.0)
+        if err is not None:
+            return err
+        _audit(actor, "clear_node_limit", node=name)
+        return web.json_response({"ok": True, "name": name, "fixed_mbps": 0})
+
+    # ---- 节点清单（scope = nodes） ----
+
     async def handle_add_node(request: web.Request) -> web.Response:
-        denied = _authorized(request)
+        actor, denied = _auth(request, "nodes")
         if denied is not None:
             return denied
         body = await _json_body(request)
@@ -375,18 +446,16 @@ def build_fleet_app(
                           "\"console_url\": ...}"}, status=400)
         name = body["name"].strip()
         fields = {k: body[k] for k in fleetconfig.NODE_FIELDS if k in body}
-        err = await _node_write(fleetconfig.add_node, name, fields)
+        _, err = await _write(fleetconfig.add_node, name, fields)
         if err is not None:
             return err
-        log.warning("写 API 已添加节点并回写 YAML（即时加入轮询）"
-                    " node=%s url=%s 令牌=%s yaml=%s", name,
-                    str(fields.get("url", "")).strip(),
-                    "有" if str(fields.get("token") or "").strip()
-                    else "无（只读观测）", yaml_path)
+        _audit(actor, "add_node", node=name,
+               url=str(fields.get("url", "")).strip(),
+               token="有" if str(fields.get("token") or "").strip() else "无")
         return web.json_response({"ok": True, "name": name})
 
     async def handle_update_node(request: web.Request) -> web.Response:
-        denied = _authorized(request)
+        actor, denied = _auth(request, "nodes")
         if denied is not None:
             return denied
         name = request.match_info["name"]
@@ -396,13 +465,12 @@ def build_fleet_app(
         if not fields:
             return web.json_response(
                 {"error": "请求体必须是 JSON，且至少含 url / token / "
-                          "console_url 之一（token 给空串 = 清除令牌）"},
-                status=400)
-        err = await _node_write(fleetconfig.update_node, name, fields)
+                          "console_url 之一（token 给空串 = 清除令牌；限速用 "
+                          "PUT /api/nodes/{name}/limit）"}, status=400)
+        _, err = await _write(fleetconfig.update_node, name, fields)
         if err is not None:
             return err
-        log.warning("写 API 已修改节点接线并回写 YAML node=%s 改了=%s "
-                    "yaml=%s", name, ",".join(sorted(fields)), yaml_path)
+        _audit(actor, "update_node", node=name, fields=",".join(sorted(fields)))
         return web.json_response({"ok": True, "name": name})
 
     async def handle_import_nodes(request: web.Request) -> web.Response:
@@ -411,7 +479,7 @@ def build_fleet_app(
         dry_run = 只预览每行会怎样（新增/更新/无变化/错误），不写盘；
         正式导入跳过有错的行，其余一次原子回写。响应里绝不带令牌。
         """
-        denied = _authorized(request)
+        actor, denied = _auth(request, "nodes")
         if denied is not None:
             return denied
         body = await _json_body(request)
@@ -442,29 +510,115 @@ def build_fleet_app(
         if not dry_run and (counts["add"] or counts["update"]):
             if poke is not None:
                 poke.set()
-            log.warning("写 API 已粘贴导入节点并回写 YAML 新增=%d 更新=%d "
-                        "无变化=%d 跳过（有错）=%d 节点=%s yaml=%s",
-                        counts["add"], counts["update"], counts["same"],
-                        counts["error"],
-                        ",".join(r["name"] for r in results
-                                 if r["action"] in ("add", "update")),
-                        yaml_path)
+            _audit(actor, "import_nodes", added=counts["add"],
+                   updated=counts["update"], skipped=counts["error"],
+                   nodes=",".join(r["name"] for r in results
+                                  if r["action"] in ("add", "update")))
         return web.json_response({"dry_run": dry_run, "items": results,
                                   "ignored_lines": ignored, **counts})
 
     async def handle_delete_node(request: web.Request) -> web.Response:
-        denied = _authorized(request)
+        actor, denied = _auth(request, "nodes")
         if denied is not None:
             return denied
         name = request.match_info["name"]
-        err = await _node_write(fleetconfig.remove_node, name)
+        _, err = await _write(fleetconfig.remove_node, name)
         if err is not None:
             return err
-        log.warning("写 API 已删除节点并回写 YAML（停止轮询与下发，其实例"
-                    "配额保持现状） node=%s yaml=%s", name, yaml_path)
+        _audit(actor, "remove_node", node=name)
         return web.json_response({"ok": True, "name": name})
 
-    app = web.Application()
+    # ---- 开放 API 密钥（只有管理员令牌能管） ----
+
+    async def handle_list_keys(request: web.Request) -> web.Response:
+        _, denied = _auth(request, None)
+        if denied is not None:
+            return denied
+        return web.json_response({"keys": [
+            {"name": k.name, "scopes": list(k.scopes), "created": k.created}
+            for k in keys_fn()], "scopes": list(fleetconfig.API_SCOPES)})
+
+    async def handle_create_key(request: web.Request) -> web.Response:
+        actor, denied = _auth(request, None)
+        if denied is not None:
+            return denied
+        body = await _json_body(request)
+        if body is None or not isinstance(body.get("name"), str):
+            return web.json_response(
+                {"error": "请求体必须是 JSON {\"name\": \"<密钥名>\", "
+                          "\"scopes\": [\"limits\", \"nodes\"]}"}, status=400)
+        name = body["name"].strip()
+        token, err = await _write(fleetconfig.add_api_key, name,
+                                  body.get("scopes"))
+        if err is not None:
+            return err
+        _audit(actor, "create_key", key=name,
+               scopes=",".join(sorted(set(body.get("scopes") or []))))
+        return web.json_response({
+            "ok": True, "name": name, "scopes": sorted(set(body["scopes"])),
+            "token": token,
+            "note": "令牌只显示这一次，总控只存它的 sha256——请立刻交给"
+                    "第三方系统妥善保存；丢了就吊销重建"})
+
+    async def handle_delete_key(request: web.Request) -> web.Response:
+        actor, denied = _auth(request, None)
+        if denied is not None:
+            return denied
+        name = request.match_info["name"]
+        _, err = await _write(fleetconfig.remove_api_key, name)
+        if err is not None:
+            return err
+        _audit(actor, "revoke_key", key=name)
+        return web.json_response({"ok": True, "name": name})
+
+    async def handle_whoami(request: web.Request) -> web.Response:
+        """第三方自检凭据：返回调用者身份与可用范围（不写任何东西）。"""
+        actor, denied = _auth(request, "any")
+        if denied is not None:
+            return denied
+        if actor == "admin":
+            return web.json_response({"actor": "admin", "scopes": list(
+                fleetconfig.API_SCOPES) + ["keys"]})
+        name = actor.split(":", 1)[1]
+        k = next(k for k in keys_fn() if k.name == name)
+        return web.json_response({"actor": actor, "scopes": list(k.scopes)})
+
+    async def handle_openapi(_request: web.Request) -> web.Response:
+        return web.json_response(fleetopenapi.spec())
+
+    # ---- 响应头：嵌入白名单（frame-ancestors）+ 跨域（CORS） ----
+
+    cors_set = set(cors_origins or ())
+    ancestors = ["'self'"] + list(frame_ancestors or ())
+
+    @web.middleware
+    async def preflight_mw(request: web.Request, handler):
+        if request.method == "OPTIONS" and request.path.startswith("/api/"):
+            if request.headers.get("Origin", "") not in cors_set:
+                return web.json_response(
+                    {"error": "跨域来源不在 RL_CORS_ORIGINS 白名单里"},
+                    status=403)
+            return web.Response(status=204, headers={
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE",
+                "Access-Control-Allow-Headers":
+                    "Authorization, X-API-Token, Content-Type",
+                "Access-Control-Max-Age": "600"})
+        return await handler(request)
+
+    async def on_prepare(request: web.Request,
+                         response: web.StreamResponse) -> None:
+        h = response.headers
+        h["Content-Security-Policy"] = "frame-ancestors " + " ".join(ancestors)
+        if not frame_ancestors:
+            h["X-Frame-Options"] = "SAMEORIGIN"     # 老浏览器不认 CSP
+        h["X-Content-Type-Options"] = "nosniff"
+        origin = request.headers.get("Origin", "")
+        if origin and origin in cors_set and request.path.startswith("/api/"):
+            h["Access-Control-Allow-Origin"] = origin
+            h["Vary"] = "Origin"
+
+    app = web.Application(middlewares=[preflight_mw])
+    app.on_response_prepare.append(on_prepare)
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/overview", handle_overview)
     app.router.add_get("/api/history", handle_history)
@@ -472,13 +626,20 @@ def build_fleet_app(
     app.router.add_get("/api/metrics-log", handle_metrics_log)
     app.router.add_get("/api/logs", handle_logs)
     app.router.add_get("/api/stream", handle_stream)
+    app.router.add_get("/api/openapi.json", handle_openapi)
     if yaml_path:
+        app.router.add_get("/api/whoami", handle_whoami)
         app.router.add_put("/api/total-quota", handle_put_total)
         app.router.add_delete("/api/total-quota", handle_delete_total)
         app.router.add_post("/api/nodes", handle_add_node)
         app.router.add_post("/api/nodes/import", handle_import_nodes)
         app.router.add_put("/api/nodes/{name}", handle_update_node)
         app.router.add_delete("/api/nodes/{name}", handle_delete_node)
+        app.router.add_put("/api/nodes/{name}/limit", handle_put_limit)
+        app.router.add_delete("/api/nodes/{name}/limit", handle_delete_limit)
+        app.router.add_get("/api/keys", handle_list_keys)
+        app.router.add_post("/api/keys", handle_create_key)
+        app.router.add_delete("/api/keys/{name}", handle_delete_key)
     return app
 
 
@@ -492,18 +653,28 @@ async def run_fleet_console(
     api_token: str = "",
     poke: "asyncio.Event | None" = None,
     metrics_path: str = "",
+    keys_fn: "Callable[[], list] | None" = None,
+    audit_fn: "Callable[[str, str, dict], None] | None" = None,
+    frame_ancestors: "list | tuple" = (),
+    cors_origins: "list | tuple" = (),
+    ssl_context=None,
 ) -> None:
-    """常驻任务：启动总控 HTTP 服务并挂起到被取消（同 run_console）。"""
+    """常驻任务：启动总控 HTTP(S) 服务并挂起到被取消（同 run_console）。
+    ssl_context 非空 = HTTPS（被 HTTPS 页面 iframe 嵌入时必须，否则浏览器
+    按混合内容拦掉）。"""
     runner = web.AppRunner(
         build_fleet_app(hub, logbuf, log, yaml_path=yaml_path,
                         api_token=api_token, poke=poke,
-                        metrics_path=metrics_path),
+                        metrics_path=metrics_path, keys_fn=keys_fn,
+                        audit_fn=audit_fn, frame_ancestors=frame_ancestors,
+                        cors_origins=cors_origins),
         access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, bind, port)
+    site = web.TCPSite(runner, bind, port, ssl_context=ssl_context)
     await site.start()
     eff_token, token_weak = tokenpolicy.effective(api_token)
-    log.info("总控制台已启动 bind=%s port=%d 写API=%s", bind, port,
+    log.info("总控制台已启动 %s bind=%s port=%d 写API=%s",
+             "https" if ssl_context is not None else "http", bind, port,
              ("已启用（令牌鉴权）" if yaml_path and eff_token
               else "已禁用（RL_API_TOKEN 强度不足，视为未配置）"
               if yaml_path and token_weak

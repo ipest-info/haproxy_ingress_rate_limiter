@@ -24,7 +24,12 @@
 #   - **取消总量控制 = 解除**：total 从 >0 变为 0 时，全部在册节点标记
 #     "待解除"，逐台 DELETE 实例总限速（节点恢复不限）。离线的保持待解除，
 #     恢复在线即解；之后总控回到只汇总不下发。只认**运行期的变化**——
-#     以 0 启动的总控不碰节点（不知道节点上的限速是谁设的）。
+#     以 0 启动的总控不碰节点（不知道节点上的限速是谁设的）；
+#   - **固定限速**（节点 fixed_mbps > 0，页面/开放 API 设置）：该节点的
+#     实例出向目标就是这个值，照值下发、不参与按需分配，但计入总量记账
+#     （池 = total − Σ固定 − 冻结记账）。它与总量控制无关：total = 0 时
+#     照样生效，取消总量控制也不解除它。取消固定时：在做总量控制 → 回到
+#     按需分配；没在做 → 解除（那个限速本来就是总控设的）。
 #
 # 单协程访问（allocate_once 只被分配环调用），无需加锁。
 
@@ -69,6 +74,8 @@ class NodeState:
     # 总量控制已取消、该节点的实例总限速还没解除（离线/下发失败时保持，
     # 后续每轮重试；成功 DELETE 或重新设了总带宽即清除）。
     release_pending: bool = False
+    # 固定限速（Mbps；0 = 按需分配）。来自总控配置，fleetpoll 同步。
+    fixed_mbps: float = 0.0
 
 
 class FleetGovernor:
@@ -80,6 +87,8 @@ class FleetGovernor:
         # 上一轮的总带宽（None = 还没跑过）：用来识别"取消总量控制"
         # 这个**变化**——以 0 启动不算取消。
         self._last_total: "float | None" = None
+        # 上一轮各节点的固定限速：识别"取消固定"这个变化。
+        self._last_fixed: "dict[str, float]" = {}
 
     def allocate_once(self, states: list, total: float,
                       params: AllocConfig) -> list:
@@ -87,27 +96,60 @@ class FleetGovernor:
         写清单 [(NodeState, 要下发的 Mbps | None)]（已过写抑制；None =
         解除该节点的实例总限速，即 DELETE）。
 
-        states 是全部在册节点；total ≤ 0 = 不做总量控制：只解除取消
-        那一刻还在册节点的限速（见 _release），不分配。
+        states 是全部在册节点；固定限速的节点照值下发（见 _pinned）；
+        其余按需分配。total ≤ 0 = 不做总量控制：按需节点只解除取消那一刻
+        还在册的（见 _release），不分配。
         """
-        log = self._log
         cancelled = (self._last_total is not None and self._last_total > 0
                      and total <= 0)
         self._last_total = total
+        pinned = [s for s in states if s.fixed_mbps > 0]
+        auto = [s for s in states if s.fixed_mbps <= 0]
+        for s in auto:
+            # 刚取消固定、又没在做总量控制：那个限速是总控设的，解除。
+            if (self._last_fixed.get(s.name, 0.0) > 0 and total <= 0
+                    and s.token):
+                s.release_pending = True
+        self._last_fixed = {s.name: s.fixed_mbps for s in states}
+        writes = self._pinned(pinned)
         if total <= 0:
             if cancelled:
-                self._mark_release(states)
-            return self._release(states)
-        for s in states:
+                self._mark_release(auto)
+            return writes + self._release(auto)
+        for s in auto:
             s.release_pending = False
+        return writes + self._allocate_auto(
+            auto, total, params, sum(s.fixed_mbps for s in pinned))
 
+    def _pinned(self, pinned: list) -> list:
+        """固定限速节点：照值下发（与自报值差 < 0.05Mbps 不重复写）。"""
+        writes = []
+        for s in pinned:
+            s.desired_mbps = s.fixed_mbps
+            s.release_pending = False
+            if not (s.online and s.token and s.executable):
+                continue                  # 离线/无令牌/不可执行：等条件具备
+            if s.quota_mbps is not None and abs(
+                    s.quota_mbps - s.fixed_mbps) < 0.05:
+                continue
+            writes.append((s, s.fixed_mbps))
+            self._log.info("固定限速下发 node=%s %s→%.1fMbps", s.name,
+                           f"{s.quota_mbps:.1f}" if s.quota_mbps is not None
+                           else "未知", s.fixed_mbps)
+        return writes
+
+    def _allocate_auto(self, states: list, total: float,
+                       params: AllocConfig, pinned_reserved: float) -> list:
+        """按需分配（只含没设固定限速的节点）。pinned_reserved = Σ固定
+        限速，与冻结记账一起从池里扣掉。"""
+        log = self._log
         ctrl = [s for s in states
                 if s.online and s.executable and not s.degraded and s.token]
         frozen = [s for s in states if s not in ctrl]
 
         # 冻结记账：fail-static（失联节点的配额绝不碰）与总量守恒的
-        # 交点——它占着的份额如实从池里扣掉。
-        reserved = 0.0
+        # 交点——它占着的份额如实从池里扣掉。固定限速同样扣。
+        reserved = pinned_reserved
         for s in frozen:
             s.desired_mbps = None
             if s.quota_mbps is None:
@@ -120,10 +162,10 @@ class FleetGovernor:
         pool = max(0.0, total - reserved)
         if reserved > total:
             log.warning(
-                "冻结节点（离线/降级/不可执行/无令牌）的配额之和已超过"
-                "总带宽（超卖），可控节点将被压到保底份额 "
-                "reserved=%.1fMbps total=%gMbps frozen=%d",
-                reserved, total, len(frozen))
+                "固定限速与冻结节点（离线/降级/不可执行/无令牌）的配额之和"
+                "已超过总带宽（超卖），按需节点将被压到保底份额 "
+                "reserved=%.1fMbps（其中固定 %.1fMbps） total=%gMbps "
+                "frozen=%d", reserved, pinned_reserved, total, len(frozen))
         if not ctrl:
             log.warning(
                 "没有任何可控节点（在线+可执行+未降级+有令牌），本轮"

@@ -5,8 +5,10 @@
 <style>
 /* 总控制台：汇总数十台节点的流量并做总量控制。
    视觉与交互骨架照抄节点控制台（index.html）——同一套配色/卡片/图表，
-   运维在两边切换时不用重新学一遍页面。四个 tab：总览 / 节点管理 /
-   历史回查（读监控落盘）/ 日志。 */
+   运维在两边切换时不用重新学一遍页面。五个 tab：总览 / 节点管理 /
+   历史回查（读监控落盘）/ 开放 API（第三方密钥）/ 日志。
+   嵌入模式（?embed=1&tab=overview|nodes|history|logs）：去掉页头、页签
+   与一切写操作，只读展示——给第三方系统 iframe 引用。 */
 :root {
   --surface-0: #f5f5f4; --surface-1: #ffffff; --surface-2: #f0efed;
   --surface-3: #e8e7e4;
@@ -206,6 +208,27 @@ a.btn-link:hover { text-decoration: underline; }
 .ev-time { font-variant-numeric: tabular-nums; color: var(--text-secondary); }
 .node-table td.ev-detail { white-space: normal; min-width: 260px; }
 
+/* 开放 API */
+.key-form { display: flex; align-items: flex-end; gap: 10px 16px; flex-wrap: wrap; }
+.key-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-secondary); }
+.key-form input[type=text] { width: 200px; }
+.key-form label.chk { flex-direction: row; align-items: center; padding-bottom: 7px; }
+.new-token {
+  margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+  border: 1px solid var(--warn); background: rgba(184,121,10,.08);
+}
+.new-token code {
+  display: block; margin: 6px 0; padding: 6px 8px; border-radius: 6px; word-break: break-all;
+  background: var(--surface-1); font: 12.5px/1.5 ui-monospace, Menlo, Consolas, monospace;
+}
+pre.curl {
+  margin: 8px 0 0; padding: 10px 12px; border-radius: 8px; overflow-x: auto;
+  background: var(--surface-2); font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace;
+}
+/* 嵌入模式：只读展示 */
+body.embed header, body.embed .tabs, body.embed .w { display: none !important; }
+body.embed main { padding-top: 12px; }
+
 #logs { max-height: 460px; overflow-y: auto;
         font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace; }
 #logs div { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
@@ -250,6 +273,7 @@ a.btn-link:hover { text-decoration: underline; }
   <button data-tab="overview" aria-selected="true">总览</button>
   <button data-tab="nodes" aria-selected="false">节点管理</button>
   <button data-tab="history" aria-selected="false">历史回查</button>
+  <button data-tab="api" aria-selected="false">开放 API</button>
   <button data-tab="logs" aria-selected="false">日志</button>
 </div></nav>
 
@@ -259,7 +283,7 @@ a.btn-link:hover { text-decoration: underline; }
       <div class="card-head">
         <span class="card-title">总量控制</span>
         <span class="tag" id="f-total-tag">–</span>
-        <span class="quota-edit">
+        <span class="quota-edit w">
           <span class="hint">总流出带宽 Mbps，0 = 不做总量控制</span>
           <input id="total-input" type="number" min="0" step="any" placeholder="Mbps">
           <button id="total-save">保存</button>
@@ -295,7 +319,7 @@ a.btn-link:hover { text-decoration: underline; }
   </section>
 
   <section class="tabpage" id="page-nodes">
-    <div class="card">
+    <div class="card w">
       <div class="card-head">
         <span class="card-title">粘贴接入串</span>
         <span class="tag ok">推荐 · 可批量</span>
@@ -315,7 +339,7 @@ a.btn-link:hover { text-decoration: underline; }
       </div>
     </div>
 
-    <div class="card">
+    <div class="card w">
       <div class="card-head">
         <span class="card-title" id="nf-title">手工添加节点</span>
         <span class="hint">写回 fleet.yaml、即时加入轮询；需页头令牌（rl-fleet 的 RL_API_TOKEN）</span>
@@ -330,6 +354,8 @@ a.btn-link:hover { text-decoration: underline; }
             <input id="nf-token" type="password" placeholder="≥32 位随机串，如 openssl rand -hex 32" autocomplete="new-password"></label>
           <label>页面跳转地址（可选）
             <input id="nf-console" placeholder="内外网地址不同时填；缺省 = 控制台地址" autocomplete="off"></label>
+          <label>固定限速 Mbps（可选）
+            <input id="nf-fixed" type="number" min="0" step="any" placeholder="留空 = 按需分配" autocomplete="off"></label>
         </div>
         <div class="form-actions">
           <label class="chk" id="nf-clear-wrap" hidden>
@@ -398,6 +424,53 @@ a.btn-link:hover { text-decoration: underline; }
     </div>
   </section>
 
+  <section class="tabpage" id="page-api">
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">API 密钥</span>
+        <span class="hint">给第三方系统用的凭据：按范围授权、可随时吊销，每次写操作都记审计（历史回查里 type=api）。
+          只有管理员令牌（rl-fleet 的 RL_API_TOKEN）能管理密钥——在页头填它</span>
+      </div>
+      <div class="card-body">
+        <div class="key-form">
+          <label>密钥名（标识第三方，1~64 位字母/数字/._-）
+            <input type="text" id="key-name" maxlength="64" placeholder="billing-system" autocomplete="off"></label>
+          <label class="chk"><input type="checkbox" id="key-scope-limits" checked> limits：总带宽、节点固定限速</label>
+          <label class="chk"><input type="checkbox" id="key-scope-nodes"> nodes：节点清单增删改、接入串导入</label>
+          <button id="key-create" class="primary">创建密钥</button>
+        </div>
+        <div class="new-token" id="key-new" hidden>
+          <b>新密钥 <span id="key-new-name"></span> 的令牌——只显示这一次</b>（总控只存它的 sha256，关掉就再也拿不到；丢了吊销重建）：
+          <code id="key-new-token"></code>
+          <button id="key-copy">复制</button> <button id="key-hide">我已保存，收起</button>
+        </div>
+        <table class="node-table left" id="key-table" style="margin-top:12px"><tbody>
+          <tr><td class="hint">页头填管理员令牌后显示</td></tr>
+        </tbody></table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><span class="card-title">接口速查</span>
+        <span class="hint">完整说明见 docs/12-总控开放API.md；机器可读描述：<a href="/api/openapi.json" target="_blank" rel="noopener">/api/openapi.json</a>（可直接导入 Postman / Apifox）</span></div>
+      <div class="card-body" style="overflow-x:auto">
+        <table class="node-table left"><tbody>
+          <tr><th>接口</th><th>范围</th><th>说明</th></tr>
+          <tr><td class="url">PUT /api/total-quota</td><td>limits</td><td>设总流出带宽 <code>{"quota_mbps": 1000}</code>；0 = 取消总量控制</td></tr>
+          <tr><td class="url">DELETE /api/total-quota</td><td>limits</td><td>取消总量控制（解除按需节点限速）</td></tr>
+          <tr><td class="url">PUT /api/nodes/{name}/limit</td><td>limits</td><td>节点固定限速 <code>{"mbps": 50}</code>，不参与按需分配</td></tr>
+          <tr><td class="url">DELETE /api/nodes/{name}/limit</td><td>limits</td><td>取消固定，回到按需分配</td></tr>
+          <tr><td class="url">POST /api/nodes</td><td>nodes</td><td>添加节点 <code>{"name","url","token"}</code></td></tr>
+          <tr><td class="url">PUT / DELETE /api/nodes/{name}</td><td>nodes</td><td>改接线 / 删除节点</td></tr>
+          <tr><td class="url">POST /api/nodes/import</td><td>nodes</td><td>粘贴接入串批量导入 <code>{"text","dry_run"}</code></td></tr>
+          <tr><td class="url">GET /api/whoami</td><td>任一</td><td>检查凭据：身份与可用范围</td></tr>
+          <tr><td class="url">GET /api/overview、/api/nodes、/api/metrics-log</td><td>无需</td><td>读接口：概览、节点清单、历史数据与审计</td></tr>
+        </tbody></table>
+        <pre class="curl" id="api-curl"></pre>
+      </div>
+    </div>
+  </section>
+
   <section class="tabpage" id="page-logs">
     <div class="card">
       <div class="card-head">
@@ -434,8 +507,12 @@ const BUF_MAX = 1200;
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name);
 
 // ---- 令牌与写 API（与节点控制台同一套交互） ----
+// 嵌入模式（第三方 iframe 引用）：只读展示，不带任何令牌。
+const QS = new URLSearchParams(location.search);
+const EMBED = QS.get("embed") === "1";
+if (EMBED) document.body.classList.add("embed");
 const tokenInput = $("#api-token");
-tokenInput.value = localStorage.getItem("rl_fleet_token") || "";
+tokenInput.value = EMBED ? "" : (localStorage.getItem("rl_fleet_token") || "");
 tokenInput.addEventListener("change", () =>
   localStorage.setItem("rl_fleet_token", tokenInput.value.trim()));
 
@@ -623,6 +700,7 @@ function renderNodeTable(snap) {
       <th>配额（本轮分配）</th><th>利用率</th><th style="text-align:left">最近错误</th></tr>` +
     rows.map(([name, n]) => {
       const quota = (n.quota_mbps == null ? "–" : n.quota_mbps ? fmt1(n.quota_mbps) : "不限")
+        + (n.fixed_mbps ? ' <span class="tag" title="固定限速：照值下发，不参与按需分配">固定</span>' : "")
         + (n.release_pending ? ' <span class="tag warn" title="总量控制已取消，该节点的实例总限速还没解除（离线或下发失败，自动重试）">待解除</span>' : "");
       const desired = n.desired_mbps == null ? "" :
         `（<span style="${Math.abs((n.desired_mbps||0)-(n.quota_mbps||0)) > 1 ? 'color:var(--warn)' : ''}">${fmt1(n.desired_mbps)}</span>）`;
@@ -660,7 +738,7 @@ function renderNodeList() {
   }
   const live = (state.latest && state.latest.nodes) || {};
   tb.innerHTML = `<tr><th>节点</th><th>控制台地址</th><th>页面跳转地址</th>
-      <th>令牌</th><th>状态</th><th></th></tr>` +
+      <th>令牌</th><th>限速</th><th>状态</th><th class="w"></th></tr>` +
     state.nodesCfg.map(n => `<tr>
         <td><b>${esc(n.name)}</b></td>
         <td class="url">${esc(n.url)}</td>
@@ -668,8 +746,9 @@ function renderNodeList() {
         <td>${n.has_token ? '<span class="tag ok">已配置</span>'
              : n.token_weak ? '<span class="tag alert" title="fleet.yaml 里的令牌没过强度规则，已当作没有令牌：只读观测，不下发、不解除。在该节点上重新生成强令牌后点「编辑」更新">强度不足 · 已作废</span>'
              : '<span class="tag">未配置 · 只读观测</span>'}</td>
+        <td>${n.fixed_mbps ? `<span class="tag warn">固定 ${fmt1(n.fixed_mbps)} Mbps</span>` : '<span class="hint">按需分配</span>'}</td>
         <td>${live[n.name] ? nodeBadge(live[n.name]) : '<span class="tag">等待轮询</span>'}</td>
-        <td class="ops"><button data-edit="${esc(n.name)}">编辑</button>
+        <td class="ops w"><button data-edit="${esc(n.name)}">编辑</button>
           <button class="danger" data-del="${esc(n.name)}">删除</button></td>
       </tr>`).join("");
 }
@@ -730,7 +809,7 @@ function renderImport(r) {
 
 function resetNodeForm() {
   state.editing = null;
-  for (const id of ["#nf-name", "#nf-url", "#nf-token", "#nf-console"]) $(id).value = "";
+  for (const id of ["#nf-name", "#nf-url", "#nf-token", "#nf-console", "#nf-fixed"]) $(id).value = "";
   $("#nf-name").disabled = false;
   $("#nf-token").placeholder = "≥32 位随机串，如 openssl rand -hex 32";
   $("#nf-clear-token").checked = false;
@@ -748,6 +827,7 @@ function editNode(name) {
   $("#nf-name").disabled = true;              // 改名 = 删了重加
   $("#nf-url").value = n.url;
   $("#nf-console").value = n.console_url || "";
+  $("#nf-fixed").value = n.fixed_mbps || "";
   $("#nf-token").value = "";
   $("#nf-token").placeholder = n.has_token ? "留空 = 保持原令牌" : "留空 = 仍为只读观测";
   $("#nf-clear-wrap").hidden = !n.has_token;
@@ -767,6 +847,9 @@ async function saveNode() {
     toast("控制台地址应为 http(s)://<节点地址>:<端口>，如 http://10.0.1.11:8090", true); return;
   }
   if (token && token.length < 32) { toast("令牌太短：至少 32 位高强度随机串（如 openssl rand -hex 32）", true); return; }
+  const fixedRaw = $("#nf-fixed").value.trim(), fixed = fixedRaw === "" ? 0 : parseFloat(fixedRaw);
+  if (!isFinite(fixed) || fixed < 0) { toast("固定限速必须是 ≥ 0 的数字（Mbps；留空/0 = 按需分配）", true); return; }
+  const before = state.editing ? ((state.nodesCfg.find(x => x.name === state.editing) || {}).fixed_mbps || 0) : 0;
   let r;
   if (state.editing) {
     const body = {url, console_url: cu};
@@ -780,6 +863,12 @@ async function saveNode() {
     r = await apiWrite("POST", "/api/nodes", {name, url, token, console_url: cu});
     if (r) toast("节点 " + name + " 已添加——即时加入轮询，首次轮询成功后参与分配");
   }
+  if (r && fixed !== before) {
+    const lr = fixed
+      ? await apiWrite("PUT", `/api/nodes/${encodeURIComponent(name)}/limit`, {mbps: fixed})
+      : await apiWrite("DELETE", `/api/nodes/${encodeURIComponent(name)}/limit`);
+    if (lr) toast(fixed ? `节点 ${name} 固定限速 ${fixed} Mbps（不参与按需分配）` : `节点 ${name} 回到按需分配`);
+  }
   if (r) { resetNodeForm(); setTimeout(loadNodes, 800); }
 }
 
@@ -792,6 +881,56 @@ async function deleteNode(name) {
     toast("节点 " + name + " 已删除");
     setTimeout(loadNodes, 800);
   }
+}
+
+// ---- 开放 API：密钥管理（只认管理员令牌） ----
+async function loadKeys() {
+  const tb = $("#key-table tbody");
+  if (!tokenInput.value.trim()) {
+    tb.innerHTML = '<tr><td class="hint">页头填管理员令牌（RL_API_TOKEN）后显示</td></tr>'; return;
+  }
+  let r, j = {};
+  try { r = await fetch("/api/keys", {headers: {"X-API-Token": tokenInput.value.trim()}}); j = await r.json(); }
+  catch (e) { return; }
+  if (!r.ok) { tb.innerHTML = `<tr><td class="hint">${esc(j.error || "HTTP " + r.status)}</td></tr>`; return; }
+  const keys = j.keys || [];
+  tb.innerHTML = !keys.length ? '<tr><td class="hint">还没有 API 密钥——用上面的表单给第三方系统建一个</td></tr>'
+    : '<tr><th>密钥名</th><th>范围</th><th>创建时间（UTC）</th><th></th></tr>' + keys.map(k => `<tr>
+        <td><b>${esc(k.name)}</b></td><td>${k.scopes.map(s => `<span class="tag">${esc(s)}</span>`).join(" ")}</td>
+        <td class="url">${esc(k.created || "–")}</td>
+        <td class="ops"><button class="danger" data-revoke="${esc(k.name)}">吊销</button></td></tr>`).join("");
+}
+
+async function createKey() {
+  const name = $("#key-name").value.trim();
+  const scopes = [["limits", "#key-scope-limits"], ["nodes", "#key-scope-nodes"]]
+    .filter(([, id]) => $(id).checked).map(([s]) => s);
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) { toast("密钥名应为 1~64 位字母/数字/._-", true); return; }
+  if (!scopes.length) { toast("至少选一个范围", true); return; }
+  const r = await apiWrite("POST", "/api/keys", {name, scopes});
+  if (!r) return;
+  $("#key-new-name").textContent = r.name;
+  $("#key-new-token").textContent = r.token;
+  $("#key-new").hidden = false;
+  $("#key-name").value = "";
+  loadKeys();
+}
+
+async function revokeKey(name) {
+  if (!confirm(`吊销密钥 ${name}？用它的第三方系统会立即失去写权限。`)) return;
+  const r = await apiWrite("DELETE", "/api/keys/" + encodeURIComponent(name));
+  if (r) { toast("密钥 " + name + " 已吊销"); loadKeys(); }
+}
+
+function renderCurl() {
+  $("#api-curl").textContent =
+`# 检查凭据
+curl -s ${location.origin}/api/whoami -H 'X-API-Token: <密钥>'
+# 设总流出带宽 1000 Mbps
+curl -s -X PUT ${location.origin}/api/total-quota -H 'X-API-Token: <密钥>' -d '{"quota_mbps": 1000}'
+# 节点 node-sh-01 固定限速 50 Mbps / 取消固定
+curl -s -X PUT ${location.origin}/api/nodes/node-sh-01/limit -H 'X-API-Token: <密钥>' -d '{"mbps": 50}'
+curl -s -X DELETE ${location.origin}/api/nodes/node-sh-01/limit -H 'X-API-Token: <密钥>'`;
 }
 
 // ---- 历史回查（/api/metrics-log：分钟行 + 事件） ----
@@ -1032,6 +1171,7 @@ function switchTab(name) {
   for (const b of $$(".tabs button")) b.setAttribute("aria-selected", String(b.dataset.tab === name));
   for (const p of $$(".tabpage")) p.classList.toggle("on", p.id === "page-" + name);
   if (name === "nodes") loadNodes();
+  if (name === "api") { loadKeys(); renderCurl(); }
   if (name === "history") {
     hqNodeOptions();
     if (!state.hq.loaded) { hqRange(1); hqQuery(); } else drawHist();
@@ -1081,6 +1221,17 @@ $("#imp-text").addEventListener("input", () => {
 $("#imp-preview").onclick = () => importNodes(true);
 $("#imp-go").onclick = () => importNodes(false);
 $("#imp-clear").onclick = () => { $("#imp-text").value = ""; importNodes(true); };
+$("#key-create").onclick = createKey;
+$("#key-hide").onclick = () => { $("#key-new").hidden = true; $("#key-new-token").textContent = ""; };
+$("#key-copy").onclick = async () => {
+  try { await navigator.clipboard.writeText($("#key-new-token").textContent); toast("已复制到剪贴板"); }
+  catch (e) { toast("复制失败，请手工选中复制", true); }
+};
+$("#key-table").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-revoke]");
+  if (b) revokeKey(b.dataset.revoke);
+});
+tokenInput.addEventListener("change", () => { if (state.tab === "api") loadKeys(); });
 $("#nf-save").onclick = saveNode;
 $("#nf-cancel").onclick = resetNodeForm;
 $("#nl-table").addEventListener("click", (e) => {
@@ -1098,6 +1249,10 @@ $("#log-level").onchange = (e) => {
 
 (async function boot() {
   buildCharts();
+  if (EMBED) {
+    const tab = QS.get("tab") || "overview";
+    if (["overview", "nodes", "history", "logs"].includes(tab)) switchTab(tab);
+  }
   try {
     const h = await (await fetch("/api/history")).json();
     for (const snap of h.snapshots || []) applySnapshot(snap, false);

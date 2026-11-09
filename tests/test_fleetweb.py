@@ -155,7 +155,7 @@ async def test_nodes_read_view_never_leaks_tokens(client):
     j = await (await client.get("/api/nodes")).json()
     assert j["nodes"] == [{"name": "node1", "url": "http://10.0.0.1:8090",
                            "console_url": "", "has_token": True,
-                           "token_weak": False}]
+                           "token_weak": False, "fixed_mbps": 0.0}]
     assert "fe8890a02029cbe0d9a67dd1cb2cbd8f1daa11101d13ef31" not in json.dumps(j)
 
 
@@ -383,3 +383,166 @@ async def test_import_requires_fleet_token(client):
     r = await client.post("/api/nodes/import", json={
         "text": "rl-node name=n9 url=http://x:1", "dry_run": True})
     assert r.status == 401
+
+
+# ---------------------------------------------------------------------------
+# 开放 API：按范围授权的密钥、节点固定限速、审计、跨域/嵌入响应头
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+async def oclient(tmp_path):
+    """带密钥清单（实时读 YAML）、审计回调、跨域与嵌入白名单的总控。"""
+    yml = tmp_path / "fleet.yaml"
+    yml.write_text(FLEET_YAML, encoding="utf-8")
+    audits: list = []
+    app = fleetweb.build_fleet_app(
+        hub(nodes_fn=lambda: fleetconfig.load(str(yml)).nodes),
+        fleetweb.LogBuffer(), log, yaml_path=str(yml), api_token=TOKEN,
+        keys_fn=lambda: fleetconfig.load(str(yml)).api_keys,
+        audit_fn=lambda actor, op, d: audits.append((actor, op, d)),
+        frame_ancestors=["https://portal.example.com"],
+        cors_origins=["https://ops.example.com"])
+    app["yml"], app["audits"] = yml, audits
+    async with TestClient(TestServer(app)) as c:
+        yield c
+
+
+async def _new_key(c, name, scopes):
+    r = await c.post("/api/keys", headers=auth(),
+                     json={"name": name, "scopes": scopes})
+    assert r.status == 200, await r.text()
+    return (await r.json())["token"]
+
+
+async def test_key_lifecycle_and_scopes(oclient):
+    c, yml = oclient, oclient.app["yml"]
+    tok = await _new_key(c, "billing", ["limits"])
+    # 明文令牌只出现在创建响应里：YAML 只存 sha256，列表不给令牌。
+    assert tok not in yml.read_text(encoding="utf-8")
+    assert fleetconfig.hash_token(tok) in yml.read_text(encoding="utf-8")
+    j = await (await c.get("/api/keys", headers=auth())).json()
+    assert [(k["name"], k["scopes"]) for k in j["keys"]] == \
+        [("billing", ["limits"])]
+    assert tok not in json.dumps(j)
+
+    me = await (await c.get("/api/whoami", headers=auth(tok))).json()
+    assert me == {"actor": "key:billing", "scopes": ["limits"]}
+
+    # limits 范围：能改总带宽与节点固定限速……
+    r = await c.put("/api/total-quota", headers=auth(tok),
+                    json={"quota_mbps": 800})
+    assert r.status == 200
+    r = await c.put("/api/nodes/node1/limit", headers=auth(tok),
+                    json={"mbps": 50})
+    assert r.status == 200
+    assert fleetconfig.load(str(yml)).nodes[0].fixed_mbps == 50.0
+    # ……但不能动节点清单，更不能管密钥。
+    r = await c.post("/api/nodes", headers=auth(tok),
+                     json={"name": "n2", "url": "http://x:1"})
+    assert r.status == 403 and "nodes" in (await r.json())["error"]
+    r = await c.get("/api/keys", headers=auth(tok))
+    assert r.status == 403
+
+    # 吊销后立即失效。
+    r = await c.delete("/api/keys/billing", headers=auth())
+    assert r.status == 200
+    r = await c.put("/api/total-quota", headers=auth(tok),
+                    json={"quota_mbps": 1})
+    assert r.status == 401
+
+    # 审计：谁做了什么（令牌不进审计）。
+    ops = [(a, op) for a, op, _ in c.app["audits"]]
+    assert ops == [("admin", "create_key"), ("key:billing", "set_total"),
+                   ("key:billing", "set_node_limit"), ("admin", "revoke_key")]
+    assert tok not in json.dumps(c.app["audits"])
+
+
+async def test_nodes_scope_key_cannot_touch_limits(oclient):
+    tok = await _new_key(oclient, "cmdb", ["nodes"])
+    r = await oclient.post("/api/nodes", headers=auth(tok),
+                           json={"name": "n2", "url": "http://10.0.0.2:8090"})
+    assert r.status == 200
+    r = await oclient.put("/api/total-quota", headers=auth(tok),
+                          json={"quota_mbps": 1})
+    assert r.status == 403
+
+
+@pytest.mark.parametrize("method, url, body, status", [
+    ("PUT", "/api/nodes/node1/limit", {"mbps": 0}, 400),     # 取消用 DELETE
+    ("PUT", "/api/nodes/node1/limit", {"mbps": -5}, 400),
+    ("PUT", "/api/nodes/node1/limit", {"mbps": True}, 400),
+    ("PUT", "/api/nodes/nope/limit", {"mbps": 5}, 404),
+    ("DELETE", "/api/nodes/nope/limit", None, 404),
+    ("POST", "/api/keys", {"name": "k", "scopes": ["all"]}, 400),
+    ("POST", "/api/keys", {"name": "bad name", "scopes": ["limits"]}, 400),
+    ("DELETE", "/api/keys/nope", None, 404),
+])
+async def test_open_api_validation(oclient, method, url, body, status):
+    r = await oclient.request(method, url, headers=auth(), json=body)
+    assert r.status == status, await r.text()
+
+
+async def test_clear_node_limit(oclient):
+    yml = oclient.app["yml"]
+    await oclient.put("/api/nodes/node1/limit", headers=auth(),
+                      json={"mbps": 30})
+    r = await oclient.delete("/api/nodes/node1/limit", headers=auth())
+    assert r.status == 200
+    assert fleetconfig.load(str(yml)).nodes[0].fixed_mbps == 0.0
+    assert "fixed_mbps" not in yml.read_text(encoding="utf-8")
+
+
+async def test_duplicate_key_name_conflicts(oclient):
+    await _new_key(oclient, "dup", ["limits"])
+    r = await oclient.post("/api/keys", headers=auth(),
+                           json={"name": "dup", "scopes": ["nodes"]})
+    assert r.status == 409
+
+
+async def test_cors_preflight_and_headers(oclient):
+    ok = {"Origin": "https://ops.example.com",
+          "Access-Control-Request-Method": "PUT"}
+    r = await oclient.options("/api/total-quota", headers=ok)
+    assert r.status == 204
+    assert "X-API-Token" in r.headers["Access-Control-Allow-Headers"]
+    assert r.headers["Access-Control-Allow-Origin"] == "https://ops.example.com"
+    r = await oclient.options("/api/total-quota", headers={
+        "Origin": "https://evil.example", "Access-Control-Request-Method": "PUT"})
+    assert r.status == 403
+    r = await oclient.get("/api/overview",
+                          headers={"Origin": "https://ops.example.com"})
+    assert r.headers["Access-Control-Allow-Origin"] == "https://ops.example.com"
+    r = await oclient.get("/api/overview",
+                          headers={"Origin": "https://evil.example"})
+    assert "Access-Control-Allow-Origin" not in r.headers
+
+
+async def test_frame_ancestors_allowlist(oclient):
+    r = await oclient.get("/")
+    assert r.headers["Content-Security-Policy"] == \
+        "frame-ancestors 'self' https://portal.example.com"
+    assert "X-Frame-Options" not in r.headers      # 有白名单就不能再 SAMEORIGIN
+
+
+async def test_default_only_same_origin_can_embed(client):
+    """没配白名单 = 只许同源嵌入（防点击劫持），老浏览器靠 X-Frame-Options。"""
+    r = await client.get("/")
+    assert r.headers["Content-Security-Policy"] == "frame-ancestors 'self'"
+    assert r.headers["X-Frame-Options"] == "SAMEORIGIN"
+    r = await client.options("/api/total-quota", headers={
+        "Origin": "https://ops.example.com",
+        "Access-Control-Request-Method": "PUT"})
+    assert r.status == 403                          # 没配 CORS = 不放行
+
+
+async def test_openapi_matches_routes(oclient):
+    spec = await (await oclient.get("/api/openapi.json")).json()
+    assert spec["openapi"].startswith("3.")
+    routes = {(r.method, r.resource.canonical)
+              for r in oclient.app.router.routes()
+              if r.resource is not None
+              and r.resource.canonical.startswith("/api/")
+              and r.method != "HEAD"}
+    documented = {(m.upper(), path) for path, ops in spec["paths"].items()
+                  for m in ops if m != "parameters"}
+    assert routes == documented

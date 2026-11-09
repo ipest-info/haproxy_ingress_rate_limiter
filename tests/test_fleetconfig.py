@@ -308,6 +308,57 @@ def test_import_update_without_token_clears_it(yml):
 
 
 # ---------------------------------------------------------------------------
+# 节点固定限速、开放 API 密钥
+# ---------------------------------------------------------------------------
+
+def test_set_node_limit_roundtrip(yml):
+    fleetconfig.set_node_limit(str(yml), "node2", 42)
+    n2 = fleetconfig.load(str(yml)).nodes[1]
+    assert n2.fixed_mbps == 42.0
+    fleetconfig.set_node_limit(str(yml), "node2", 0)
+    assert fleetconfig.load(str(yml)).nodes[1].fixed_mbps == 0.0
+    with pytest.raises(fleetconfig.NodeNotFoundError):
+        fleetconfig.set_node_limit(str(yml), "nope", 5)
+    with pytest.raises(fleetconfig.FleetConfigError):
+        fleetconfig.set_node_limit(str(yml), "node1", -1)
+
+
+def test_negative_fixed_rejected():
+    with pytest.raises(ValueError, match="fixed_mbps"):
+        fleetconfig.from_raw({"nodes": [{"name": "a", "url": "http://x:1",
+                                         "fixed_mbps": -3}]}, source="测试")
+
+
+def test_api_key_create_and_revoke(yml):
+    tok = fleetconfig.add_api_key(str(yml), "billing", ["limits", "limits"])
+    from rl_limiter import tokenpolicy
+    assert tokenpolicy.is_strong(tok)
+    (k,) = fleetconfig.load(str(yml)).api_keys
+    assert (k.name, k.scopes) == ("billing", ("limits",))
+    assert k.token_sha256 == fleetconfig.hash_token(tok)
+    assert tok not in yml.read_text(encoding="utf-8")
+    with pytest.raises(fleetconfig.KeyExistsError):
+        fleetconfig.add_api_key(str(yml), "billing", ["nodes"])
+    fleetconfig.remove_api_key(str(yml), "billing")
+    assert fleetconfig.load(str(yml)).api_keys == []
+    with pytest.raises(fleetconfig.KeyNotFoundError):
+        fleetconfig.remove_api_key(str(yml), "billing")
+
+
+@pytest.mark.parametrize("key, kw", [
+    ({"name": "k", "token_sha256": "ab", "scopes": ["limits"]}, "sha256"),
+    ({"name": "k", "token_sha256": "a" * 64, "scopes": []}, "scopes"),
+    ({"name": "k", "token_sha256": "a" * 64, "scopes": ["root"]}, "scopes"),
+    ({"name": "k", "token": "plain", "scopes": ["limits"]}, "不存明文"),
+    ({"name": "bad name", "token_sha256": "a" * 64, "scopes": ["nodes"]},
+     "name"),
+])
+def test_api_keys_validated(key, kw):
+    with pytest.raises(ValueError, match=kw):
+        fleetconfig.from_raw({"api_keys": [key]}, source="测试")
+
+
+# ---------------------------------------------------------------------------
 # 热更轮询
 # ---------------------------------------------------------------------------
 

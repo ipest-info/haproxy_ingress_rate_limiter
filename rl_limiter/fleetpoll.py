@@ -69,6 +69,7 @@ class NodePoller:
             s.url = n.url
             s.console_url = n.console_url or n.url
             s.token = n.token
+            s.fixed_mbps = n.fixed_mbps
         for name in list(self._states):
             if name not in seen:
                 s = self._states.pop(name)

@@ -93,8 +93,11 @@ async def test_cancel_total_releases_nodes_immediately(tmp_path):
                                 params={"kind": "event"}) as r:
                 assert r.status == 200
                 ev = (await r.json())["rows"]
+            # 开放 API 的审计事件：谁（admin）做了什么。
+            assert [(e["by"], e["op"]) for e in ev if e["type"] == "api"] \
+                == [("admin", "set_total"), ("admin", "cancel_total")]
             got = [(e["type"], e.get("node"), e.get("from_mbps"),
-                    e.get("to_mbps")) for e in ev]
+                    e.get("to_mbps")) for e in ev if e["type"] != "api"]
             assert got == [
                 ("start", None, None, None),
                 ("total", None, 0.0, 100.0),
